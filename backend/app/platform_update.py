@@ -2617,6 +2617,10 @@ class PreparedUpdate(TypedDict):
   requires_image: bool
   late: str | None  # live state saved at the swap, in-progress edits on top
   late_committed: str | None  # its committed part
+  # The late edits merged back before the server imported anything; the
+  # record stays swapped until that server starts, so a merged tree that
+  # cannot start is still returned to ``late`` by the boot script.
+  replayed: str | None
 
 
 def read_prepared_update() -> PreparedUpdate | None:
@@ -2637,6 +2641,7 @@ def read_prepared_update() -> PreparedUpdate | None:
     requires_image=bool(record.get("requires_image")),
     late=record.get("late") or None,
     late_committed=record.get("late_committed") or None,
+    replayed=record.get("replayed") or None,
   )
 
 
@@ -2695,7 +2700,7 @@ def _prepare(
   record = PreparedUpdate(
     state="prepared", snapshot=snapshot, prepared=prepared, target=target,
     image_digest=image_digest, requires_image=requires_image, late=None,
-    late_committed=None,
+    late_committed=None, replayed=None,
   )
   _write_prepared_update(record)
   _set_update_progress(
@@ -2860,21 +2865,40 @@ def late_edits_pending() -> bool:
   that is missing its own recent edits.
   """
   record = read_prepared_update()
-  return record is not None and record["state"] == "swapped"
+  return (
+    record is not None and record["state"] == "swapped"
+    and not record["replayed"]
+  )
 
 
 def complete_platform_swap(repo: Path = PLATFORM_REPO) -> str | None:
   """At boot, finish a swap: merge late edits back or park them.
 
-  Returns ``replayed``, ``conflict`` (parked for the resolver), ``reverted``
-  (the boot script returned to the previous version), or None.
+  The boot script calls this before uvicorn imports anything (through
+  ``reconcile_clone_sync``), so a clean merge-back is what the server loads;
+  the startup task calls it again to confirm. Returns ``replayed``,
+  ``conflict`` (parked for the resolver), ``reverted`` (the boot script
+  returned to the previous version), or None.
   """
   record = read_prepared_update()
   if record is None:
     return None
   local = _local_branch(repo)
+  if record["state"] == "swapped" and record["replayed"]:
+    # A server started on the merged-back source: the boot script returns a
+    # tree that cannot start to ``late`` (state reverted) before this runs.
+    _clear_prepared_update(repo)
+    return "replayed"
+  if record["state"] == "swapped" and (
+    ((_read_conflict_flag() or {}).get("overlay") or {}).get("replay")
+  ):
+    # Already parked for its resolver: merging again would overwrite it.
+    return "conflict"
   unswapped = PreparedUpdate(
-    **{**record, "state": "prepared", "late": None, "late_committed": None},
+    **{
+      **record, "state": "prepared", "late": None, "late_committed": None,
+      "replayed": None,
+    },
   )
   if record["state"] == "reverted":
     # The previous version is back with its recent edits. The update stays
@@ -2933,7 +2957,7 @@ def complete_platform_swap(repo: Path = PLATFORM_REPO) -> str | None:
       _restore_working_edits(repo, local)
     # Dropping the stamp makes the watcher's startup check rebuild the shell.
     _invalidate_frontend_build_stamp(repo)
-    _clear_prepared_update(repo)
+    _write_prepared_update({**record, "replayed": _rev(repo, local)})
     return "replayed"
 
 
@@ -3084,7 +3108,12 @@ def continue_platform_overlay_update(repo: Path = PLATFORM_REPO) -> str:
       )
       if result.status == "updated":
         if parked.get("replay"):
+          # The server booted before these edits returned, so it still owes
+          # the restart that loads them.
           _clear_prepared_update(repo)
+          _record_update_activation(
+            repo, result.new_sha, recorded_upstream_sha(repo),
+          )
         else:
           _record_update_activation(repo, result.new_sha, target)
       return result.status
@@ -3268,12 +3297,17 @@ def reconcile_clone_sync() -> str:
       if source and not _is_ancestor(PLATFORM_REPO, source, "HEAD"):
         source = None  # Recovery may leave provenance unprovable; do not guess hook authority.
       hook_refresh = _refresh_git_hooks(PLATFORM_REPO, source)
-      summary = f"startup[installed] head={_short(_rev(PLATFORM_REPO, 'HEAD'))} {recovery}"
-      if hook_refresh == "":
-        summary += " hooks=refreshed"
-      elif hook_refresh:
-        summary += f" hooks=error:{hook_refresh}"
-      return summary
+    # Edits made on the previous version merge back before uvicorn imports
+    # the swapped-in update, so the server loads both on this boot.
+    swap = complete_platform_swap(PLATFORM_REPO)
+    summary = f"startup[installed] head={_short(_rev(PLATFORM_REPO, 'HEAD'))} {recovery}"
+    if swap:
+      summary += f" swap={swap}"
+    if hook_refresh == "":
+      summary += " hooks=refreshed"
+    elif hook_refresh:
+      summary += f" hooks=error:{hook_refresh}"
+    return summary
   except Exception as exc:
     return f"startup[error] {exc!r}"
 
