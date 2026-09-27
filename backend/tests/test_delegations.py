@@ -1400,6 +1400,71 @@ def _run_activity_checkpoint(
   return disposition, seen_prompts
 
 
+def test_delegated_prompt_keeps_a_leading_goal_command_verbatim(db, monkeypatch):
+  """Only an owner's /goal becomes a plain 'Goal:' request. A helper's task is
+  immutable, hash-bound intent, so text that happens to start with /goal must
+  reach the helper exactly as written."""
+  import hashlib
+  from app import schemas
+  from app.broadcast import create_broadcast, remove_broadcast
+
+  task = "/goal inspect how the literal command is parsed"
+  _parent_id, child_id, delegation_id = _seed_delegation(
+    db, suffix="literal-goal", child_status="running",
+  )
+  child = db.get(models.Chat, child_id)
+  child.messages = [{"role": "user", "content": task}]
+  db.get(models.Delegation, delegation_id).prompt_sha256 = hashlib.sha256(
+    task.encode("utf-8"),
+  ).hexdigest()
+  if db.query(models.Owner).first() is None:
+    db.add(models.Owner(
+      username="literal-goal-owner", hashed_password="unused", provider="claude",
+    ))
+  run_token = "literal-goal-child-run"
+  db.add(models.ChatRun(
+    id=run_token, root_run_id=run_token, chat_id=child_id,
+    status="running", provider="claude", provider_execution_admitted=False,
+  ))
+  db.commit()
+  seen_prompts = []
+
+  async def provider_turn(*, user_message, bc, **_kwargs):
+    seen_prompts.append(user_message)
+    return {"session_id": None, "cost_usd": 0.0, "error": None}
+
+  async def skip_browser_cleanup(_chat_id):
+    return None
+
+  monkeypatch.setattr(
+    chat_mod, "get_provider", lambda _id: _ActivityCheckpointProvider("claude"),
+  )
+  # A helper's Claude turn may run in the parent's shared helper host; either
+  # way the provider receives the same assembled prompt.
+  monkeypatch.setattr("app.claude_sdk_runner.run_claude_sdk_turn", provider_turn)
+  monkeypatch.setattr(
+    "app.claude_helper_host.run_claude_host_turn", provider_turn,
+  )
+  monkeypatch.setattr(chat_mod, "_close_browser_session", skip_browser_cleanup)
+  create_broadcast(child_id)
+  try:
+    asyncio.run(chat_mod._run_chat_impl(
+      messages=[schemas.ChatMessage(role="user", content=task)],
+      chat_id=child_id,
+      session_id=None,
+      provider_id="claude",
+      run_gen=None,
+      run_token=run_token,
+    ))
+  finally:
+    remove_broadcast(child_id)
+
+  assert len(seen_prompts) == 1
+  assert task in seen_prompts[0]
+  assert "Goal: inspect" not in seen_prompts[0]
+  assert not seen_prompts[0].startswith("/goal")
+
+
 @pytest.mark.parametrize("provider_id", ["claude", "codex"])
 def test_automatic_root_checkpoint_does_not_admit_or_ack_sibling_root_result(
   db, monkeypatch, provider_id,

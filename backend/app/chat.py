@@ -5037,11 +5037,6 @@ async def _run_chat_impl_with_db(
   raw_user_message = messages[-1].content
   user_message = raw_user_message
   historical_goal_mode = _chat_has_goal_intent(messages)
-  # Möbius owns `/goal`: the command already created the Goal, so the agent's
-  # copy is a plain request. Claude's CLI has its own `/goal`, which would echo
-  # the hidden context below and arm a second goal loop. (Agent copy only; the
-  # persisted/displayed user text is never touched here.)
-  user_message = goal_request_for_agent(user_message)
 
   # The per-turn run token is allocated by the scheduler (the route /
   # continuation / stale-pending drain) and passed in, so the SAME token
@@ -5081,12 +5076,17 @@ async def _run_chat_impl_with_db(
     except Exception:
       log.exception("codex skills sync failed chat_id=%s", chat_id)
   if run_policy is None:
+    # Möbius owns an owner's `/goal`: the command already created the Goal, so
+    # the agent's copy is a plain request. Claude's CLI has its own `/goal`,
+    # which would echo the hidden context below and arm a second goal loop.
+    # (Agent copy only; the persisted/displayed user text is never touched.)
+    user_message = goal_request_for_agent(user_message)
     app_context_block, app_context_env = _build_app_context(
       db, chat_id, settings.data_dir,
     )
   else:
     # Delegation prompts are plain bounded tasks even if their text happens to
-    # begin with an owner-only slash command.
+    # begin with an owner-only slash command; they reach the helper verbatim.
     historical_goal_mode = False
 
   # Durable run identity: the turn's StartTurn (initial send) or
