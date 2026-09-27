@@ -1313,11 +1313,32 @@ def _activity_continuation_run_id(db: Session, row: models.Delegation) -> str:
   Keyed by the result (its child run), not the helper: a follow-up result
   must open its own continuation instead of attaching to the finished one
   that delivered the helper's earlier result.
+
+  A completed continuation whose admitted envelope does not name this
+  helper never received its result (an earlier delegated parent's checkpoint
+  admitted none), so the still-owed result gets one retry identity. A
+  nonterminal one keeps the original identity for restart recovery, and a
+  retry that also ends without it is not retried again.
   """
   result_run_id = current_result_run_ids(db, [row.id]).get(row.id, "")
   basis = f"{row.parent_chat_id}\0{row.id}\0{result_run_id}"
-  digest = hashlib.sha256(basis.encode("utf-8")).hexdigest()
-  return f"{_ACTIVITY_RUN_PREFIX}{digest[:48]}"
+
+  def run_id(value: str) -> str:
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return f"{_ACTIVITY_RUN_PREFIX}{digest[:48]}"
+
+  first = run_id(basis)
+  attempt = db.query(
+    models.ChatRun.status, models.ChatRun.activity_delivery_json,
+  ).filter(
+    models.ChatRun.id == first, models.ChatRun.chat_id == row.parent_chat_id,
+  ).first()
+  if attempt is not None and attempt.status == "completed":
+    envelope = attempt.activity_delivery_json
+    admitted = envelope.get("delegation_ids") if isinstance(envelope, dict) else None
+    if row.id not in (admitted or ()):
+      return run_id(f"{basis}\0retry")
+  return first
 
 
 def _wake_message_results(message: object) -> dict[str, str | None]:

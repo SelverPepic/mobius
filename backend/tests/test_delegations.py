@@ -1441,6 +1441,63 @@ def test_nested_helper_wake_receives_and_latches_its_sub_helper_result(
   assert row.incorporated_run_id == f"child-run-{suffix}"
 
 
+@pytest.mark.parametrize("provider_id", ["claude", "codex"])
+def test_a_completed_wake_that_admitted_no_result_is_retried_once(
+  db, monkeypatch, provider_id,
+):
+  """Before delegated turns received results, a nested helper's wake ran and
+  completed without admitting its sub-helper's result, and its fixed identity
+  could never run again. That still-owed result gets one retry, which
+  receives and latches it; a retry that also admits nothing is final."""
+  suffix = f"legacy-wake-{provider_id}"
+  parent_id, _child_id, delegation_id = _seed_delegation(
+    db, suffix=suffix,
+    result_blocks=[{"type": "text", "content": "KIWI-legacy-result"}],
+    parent_messages=[{"role": "user", "content": "Do the bounded task."}],
+  )
+  _seed_delegation(db, suffix=f"{suffix}-outer", parent_id=f"outer-{suffix}",
+                   child_status=None)
+  outer = db.get(models.Delegation, f"delegation-{suffix}-outer")
+  outer.child_chat_id = parent_id
+  parent = db.get(models.Chat, parent_id)
+  parent.created_by_app_id = outer.app_id
+  parent.provider = provider_id
+  db.commit()
+  root_run_id = _seed_idle_parent_wake_root(db, delegation_id)
+  row = db.get(models.Delegation, delegation_id)
+  first = delegations_mod._activity_continuation_run_id(db, row)
+  empty_envelope = {
+    "delegation_ids": [],
+    "delivery_contract": delegations_mod.ACTIVITY_DELIVERY_FINALIZE_ATOMIC,
+    "source_work_id": row.parent_root_run_id,
+  }
+  db.add(make_goal_run(db,
+    id=first, root_run_id=root_run_id, chat_id=parent_id, status="completed",
+    provider=provider_id, started_at=now_naive_utc(), ended_at=now_naive_utc(),
+    activity_delivery_json=empty_envelope,
+  ))
+  db.commit()
+
+  retry = delegations_mod._activity_continuation_run_id(db, row)
+  assert retry != first
+  disposition, seen_prompts = _run_activity_checkpoint(
+    db, monkeypatch, parent_id=parent_id, root_run_id=root_run_id,
+    delegation_id=delegation_id, response="Got KIWI-legacy-result.",
+    provider_id=provider_id,
+  )
+
+  assert len(seen_prompts) == 1 and "KIWI-legacy-result" in seen_prompts[0]
+  db.expire_all()
+  assert db.get(models.Delegation, delegation_id).delivered_run_id == (
+    f"child-run-{suffix}"
+  )
+  # A retry that also admitted nothing keeps its own identity: no third run.
+  db.get(models.ChatRun, retry).activity_delivery_json = empty_envelope
+  db.get(models.Delegation, delegation_id).delivered_run_id = None
+  db.commit()
+  assert delegations_mod._activity_continuation_run_id(db, row) == retry
+
+
 def test_finalize_leaves_a_follow_up_sent_during_the_turn_owed(db):
   """A turn that receives a helper result and sends it a follow-up.
 
