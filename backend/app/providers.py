@@ -852,6 +852,19 @@ class ClaudeProvider(BaseProvider):
     return env
 
 
+# Möbius owns helpers for every provider (``spawn_agent`` on the control
+# server), so every Codex launch switches Codex's own sub-agent tools off.
+# ``agents.enabled=false`` is the switch that wins: without it a model catalog
+# entry's ``multi_agent_version`` (bundled models say "v2") re-enables the
+# ``collaboration.*`` tools regardless of the feature flags. The v2 feature
+# outranks that switch in turn, so it must stay off too.
+CODEX_NATIVE_HELPERS_OFF = (
+  "agents.enabled=false",
+  "features.multi_agent=false",
+  "features.multi_agent_v2.enabled=false",
+)
+
+
 class CodexProvider(BaseProvider):
   """OpenAI Codex provider.
 
@@ -1047,8 +1060,7 @@ class MobiusProvider(BaseProvider):
       "features.remote_compaction_v2=false",
       "features.apps=false",
       "features.plugins=false",
-      "features.multi_agent=false",
-      "features.multi_agent_v2.enabled=false",
+      *CODEX_NATIVE_HELPERS_OFF,
       "features.standalone_web_search=true",
       # The capability is intentionally enabled for this provider; do not
       # surface Codex's generic experimental-feature warning as a chat error.
@@ -1410,10 +1422,20 @@ def owner_default_provider(
   return resolve_default_provider(data_dir, configured_provider)
 
 
-def get_provider(provider_id: str | None = None) -> BaseProvider:
-  """Resolve a provider; an explicitly removed app must never fall into Claude."""
-  from app.config import get_settings
-  sync_app_model_providers(get_settings().data_dir)
+def get_provider(
+  provider_id: str | None = None, *, data_dir: str | None = None
+) -> BaseProvider:
+  """Resolve a provider; an explicitly removed app must never fall into Claude.
+
+  The app-model registry sync needs a durable-data root. An out-of-band caller
+  (a scheduled runner given an explicit `data_dir`) passes it here so provider
+  resolution stays off global server settings; only the in-process default path
+  falls back to `get_settings().data_dir`.
+  """
+  if data_dir is None:
+    from app.config import get_settings
+    data_dir = get_settings().data_dir
+  sync_app_model_providers(data_dir)
   selected = provider_id or DEFAULT_PROVIDER
   if selected not in PROVIDERS:
     raise ValueError(f"Provider {selected!r} is not installed.")

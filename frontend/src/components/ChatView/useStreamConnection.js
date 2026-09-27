@@ -40,6 +40,7 @@ import { ChatTransportError, chatHttpError } from './sendErrors.js'
 import {
   classifyReplayOutcome,
   claimIntentDispatch,
+  holdInteractiveDispatch,
   enqueueIntent,
   markIntentLocallyQueued,
   outboxPrincipalKey,
@@ -57,6 +58,10 @@ import {
   TEXT_REVEAL_MIN_COMMIT_MS,
   textRevealBudget,
 } from './streamCadence.js'
+import {
+  QUICK_WAKE_HIDDEN_MS,
+  BROADCAST_REGISTRATION_WINDOW_MS,
+} from './streamTiming.js'
 
 // Hard cap on the send POST. It normally returns 202 immediately. Keep this
 // above every bounded backend wait: aborting at 20s while a request was still
@@ -83,12 +88,6 @@ export async function retireInteractiveIntent({
   return retired ? false : outboxRetained
 }
 
-// A hidden tab that comes back inside this window is usually a glance at
-// the notification shade or an app switch. If the SSE socket has also read
-// recently, keep it: tearing down a healthy stream is what makes quiet tool
-// turns flash "Reconnecting…" on every foreground.
-const QUICK_WAKE_HIDDEN_MS = 5000
-
 // chats_stream.py sends keepalive SSE comments every 30s. Two missed
 // keepalives plus grace means a socket is no longer demonstrably healthy
 // and the long-standing frozen-tab reconnect defense should take over.
@@ -97,23 +96,10 @@ const FRESH_SSE_READ_MS = 70000
 // One server keepalive interval plus grace, deliberately shorter than the
 // broad freshness window above. A quick wake may keep a socket because it
 // read recently, but if that exact controller produces no later read by this
-// deadline, treat it as silently dead and replace it without showing the
-// reconnecting note: the user did not initiate anything, and a baseline
-// comparison makes still-flowing keepalives a no-op.
+// deadline, treat it as silently dead and replace it: the user did not
+// initiate anything, and a baseline comparison makes still-flowing keepalives
+// a no-op.
 const KEPT_SOCKET_DEADMAN_MS = 40000
-
-// Window during which a 204 from /stream after a send is a race
-// (the SSE GET landed before chats_stream.py:POST /messages finished
-// registering the broadcast) rather than "agent finished." The POST
-// handler returns 202 only AFTER create_broadcast(chat_id) completes,
-// so any 204 outside this window genuinely means there's no active
-// turn left and the right move is a DB refresh. Inside the window,
-// schedule a quick reconnect instead — refreshing here would wipe
-// the optimistic user message before persistence catches up.
-//
-// 1.5s is the empirical headroom: round-trip + create_broadcast +
-// scheduler hop are well under that on local + remote prod traffic.
-const BROADCAST_REGISTRATION_WINDOW_MS = 1500
 
 /**
  * Hook that manages an SSE connection to /api/chats/{chatId}/stream.
@@ -244,7 +230,6 @@ const BROADCAST_REGISTRATION_WINDOW_MS = 1500
  *   isStreaming: boolean,
  *   isStreamingRef: React.MutableRefObject<boolean>,
  *   connectionError: string | null,
- *   reconnecting: boolean,
  *   catchUpCommitSeq: number,
  *   sendMessage: (text: string, attachments?: Array<object>,
  *                 opts?: {hidden?: boolean, queueOnly?: boolean, cid?: string,
@@ -409,29 +394,6 @@ export default function useStreamConnection(chatId, {
   const [connectionError, _setConnectionError] = useState(null)
   const connectionErrorRef = useRef(null)
   function setConnectionError(v) { connectionErrorRef.current = v; _setConnectionError(v) }
-
-  // Visible wake/online reattach window. Distinct from `connectionError`:
-  // the SSE is being proactively REPLACED after sleep/wake or network
-  // recovery (an expected, healthy transition), not failing — so it renders
-  // as a quiet note, never the error styling. Armed only by the
-  // attachment owner after a wake. Presentation owns the visibility delay so
-  // proxy rotations and wake reattachments share one policy. Cleared on every
-  // settled outcome: catch-up commit, `done`,
-  // terminal 204/EOF, or the stream erroring into the connectionError
-  // states (which take over the ConnectionStatus slot).
-  const [reconnecting, _setReconnecting] = useState(false)
-  const reconnectNoteShownRef = useRef(false)
-  function armReconnectingNote() {
-    if (reconnectNoteShownRef.current) return
-    reconnectNoteShownRef.current = true
-    _setReconnecting(true)
-  }
-  function clearReconnectingNote() {
-    if (reconnectNoteShownRef.current) {
-      reconnectNoteShownRef.current = false
-      _setReconnecting(false)
-    }
-  }
 
   const abortRef = useRef(null)
   // Attachment belongs here, not to each caller that observes a wake. Hidden
@@ -672,7 +634,6 @@ export default function useStreamConnection(chatId, {
       clearQuestionResponseTracking()
       setIsStreaming(false)
       setConnectionError(null)
-      clearReconnectingNote()
       retryCount.current = 0
       justSentAtRef.current = 0
     }
@@ -697,10 +658,6 @@ export default function useStreamConnection(chatId, {
     textBufferItemIdRef.current = null
     forceNewTextBlockRef.current = false
     lastGoodItemsRef.current = []
-    // The reattach note (and its pending show-timer) belongs to the chat
-    // we're leaving — a stale timer firing after the switch would flash
-    // "Reconnecting…" over the new chat.
-    clearReconnectingNote()
     // Answers belong to the chat we're leaving; carrying them into the next
     // chat could re-arm a same-keyed question with a foreign answer.
     answerReceiptsByQuestionKeyRef.current.clear()
@@ -792,16 +749,6 @@ export default function useStreamConnection(chatId, {
   const connectToStream = useCallback(async (resetState = false) => {
     if (abortRef.current && !connectionStaleRef.current
         && activeStreamChatIdRef.current === chatIdRef.current) return
-    // The note describes an actual attachment, never a duplicate lifecycle
-    // signal after catchup has already cleared it.
-    if (resetState && (connectionStaleRef.current || connectionErrorRef.current)) {
-      const hiddenDuration = hiddenAtRef.current
-        ? Math.max(0, Date.now() - hiddenAtRef.current)
-        : lastHiddenDurationRef.current
-      if (hiddenDuration === null || hiddenDuration >= QUICK_WAKE_HIDDEN_MS) {
-        armReconnectingNote()
-      }
-    }
     activeStreamChatIdRef.current = chatIdRef.current
     if (connectionErrorRef.current === 'disconnected') retryCount.current = 0
     disconnect()
@@ -916,7 +863,6 @@ export default function useStreamConnection(chatId, {
               clearQuestionResponseTracking()
               answerReceiptsByQuestionKeyRef.current.clear()
               setConnectionError(null)
-              clearReconnectingNote()
               retryCount.current = 0
               setIsStreaming(false)
               // The transcript and stream retirement share this synchronous
@@ -933,7 +879,6 @@ export default function useStreamConnection(chatId, {
           abortRef.current = null
           wantsReconnectRef.current = true
           setConnectionError('disconnected')
-          clearReconnectingNote()
           setIsStreaming(false)
         }
         settleOwnedCatchUp()
@@ -1092,9 +1037,6 @@ export default function useStreamConnection(chatId, {
               Date.now(),
             )
             commitCatchUp()
-            // The reattach window ends when the catch-up burst commits —
-            // from here on it's normal live streaming again.
-            clearReconnectingNote()
             continue
           }
 
@@ -1474,7 +1416,6 @@ export default function useStreamConnection(chatId, {
             queuedContinuationTsRef.current = null
             queuedContinuationMessageRef.current = null
             setConnectionError(null)
-            clearReconnectingNote()
             retryCount.current = 0
             // The turn is done — its answers are durable in the promoted
             // message now, so drop the reconnect-survival cache before the
@@ -1512,7 +1453,6 @@ export default function useStreamConnection(chatId, {
         // EOF without an explicit done is still terminal here. Promote and
         // clear running state in the same batch so the final live row does not
         // briefly collapse into the generic thinking dots.
-        clearReconnectingNote()
         onStreamEndRef.current?.()
         setIsStreaming(false)
         return
@@ -1525,24 +1465,17 @@ export default function useStreamConnection(chatId, {
       // catch-up instead of hiding the in-progress assistant message.
       setIsStreaming(true)
       if (document.visibilityState === 'visible') {
-        // The 'retrying' connectionError takes over the ConnectionStatus
-        // slot; drop the quiet note so only one indicator renders.
-        clearReconnectingNote()
         setConnectionError('retrying')
         scheduleReconnect(() => connectRef.current?.(true), 300)
       }
     } catch (err) {
       // An abort means this connection was REPLACED (wake handler, Stop,
-      // fresh send) — the reattach window, if one is open, continues on
-      // the successor connection, so the note is deliberately left alone.
+      // fresh send); the successor connection owns what happens next.
       if (err.name === 'AbortError' || !isCurrent()) return
       abortRef.current = null
       void verifyConnectivity()
       flushBuffer()
       setIsStreaming(false)
-      // Real failure: the connectionError states below own the
-      // ConnectionStatus slot from here.
-      clearReconnectingNote()
       // Retry with exponential backoff.
       // IMPORTANT: reconnect with resetState=true so catch-up rebuilds into an
       // off-screen buffer. Without this, replay would append from the start on
@@ -1633,7 +1566,6 @@ export default function useStreamConnection(chatId, {
   const retry = useCallback(() => {
     retryCount.current = 0
     setConnectionError(null)
-    clearReconnectingNote()
     setIsStreaming(true)
     wantsReconnectRef.current = true
     // Explicit Retry replaces the transport; ordinary attachment requests share it.
@@ -1692,6 +1624,7 @@ export default function useStreamConnection(chatId, {
     let responseData = null
     let outboxCid = null
     let outboxRetained = false
+    let releaseDispatchHold = () => {}
     try {
       const body = { content: text }
       if (hidden) body.hidden = true
@@ -1739,6 +1672,11 @@ export default function useStreamConnection(chatId, {
       // another turn. Steers target one live turn and are never replayable.
       outboxCid = (cid && !forceSteer && !directSteer) ? cid : null
       const deferToOutbox = deferDelivery || !getDeliveryReadySnapshot()
+      // This send will POST its own intent, so own the cid BEFORE it becomes
+      // visible in the outbox. Otherwise the shell drain can list it between
+      // enqueue and our claim and dispatch the same cid alongside us. A
+      // deferred send hands the intent to that drain instead, so holds nothing.
+      if (outboxCid && !deferToOutbox) releaseDispatchHold = holdInteractiveDispatch(outboxCid)
       if (outboxCid) {
         outboxRetained = await enqueueIntent({
           chatId: requestOwner.chatId,
@@ -1753,6 +1691,9 @@ export default function useStreamConnection(chatId, {
       // a known interruption, leave presentation with the local queue/card.
       // No POST, stream reset, or optimistic run belongs to that transition.
       if (deferToOutbox || !getDeliveryReadySnapshot()) {
+        // Readiness may have dropped since deferToOutbox was read: hand the
+        // intent to the drain before it is announced as locally queued.
+        releaseDispatchHold()
         if (outboxRetained) {
           await markIntentLocallyQueued(outboxCid, { chatId: requestOwner.chatId, principalKey: outboxPrincipalKey(getToken()) })
           return { status: 'locally_queued', cid: outboxCid }
@@ -1771,7 +1712,6 @@ export default function useStreamConnection(chatId, {
         textBufferItemIdRef.current = null
         setIsStreaming(true)
         setConnectionError(null)
-        clearReconnectingNote()
       }
       // Time-box the send POST. It normally returns 202 immediately (the turn
       // runs as a background task), so a hang means a dead socket (mobile
@@ -1923,7 +1863,6 @@ export default function useStreamConnection(chatId, {
         forceNewTextBlockRef.current = false
         setIsStreaming(true)
         setConnectionError(null)
-        clearReconnectingNote()
       }
       // Resume acknowledges an existing interrupted turn, not a new message.
       // Retain its visible answer until the successor catch-up can replace it.
@@ -1932,7 +1871,6 @@ export default function useStreamConnection(chatId, {
         justSentAtRef.current = Date.now()
         setIsStreaming(true)
         setConnectionError(null)
-        clearReconnectingNote()
       }
       // Started: ensure streaming state is set even if the caller
       // passed queueOnly:true expecting it would be queued.
@@ -1954,6 +1892,9 @@ export default function useStreamConnection(chatId, {
         setConnectionError(null)
       }
     } catch (err) {
+      // A failed or ambiguous POST leaves the record for the shell drain; release
+      // ownership before markIntentLocallyQueued asks that drain to take it.
+      releaseDispatchHold()
       if (err?.code === 'OUTBOX_SETTLED') {
         // A concurrent local cancellation or another tab's receipt owns this
         // cid now. Neither absence nor retirement authorizes another POST.
@@ -1987,6 +1928,8 @@ export default function useStreamConnection(chatId, {
         setIsStreaming(false)
       }
       throw err
+    } finally {
+      releaseDispatchHold()
     }
 
     // No delay needed: chats_stream.py's POST handler calls
@@ -2163,7 +2106,6 @@ export default function useStreamConnection(chatId, {
     isStreaming,
     isStreamingRef,
     connectionError,
-    reconnecting,
     catchUpCommitSeq,
     sendMessage,
     connectToStream,

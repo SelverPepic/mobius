@@ -158,7 +158,7 @@ async def test_cancel_during_spawn_reaps_process_before_releasing_runtime(monkey
 
   monkeypatch.setattr(app_services, "service_contract", lambda *a, **k: {})
   monkeypatch.setattr(app_services, "service_entry", lambda *a: entry)
-  monkeypatch.setattr(app_services, "service_environment", lambda *a: {})
+  monkeypatch.setattr(app_services, "service_environment", lambda *a, **k: {})
   monkeypatch.setattr(app_services, "hold_runtime", lambda *_: SimpleNamespace(
     close=lambda: released.append(processes[0].returncode),
   ))
@@ -206,6 +206,7 @@ print(json.dumps({
 
 def _service_app(
   db, *, access="self", slug="service-test", service_id=None, aliases=(),
+  service_bytes=SERVICE,
 ):
   source = Path(get_settings().data_dir) / "apps" / slug
   source.mkdir(parents=True)
@@ -235,7 +236,7 @@ def _service_app(
   revision = "a" * 64
   accepted = runtime_parent(app.id) / revision
   accepted.mkdir(parents=True)
-  (accepted / "service.py").write_bytes(SERVICE)
+  (accepted / "service.py").write_bytes(service_bytes)
   app.runtime_revision = revision
   db.commit()
   return app
@@ -262,6 +263,53 @@ def test_authenticated_service_receives_one_bounded_json_envelope(
     "scope": "owner",
     "app_slug": None,
   }
+
+
+SERVICE_ENV = b'''import json, os, sys
+json.load(sys.stdin)
+print(json.dumps({
+  "status": 200,
+  "body": {
+    "provider_env": sorted(
+      key for key in ("DATA_DIR", "CLAUDE_CONFIG_DIR", "CODEX_HOME")
+      if key in os.environ
+    ),
+  },
+}))
+'''
+
+
+def test_only_authenticated_services_receive_provider_credentials(
+  client, auth, db, monkeypatch,
+):
+  monkeypatch.setenv("DATA_DIR", "/data")
+  monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/data/cli-auth/claude")
+  monkeypatch.setenv("CODEX_HOME", "/data/cli-auth/codex")
+  private = _service_app(
+    db, slug="recall-navigator", service_bytes=SERVICE_ENV,
+  )
+  public = _service_app(
+    db, access="public", slug="public-echo", service_bytes=SERVICE_ENV,
+  )
+  everything = ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "DATA_DIR"]
+
+  # A private service the owner reaches may run a provider CLI, so it receives
+  # the same credential locations as its scheduled job.
+  private_call = client.post(
+    f"/api/apps/{private.id}/service/echo", headers=auth, json={},
+  )
+  assert private_call.json()["provider_env"] == everything
+
+  # An anonymous caller of a public service gets none of them.
+  anonymous_call = client.post("/api/app-services/public-echo/echo", json={})
+  assert anonymous_call.json()["provider_env"] == []
+
+  # Nor does the owner's own authenticated call to a publicly reachable service:
+  # the credentials follow the reviewed access, not the current caller.
+  owner_call = client.post(
+    f"/api/apps/{public.id}/service/echo", headers=auth, json={},
+  )
+  assert owner_call.json()["provider_env"] == []
 
 
 def test_public_service_requires_an_explicit_reviewed_grant(client, auth, db):
@@ -388,6 +436,16 @@ def test_service_cannot_set_transport_or_credential_headers(client, auth, db):
   assert response.status_code == 502
   assert response.json()["detail"] == "response contains an invalid header"
   assert "set-cookie" not in response.headers
+
+
+@pytest.mark.parametrize(
+  "name", ["Clear-Site-Data", "Refresh", "Service-Worker-Allowed"],
+)
+def test_service_cannot_set_origin_wide_headers(name):
+  # A service answers on the shell origin, so these would act on the owner's
+  # whole session rather than on the app's own response.
+  with pytest.raises(ValueError):
+    app_services._response_headers({name: "*"})
 
 
 def test_service_rejects_nonstandard_json_constants(client, auth, db):

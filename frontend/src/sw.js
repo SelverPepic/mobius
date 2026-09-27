@@ -60,6 +60,7 @@ import {
   withOpaqueFramePublicAssetCors,
   isCacheableAppAssetResponse,
   SHELL_DATA_CACHE,
+  isShellListUrl,
   requiresLiveShellList,
   SHELL_DOCUMENT_POLICY_REVISION,
   isImmutableAppAsset,
@@ -72,6 +73,7 @@ import {
   shouldServeCacheFirst,
   shouldFallBackToCacheOnError,
   isAppCodeRoute,
+  isCacheableProxyRequest,
   appCodeCacheKey,
   appCodeRequestMayBeStored,
   appCodeStoreAction,
@@ -370,21 +372,9 @@ registerRoute(
   }),
 )
 
-// /api/proxy — server-side CORS bypass. Only cache asset
-// extensions (images, fonts, audio, video). JSON APIs and other
-// dynamic responses bypass the cache by not matching this route
-// so they go straight to network.
-const CACHEABLE_PROXY_EXT =
-  /\.(jpg|jpeg|png|gif|webp|svg|ico|woff2?|ttf|otf|eot|hdr|exr|mp3|mp4|webm|ogg|wav)(\?|$)/i
-
+// /api/proxy — server-side CORS bypass; see isCacheableProxyRequest.
 registerRoute(
-  ({ url }) => {
-    if (url.origin !== self.location.origin) return false
-    if (url.pathname === '/api/proxy/favicon') return true
-    if (url.pathname !== '/api/proxy') return false
-    const upstream = url.searchParams.get('url') || ''
-    return CACHEABLE_PROXY_EXT.test(upstream)
-  },
+  ({ url, request }) => isCacheableProxyRequest(url, request, self.location.origin),
   new StaleWhileRevalidate({ cacheName: 'mobius-proxy' }),
 )
 
@@ -650,9 +640,7 @@ registerRoute(
 // next refetch. NetworkFirst returns the live list when online and still
 // falls back to the cached list offline (cold-drawer render preserved).
 registerRoute(
-  ({ url }) =>
-    url.origin === self.location.origin &&
-    (url.pathname === '/api/chats' || url.pathname === '/api/apps/'),
+  ({ url }) => url.origin === self.location.origin && isShellListUrl(url),
   new NetworkFirst({
     cacheName: SHELL_DATA_CACHE,
     // KEPT at 5s deliberately. Workbox returns a cache fallback as a

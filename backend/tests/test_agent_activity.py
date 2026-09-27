@@ -278,6 +278,22 @@ def test_app_tool_without_a_receipt_is_a_failed_card():
   )["status"] == "failed"
 
 
+def test_only_app_tool_results_are_unwrapped_not_command_output():
+  # A shell command's output is already the text the agent reads, so the
+  # MCP-result unwrapping must not touch it — only an app-tool call is unwrapped.
+  wrapped = json.dumps({"content": [{"type": "text", "text": _receipt()}]})
+  command = _lifecycle([
+    {"type": "tool_start", "tool": "Bash", "input": COMMAND_TEXT,
+     "tool_use_id": "t1"},
+    {"type": "tool_output", "tool_use_id": "t1", "content": wrapped,
+     "output_complete": True, "output_exit_code": 0},
+  ])
+  assert command["status"] != "succeeded"
+  assert _tool_lifecycle(
+    "mobius_control:brain_search", wrapped,
+  )["status"] == "succeeded"
+
+
 def test_tool_triggered_activities_bind_from_the_applied_manifest(
   db, tmp_path, monkeypatch,
 ):

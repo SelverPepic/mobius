@@ -3,6 +3,7 @@
 import {
   _topmostVisibleMsg,
   _scrollTopOf,
+  anchorModeDisplaced,
   anchorModeForElement,
   anchorModeFromScroll,
   contentHoldModeFromScroll,
@@ -17,8 +18,14 @@ export const FOLLOW_STICK_BAND_PX = 70
 export const HISTORY_PREFETCH_MIN_PX = 240
 export const HISTORY_PREFETCH_VIEWPORTS = 4
 
-export function olderHistoryRetryShown(error, offset) {
-  return Boolean(error) && Number(offset) > 0
+const HISTORY_RETRY_DELAYS_MS = [1000, 3000, 8000, 15000, 30000]
+
+/** Delay before quietly re-requesting a failed older-history page. There is no
+ * retry control: the page is requested again while the reader still waits at
+ * the top for it, backing off to a steady cap. */
+export function olderHistoryRetryDelayMs(attempt) {
+  const index = Math.min(Math.max(0, attempt), HISTORY_RETRY_DELAYS_MS.length - 1)
+  return HISTORY_RETRY_DELAYS_MS[index]
 }
 
 export function olderHistoryShouldLoad(scrollEl, { userDriven = false } = {}) {
@@ -101,6 +108,15 @@ export function modeAfterSpacerResize(mode, spacerH) {
   return spacerH <= 1 ? { kind: 'FOLLOW_BOTTOM' } : mode
 }
 
+
+/** Whether a content resize re-applies a tracking mode. A FOLLOW_BOTTOM resize
+ * driven by the focused inline answer editor is the reader typing, not the live
+ * tail advancing: following it scrolls the card being written in by a line per
+ * Shift+Enter. Tail growth in the same batch is followed on the next firing the
+ * editor does not drive. */
+export function resizeReappliesMode(kind, { editorResized = false } = {}) {
+  return !(kind === 'FOLLOW_BOTTOM' && editorResized)
+}
 
 /** A short stream ended before filling its reservation: retain the pin
  * identity but retire its live-only automatic-follow handoff. */
@@ -523,6 +539,25 @@ export function modeForForegroundReturn(scrollEl) {
 export function modeForChatExit(scrollEl) {
   if (!scrollEl) return null
   return contentHoldModeFromScroll(scrollEl)
+}
+
+
+/** Whether a surface relinquishing the reading coordinate must re-measure it
+ *  from physical geometry instead of transferring its settled address.
+ *
+ *  Live FOLLOW/PIN modes always freeze. A settled ANCHOR_AT transfers by its
+ *  semantic address, because a world reflow (the viewport box changed size)
+ *  makes a fresh measurement lose its nested part. With the viewport box
+ *  unchanged there is no reflow to protect against: if the viewport has moved
+ *  off the anchor anyway, the reader moved it without an owned gesture, and
+ *  what is on screen is the only true reading location. */
+export function handoffNeedsPhysicalFreeze(scrollEl, mode, observedViewport) {
+  if (mode?.kind !== 'ANCHOR_AT') return true
+  if (!scrollEl || observedViewport?.element !== scrollEl) return false
+  const viewportUnchanged = scrollEl.clientHeight > 0
+    && Math.abs(scrollEl.clientHeight - observedViewport.height) < 1
+    && Math.abs(scrollEl.clientWidth - observedViewport.width) < 1
+  return viewportUnchanged && anchorModeDisplaced(scrollEl, mode)
 }
 
 

@@ -1,4 +1,4 @@
-import { fetchFreshShellList } from './shellListReconciliation.js'
+import { fetchFreshShellList, letSystemStreamOwnListRefresh } from './shellListReconciliation.js'
 import { requestChatChanges } from '../../lib/chatChangesNavigation.js'
 import { lazy, Suspense, useState, useEffect, useLayoutEffect, useCallback, useMemo, useReducer, useRef } from 'react'
 import { flushSync } from 'react-dom'
@@ -90,7 +90,6 @@ import {
 } from './workspacePlacement.js'
 import {
   appCrashReportDraft,
-  appUpdateStaleMessage,
   findAppStoreApp,
 } from '../../lib/appRecovery.js'
 import {
@@ -139,7 +138,9 @@ import {
   withChatOwnerInput,
   withChatRename,
   withChatRunState,
+  withRefreshedChatRows,
 } from './chatListProjection.js'
+import { createChatRowRefresh } from './chatRowRefresh.js'
 import {
   clearComposerDraft,
   consumeComposerHandoff,
@@ -213,6 +214,8 @@ const EMPTY_LIST = Object.freeze([])
 // Reconnect list reads order durable state ahead of buffered system events, so
 // they need a short deadline rather than holding notifications behind a stalled request.
 const SYSTEM_RECONNECT_LIST_TIMEOUT_MS = 5_000
+// Run/wait events arriving this close together share one scoped rows read.
+const CHAT_ROW_REFRESH_BATCH_MS = 250
 // Mode timing lives with the pure snapshot geometry in workspaceView.js; browser
 // transition completion owns its lifetime, so Shell has no animation timers.
 const SettingsView = lazy(() => import('../SettingsView/SettingsView.jsx'))
@@ -285,7 +288,7 @@ export default function Shell({ onInitialVisualReady }) {
     activeProjectId,
     activeArtifactRef,
     drawerOpen, settingsOverlayOpen, settingsOpenRaw, openDrawer, closeDrawer,
-    navTo, navigateBackward, navigateForward,
+    navTo, recordChatNavigation, navigateBackward, navigateForward,
     tabRevealRevision, applyModeDestination, dismissSettings,
     backFiredRef, drawerPushedRef, navStackRef, navigationEpochRef,
     activeViewRef, activeChatIdRef, activeAppIdRef,
@@ -550,6 +553,9 @@ export default function Shell({ onInitialVisualReady }) {
 
   const { loadTheme } = useTheme()
   const queryClient = useQueryClient()
+  // Before the list queries below mount: the system stream's open barrier is
+  // their live read (see reconcileSystemStateOnOpen).
+  useState(() => letSystemStreamOwnListRefresh(queryClient, [appQueries, chatQueries]))
   const recencyMarkedAppRef = useRef(null)
   useEffect(() => {
     if (activeView !== 'canvas' || activeAppId == null) {
@@ -2118,6 +2124,15 @@ export default function Shell({ onInitialVisualReady }) {
     () => appAttentionIds(apps, newAppIds, visibleAppIds),
     [apps, newAppIds, visibleAppIds],
   )
+  // Report the owner's timezone so plain daily app schedules fire at that
+  // wall time for them. Automated browsers (agent screenshots) run on the
+  // server's clock and do not speak for the owner, so they never report.
+  useEffect(() => {
+    if (typeof navigator !== 'undefined' && navigator.webdriver) return
+    let zone = ''
+    try { zone = Intl.DateTimeFormat().resolvedOptions().timeZone || '' } catch (_) {}
+    if (zone) api.owner.timezone.save(zone).catch(() => {})
+  }, [])
   // First-sign-in walkthrough. The query result is the source of
   // truth — backend persists completion via
   // POST /api/owner/walkthrough/complete. We render the overlay iff
@@ -2373,6 +2388,35 @@ export default function Shell({ onInitialVisualReady }) {
       return next
     })
   }, [queryClient])
+  // Run and wait events each change a few rows. Re-reading the complete list
+  // per event sent ~1 MB to every open window while agents worked, so events
+  // refresh just their rows (see chatRowRefresh.js for the ordering rules).
+  const chatRowRefreshRef = useRef(null)
+  useEffect(() => {
+    const refresh = createChatRowRefresh({
+      readRows: async ids => jsonOrThrow(
+        await api.chats.rows(ids, { cache: 'no-store' }), 'chat rows fetch failed:',
+      ),
+      applyRows: (ids, fresh) => {
+        projectChatList(rows => reconcileCreatedChats(
+          withRefreshedChatRows(rows, ids, fresh),
+        ))
+        // Scoped reads never refill the offline list copy; drop the stale one so
+        // a cold offline start keeps the fresher persisted list.
+        void invalidateShellListCache('chats')
+      },
+      refreshAll: refreshChats,
+      fullReadInFlight: () => queryClient.isFetching({ queryKey: chatQueries.keys.all }) > 0,
+      fullReadMark: chatQueries.list.readMark,
+      fullReadLandedSince: chatQueries.list.readLandedSince,
+      batchMs: CHAT_ROW_REFRESH_BATCH_MS,
+    })
+    chatRowRefreshRef.current = refresh
+    return () => refresh.cancel()
+  }, [projectChatList, queryClient, reconcileCreatedChats, refreshChats])
+  const refreshChatRows = useCallback(
+    chatId => chatRowRefreshRef.current?.request(chatId), [],
+  )
   const markChatOwnerActivity = useCallback((chatId) => {
     const at = new Date().toISOString()
     projectChatList(rows => withChatOwnerActivity(rows, chatId, at))
@@ -2725,14 +2769,12 @@ export default function Shell({ onInitialVisualReady }) {
   // Holding chatsLoadedRef past first hydration would just delay an
   // already-correct call.
   //
-  // Defensive refetch: TanStack's default refetchOnMount + staleTime
-  // (30s in queryClient.js) can leave the persisted snapshot serving
-  // beyond a reload — if the snapshot was written <30s before the
-  // reload, the on-mount refetch is skipped as "fresh". When `prev`
-  // isn't in that snapshot, we'd otherwise wait forever for a live
-  // confirmation that never comes. Force a refetch in that case so
-  // `isFetchedAfterMount` eventually flips and demotion (or
-  // confirmation) actually runs.
+  // Live confirmation: a persisted snapshot hydrates without a mount-time
+  // refetch (letSystemStreamOwnListRefresh). The system stream's open barrier
+  // reads the list live on every (re)connect and reconnects if that read
+  // fails, so `isFetchedAfterMount` flips once it lands and demotion (or
+  // confirmation) runs then. Starting a separate read here would begin before
+  // the stream's subscription and always be discarded by the barrier.
   useEffect(() => {
     if (!chatsQuery.isFetched) return
     const liveFetched = chatsQuery.isSuccess
@@ -2742,15 +2784,10 @@ export default function Shell({ onInitialVisualReady }) {
     if (prevInChats) {
       // Cached data shows `prev` is valid. Keep it mounted as-is so
       // ChatView's scroll/spacer restore proceeds without remounting.
-      // BUT: if we're still on stale-cache hydration (not liveFetched),
-      // also nudge a refetch — the persisted snapshot can be a stale
-      // FALSE POSITIVE too (a chat the user deleted in another tab
-      // before reload still appears in the cache). Without the nudge,
-      // ChatView would mount on `prev`, fetch `/api/chats/{prev}`,
-      // 404, and show an error state for the full 30s staleTime
-      // window. The nudge resolves the situation in one round-trip.
+      // The persisted snapshot can be a stale FALSE POSITIVE (a chat
+      // deleted in another tab before reload); the stream's live read
+      // corrects it within one round-trip of connecting.
       knownExistingOffListChatIdsRef.current.delete(prev)
-      if (!liveFetched && !chatsQuery.isFetching) refreshChats()
       chatsLoadedRef.current = true
       return
     }
@@ -2777,11 +2814,8 @@ export default function Shell({ onInitialVisualReady }) {
       // from the server yet. Hold `prev` as a tentative restore —
       // ChatView mounts on it, and if it's gone server-side, the
       // 404 from ChatView's own fetch surfaces a retryable error
-      // instead of a silent chat-switch. Nudge the chats query in
-      // case TanStack's staleTime (30s in queryClient.js) skipped
-      // the on-mount refetch — without that nudge a fresh persisted
-      // snapshot pins us here indefinitely.
-      if (!chatsQuery.isFetching) refreshChats()
+      // instead of a silent chat-switch. The stream's live read
+      // re-runs this effect once it lands.
       chatsLoadedRef.current = true
       return
     }
@@ -2842,8 +2876,7 @@ export default function Shell({ onInitialVisualReady }) {
     })()
     return () => { cancelled = true }
   }, [chats, chatsQuery.isFetched, chatsQuery.isSuccess,
-      chatsQuery.isFetchedAfterMount, chatsQuery.isFetching,
-      refreshChats, dispatchWorkspace, applyModeDestination,
+      chatsQuery.isFetchedAfterMount, dispatchWorkspace, applyModeDestination,
       requestEmptySingleNewChat, workspaceStateRef, activeChatIdRef])
 
   // Handle non-content SSE events: theme changes, app updates, shell rebuilds.
@@ -3057,18 +3090,9 @@ export default function Shell({ onInitialVisualReady }) {
       // not cover the composer; actionable update drift uses app_update_stale.
       return
     } else if (ev.type === 'app_update_stale') {
-      // The reviewed candidate changed while a conflict was being resolved.
-      // Keep the prior live version explicit and take the owner back to the
-      // canonical review surface when the bootstrapped store is available.
-      const appStore = findAppStoreApp(appsRef.current)
-      showToast(appUpdateStaleMessage(ev), {
-        variant: 'error',
-        duration: 12000,
-        action: appStore ? {
-          label: 'Open App Store',
-          onAction: () => navToRef.current('canvas', { appId: appStore.id }),
-        } : undefined,
-      })
+      // A reviewed candidate changed while a conflict was being resolved. The
+      // previous version keeps running, so this is never worth interrupting
+      // the owner for; the store's own update check is the discovery surface.
     } else if (ev.type === 'chat_owner_input_changed') {
       if (ev.chatId) {
         markChatOwnerInput(ev.chatId, ownerInputChangeFromEvent(ev))
@@ -3083,7 +3107,7 @@ export default function Shell({ onInitialVisualReady }) {
         // Reconcile ChatView immediately and refresh the compact list so its
         // Waiting card and Recents marker agree across tabs and reconnects.
         markChatRunReconcile(ev.chatId)
-        void invalidateShellListCache('chats').then(refreshChats)
+        refreshChatRows(ev.chatId)
       }
     } else if (ev.type === 'chat_run_started') {
       if (ev.chatId) {
@@ -3097,7 +3121,7 @@ export default function Shell({ onInitialVisualReady }) {
         // must not masquerade as a fresh owner interaction. Reconcile every
         // start so durable owner activity, rather than the transient run
         // signal, owns the Recents position.
-        void invalidateShellListCache('chats').then(refreshChats)
+        refreshChatRows(ev.chatId)
       }
     } else if (ev.type === 'chat_run_finished') {
       const chatId = ev.chatId
@@ -3117,7 +3141,7 @@ export default function Shell({ onInitialVisualReady }) {
         // Failure attention is durable and versioned on the run transition.
         // Refresh the compact list rather than guessing from transcript text;
         // planned restart parks therefore remain neutral automatically.
-        void invalidateShellListCache('chats').then(refreshChats)
+        refreshChatRows(chatId)
         // Project agents write directly into the project directory. Refresh
         // every mounted folder query for that project so generated artifacts
         // appear as soon as the run finishes, without polling the filesystem.
@@ -3203,7 +3227,7 @@ export default function Shell({ onInitialVisualReady }) {
     markChatOwnerInput, markChatRunState, markShellUpdateAvailable,
     markStreamingAcknowledged, markStreamingEnd,
     onNotificationCreated, placeInWorkspace, projectChatLookup, queryClient,
-    refreshApps, refreshChats, tombstoneRoute, warmAppCode,
+    refreshApps, refreshChatRows, refreshChats, tombstoneRoute, warmAppCode,
   ])
 
   // Shell-level SSE subscription for system events. Stays open for
@@ -3800,6 +3824,13 @@ export default function Shell({ onInitialVisualReady }) {
       paneId: forceNew ? ws.focusedPaneId : null,
       paneActiveKey: forceNew ? `chat:${chatId}` : null,
     }
+    // New Chat is a navigation like picking a chat: it owes Back a target
+    // whether it came from the mobile drawer (retag its sentinel), the
+    // persistent desktop sidebar, or the shortcut (push a nav entry). Record it
+    // before the destination is applied, while the route being left is still
+    // current. A later id rotation needs no retag here: the current entry is
+    // re-stamped from the active route when the replacement is applied.
+    recordChatNavigation(chatId, { paneId: ws.focusedPaneId })
     // The client-minted id is the workspace destination immediately. This
     // mounts ChatView's one canonical composer before the tap task ends; row
     // allocation only unlocks its server runtime and never swaps its owner.

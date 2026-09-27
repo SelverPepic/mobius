@@ -419,7 +419,27 @@ export function entriesToTrim(existingKeys, max) {
 // Authoritative shell reconciliation must never mistake an offline snapshot
 // for live truth. Ordinary list reads keep their NetworkFirst offline fallback.
 export function requiresLiveShellList(request) {
-  const { pathname } = new URL(request.url)
-  return request.cache === 'no-store'
-    && (pathname === '/api/chats' || pathname === '/api/apps/')
+  return request.cache === 'no-store' && isShellListUrl(new URL(request.url))
+}
+
+// The offline projection is the complete list. A scoped read such as
+// `/api/chats?ids=…` is live-only: caching it would add a stale entry per id set.
+export function isShellListUrl(url) {
+  return url.search === ''
+    && (url.pathname === '/api/chats' || url.pathname === '/api/apps/')
+}
+
+// /api/proxy responses worth caching: asset extensions (images, fonts, audio,
+// video) and favicons. JSON APIs and other dynamic responses go straight to
+// network. Cached third-party bytes are subresources only: never answer a
+// navigation with one, since it would open as a shell-origin document.
+const CACHEABLE_PROXY_EXT =
+  /\.(jpg|jpeg|png|gif|webp|svg|ico|woff2?|ttf|otf|eot|hdr|exr|mp3|mp4|webm|ogg|wav)(\?|$)/i
+
+export function isCacheableProxyRequest(url, request, origin) {
+  if (url.origin !== origin) return false
+  if (request?.mode === 'navigate') return false
+  if (url.pathname === '/api/proxy/favicon') return true
+  if (url.pathname !== '/api/proxy') return false
+  return CACHEABLE_PROXY_EXT.test(url.searchParams.get('url') || '')
 }

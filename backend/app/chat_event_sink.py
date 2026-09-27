@@ -56,6 +56,7 @@ from app.agent_activity import (
   activity_from_app_tool,
   activity_from_command,
   app_tool_result_text,
+  is_app_tool_call,
   activity_from_result,
   activity_from_task_output,
   activity_without_receipt,
@@ -400,8 +401,6 @@ class ChatEventSink:
     # the next snapshot (or the terminal finalize) appends the continuation as
     # a fresh assistant message.
     self._steering = False
-    # Fresh owner input authorizes one return to unfinished Goal work.
-    self.owner_steer_committed = False
     self._lifecycle_writes: list[tuple[RecordAgentLifecycle, object]] = []
     # Some providers stream command output but omit the final aggregate. Keep
     # only the bounded raw tail needed by protocol receipts; presentation
@@ -616,11 +615,19 @@ class ChatEventSink:
       return
     pending = self._app_activity_for_tool(event.get("tool_use_id"))
     if event.get("output_complete") and pending is not None:
-      content = app_tool_result_text(
-        event.get("content")
-        if result_content is None
-        else result_content
+      blk = _tool_block_for_event(self.assistant_blocks, event.get("tool_use_id"))
+      content = (
+        event.get("content") if result_content is None else result_content
       )
+      # A provider reports an app tool's result as text (Claude) or as the JSON
+      # of the MCP result object (Codex); its receipt is a line inside that
+      # text. A shell-command activity's output is already that text, so only
+      # unwrap for an app-tool call.
+      if is_app_tool_call(
+        blk.get("tool") if isinstance(blk, dict) else None,
+        self._agent_activity_binding,
+      ):
+        content = app_tool_result_text(content)
       dispatch = background_dispatch(content)
       if dispatch is not None and event.get("output_exit_code") in (None, 0):
         event["app_activity"] = defer_activity(pending, dispatch)
@@ -633,9 +640,6 @@ class ChatEventSink:
         # terminal aggregate. Prefer any transcript-facing streamed tail:
         # App receipts print last, so the streamed tail is sufficient without
         # accumulating unbounded command output in a second buffer.
-        blk = _tool_block_for_event(
-          self.assistant_blocks, event.get("tool_use_id"),
-        )
         streamed = blk.get("output") if isinstance(blk, dict) else None
         if isinstance(streamed, str) and streamed.strip():
           content = streamed
@@ -1440,9 +1444,6 @@ class ChatEventSink:
       user_msgs, consume_pending_cids,
     )
     stored_messages = stored_result["stored_messages"]
-    self.owner_steer_committed |= bool(
-      stored_result.get("owner_steer_committed", False)
-    )
     try:
       self.bc.publish(steered_into_turn_event(
         stored_messages,
@@ -1607,21 +1608,6 @@ class ChatEventSink:
       block.get("type") == "question"
       and block.get("question_id") == question_id
       and block.get("response_mode") == "continuation"
-      for block in self.assistant_blocks
-    )
-
-  def has_open_continuation_card(self) -> bool:
-    """Whether this turn already handed its next move to the owner.
-
-    QuestionCommit saves the card through the writer's session; terminal Goal
-    settlement may still hold an older Chat in its own identity map. Read the
-    same-turn handoff from its owning sink instead of that cached transcript.
-    A failed save scrubs the card before returning to the caller.
-    """
-    return any(
-      block.get("type") == "question"
-      and block.get("response_mode") == "continuation"
-      and not block.get("answers")
       for block in self.assistant_blocks
     )
 

@@ -12,7 +12,8 @@ the initial read only when the request already needs one of its advanced paths:
 - wrapping or packaging an existing site/game;
 - an installable or upstream-tracked app;
 - external fetching/proxying or a separate service;
-- secrets, cross-app access, concurrent writers, or raw file storage;
+- secrets, cross-app access, concurrent writers, raw file storage, or
+  product-level offline support;
 - microphone/device capabilities;
 - an embedded agent, immersive mode, or internal navigation/back handling.
 
@@ -55,12 +56,8 @@ improve the requested experience after the first apply.
 Read the compact live app list once and update an existing app with the same
 purpose instead of duplicating it:
 
-```bash
-python "$SCRIPTS_DIR/list_apps.py"
-```
-
-Use this helper instead of rebuilding a `curl | python` quoting pipeline or
-printing the full capability payload.
+Call the `list_apps` tool. It returns compact identities; do not rebuild a
+`curl | python` pipeline or print the full capability payload.
 
 Do not search GitHub or the App Store for a uniquely named personal app.
 Search the wider ecosystem only when the partner asked for something
@@ -124,8 +121,8 @@ bright decision wheel, a tactile stack of cards—then support it with restraine
 chrome. Visual richness should come from hierarchy, composition, motion, and
 state feedback, not extra screens.
 
-The manifest should truthfully describe the local app. A typical private,
-offline-safe app uses:
+The manifest should truthfully describe the local app. A typical private app
+uses:
 
 ```json
 {
@@ -135,18 +132,20 @@ offline-safe app uses:
   "description": "One useful sentence.",
   "entry": "index.jsx",
   "icon": "icon.png",
-  "offline_capable": true,
+  "offline_capable": false,
   "permissions": {},
   "source_files": []
 }
 ```
 
-List every imported sibling source file in `source_files`. Set
-`offline_capable` to `true` only when every required read and write works
-without the network. The manifest's `icon` is the package-artwork source of
-truth: apply validates and materializes that exact accepted file, so do not
-upload a second copy after applying. The apply helper also applies the offline
-flag and versioned `capabilities` object; do not patch the app row separately.
+List every imported sibling source file in `source_files`. Keep
+`offline_capable` false for a new app and preserve an existing app's value on
+update; see `building-apps.md` if offline use is a real product promise.
+
+The manifest's `icon` is the package-artwork source of truth: apply validates
+and materializes that exact accepted file, so do not upload a second copy after
+applying. The apply helper also applies the offline flag and versioned
+`capabilities` object; do not patch the app row separately.
 
 Edit `mobius.json` surgically: change only the span you mean to change. Do not
 round-trip it through a full `json.dumps(...)` rewrite — Python's default
@@ -155,31 +154,16 @@ reorder keys or reflow whitespace. The meaning is unchanged, but the bytes
 differ, and a later Store update then has to reconcile manufactured drift
 against the reviewed upstream. The same applies to any tracked JSON.
 
-Offline support is a product choice, not a default requirement. Choose it when
-it materially benefits the app's use case or preserves an existing product
-promise. Möbius supplies generic cached storage, durable queues, connectivity,
-and conflict delivery; the app chooses what data to warm and owns completeness
-decisions, reconciliation, and UI. If offline logic depends on complete
-collection membership, use `storage.listWithStatus()` and treat
-`complete:false` as unavailable, not empty.
-
 ### 3. Apply once early, then after each coherent revision
 
-As soon as the first slice compiles and contains one real feature:
-
-```bash
-python "$SCRIPTS_DIR/apply_app.py" /data/apps/<slug>
-```
+As soon as the first slice compiles and contains one real feature, call the
+`apply_app` tool with `source_dir: /data/apps/<slug>`.
 
 For a Store-installed app, ordinary apply deliberately accepts local UI source
 while preserving the Store-reviewed manifest, skills, permissions, schedules,
 and project templates. If—and only if—the partner explicitly chose to make the
-local package manifest authoritative for this revision, use the deliberate
-variant:
-
-```bash
-python "$SCRIPTS_DIR/apply_app.py" --accept-local-package /data/apps/<slug>
-```
+local package manifest authoritative for this revision, pass
+`accept_local_package: true`.
 
 This keeps the app's Store provenance while accepting the validated local
 runtime declarations, permissions, project templates, skills and schedules,
@@ -188,9 +172,9 @@ receipt warns that a future reviewed Store update may replace the accepted
 declarations. Never use it merely to make an ordinary source edit take effect
 or to work around a manifest/permission guard.
 
-The helper validates the manifest and complete source tree, compiles and
-commits that exact revision, returns a compact receipt with `app_id`,
-`preview_path`, and `open_path`, and emits one live-preview action tied to this
+It validates the manifest and complete source tree, compiles and commits that
+exact revision, returns a compact receipt with `app_id` and `open_path`, and
+emits one live-preview action tied to this
 building chat. That action keeps the partner's focused pane untouched. On a
 phone it leaves Standard/Builder mode and the visible screen unchanged, parking
 the app until the partner taps the preview CTA. On a larger screen it opens the
@@ -200,7 +184,7 @@ Reuse that numeric ID for preview, storage, notifications, and later actions;
 do not list apps again after a successful apply. Do not send a separate
 `open_item`.
 
-Afterward, edit source files normally and run the same command once the change
+Afterward, edit source files normally and apply again once the change
 is coherent enough to preview. Each successful apply live-swaps the already
 open app, so the partner can watch and try the build as it gains layers. For a
 material build, the first apply is a beginning rather than the closeout: keep
@@ -238,8 +222,12 @@ const unsubscribe = store.subscribe('state.json', setValue)
 ```
 
 Do not probe guessed keys. If records are split across keys, keep an explicit
-index or use `store.list()`. Do not use `localStorage`, IndexedDB, native
-`alert`/`confirm`/`prompt`, or owner credentials.
+index or use `store.list()` for best-known display. If behavior depends on
+complete membership—such as deciding that a collection is empty, seeding
+defaults, or deleting records—switch to `building-apps.md` and use
+`store.listWithStatus()`; `complete: false` means unavailable or partial, not
+empty. Do not use `localStorage`, IndexedDB, native `alert`/`confirm`/`prompt`,
+or owner credentials.
 
 ### 5. Verify the rendered app without exploring the whole shell
 
@@ -301,7 +289,7 @@ Run validation once:
 python "$SCRIPTS_DIR/validate-app.py" /data/apps/<slug>
 ```
 
-Do not run `git add` or `git commit`. `apply_app.py` owns every accepted source
+Do not run `git add` or `git commit`. `apply_app` owns every accepted source
 commit and leaves later edits as an unpublished draft until the next apply.
 Repository status is diagnostic: a clean tree confirms the applied revision,
 while a dirty tree means an edit still awaits apply.

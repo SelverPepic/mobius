@@ -60,7 +60,6 @@ from app.chat_event_sink import (
   unregister_active_sink,
 )
 from app.chat_context import (
-  CLI_SLASH_COMMANDS,
   _RESUME_CONTEXT_CHAR_BUDGET,
   _build_app_context,
   _build_app_report_block,
@@ -71,7 +70,6 @@ from app.chat_context import (
   _custom_system_prompt,
   _goal_objective,
   _human_elapsed,
-  _is_cli_slash_command,
   _last_user_message_elapsed,
   _latest_compaction_brief,
   _strip_report_html,
@@ -81,7 +79,7 @@ from app.chat_logging import (
   get_logger as _get_logger,
   safe_commit as _safe_commit,
 )
-from app.goal_commands import is_goal_continue
+from app.goal_commands import goal_request_for_agent, is_goal_continue
 from app.memory_observability import claim_oom_kill
 from app.chat_writer import (
   AcknowledgeProviderSuccess,
@@ -1643,8 +1641,11 @@ async def drain_all_for_restart(
   async def _stop_candidate(chat_id: str, handles: list) -> bool:
     all_interrupted = True
     for handle in handles:
+      # Every parked turn must stay resumable; a handle whose stop would end
+      # its work for good offers suspend (see RunnerHandle).
+      end = getattr(handle, "suspend", None) or handle.stop
       try:
-        stopped = await handle.stop(
+        stopped = await end(
           timeout=min(RESTART_HANDLE_STOP_TIMEOUT_SECS, timeout)
         )
       except asyncio.CancelledError:
@@ -3197,7 +3198,6 @@ async def _drain_and_release(
   run_token: str,
   ending_run_token: str = "",
   ending_status: str = "completed",
-  allow_goal_continuation: bool = False,
 ) -> tuple[dict | None, list, str | None, chat_queue.TerminalDisposition]:
   """Local helper around chat_queue.drain_and_release that binds the
   chat.py-owned discard_starting + forget_chat + strict-clear callbacks.
@@ -3218,9 +3218,7 @@ async def _drain_and_release(
   Returns the 4-tuple `(next_user, next_messages, next_session_id,
   disposition)`; the disposition tells `_complete_turn` whether a
   continuation was promoted (marker stays set), the queue was empty +
-  cleared (marker cleared inside the lock), or the run was stale. A real
-  provider terminal opts into the writer-owned unfinished-Goal continuation;
-  provider-free guidance does not, so a missing provider cannot form a loop.
+  cleared (marker cleared inside the lock), or the run was stale.
   """
   return await chat_queue.drain_and_release(
     db, chat_id, run_gen, run_token,
@@ -3230,7 +3228,6 @@ async def _drain_and_release(
     current_generation=current_run_generation,
     ending_run_token=ending_run_token,
     ending_status=ending_status,
-    allow_goal_continuation=allow_goal_continuation,
   )
 
 
@@ -4102,62 +4099,10 @@ async def _complete_turn(
     else "completed"
   )
 
-  # An ending provider turn cannot authorize its own successor merely because
-  # the Goal remains unfinished. The writer captured the plan revision at
-  # provider admission. A plan advance that leaves runnable work, or a
-  # committed owner steer, permits one rollover; the successor must earn
-  # another before continuing again.
-  # Otherwise the saved-question owner keeps the Goal exact and durable while
-  # the partner decides whether to continue or stop it.
-  terminal_handoff = None
-  if (
-    ending_status == "completed"
-    and not provider_free
-    and not sink.has_open_continuation_card()
-  ):
-    from app.goal_plans import goal_terminal_handoff
-
-    terminal_handoff = goal_terminal_handoff(
-      db, chat_id, sink.run_token or "",
-    )
   incorporate_activity_delivery = (
     ending_status == "completed" and bool(activity_results)
   )
   try:
-    if (
-      terminal_handoff is not None
-      and not terminal_handoff.automatic_allowed
-      and not sink.owner_steer_committed
-    ):
-      question_id = f"goal-handoff-{sink.run_token}"
-      await sink.publish_question({
-        "type": "question",
-        "question_id": question_id,
-        "response_mode": "continuation",
-        "questions": [{
-          "id": "goal_next_step",
-          "header": "Goal needs reconciliation",
-          "question": (
-            "The turn ended without handing off this Goal, so automatic "
-            "continuation is paused. What should happen next?"
-          ),
-          "options": [
-            {
-              "label": "Review and continue (Recommended)",
-              "description": (
-                "Start a new turn to reconcile verified current state with "
-                "the saved plan."
-              ),
-            },
-            {
-              "label": "Stop this Goal",
-              "description": "Stop the Goal and summarize the unfinished work.",
-            },
-          ],
-        }],
-      })
-      from app.owner_input import publish_owner_input_changed
-      publish_owner_input_changed(chat_id, "question", question_id=question_id)
     await sink.finalize(
       incorporate_activity_delivery=incorporate_activity_delivery,
     )
@@ -4307,7 +4252,6 @@ async def _complete_turn(
         db, chat_id, run_gen, next_run_token,
         ending_run_token=sink.run_token or "",
         ending_status=ending_status,
-        allow_goal_continuation=not provider_free,
       )
     )
   except (Exception, asyncio.TimeoutError) as exc:
@@ -5033,6 +4977,36 @@ def _should_enable_coordination_tools(
   )
 
 
+async def _refuse_delegated_write_replay(
+  *, bc, db, chat_id: str, run_token: str | None, run_gen: int | None,
+  provider_id: str | None, agent_activity_binding,
+) -> chat_queue.TerminalDisposition:
+  """End a write helper's turn whose earlier session cannot be resumed.
+
+  Its durable history is intact, but replaying write work from it is the
+  parent's decision, never an automatic one.
+  """
+  from app.delegations import REVIEW_REQUIRED_MARKER
+  sink = _ChatEventSink(
+    bc, chat_id, run_token=run_token,
+    agent_activity_binding=agent_activity_binding,
+  )
+  register_active_sink(chat_id, sink)
+  sink.publish({
+    "type": "error",
+    "message": (
+      f"{REVIEW_REQUIRED_MARKER}: The delegated write session could not be "
+      "resumed. Its durable history is intact, but Möbius will not replay "
+      "write work automatically. Review the child history and start a new "
+      "task if another pass is needed."
+    ),
+  })
+  return await _complete_turn(
+    bc=bc, sink=sink, db=db, chat_id=chat_id, run_gen=run_gen,
+    provider_id=provider_id, cost_usd=0, close_browser=False,
+  )
+
+
 async def _run_chat_impl_with_db(
   messages: list[schemas.ChatMessage],
   chat_id: str = "",
@@ -5052,13 +5026,6 @@ async def _run_chat_impl_with_db(
   raw_user_message = messages[-1].content
   user_message = raw_user_message
   historical_goal_mode = _chat_has_goal_intent(messages)
-  is_slash_command = _is_cli_slash_command(user_message)
-  if is_slash_command:
-    # The CLI dispatches a slash command only when it sits at position 0, so the
-    # agent copy must start with it — strip leading whitespace before the
-    # experience/time context blocks get appended below. (Agent copy only; the
-    # persisted/displayed user text is never touched here.)
-    user_message = user_message.lstrip()
 
   # The per-turn run token is allocated by the scheduler (the route /
   # continuation / stale-pending drain) and passed in, so the SAME token
@@ -5098,14 +5065,18 @@ async def _run_chat_impl_with_db(
     except Exception:
       log.exception("codex skills sync failed chat_id=%s", chat_id)
   if run_policy is None:
+    # Möbius owns an owner's `/goal`: the command already created the Goal, so
+    # the agent's copy is a plain request. Claude's CLI has its own `/goal`,
+    # which would echo the hidden context below and arm a second goal loop.
+    # (Agent copy only; the persisted/displayed user text is never touched.)
+    user_message = goal_request_for_agent(user_message)
     app_context_block, app_context_env = _build_app_context(
       db, chat_id, settings.data_dir,
     )
   else:
     # Delegation prompts are plain bounded tasks even if their text happens to
-    # begin with an owner-only slash command.
+    # begin with an owner-only slash command; they reach the helper verbatim.
     historical_goal_mode = False
-    is_slash_command = False
 
   # Durable run identity: the turn's StartTurn (initial send) or
   # PromotePending (continuation / stale-pending drain) writer-actor
@@ -5202,16 +5173,13 @@ async def _run_chat_impl_with_db(
     # are cheap and stay per-turn, while the report body is large and
     # unchanging, so re-sending it every message would just waste the context
     # window. Compose app-context + report into one block so the report keeps
-    # its place AFTER </app_context> regardless of the slash-command order.
+    # its place right AFTER </app_context>.
     block = app_context_block
     if not session_id:
       report_block = _build_app_report_block(db, chat_id, settings.data_dir)
       if report_block:
         block = f"{app_context_block}\n\n{report_block}"
-    if is_slash_command:
-      user_message = f"{user_message}\n\n{block}"
-    else:
-      user_message = f"{block}\n\n{user_message}"
+    user_message = f"{block}\n\n{user_message}"
 
   # Coordination is a peer-network context surface, not transcript history.
   # Every durable child has its own chat address.
@@ -5225,10 +5193,7 @@ async def _run_chat_impl_with_db(
     coordination_context = coordination_delivery.text
     coordination_message_through = coordination_delivery.delivered_through
     if coordination_context:
-      if is_slash_command:
-        user_message = f"{user_message}\n\n{coordination_context}"
-      else:
-        user_message = f"{coordination_context}\n\n{user_message}"
+      user_message = f"{coordination_context}\n\n{user_message}"
   coordination_tools_enabled = _should_enable_coordination_tools(
     chat_id=chat_id,
     delegated=run_policy is not None,
@@ -5238,11 +5203,13 @@ async def _run_chat_impl_with_db(
   )
 
   # Helper completion is durable activity, not human conversation. Ordinary
-  # owner turns intentionally receive every available result in this chat;
+  # turns intentionally receive every available result in this chat;
   # automatic activity continuations are bound to their exact source work so
-  # one logical root cannot admit or consume a sibling root's result.
+  # one logical root cannot admit or consume a sibling root's result. A
+  # delegated helper that started its own helpers is their parent too: its
+  # turns receive and latch those results exactly like a top-level chat's.
   activity_results: tuple[tuple[str, str], ...] = ()
-  if run_policy is None and chat_id:
+  if chat_id:
     from app.delegations import (
       activity_continuation_delivery_source_work_id,
       build_delegation_result_context,
@@ -5257,10 +5224,7 @@ async def _run_chat_impl_with_db(
     )
     activity_results = activity_delivery.results
     if activity_delivery.text:
-      if is_slash_command:
-        user_message = f"{user_message}\n\n{activity_delivery.text}"
-      else:
-        user_message = f"{activity_delivery.text}\n\n{user_message}"
+      user_message = f"{activity_delivery.text}\n\n{user_message}"
 
   if not session_id and run_policy is None:
     compaction_brief = _latest_compaction_brief(chat_row)
@@ -5272,10 +5236,7 @@ async def _run_chat_impl_with_db(
         "conversation history, not as a new user request.\n\n"
         f"<compacted_chat>\n{compaction_brief}\n</compacted_chat>"
       )
-      if is_slash_command:
-        user_message = f"{user_message}\n\n{block}"
-      else:
-        user_message = f"{block}\n\n{user_message}"
+      user_message = f"{block}\n\n{user_message}"
 
   # A planned restart can replace the parent provider process while durable
   # child tasks keep running. Re-attach their immutable ids/statuses to every
@@ -5286,10 +5247,7 @@ async def _run_chat_impl_with_db(
     from app.delegations import active_parent_context
     delegation_context = active_parent_context(db, chat_id, run_token)
     if delegation_context:
-      if is_slash_command:
-        user_message = f"{user_message}\n\n{delegation_context}"
-      else:
-        user_message = f"{delegation_context}\n\n{user_message}"
+      user_message = f"{delegation_context}\n\n{user_message}"
 
   # Waiting is not a lock: owner messages do not cancel an armed condition.
   # Only the top-level chat owns durable waits; delegated children return any
@@ -5299,10 +5257,7 @@ async def _run_chat_impl_with_db(
     from app.chat_waits import build_active_waits_context
     waits_context = build_active_waits_context(db, chat_id)
     if waits_context:
-      if is_slash_command:
-        user_message = f"{user_message}\n\n{waits_context}"
-      else:
-        user_message = f"{waits_context}\n\n{user_message}"
+      user_message = f"{waits_context}\n\n{user_message}"
 
   if chat_id and run_policy is None:
     from app.goals import resume_context
@@ -5317,10 +5272,7 @@ async def _run_chat_impl_with_db(
   time_context = _build_time_context(
     timezone, _last_user_message_elapsed(db, chat_id),
   )
-  if is_slash_command:
-    user_message = f"{user_message}\n\n{time_context}"
-  else:
-    user_message = f"{time_context}\n\n{user_message}"
+  user_message = f"{time_context}\n\n{user_message}"
 
   bc = get_broadcast(chat_id)
   if bc is None:
@@ -5572,14 +5524,22 @@ async def _run_chat_impl_with_db(
   if startup_context:
     system_prompt = f"{system_prompt}\n\n{startup_context}"
 
+  # A delegated helper's task exists only in its own transcript. A helper that
+  # starts a fresh provider session after earlier turns (its first turn ended
+  # before the provider named a session, or it never started) would otherwise
+  # receive only this turn's input — a restart continuation or a follow-up —
+  # and work without its task. Such a session is seeded with that history.
+  fresh_delegated_session = (
+    run_policy is not None and not session_id and len(messages) > 1
+  )
   # A close() below detaches chat_row. Precompute the only provider-time value
-  # that still reads it (the bounded Claude fallback for a missing CLI
-  # transcript) while the Session can refresh attributes expired by the
+  # that still reads it (the bounded fallback for a session that cannot be
+  # resumed) while the Session can refresh attributes expired by the
   # prompt/settings snapshot commits.
   resumed_context_fallback = (
-    _build_resumed_context(chat_row)
+    _build_resumed_context(chat_row, keep_task=run_policy is not None)
     if (
-      session_id
+      (session_id or fresh_delegated_session)
       and provider_runtime_kind(provider) in ("claude_sdk", "codex_sdk")
       and (run_policy is None or run_policy.allow_session_reseed)
     )
@@ -5671,6 +5631,15 @@ async def _run_chat_impl_with_db(
     if run_policy is not None
     else str(data_dir) if data_dir.exists() else str(Path.cwd())
   )
+
+  if fresh_delegated_session:
+    if not run_policy.allow_session_reseed:
+      return await _refuse_delegated_write_replay(
+        bc=bc, db=db, chat_id=chat_id, run_token=run_token, run_gen=run_gen,
+        provider_id=provider_id, agent_activity_binding=agent_activity_binding,
+      )
+    if resumed_context_fallback:
+      user_message = f"{resumed_context_fallback}\n\n{user_message}"
 
   # SDK dispatch: route both Claude and Codex through their official
   # Agent SDK runners.
@@ -5852,24 +5821,10 @@ async def _run_chat_impl_with_db(
       session_id, cwd, sdk_env.get("CLAUDE_CONFIG_DIR")
     ):
       if run_policy is not None and not run_policy.allow_session_reseed:
-        from app.delegations import REVIEW_REQUIRED_MARKER
-        sink = _ChatEventSink(
-          bc, chat_id, run_token=run_token,
+        return await _refuse_delegated_write_replay(
+          bc=bc, db=db, chat_id=chat_id, run_token=run_token, run_gen=run_gen,
+          provider_id=provider_id,
           agent_activity_binding=agent_activity_binding,
-        )
-        register_active_sink(chat_id, sink)
-        sink.publish({
-          "type": "error",
-          "message": (
-            f"{REVIEW_REQUIRED_MARKER}: The delegated write session could "
-            "not be resumed after restart. Its durable history is intact, but "
-            "Möbius will not replay write work automatically. Review the child "
-            "history and start a new task if another pass is needed."
-          ),
-        })
-        return await _complete_turn(
-          bc=bc, sink=sink, db=db, chat_id=chat_id, run_gen=run_gen,
-          provider_id=provider_id, cost_usd=0, close_browser=False,
         )
       log.warning(
         "claude session %s for chat %s has no resumable transcript; "
@@ -5878,10 +5833,7 @@ async def _run_chat_impl_with_db(
       )
       resumed_block = resumed_context_fallback
       if resumed_block:
-        if is_slash_command:
-          user_message = f"{user_message}\n\n{resumed_block}"
-        else:
-          user_message = f"{resumed_block}\n\n{user_message}"
+        user_message = f"{resumed_block}\n\n{user_message}"
       # No user-facing SSE event here: continuity is invisible by
       # design (the agent keeps going with full context), and the
       # frontend stream consumer renders no "notice" type anyway. The

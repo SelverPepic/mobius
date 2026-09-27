@@ -141,7 +141,7 @@ function useChatAppArtifactsQuery(chatId, { enabled = true } = {}) {
   })
 }
 
-function useAppsQuery({ reconcile, enabled = true } = {}) {
+function useAppsQuery({ reconcile, enabled = true, staleTime } = {}) {
   return useQuery({
     queryKey: appsKey,
     queryFn: async (context) => {
@@ -149,6 +149,7 @@ function useAppsQuery({ reconcile, enabled = true } = {}) {
       return reconcile ? reconcile(rows) : rows
     },
     enabled,
+    ...(staleTime === undefined ? {} : { staleTime }),
   })
 }
 
@@ -172,9 +173,19 @@ function useProjectTemplatesQuery() {
   return useQuery({ queryKey: projectTemplatesKey, queryFn: fetchProjectTemplates })
 }
 
+// Complete list reads are numbered as they start; `landed` is the newest one
+// that returned a list. A scoped row read marks the count before its request
+// and yields only to a complete read that started after that mark and landed.
+const chatListReads = { started: 0, landed: 0 }
+
 async function fetchChats({ signal, timeoutMs, cache } = {}) {
+  const read = ++chatListReads.started
   const res = await api.chats.list({ signal, timeoutMs, cache })
   const data = await jsonOrThrow(res, 'chats fetch failed:')
+  // A replaced read may finish decoding after its abort; its rows never reach
+  // the cache, so it must not count as landed.
+  signal?.throwIfAborted()
+  chatListReads.landed = Math.max(chatListReads.landed, read)
   return Array.isArray(data) ? data : []
 }
 
@@ -617,6 +628,8 @@ export const chatQueries = {
   list: {
     key: chatsKey,
     fetch: fetchChats,
+    readMark: () => chatListReads.started,
+    readLandedSince: mark => chatListReads.landed > mark,
     useQuery: useChatsQuery,
     invalidate: (queryClient) => queryClient.invalidateQueries({ queryKey: chatsKey }),
   },

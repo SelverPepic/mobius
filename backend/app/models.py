@@ -84,6 +84,11 @@ class Owner(Base):
   # than a boolean flag) so we can correlate first-completion against
   # other onboarding signals later — same shape as a SCD type 1 row.
   walkthrough_completed_at = Column(DateTime, nullable=True, default=None)
+  # The owner's IANA timezone as last reported by the shell's browser. Plain
+  # daily app schedules (manifest defaults such as "30 5 * * *") are owned in
+  # this zone so they fire at that wall time for the owner. Null until a
+  # shell has reported it; server time applies meanwhile.
+  timezone = Column(String(64), nullable=True, default=None)
   # Monotonic JWT-validity generation. Every owner-derived token (the
   # 30-day login token, the 8h app token, the run-bound agent token, the
   # 90-day service token) is stamped with the owner's token_epoch at
@@ -423,13 +428,6 @@ class ChatRun(Base):
   goal_plan_json = Column(JSON, nullable=True, default=None)
   goal_plan_revision = Column(
     Integer, nullable=False, default=0, server_default="0"
-  )
-  # Exact plan revision visible when this physical Goal turn was admitted.
-  # Settlement compares this checkpoint with the root's current revision;
-  # unfinished work may schedule another provider turn only after the durable
-  # plan advances. NULL is legacy/ordinary work and never proves progress.
-  goal_plan_revision_at_admission = Column(
-    Integer, nullable=True, default=None
   )
   # App that initiated this turn under the app-attributed-chat contract
   # (077 §1). NULL = an ordinary owner-driven turn. Reserved now so the
@@ -1220,6 +1218,22 @@ class AppServiceAlias(Base):
     Integer, ForeignKey("apps.id", ondelete="CASCADE"), nullable=False,
     index=True,
   )
+  created_at = Column(DateTime, nullable=False, default=now_naive_utc)
+
+
+class DefaultPinInitialization(Base):
+  """Singleton marker: whether this deployment's default pins are settled.
+
+  No row means undecided; ``initialized_at`` NULL means a new deployment still
+  owes its Store pin; set means decided. A row rather than a file so the pin
+  and the marker commit together. ``create_all`` creates the table.
+  """
+
+  __tablename__ = "default_pin_initialization"
+
+  # Fixed sentinel primary key — this table holds at most one row.
+  id = Column(String(32), primary_key=True)
+  initialized_at = Column(DateTime, nullable=True, default=None)
   created_at = Column(DateTime, nullable=False, default=now_naive_utc)
 
 

@@ -101,6 +101,7 @@ import {
   composerTailIntentRequestsFollow,
   delayedSendWillPin,
   gestureLayoutRetryDelay,
+  handoffNeedsPhysicalFreeze,
   layoutMayOwnScroll,
   modeAfterQuestionResponseStart,
   modeAfterReaderGesture,
@@ -123,6 +124,7 @@ import {
   readerScrollEscapeDirection,
   scrollAuthorityAllowsCommit,
   settledPinMode,
+  resizeReappliesMode,
   shouldPinSend,
   terminalLayoutAuthority,
 } from './scroll/policy.js'
@@ -600,9 +602,14 @@ export default function useScrollMode({
         readerLocationExplicitRef.current = true
         // Main-effect cleanup has already settled pending input to ANCHOR_AT.
         // Preserve that address: re-measuring after a world reflow can lose its
-        // nested part. Live FOLLOW/PIN modes still need one physical freeze.
+        // nested part. Live FOLLOW/PIN modes still need one physical freeze,
+        // as does an anchor the reader moved off without an owned gesture.
         persistMode({
-          freezeToCurrentPosition: modeRef.current.kind !== 'ANCHOR_AT',
+          freezeToCurrentPosition: handoffNeedsPhysicalFreeze(
+            scrollRef.current,
+            modeRef.current,
+            observedScrollViewportRef.current,
+          ),
         })
       }
       readingPositionOwnerRef.current = false
@@ -1630,7 +1637,8 @@ export default function useScrollMode({
     // ResizeObserver — re-runs spacer sizing on content size changes.
     // Re-applies content-tracking modes:
     //   FOLLOW_BOTTOM — every firing, so streaming keeps the user
-    //                   glued to the tail.
+    //                   glued to the tail (except the reader's own typing in
+    //                   the inline answer editor; see resizeReappliesMode).
     //   ANCHOR_AT     — during the reveal window, re-applied every firing
     //                   (lazy renderers — KaTeX, highlight.js, markdown
     //                   re-wrap — settle in the first ~1s and shift the
@@ -1701,14 +1709,16 @@ export default function useScrollMode({
         // every late renderer or font swap becomes a visible jump.
         || (k === 'ANCHOR_AT' && !revealedRef.current)
       ) {
-        writeMode(
-          scrollEl,
-          modeRef.current,
-          k === 'FOLLOW_BOTTOM'
-            ? 'layout:follow-live-tail'
-            : 'layout:restore-anchor',
-          authorityVersion,
-        )
+        if (resizeReappliesMode(k, { editorResized })) {
+          writeMode(
+            scrollEl,
+            modeRef.current,
+            k === 'FOLLOW_BOTTOM'
+              ? 'layout:follow-live-tail'
+              : 'layout:restore-anchor',
+            authorityVersion,
+          )
+        }
       } else if (k === 'PIN_USER_MSG') {
         // Repair only a shifted row or a previously clamped target that has
         // become reachable. The predicate deliberately gates on the target,

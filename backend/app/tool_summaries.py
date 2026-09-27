@@ -69,10 +69,16 @@ def summarize_tool_input(tool: str, inp: dict[str, Any]) -> str:
       return f"{len(plan)} step(s)"
     return ""
   if inp:
+    # Each value is clipped visibly so a reader (and the shell's row title)
+    # never mistakes a cut value for the whole one.
     return ", ".join(
-      f"{k}={str(v)[:40]}" for k, v in inp.items()
+      f"{k}={_clip(str(v), 60)}" for k, v in inp.items()
     )[:200]
   return ""
+
+
+def _clip(text: str, limit: int) -> str:
+  return text if len(text) <= limit else text[:limit].rstrip() + "…"
 
 
 _HELPER_TOOLS = frozenset({"spawn_agent", "message_agent", "stop_agent", "list_agents"})
