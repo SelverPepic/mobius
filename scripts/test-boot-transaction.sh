@@ -62,7 +62,7 @@ expect_log() {
 serving_platform() {
   [ "$(docker exec "$name" cat /tmp/serving-source)" = "platform" ] \
     || fail "the platform checkout is not served"
-  [ "$(docker exec "$name" cat /tmp/platform-boot-transaction)" = "1" ] \
+  [ "$(docker exec "$name" cat /tmp/platform-boot-transaction)" = "$protocol" ] \
     || fail "the boot transaction did not publish its protocol"
 }
 
@@ -71,9 +71,9 @@ write_record() {
 fields = json.loads(sys.argv[2])
 fields.setdefault("image_digest", None)
 fields.setdefault("requires_image", True)
-fields.setdefault("protocol", 1)
+fields.setdefault("protocol", int(sys.argv[3]))
 with open(sys.argv[1], "w") as handle:
-  json.dump(fields, handle)' "$record" "$1"
+  json.dump(fields, handle)' "$record" "$1" "$protocol"
 }
 
 commit_on_head() {  # <path> <content>: a commit adding one file, branch unmoved
@@ -101,6 +101,9 @@ docker run -d --name "$name" --init --restart no \
   -e "MOEBIUS_SKIP_BOOTSTRAP=1" \
   "$IMAGE" >/dev/null
 wait_healthy  # first boot seeds /data/platform from the baked checkout
+# The protocol this image's own boot transaction publishes.
+protocol=$(docker exec "$name" cat /app/platform-baked/backend/runtime/boot-protocol)
+[[ "$protocol" =~ ^[0-9]+$ ]] || fail "the image records no boot protocol"
 echo "0. the first boot runs the same transaction on the fresh seed"
 serving_platform
 
@@ -153,7 +156,7 @@ as_mobius test ! -e /data/platform/boot-smoke-other-image.txt \
 as_mobius rm -f "$record"
 
 echo "4. a record from a newer boot protocol stops the boot"
-write_record "{\"state\":\"prepared\",\"snapshot\":\"$late\",\"prepared\":\"$late\",\"target\":\"$image\",\"protocol\":99}"
+write_record "{\"state\":\"prepared\",\"snapshot\":\"$late\",\"prepared\":\"$late\",\"target\":\"$image\",\"protocol\":$((protocol + 1))}"
 docker restart "$name" >/dev/null
 for _ in $(seq 1 60); do
   [ "$(docker inspect -f '{{.State.Running}}' "$name")" = "true" ] || break

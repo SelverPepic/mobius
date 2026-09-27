@@ -428,16 +428,32 @@ def run() -> int:
     try:
         with LOCK.open("a+") as lock:
             acquire_lock(lock)
-            # Reconciliation uses this same lock when removing abandoned
-            # claims. Claim only after ownership is established so a boot-time
-            # reconcile can never mistake a live worker's request for debris.
-            os.replace(request, claimed)
-            request_claimed = True
-            payload = read_json(claimed)
+            # Publish this operation's nonce before claiming: while the request
+            # is still in the inbox the app sees it queued, and once it is gone
+            # the status already names it, so the app never mistakes a claimed
+            # request for one that ended. The app's withdrawal races this claim
+            # with the same atomic rename.
+            payload = read_json(request)
             expected, nonce = parse_request(payload)
             write_status(config_value, operation_id=operation, state="queued",
                          expected_sha=expected, request_nonce=nonce, code=None,
                          message="Container rebuild queued.")
+            # Reconciliation uses this same lock when removing abandoned
+            # claims. Claim only after ownership is established so a boot-time
+            # reconcile can never mistake a live worker's request for debris.
+            try:
+                os.replace(request, claimed)
+            except FileNotFoundError:
+                # Withdrawn: whatever is in the inbox now is a newer request.
+                request_claimed = True
+                write_status(config_value, operation_id=operation, state="failed",
+                             expected_sha=expected, request_nonce=nonce,
+                             code="withdrawn",
+                             message="The request was withdrawn before it started.")
+                return 1
+            request_claimed = True
+            if read_json(claimed) != payload:
+                raise ValueError("the replacement request changed while it was claimed")
             cid, previous = app_container(config_value)
             image_ref = f"{IMAGE}:sha-{expected}"
             require_pull_space(previous)

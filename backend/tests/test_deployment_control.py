@@ -1948,8 +1948,7 @@ async def test_cancel_releases_a_binding_only_when_no_replacement_runs(
     return {"supported": True, "state": "replacing"}
 
   monkeypatch.setattr(dc, "read_rebuild_status", active)
-  with pytest.raises(dc.DeploymentControlError):
-    await dc.release_ended_binding()
+  await dc.release_ended_binding()
   assert bound_operations == []
 
   async def idle():
@@ -1958,3 +1957,46 @@ async def test_cancel_releases_a_binding_only_when_no_replacement_runs(
   monkeypatch.setattr(dc, "read_rebuild_status", idle)
   await dc.release_ended_binding()
   assert bound_operations == [("unbind", "c" * 40, operation)]
+
+
+@pytest.mark.parametrize(("queued", "status", "ended"), [
+  ({"nonce": "e" * 32}, {"state": "idle"}, False),  # still queued
+  (None, {"state": "preparing", "request_nonce": "e" * 32}, False),  # claimed
+  (None, {"state": "failed", "request_nonce": "e" * 32}, True),
+  (None, {"state": "succeeded", "request_nonce": "e" * 32}, True),
+  # Gone from the inbox yet never named: the helper never claimed it.
+  (None, {"state": "succeeded", "request_nonce": "f" * 32}, True),
+  ({"nonce": "f" * 32}, {"state": "idle"}, True),
+])
+def test_a_host_binding_ends_only_with_proof_the_request_cannot_run(
+  tmp_path, monkeypatch, queued, status, ended,
+):
+  control, inbox = _install_control(tmp_path, monkeypatch)
+  if queued:
+    (inbox / "request.json").write_text(json.dumps({
+      "version": 2, "expected_sha": "c" * 40, **queued,
+    }), encoding="utf-8")
+  (control / "status.json").write_text(json.dumps(status), encoding="utf-8")
+
+  assert dc._host_request_ended("e" * 32) is ended
+
+
+@pytest.mark.asyncio
+async def test_seeing_nothing_running_does_not_release_a_host_binding(
+  tmp_path, monkeypatch, bound_operations,
+):
+  """A just-claimed request can look idle for a moment; only the inbox and
+  the exact nonce prove its replacement ended."""
+  control, inbox = _install_control(tmp_path, monkeypatch)
+  nonce = "e" * 32
+  monkeypatch.setattr(
+    dc.platform_update, "read_prepared_update",
+    lambda: {**_prepared_record("c" * 40), "operation": {"controller": "host", "id": nonce}},
+  )
+  (control / "status.json").write_text(
+    json.dumps({"state": "preparing", "request_nonce": nonce}), encoding="utf-8",
+  )
+
+  await dc.release_ended_binding()
+
+  assert bound_operations == []

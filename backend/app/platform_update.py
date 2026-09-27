@@ -3328,24 +3328,26 @@ def _revert_swap(repo: Path, record: PreparedUpdate, *, reason: str) -> None:
   swapped record the next boot reverts again.
   """
   local = _local_branch(repo)
-  parked = _replay_parked(record)
-  _abort_interrupted(repo)
-  set_aside = _set_aside_unsaved_update_work(repo, local, record)
-  resolver_work = _set_aside_resolver_work(repo) if parked else None
-  _reset_hard_to(repo, local, record["late"])
-  _clear_reconcile_pre()
-  _settle_reverted(
-    repo, record, reason=reason,
-    set_aside=" and ".join(ref for ref in (set_aside, resolver_work) if ref) or None,
-  )
-  if parked:
-    # Only now, with the record settled, is the parked merge obsolete.
+  resolver_work = None
+  if _replay_parked(record):
+    # Keep the resolver's answer, then drop its merge while the record still
+    # says swapped: a crash from here on repeats this revert, and a settled
+    # record never sits beside a stale late-edit conflict.
+    resolver_work = _set_aside_resolver_work(repo)
     flag = _read_conflict_flag() or {}
     worktree = Path(str(
       (flag.get("overlay") or {}).get("worktree") or _overlay_candidate_path(repo)
     ))
     app_git.remove_overlay_worktree(repo, worktree)
     CONFLICT_FLAG.unlink(missing_ok=True)
+  _abort_interrupted(repo)
+  set_aside = _set_aside_unsaved_update_work(repo, local, record)
+  _reset_hard_to(repo, local, record["late"])
+  _clear_reconcile_pre()
+  _settle_reverted(
+    repo, record, reason=reason,
+    set_aside=" and ".join(ref for ref in (set_aside, resolver_work) if ref) or None,
+  )
 
 
 def _set_aside_unsaved_update_work(

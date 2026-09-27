@@ -5808,24 +5808,44 @@ def test_a_resolved_uncommitted_late_edit_conflict_boots_as_replayed_again(clone
   assert pu.settle_prepared_update_for_this_image(platform) == "replayed"
 
 
+@pytest.mark.parametrize(("module", "name", "after"), [
+  ("pu", "_set_aside_resolver_work", True),  # answer kept, merge not dropped
+  ("app_git", "remove_overlay_worktree", True),  # worktree gone, flag not
+  ("pu", "_reset_hard_to", False),  # merge dropped, checkout not reset
+  ("pu", "_settle_reverted", False),  # checkout reset, record still swapped
+])
 def test_an_image_not_kept_during_a_late_edit_conflict_keeps_the_resolver_s_work(
-  clone_env, monkeypatch,
+  clone_env, monkeypatch, module, name, after,
 ):
   origin, platform = clone_env
   record, worktree = _bound_late_conflict(platform, origin, uncommitted=False)
   (worktree / "backend/requirements.lock").write_text("half resolved\n")
 
-  # Killed before the reset: the record must still describe the swap.
-  _kill_once(monkeypatch, "_reset_hard_to", after=False)
+  target = pu if module == "pu" else app_git
+  real = getattr(target, name)
+  calls = []
+
+  def killed(*args, **kwargs):
+    if calls:
+      return real(*args, **kwargs)
+    calls.append(name)
+    if after:
+      real(*args, **kwargs)
+    raise _Killed(name)
+
+  monkeypatch.setattr(target, name, killed)
   _boot_image(record["snapshot"])
   with pytest.raises(_Killed):
     pu.settle_prepared_update_for_this_image(platform)
+  # Killed anywhere, the record still describes the swap, never a settled
+  # update beside a stale late-edit conflict.
   assert pu.read_prepared_update()["state"] == "swapped"
 
   assert pu.settle_prepared_update_for_this_image(platform) == "reverted"
   assert pu.read_prepared_update()["state"] == "prepared"
   assert not pu.CONFLICT_FLAG.exists()
   assert not worktree.exists()
+  assert pu.unfinished_update(platform)["stage"] == "finish"
   refs = _git(
     platform, "for-each-ref", "--format=%(refname)", pu._SET_ASIDE_PREFIX,
   ).stdout.split()

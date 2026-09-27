@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
@@ -564,3 +565,69 @@ def test_the_helper_advertises_the_request_versions_it_accepts(tmp_path, monkeyp
   status = host.write_status({"control_dir": control}, state="idle")
 
   assert status["request_versions"] == [1, 2]
+
+
+def test_the_helper_names_a_request_in_its_status_before_claiming_it(
+  tmp_path, monkeypatch,
+):
+  """The app treats a request gone from the inbox and absent from the status
+  as never claimed, so the helper must publish its nonce first."""
+  _config, inbox = _worker_paths(tmp_path, monkeypatch)
+  request = inbox / "request.json"
+  nonce = "a" * 32
+  request.write_text(json.dumps({
+    "version": 2, "expected_sha": "3" * 40, "nonce": nonce,
+  }), encoding="utf-8")
+  order = []
+  real_replace = host.os.replace
+
+  def record_replace(source, target):
+    if Path(source) == request:
+      order.append("claim")
+    return real_replace(source, target)
+
+  def record_status(_config, **fields):
+    if fields.get("request_nonce") == nonce and fields.get("state") == "queued":
+      order.append("named")
+    return fields
+
+  monkeypatch.setattr(host.os, "replace", record_replace)
+  monkeypatch.setattr(host, "write_status", record_status)
+  monkeypatch.setattr(
+    host, "app_container",
+    lambda _config: (_ for _ in ()).throw(RuntimeError("stop after the claim")),
+  )
+
+  host.run()
+
+  assert order[:2] == ["named", "claim"]
+
+
+def test_a_request_withdrawn_before_its_claim_fails_and_spares_the_inbox(
+  tmp_path, monkeypatch,
+):
+  _config, inbox = _worker_paths(tmp_path, monkeypatch)
+  request = inbox / "request.json"
+  nonce = "b" * 32
+  request.write_text(json.dumps({
+    "version": 2, "expected_sha": "4" * 40, "nonce": nonce,
+  }), encoding="utf-8")
+  newer = json.dumps({"version": 2, "expected_sha": "5" * 40, "nonce": "c" * 32})
+
+  def withdrawn_then_requeued(source, _target):
+    if Path(source) == request:
+      # The app withdrew this request and queued a newer one meanwhile.
+      request.write_text(newer, encoding="utf-8")
+      raise FileNotFoundError(source)
+
+  statuses = []
+  monkeypatch.setattr(host.os, "replace", withdrawn_then_requeued)
+  monkeypatch.setattr(
+    host, "write_status", lambda _config, **fields: statuses.append(fields) or fields,
+  )
+
+  assert host.run() == 1
+  assert statuses[-1]["state"] == "failed"
+  assert statuses[-1]["code"] == "withdrawn"
+  assert statuses[-1]["request_nonce"] == nonce
+  assert request.read_text(encoding="utf-8") == newer

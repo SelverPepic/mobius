@@ -679,15 +679,57 @@ async def _release_binding(operation: dict) -> None:
     )
 
 
+def _host_request_ended(nonce: str) -> bool:
+  """Whether the host helper can no longer start the request with ``nonce``.
+
+  The helper publishes a request's nonce in its status before it takes the
+  request out of the inbox (``mobius-rebuild-host.run``). So a request that
+  is neither still queued nor named by the status was never claimed and can
+  never run; one the status names has ended once that status is terminal.
+  Read the inbox first: a request gone from it is already in the status.
+  """
+  try:
+    pending = json.loads((_inbox_dir() / "request.json").read_text(encoding="utf-8"))
+  except FileNotFoundError:
+    pending = None
+  except (OSError, UnicodeError, json.JSONDecodeError):
+    return False
+  if isinstance(pending, dict) and pending.get("nonce") == nonce:
+    return False
+  try:
+    status = json.loads(_status_path().read_text(encoding="utf-8"))
+  except (OSError, UnicodeError, json.JSONDecodeError):
+    return False
+  if not isinstance(status, dict):
+    return False
+  if status.get("request_nonce") == nonce:
+    return str(status.get("state") or "idle") not in _ACTIVE_STATES
+  return True
+
+
+async def _binding_ended(operation: dict) -> bool:
+  """Proof that a bound replacement can no longer start or succeed: the
+  exact operation reported terminal, or (Railway) a newer operation reported,
+  or (host) the request provably never claimed. Merely seeing nothing
+  running is not proof: a host request may be claimed but not yet reported."""
+  if operation["controller"] == "host":
+    return await asyncio.to_thread(_host_request_ended, operation["id"])
+  try:
+    status = await read_rebuild_status()
+  except DeploymentControlError:
+    return False
+  if not status.get("supported") or status.get("state") in _ACTIVE_STATES:
+    return False
+  return True
+
+
 async def release_ended_binding() -> None:
   """Before cancelling a prepared update, release a binding whose
-  replacement can no longer start: only once the controller shows nothing
-  running. An active or unreadable controller keeps it."""
+  replacement provably ended. Anything short of that proof keeps it, and
+  cancelling then refuses."""
   operation = await asyncio.to_thread(_bound_operation)
-  if operation is None:
-    return
-  _ensure_can_rebuild(await read_rebuild_status())
-  await _release_binding(operation)
+  if operation is not None and await _binding_ended(operation):
+    await _release_binding(operation)
 
 
 _settle_window_ends: float | None = None
@@ -805,9 +847,9 @@ async def _request_self_hosted_rebuild(
       status_code=409,
     )
   _ensure_can_rebuild(await read_rebuild_status())
-  # No replacement is running, so a binding left on the record belongs to an
-  # attempt that ended; this request may replace exactly that binding.
-  replacing = await asyncio.to_thread(_bound_operation)
+  # A binding left by an attempt that provably ended may be replaced.
+  stale = await asyncio.to_thread(_bound_operation)
+  replacing = stale if stale and await _binding_ended(stale) else None
   await asyncio.to_thread(final_check)
   nonce = secrets.token_hex(16)
   operation = {"controller": "host", "id": nonce}
