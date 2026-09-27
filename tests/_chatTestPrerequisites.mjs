@@ -82,14 +82,18 @@ export async function persistTestChatModel(page, { base, chatId, token }) {
  * Report the shell delivery-ready. Until connectivityStore's /api/ready probe
  * sees `ready: true` with a boot id, a send is queued locally instead of
  * starting a turn, and the composer is usable before that probe settles.
- * Specs that expect a started turn install this before navigating.
+ * Specs that expect a started turn install this before navigating; `until`
+ * holds every readiness answer until it resolves.
  */
-export async function mockDeliveryReady(page, { bootId = 'test-boot' } = {}) {
-  await page.route(/\/api\/ready$/, route => route.fulfill({
-    status: 200,
-    contentType: 'application/json',
-    json: { ready: true, boot_id: bootId },
-  }))
+export async function mockDeliveryReady(page, { bootId = 'test-boot', until = null } = {}) {
+  await page.route(/\/api\/ready$/, async route => {
+    if (until) await until
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      json: { ready: true, boot_id: bootId },
+    })
+  })
 }
 
 /**

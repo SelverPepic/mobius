@@ -1,6 +1,6 @@
 /* Saved close answers never manufacture a model turn or disturb owner intent. */
 import { test, expect, serveRecoveryBuild } from './_recoveryBrowser.mjs'
-import { installMockProviderUsage, runtimeSnapshot } from './_chatTestPrerequisites.mjs'
+import { installMockProviderUsage, runtimeSnapshot, mockDeliveryReady } from './_chatTestPrerequisites.mjs'
 import { disconnectDelivery } from './_connectivity.mjs'
 
 const BASE = process.env.MOBIUS_URL || process.env.API_BASE_URL || 'http://localhost:8001'
@@ -88,12 +88,12 @@ async function mount(page, { reject = false, acknowledgement = 'response', resta
         mime_type: 'text/plain', url: `${path}/uploads/draft-note.txt` } })
       return route.fulfill({ json: {} }) // No fixture mutation reaches live data.
     }
-    if (url.pathname === '/api/ready') return route.fulfill({ json: { ready: true, boot_id: 'fixture-ready-boot' } })
     if (url.pathname === path || url.pathname === `${path}/runtime`) return route.fulfill({ json: detail() })
     if (url.pathname === `${path}/stream`) { streams++; return route.fulfill({ status: 204, body: '' }) }
     if (url.pathname === '/api/chats') return route.fulfill({ json: [detail()] })
     return route.continue()
   })
+  await mockDeliveryReady(page)
   // The generic fixture route is intentionally broad. Register the shared
   // provider boundary after it so Playwright's LIFO dispatch handles the
   // configured Codex chat without probing the disconnected backend.

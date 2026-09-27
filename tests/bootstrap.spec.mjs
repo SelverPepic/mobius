@@ -408,11 +408,7 @@ test.describe('Unauthenticated startup', () => {
       .toBeVisible({ timeout: 10000 })
   })
 
-  // A managed deployment with no owner yet must present managed sign-in, not
-  // the local password setup. Today the setup wizard renders for any
-  // configured:false state. POST /api/auth/setup still refuses a local owner
-  // under managed sign-in, so this is a UX gap, not an access gap; the waiting
-  // screen needs a product decision before this can pass.
+  // Waiting screen for a pending managed owner: https://github.com/mobius-os/mobius/issues/1519
   test.fixme(
     'managed deployment shows a managed-sign-in screen while the broker link is pending, not the local password setup form',
     async ({ page }) => {

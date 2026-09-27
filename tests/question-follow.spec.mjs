@@ -5,7 +5,7 @@
  * cannot move the card before the continuation actually renders.
  */
 import { test, expect, serveRecoveryBuild } from './_recoveryBrowser.mjs'
-import { testChatAgentSettings, installMockAgentProvider, runtimeSnapshot } from './_chatTestPrerequisites.mjs'
+import { testChatAgentSettings, installMockAgentProvider, runtimeSnapshot, mockDeliveryReady } from './_chatTestPrerequisites.mjs'
 import { waitForComposerSendable } from './_chatSession.mjs'
 
 const BASE = process.env.MOBIUS_URL || 'http://localhost:8001'
@@ -128,10 +128,7 @@ for (const scenario of [...questionFollowScenarios, coldQuestionScenario]) test(
   const readyGate = scenario.queuedUntilReady
     ? new Promise(resolve => { releaseReadiness = resolve }) : Promise.resolve()
   try {
-    await page.route('**/api/ready', async route => {
-      await readyGate
-      return route.fulfill({ json: { ready: true, boot_id: 'question-follow-boot' } })
-    })
+    await mockDeliveryReady(page, { until: readyGate })
     await page.route(/\/api\/chats(?:\?.*)?$/, route => route.request().method() === 'GET'
       ? route.fulfill({ json: [{ id: chat.id, title: 'Question follow fixture', has_messages: true, running: false }] })
       : route.fallback())
