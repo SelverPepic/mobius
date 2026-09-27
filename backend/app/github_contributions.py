@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 
 from app import (
   app_git,
+  contribution_staging,
   fs_locks,
   github_auth,
   github_contribution_git as _git_ops,
@@ -901,6 +902,9 @@ def _settle_equivalence(record: dict, upstream_sha: str | None = None) -> str | 
     return equivalent
   if record.get("status") == "closed":
     app_git.discard_pending_equivalent_change(repo, digest)
+  if record.get("status") in ("closed", "abandoned"):
+    # A draft that never merged has nothing for an update to retire.
+    contribution_staging.unpin_draft(repo, str(record.get("id") or ""))
   return None
 
 

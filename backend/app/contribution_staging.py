@@ -230,8 +230,8 @@ def adopt_reviewed_revision(
   merged = app_git.merge_refs(source, live, head, merge_base=anchor)
   if merged.status != "clean":
     raise AdoptionRefused(
-      "Live edits overlap the review revision in: "
-      + ", ".join(merged.conflict_paths[:8])
+      ("Live edits overlap the review revision in: "
+       + ", ".join(merged.conflict_paths[:8]))[:400]
     )
   if merged.merged_tree_oid == app_git._tree_oid(source, live):
     return live
@@ -273,7 +273,9 @@ def source_holds(source: Path, base_sha: str, head_sha: str) -> bool:
 
 
 def _draft_ref(record_id: str) -> str:
-  return f"refs/mobius/contribution-drafts/{record_id}"
+  # Hashed: a valid record id is not always a valid Git ref component.
+  digest = hashlib.sha256(record_id.encode("utf-8")).hexdigest()
+  return f"refs/mobius/contribution-drafts/{digest}"
 
 
 def pin_draft(source: Path, record_id: str, base_sha: str, head_sha: str) -> dict:

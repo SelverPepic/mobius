@@ -374,3 +374,36 @@ def test_send_refuses_a_verdict_for_a_different_diff_of_the_same_head(staging):
   swapped = {**record, "plan": {**record["plan"], "diff_sha256": "f" * 64}}
   with pytest.raises(HTTPException):
     _require_all_clear_review(swapped)
+
+
+def test_a_carried_draft_is_dropped_once_live_no_longer_holds_it(staging):
+  staging["new_record"]()
+  source = staging["source"]
+  (source / "greet.py").write_text(DRAFT + "# in progress\n")
+  _commit(staging["worktree"], {"greet.py": REVISED}, "Say hello")
+  assert staging["stage"]().json()["source_sync"]["draft"]
+
+  # The owner commits their own rewrite, so live no longer holds the draft.
+  _git(source, "add", "greet.py")
+  _git(source, "commit", "-q", "-m", "owner rewrite")
+  (source / "greet.py").write_text("def greet():\n  return 'yo'\n")
+  _git(source, "commit", "-qam", "owner rewrite again")
+  _commit(staging["worktree"], {"greet.py": "def greet():\n  return 'hey'\n"}, "Say hey")
+  sync = staging["stage"]().json()["source_sync"]
+  assert sync["state"] == "diverged"
+  assert "draft" not in sync
+
+
+def test_closing_an_unmerged_contribution_releases_its_draft_pin(staging):
+  from app.github_contributions import _settle_equivalence
+
+  staging["new_record"]()
+  source = staging["source"]
+  (source / "greet.py").write_text(DRAFT + "# in progress\n")
+  _commit(staging["worktree"], {"greet.py": REVISED}, "Say hello")
+  response = staging["stage"]().json()
+  ref = response["source_sync"]["draft"]["ref"]
+  assert _git(source, "for-each-ref", ref)
+
+  _settle_equivalence({**response["record"], "status": "closed"})
+  assert _git(source, "for-each-ref", ref) == ""

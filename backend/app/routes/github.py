@@ -1862,8 +1862,13 @@ def _track_live_source(previous: dict | None, record: dict, source: Path) -> dic
   draft = (
     old_sync.get("draft")
     if isinstance(old_sync, dict) and old_sync.get("state") == "diverged"
+    and isinstance(old_sync.get("draft"), dict)
     else None
   )
+  if draft and not contribution_staging.source_holds(
+    source, str(draft.get("base_sha")), str(draft.get("head_sha")),
+  ):
+    draft = None
   detail = "The live source does not contain this reviewed version."
   if isinstance(old, dict) and contribution_staging.source_holds(
     source, str(old.get("base_sha")), str(old.get("head_sha")),
