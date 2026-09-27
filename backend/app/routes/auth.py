@@ -171,6 +171,26 @@ def setup_status(db: Session = Depends(get_db)):
   )
 
 
+def _activate_first_owner(db: Session, owner: models.Owner) -> None:
+  """Write the service credential for a newly created owner and start the
+  app initialization that was waiting for it.
+
+  Bootstrap apps install before the owner exists, so their install-time jobs
+  are deferred until this point (``app_jobs.launch_deferred_initializations``).
+  """
+  try:
+    auth.write_service_token(owner.username, owner.token_epoch)
+  except OSError as exc:
+    log.warning("Could not write service token: %s", exc)
+    return
+  try:
+    from app.app_jobs import launch_deferred_initializations
+
+    launch_deferred_initializations(db)
+  except Exception:
+    log.exception("Could not start deferred app initialization")
+
+
 def _ensure_managed_owner(db: Session, settings=None):
   """Create or repair the managed owner from the broker's verified link.
 
@@ -258,10 +278,7 @@ def _ensure_managed_owner(db: Session, settings=None):
     db.rollback()
     return db.query(models.Owner).first()
   db.refresh(owner)
-  try:
-    auth.write_service_token(owner.username, owner.token_epoch)
-  except OSError as exc:
-    log.warning("Could not write service token: %s", exc)
+  _activate_first_owner(db, owner)
   return owner
 
 
@@ -296,10 +313,7 @@ def setup(
     db.rollback()
     raise HTTPException(status_code=400, detail="Already configured.")
   db.refresh(owner)
-  try:
-    auth.write_service_token(owner.username, owner.token_epoch)
-  except OSError as exc:
-    log.warning("Could not write service token: %s", exc)
+  _activate_first_owner(db, owner)
   token = auth.create_access_token(
     {"sub": owner.username}, token_epoch=owner.token_epoch
   )

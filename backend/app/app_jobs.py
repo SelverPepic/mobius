@@ -9,6 +9,7 @@ live check fail.  PID reuse is guarded by Linux ``/proc`` start ticks.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -17,6 +18,8 @@ import time
 from pathlib import Path
 
 from app.config import get_settings
+
+log = logging.getLogger(__name__)
 
 
 def runner_script() -> Path:
@@ -61,6 +64,51 @@ def launch_app_job(
     close_fds=True,
     start_new_session=True,
   )
+
+
+def owner_exists(db) -> bool:
+  """Whether app jobs can authenticate yet.
+
+  Every app job runs with a token minted from the owner's service credential,
+  which is first written when the owner row is created. Before that, a launched
+  job can only time out.
+  """
+  from app import models
+
+  return db.query(models.Owner.id).first() is not None
+
+
+def launch_deferred_initializations(db) -> list[int]:
+  """Start the install-time initialization deferred until the first owner.
+
+  A new instance installs its bootstrap apps during startup, before anyone has
+  set up the owner account, so their ``initialize_on_install`` jobs cannot run
+  then (see ``owner_exists``). Owner creation calls this once to start every
+  live app's initialization; each app's single-flight run lock absorbs any
+  overlap with a run already in progress.
+  """
+  from app import models
+
+  launched: list[int] = []
+  apps = db.query(models.App).filter(models.App.deleted_at.is_(None)).all()
+  for app in apps:
+    background = (app.capability_contract or {}).get("background") or {}
+    job = background.get("job")
+    if not (
+      background.get("initialize_on_install") is True
+      and isinstance(job, str)
+      and job
+      and app.source_dir
+    ):
+      continue
+    source_dir = Path(app.source_dir)
+    try:
+      launch_app_job(app.id, source_dir / job, source_dir, wait_for_ready=True)
+    except Exception:
+      log.exception("deferred initialization failed to start for app %s", app.id)
+      continue
+    launched.append(app.id)
+  return launched
 
 
 def _start_ticks(pid: int) -> int | None:

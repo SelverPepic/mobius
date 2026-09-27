@@ -592,11 +592,18 @@ def test_digest_mismatch_rejects_before_fetching_code_or_mutating(
 
 
 @pytest.mark.asyncio
-async def test_bootstrap_initialization_waits_for_backend_readiness(
-  db, bypass_url_validation,
+@pytest.mark.parametrize("owner_ready", [False, True])
+async def test_bootstrap_initialization_waits_for_owner_and_backend(
+  db, bypass_url_validation, owner_ready,
 ):
-  """Bootstrap and interactive installs share launch ownership but not timing."""
+  """A new instance installs bootstrap apps before its owner exists, when no
+  job can authenticate; owner creation starts that initialization instead.
+  Once an owner exists, bootstrap launches it to wait for backend readiness."""
   from app.install import install_from_manifest
+
+  if owner_ready:
+    db.add(models.Owner(username="owner", hashed_password="x"))
+    db.commit()
 
   base = "https://capability.test/bootstrap-memory/"
   manifest = _manifest(id="bootstrap-memory", name="Bootstrap Memory")
@@ -624,6 +631,10 @@ async def test_bootstrap_initialization_waits_for_backend_readiness(
   warnings = result.warnings
 
   assert mode == "install"
+  if not owner_ready:
+    launch.assert_not_called()
+    assert "initialization deferred until owner setup" in warnings
+    return
   source_dir = Path(app.source_dir)
   launch.assert_called_once_with(
     app.id, source_dir / "memory-job.sh", source_dir,

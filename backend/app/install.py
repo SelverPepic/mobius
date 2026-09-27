@@ -3183,16 +3183,21 @@ async def _run_post_commit_effects(
     and app.source_dir
   ):
     try:
-      from app.app_jobs import launch_app_job
+      from app.app_jobs import launch_app_job, owner_exists
 
-      source_dir = Path(app.source_dir)
-      launch_app_job(
-        app.id,
-        source_dir / job_name,
-        source_dir,
-        wait_for_ready=True,
-      )
-      warnings.append("initialization waiting for startup readiness")
+      if not owner_exists(db):
+        # A new instance's bootstrap install: the job could not authenticate
+        # yet. Owner creation starts it (launch_deferred_initializations).
+        warnings.append("initialization deferred until owner setup")
+      else:
+        source_dir = Path(app.source_dir)
+        launch_app_job(
+          app.id,
+          source_dir / job_name,
+          source_dir,
+          wait_for_ready=True,
+        )
+        warnings.append("initialization waiting for startup readiness")
     except Exception as exc:
       log.exception("install: initialization job failed to start")
       warnings.append(f"initialization failed to start — {exc!r}")

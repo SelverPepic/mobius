@@ -1123,3 +1123,25 @@ def test_login_cooldown_tracking_caps_at_10k(client):
     _auth_mod._login_failures[f"user_{i}"] = 29
     _record_login_failure(f"user_{i}")
   assert len(_auth_mod._login_cooldown_until) <= _LOGIN_TRACK_CAP
+
+
+def test_managed_owner_creation_starts_deferred_initialization(client, monkeypatch):
+  from app import app_jobs
+
+  settings = configure_managed_sso(monkeypatch)
+  configure_runtime_identity(monkeypatch, {
+    "linked": True,
+    "issuer": settings.mobius_sso_issuer,
+    "subject": "user_managed-owner",
+    "instance_id": settings.mobius_sso_instance_id,
+  })
+  started = []
+  monkeypatch.setattr(
+    app_jobs, "launch_deferred_initializations",
+    lambda db: started.append(app_jobs.owner_exists(db)) or [],
+  )
+
+  client.get("/api/auth/setup/status")
+  client.get("/api/auth/setup/status")
+
+  assert started == [True]

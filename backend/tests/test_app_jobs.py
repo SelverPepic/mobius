@@ -794,3 +794,53 @@ def test_missing_runtime_context_never_executes_editable_source(tmp_path, monkey
   context = {"source_dir": str(source)}
   assert runner._runtime_job(7, job, context) is None
   assert runner._runtime_job(7, job, {**context, "runtime_dir": None}) is None
+
+
+def _initializing_app(db, name, *, initialize=True, deleted=False):
+  from datetime import UTC, datetime
+
+  app = models.App(
+    slug=name,
+    source_dir=f"/tmp/mobius-tests/{name}",
+    name=name, description="", jsx_source="export default () => null",
+    capability_contract={"background": {
+      "job": "fetch.sh", "initialize_on_install": initialize,
+    }},
+    deleted_at=datetime.now(UTC).replace(tzinfo=None) if deleted else None,
+  )
+  db.add(app)
+  db.commit()
+  db.refresh(app)
+  return app
+
+
+def test_deferred_initialization_starts_only_live_apps_that_asked(db, monkeypatch):
+  wanted = _initializing_app(db, "memory-init")
+  _initializing_app(db, "no-init", initialize=False)
+  _initializing_app(db, "removed-init", deleted=True)
+  launches = []
+  monkeypatch.setattr(
+    app_jobs, "launch_app_job",
+    lambda app_id, job, source, *, wait_for_ready: launches.append(
+      (app_id, job, source, wait_for_ready),
+    ),
+  )
+
+  assert app_jobs.launch_deferred_initializations(db) == [wanted.id]
+  source = Path(wanted.source_dir)
+  assert launches == [(wanted.id, source / "fetch.sh", source, True)]
+
+
+def test_first_owner_setup_starts_deferred_initialization(client, monkeypatch):
+  started = []
+  monkeypatch.setattr(
+    app_jobs, "launch_deferred_initializations",
+    lambda db: started.append(app_jobs.owner_exists(db)) or [],
+  )
+
+  response = client.post("/api/auth/setup", json={
+    "username": "admin", "password": "securepassword123",
+  })
+
+  assert response.status_code == 200
+  assert started == [True]
