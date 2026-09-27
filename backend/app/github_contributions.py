@@ -151,6 +151,9 @@ def _require_all_clear_review(record: dict) -> None:
     not canonical
     or review.get("state") != "all_clear"
     or reviewed_head_sha != head_sha
+    # A verdict recorded through Contribute's review call also names the diff
+    # it covered, so the same head over a different base cannot inherit it.
+    or review.get("reviewed_diff_sha256") not in (None, plan.get("diff_sha256"))
   ):
     raise HTTPException(
       status_code=409,

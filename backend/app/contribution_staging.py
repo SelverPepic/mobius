@@ -240,6 +240,9 @@ def adopt_reviewed_revision(
   ).stdout.strip()
   # A two-tree read-tree is Git's branch switch: it refuses to overwrite a
   # path with local edits and carries unrelated uncommitted work forward.
+  # Updating files before the branch is the recoverable order: a crash in
+  # between leaves the revision staged on the unchanged branch, which the next
+  # stage reports as diverged rather than silently losing it.
   switched = app_git._run(
     source, "read-tree", "-m", "-u", live, adopted, check=False,
   )
@@ -256,14 +259,52 @@ def adopt_reviewed_revision(
   return adopted
 
 
-def source_sync(state: str, source_sha: str, detail: str = "") -> dict:
+def source_holds(source: Path, base_sha: str, head_sha: str) -> bool:
+  """Whether the live source's committed ``HEAD`` contains ``base..head``.
+
+  Uncommitted work is deliberately ignored: this names the draft history the
+  source holds, while publication proofs separately refuse dirty reviewed
+  paths.
+  """
+  live = app_git._resolve_commit(source, "HEAD", read_only=True)
+  return bool(live) and app_git._change_is_subsumed(
+    source, base_sha, head_sha, live, read_only=True,
+  )
+
+
+def _draft_ref(record_id: str) -> str:
+  return f"refs/mobius/contribution-drafts/{record_id}"
+
+
+def pin_draft(source: Path, record_id: str, base_sha: str, head_sha: str) -> dict:
+  """Name the draft delta the live source holds and keep its commits alive.
+
+  ``base_sha..head_sha`` is the staged version the live source provably
+  contained before review revised it. A private ref keeps those commits
+  reachable after the review branch is rebased; whoever retires the draft
+  (the updater, once the PR has merged) deletes that ref.
+  """
+  app_git._run(source, "update-ref", _draft_ref(record_id), head_sha, check=False)
+  return {"base_sha": base_sha, "head_sha": head_sha, "ref": _draft_ref(record_id)}
+
+
+def unpin_draft(source: Path, record_id: str) -> None:
+  app_git._run(source, "update-ref", "-d", _draft_ref(record_id), check=False)
+
+
+def source_sync(
+  state: str, source_sha: str, detail: str = "", *, draft: dict | None = None,
+) -> dict:
   """Operational record of how the live source relates to the staged head.
 
   ``in_source``: the live source provably contains the reviewed change.
   ``adopted``: staging just committed the review revision onto it.
-  ``diverged``: it does not; a later update must reconcile that draft.
+  ``diverged``: it does not; ``draft`` (when known) is the exact earlier
+  staged delta it still holds, so a later update can retire that draft.
   """
   value = {"state": state, "source_sha": source_sha, "checked_at": now_iso()}
   if detail:
     value["detail"] = detail
+  if draft:
+    value["draft"] = draft
   return value

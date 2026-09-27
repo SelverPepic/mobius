@@ -1631,6 +1631,7 @@ async def attest_contribution_source_continuity(
 
 
 _STAGEABLE_STATUSES = frozenset(("prepared", "open", "draft"))
+_SOURCE_SYNC_RESERVE = 1024
 _STAGE_CLEARED_FIELDS = (
   "last_submit_error", "last_submit_error_code", "last_submit_error_detail",
 )
@@ -1832,48 +1833,64 @@ def _stage_record(
     record.pop("quality_review", None)
   else:
     record["quality_review"] = verdict
+  # Refuse an oversized record before the live source can be changed: the
+  # live-source result below adds at most the reserved bytes.
+  encoded = json.dumps(record, ensure_ascii=False, indent=2) + "\n"
+  if len(encoded.encode("utf-8")) + _SOURCE_SYNC_RESERVE > MAX_RECORD_BYTES:
+    raise ContributionSubmitError(
+      "The staged record is too large.", status_code=422,
+      code="record_too_large",
+    )
   record["source_sync"] = _track_live_source(previous, record, source_repo)
   return record, candidate
 
 
 def _track_live_source(previous: dict | None, record: dict, source: Path) -> dict:
-  """Keep the live source on the reviewed version, or say that it is not.
+  """Keep the live source on the reviewed version, or name the draft it holds.
 
   When the live source held the previous staged version, the review revision
-  is committed onto it; a later update then recognizes the published change
-  instead of replaying the superseded draft against it.
+  is committed onto it, so a later update recognizes the published change
+  instead of replaying the superseded draft. When that is not possible, the
+  result keeps the exact draft delta the live source still holds (carried
+  across later revisions) so the updater can retire it once the PR merges.
   """
   plan = record["plan"]
   if _source_contains(record):
     return contribution_staging.source_sync("in_source", plan["source_sha"])
   old = (previous or {}).get("plan")
-  if (
-    not isinstance(old, dict)
-    or not contribution_staging.adopts_reviewed_revisions(source)
-    or not _source_contains(previous)
+  old_sync = (previous or {}).get("source_sync")
+  draft = (
+    old_sync.get("draft")
+    if isinstance(old_sync, dict) and old_sync.get("state") == "diverged"
+    else None
+  )
+  detail = "The live source does not contain this reviewed version."
+  if isinstance(old, dict) and contribution_staging.source_holds(
+    source, str(old.get("base_sha")), str(old.get("head_sha")),
   ):
-    return contribution_staging.source_sync(
-      "diverged", plan["source_sha"],
-      "The live source does not contain this reviewed version.",
+    draft = contribution_staging.pin_draft(
+      source, record["id"], str(old.get("base_sha")), str(old.get("head_sha")),
     )
-  try:
-    adopted = contribution_staging.adopt_reviewed_revision(
-      source,
-      previous=(str(old.get("base_sha")), str(old.get("head_sha"))),
-      current=(plan["base_sha"], plan["head_sha"]),
-      message=f"Adopt reviewed revision: {plan['title']}",
-    )
-  except contribution_staging.AdoptionRefused as exc:
-    return contribution_staging.source_sync(
-      "diverged", plan["source_sha"], exc.detail,
-    )
-  plan["source_sha"] = adopted
-  if not _source_contains(record):
-    return contribution_staging.source_sync(
-      "diverged", adopted,
-      "The adopted revision does not reproduce the reviewed change.",
-    )
-  return contribution_staging.source_sync("adopted", adopted)
+    detail = "Installed app source changes only through its own apply flow."
+    if contribution_staging.adopts_reviewed_revisions(source):
+      try:
+        adopted = contribution_staging.adopt_reviewed_revision(
+          source,
+          previous=(draft["base_sha"], draft["head_sha"]),
+          current=(plan["base_sha"], plan["head_sha"]),
+          message=f"Adopt reviewed revision: {plan['title']}",
+        )
+      except contribution_staging.AdoptionRefused as exc:
+        detail = exc.detail
+      else:
+        plan["source_sha"] = adopted
+        if _source_contains(record):
+          contribution_staging.unpin_draft(source, record["id"])
+          return contribution_staging.source_sync("adopted", adopted)
+        detail = "The adopted revision does not reproduce the reviewed change."
+  return contribution_staging.source_sync(
+    "diverged", plan["source_sha"], detail, draft=draft,
+  )
 
 
 @router.post(
@@ -1938,12 +1955,6 @@ async def stage_contribution(
         )
       except ContributionSubmitError as exc:
         raise _stage_error(exc) from exc
-      encoded = json.dumps(record, ensure_ascii=False, indent=2) + "\n"
-      if len(encoded.encode("utf-8")) > MAX_RECORD_BYTES:
-        raise HTTPException(
-          status_code=422,
-          detail={"message": "The staged record is too large.", "code": "record_too_large"},
-        )
       atomic_write(diff_path, candidate.diff)
       _write_record(record_path, record)
   return {"record": record, "source_sync": record["source_sync"]}

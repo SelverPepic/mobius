@@ -209,6 +209,8 @@ def test_restage_with_a_revision_drops_the_verdict_and_adopts_it_live(staging):
   assert sync["source_sha"] == _git(source, "rev-parse", "HEAD")
   assert restaged["plan"]["source_sha"] == sync["source_sha"]
   assert (source / "notes.txt").read_text() == "unrelated uncommitted work\n"
+  assert "draft" not in sync
+  assert _git(source, "for-each-ref", "refs/mobius/contribution-drafts") == ""
   assert _git(source, "status", "--porcelain") == "?? notes.txt"
 
 
@@ -231,7 +233,7 @@ def test_adoption_brings_only_the_revision_across_a_rebase(staging):
 
 
 def test_live_edits_on_revised_files_are_left_untouched(staging):
-  staging["new_record"]()
+  draft_record = staging["new_record"]().json()["record"]
   source = staging["source"]
   (source / "greet.py").write_text(DRAFT + "# in progress\n")
   live_before = _git(source, "rev-parse", "HEAD")
@@ -243,6 +245,17 @@ def test_live_edits_on_revised_files_are_left_untouched(staging):
   assert sync["state"] == "diverged"
   assert _git(source, "rev-parse", "HEAD") == live_before
   assert (source / "greet.py").read_text() == DRAFT + "# in progress\n"
+  # The draft the live source still holds is named exactly and pinned.
+  draft = sync["draft"]
+  assert draft["base_sha"] == draft_record["plan"]["base_sha"]
+  assert draft["head_sha"] == draft_record["plan"]["head_sha"]
+  assert _git(source, "rev-parse", draft["ref"]) == draft["head_sha"]
+
+  # A further revision keeps naming the same live draft, not the new head.
+  _commit(staging["worktree"], {"greet.py": "def greet():\n  return 'hey'\n"}, "Say hey")
+  again = staging["stage"]().json()["source_sync"]
+  assert again["state"] == "diverged"
+  assert again["draft"] == draft
 
 
 def test_installed_app_source_is_never_committed_by_staging(staging, monkeypatch):
@@ -338,3 +351,26 @@ def test_send_freshness_accepts_what_staging_hashed_for_crlf_source(staging):
   assert staging["review"](record).status_code == 200
   record_path, diff_path = record_paths(staging["app_id"], "greet")
   _assert_fresh(read_record(record_path), diff_path, worktree, "fix/greet")
+
+
+def test_an_oversized_record_is_refused_before_the_live_source_changes(staging, monkeypatch):
+  staging["new_record"]()
+  live_before = _git(staging["source"], "rev-parse", "HEAD")
+  _commit(staging["worktree"], {"greet.py": REVISED}, "Say hello")
+  monkeypatch.setattr(github_routes, "MAX_RECORD_BYTES", 2048)
+  response = staging["stage"](body_draft="x" * 2048)
+  assert response.status_code == 422
+  assert response.json()["detail"]["code"] == "record_too_large"
+  assert _git(staging["source"], "rev-parse", "HEAD") == live_before
+
+
+def test_send_refuses_a_verdict_for_a_different_diff_of_the_same_head(staging):
+  from fastapi import HTTPException
+
+  from app.github_contributions import _require_all_clear_review
+
+  record = staging["review"](staging["new_record"]().json()["record"]).json()["record"]
+  _require_all_clear_review(record)
+  swapped = {**record, "plan": {**record["plan"], "diff_sha256": "f" * 64}}
+  with pytest.raises(HTTPException):
+    _require_all_clear_review(swapped)
