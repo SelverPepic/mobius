@@ -3574,12 +3574,20 @@ def test_persist_session_id_skips_synthetic_turn_without_db(monkeypatch, caplog)
   assert "Codex session id persistence failed" not in caplog.text
 
 
-def test_codex_builtin_helper_tools_are_off_in_both_generations():
-  """Möbius helpers replace Codex's own; v1 is on by default, so both go."""
+def test_codex_native_sub_agent_tools_stay_off_even_when_the_model_asks_for_them():
+  """Möbius helpers replace Codex's own ``collaboration.*`` tools.
+
+  Codex 0.157 lets a model catalog entry's ``multi_agent_version`` ("v2" for
+  the bundled models) re-enable them despite both feature flags; only
+  ``agents.enabled=false`` overrides the model, and the v2 feature outranks
+  that switch, so both must be off.
+  """
   ov = codex_sdk_runner._codex_config_overrides()
-  assert "features.multi_agent=false" in ov
+  assert "agents.enabled=false" in ov
   assert "features.multi_agent_v2.enabled=false" in ov
+  assert "features.multi_agent=false" in ov
   assert not any("multi_agent_v2.enabled=true" in o for o in ov)
+  assert not any(o.startswith("agents.enabled=true") for o in ov)
 
 
 def test_codex_config_overrides_disable_competing_native_goal_runtime(monkeypatch):

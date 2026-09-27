@@ -314,6 +314,7 @@ async def _sync_accepted_app_side_effects(
         drop_prior_cron=drop_prior_cron,
         bundled_job=bool(schedule and schedule.get("job")),
         warnings=warnings,
+        owner_zone=install.owner_timezone(db),
       )
     except Exception as exc:
       log.exception("app apply: cron sync failed post-commit")

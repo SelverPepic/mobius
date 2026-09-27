@@ -432,6 +432,62 @@ def test_local_apply_converges_schedule_creation_and_removal(client, auth):
   assert updated.json()["warnings"] == []
 
 
+def test_local_apply_keeps_the_owner_schedule_until_its_contract_changes(
+  client, auth,
+):
+  source = _source()
+  _declare_schedule(source)
+  manifest = json.loads((source / "mobius.json").read_text())
+  manifest["schedule"]["default"] = "30 5 * * *"
+  (source / "mobius.json").write_text(json.dumps(manifest))
+  assert client.put(
+    "/api/owner/timezone", json={"timezone": "Asia/Tokyo"}, headers=auth,
+  ).status_code == 200
+
+  def registered(register):
+    args, kwargs = register.call_args
+    return args[1], args[2].name, kwargs.get("timezone"), kwargs.get("zone_cron")
+
+  with patch("app.app_cron.register_cron") as register, \
+       patch("app.cron_tz.server_timezone_name", return_value="UTC"):
+    created = _apply(client, auth, source)
+    assert created.status_code == 200, created.text
+    app_id = created.json()["app"]["id"]
+    assert registered(register) == (
+      "* * * * *", "job.sh", "Asia/Tokyo", "30 5 * * *",
+    )
+
+    chosen = client.post(
+      f"/api/apps/{app_id}/schedule",
+      json={"cron": "45 4 * * *", "job": "job.sh", "timezone": "Asia/Tokyo"},
+      headers=auth,
+    )
+    assert chosen.status_code == 200, chosen.text
+
+    manifest["version"] = "0.2.0"
+    (source / "mobius.json").write_text(json.dumps(manifest))
+    with patch("app.install._unregister_cron") as unregister:
+      kept = _apply(client, auth, source)
+    assert kept.json()["mode"] == "updated", kept.text
+    unregister.assert_not_called()
+    assert registered(register) == (
+      "* * * * *", "job.sh", "Asia/Tokyo", "45 4 * * *",
+    )
+
+    # A new scheduled job is a new contract: its default applies again.
+    (source / "job.sh").rename(source / "refresh.sh")
+    manifest["version"] = "0.3.0"
+    manifest["schedule"]["job"] = "refresh.sh"
+    (source / "mobius.json").write_text(json.dumps(manifest))
+    with patch("app.install._unregister_cron") as unregister:
+      reset = _apply(client, auth, source)
+    assert reset.json()["mode"] == "updated", reset.text
+    unregister.assert_called_once_with(source)
+    assert registered(register) == (
+      "* * * * *", "refresh.sh", "Asia/Tokyo", "30 5 * * *",
+    )
+
+
 def test_local_apply_accepts_a_scheduled_job_without_execute_permission(
   client, auth,
 ):

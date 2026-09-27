@@ -81,7 +81,7 @@ from app.process_groups import (
   lower_process_group_priority,
   terminate_agent_processes,
 )
-from app.providers import get_skill_path
+from app.providers import CODEX_NATIVE_HELPERS_OFF, get_skill_path
 from app.question_bridge import (
   QuestionOverlapError,
   QuestionPersistenceError,
@@ -150,8 +150,8 @@ def _codex_config_overrides() -> list[str]:
   Helpers are Möbius's too: agents delegate with ``spawn_agent`` on the
   Möbius control server, whose helpers run on any provider, outlive the turn,
   and share a helper host (see ``helper_hosts``). Codex's own helper tools are
-  therefore switched off in both generations — note ``multi_agent`` (v1) is on
-  by default, so disabling only ``multi_agent_v2`` would leave it offered.
+  therefore switched off; ``CODEX_NATIVE_HELPERS_OFF`` names the settings this
+  requires.
   """
   overrides = list(_CODEX_PROMPT_CONTROL_OVERRIDES)
   # Disabling only default_mode_request_user_input leaves the native tool
@@ -159,10 +159,7 @@ def _codex_config_overrides() -> list[str]:
   overrides.append("tools.experimental_request_user_input.enabled=false")
   # One provider turn per Möbius admission; never enable a competing loop.
   overrides.append("features.goals=false")
-  overrides += [
-    "features.multi_agent=false",
-    "features.multi_agent_v2.enabled=false",
-  ]
+  overrides += CODEX_NATIVE_HELPERS_OFF
   return overrides
 
 
