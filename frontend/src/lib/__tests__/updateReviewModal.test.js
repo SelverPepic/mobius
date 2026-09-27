@@ -87,7 +87,7 @@ test('errors have one alert owner and results focus a live control', () => {
 
 test('Settings keeps current update feedback and reserves technical detail for review', () => {
   assert.doesNotMatch(updates, /Last container update|terminalRebuild|platform-updates__details/)
-  assert.match(updates, /rebuildProgressMessage\(rebuild\)/)
+  assert.match(updates, /rebuildStatusLine\(rebuild\)/)
   assert.match(updates, /update\.error && <Alert/)
   assert.doesNotMatch(updates, /rebuildRequested|rebuildReviewedUpdateRef/)
   assert.match(modal, /<details[^>]*urm__technical/)

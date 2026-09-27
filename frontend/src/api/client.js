@@ -1376,6 +1376,8 @@ export const api = {
   admin: {
     restart: () => apiFetch('/admin/restart', { method: 'POST' }),
     rebuildStatus: () => apiFetch('/admin/rebuild'),
+    // Drop an unclaimed host request so a stalled self-hosted update can retry.
+    withdrawRebuildRequest: () => apiFetch('/admin/rebuild/request', { method: 'DELETE' }),
   },
   platform: {
     status: () => apiFetch('/platform/status'),

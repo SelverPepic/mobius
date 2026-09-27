@@ -2,10 +2,13 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  rebuildAwaitingHostHelper,
   rebuildIsActive,
   rebuildPollShouldContinue,
   rebuildProgressMessage,
   rebuildRequestOutcome,
+  rebuildStartedAgo,
+  rebuildStatusLine,
 } from '../containerRebuild.js'
 
 test('container rebuild active states are exactly the controller phases', () => {
@@ -67,4 +70,54 @@ test('container rebuild progress copy stays factual', () => {
     rebuildProgressMessage({ state: 'no_change', release_source: 'latest_ghcr' }),
     'Möbius already uses the latest official version.',
   )
+})
+
+test('only the unclaimed host request offers a withdraw action', () => {
+  assert.equal(
+    rebuildAwaitingHostHelper({ state: 'queued', code: 'host_helper_unclaimed' }),
+    true,
+  )
+  assert.equal(
+    rebuildAwaitingHostHelper({ state: 'failed', code: 'host_helper_unclaimed' }),
+    false,
+  )
+  assert.equal(rebuildAwaitingHostHelper({ state: 'preparing' }), false)
+})
+
+test('elapsed time reads from the controller updated_at', () => {
+  const now = Date.parse('2026-01-01T00:10:00Z')
+  assert.equal(rebuildStartedAgo({ updated_at: '2026-01-01T00:09:30Z' }, now), 'started just now')
+  assert.equal(rebuildStartedAgo({ updated_at: '2026-01-01T00:07:00Z' }, now), 'started 3 min ago')
+  assert.equal(rebuildStartedAgo({ updated_at: '2025-12-31T22:10:00Z' }, now), 'started about 2 hours ago')
+  assert.equal(rebuildStartedAgo({ updated_at: '' }, now), '')
+  assert.equal(rebuildStartedAgo({}, now), '')
+})
+
+test('active status line surfaces the real stage message and elapsed time', () => {
+  const now = Date.parse('2026-01-01T00:05:00Z')
+  assert.equal(
+    rebuildStatusLine(
+      { state: 'preparing', message: 'Selecting the verified Möbius image.', updated_at: '2026-01-01T00:02:00Z' },
+      now,
+    ),
+    'Selecting the verified Möbius image. (started 3 min ago)',
+  )
+  // Falls back to fixed copy only when the controller sent no message.
+  assert.equal(
+    rebuildStatusLine({ state: 'preparing', updated_at: '2026-01-01T00:05:00Z' }, now),
+    'Preparing the system update… (started just now)',
+  )
+})
+
+test('an unclaimed host request keeps the fixed line; its guidance is the description', () => {
+  const now = Date.parse('2026-01-01T00:10:00Z')
+  const line = rebuildStatusLine(
+    {
+      state: 'queued', code: 'host_helper_unclaimed',
+      message: 'The host update helper has not picked up this request. Check it with `systemctl status mobius-rebuild.path` ...',
+      updated_at: '2026-01-01T00:06:00Z',
+    },
+    now,
+  )
+  assert.equal(line, 'Preparing the system update… (started 4 min ago)')
 })

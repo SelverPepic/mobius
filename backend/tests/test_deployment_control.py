@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import httpx
@@ -1594,3 +1596,129 @@ async def test_compatible_deployment_source_does_not_block_reviewed_replacement(
   assert result['state'] == 'queued'
   assert calls[0] == 'apply'
   assert calls[1][0] == 'replace'
+
+
+def _write_host_status(control, **fields):
+  base = {"handoff": "external-cutover-v1"}
+  base.update(fields)
+  (control / "status.json").write_text(json.dumps(base), encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_unclaimed_request_stays_queued_with_operator_guidance(
+  tmp_path, monkeypatch,
+):
+  _control, inbox = _install_control(tmp_path, monkeypatch)
+  monkeypatch.setattr(dc.platform_activation, "deployment_kind", lambda: "self_hosted")
+  request = inbox / "request.json"
+  request.write_text(
+    json.dumps({"version": 1, "expected_sha": "e" * 40}), encoding="utf-8",
+  )
+  # The host path unit never claimed it: the request has aged past the bound.
+  old = (
+    datetime.now(timezone.utc)
+    - timedelta(seconds=dc._UNCLAIMED_REQUEST_BOUND_S + 60)
+  ).timestamp()
+  os.utime(request, (old, old))
+
+  status = await dc.read_rebuild_status()
+
+  assert status["state"] == "queued"
+  assert status["code"] == "host_helper_unclaimed"
+  assert "mobius-rebuild.path" in status["message"]
+  assert status["expected_sha"] == "e" * 40
+  assert status["updated_at"]  # a "started N min ago" the UI can render
+  # Still queued: nothing may start beside it until the owner withdraws it.
+  with pytest.raises(dc.DeploymentControlError):
+    dc._ensure_can_rebuild(status)
+
+
+@pytest.mark.asyncio
+async def test_freshly_queued_request_reports_queued_with_a_start_time(
+  tmp_path, monkeypatch,
+):
+  _control, inbox = _install_control(tmp_path, monkeypatch)
+  monkeypatch.setattr(dc.platform_activation, "deployment_kind", lambda: "self_hosted")
+  (inbox / "request.json").write_text(
+    json.dumps({"version": 1, "expected_sha": "e" * 40}), encoding="utf-8",
+  )
+
+  status = await dc.read_rebuild_status()
+
+  assert status["state"] == "queued"
+  assert status["expected_sha"] == "e" * 40
+  assert status["updated_at"]
+
+
+@pytest.mark.asyncio
+async def test_a_long_running_stage_stays_active_and_is_never_relabeled(
+  tmp_path, monkeypatch,
+):
+  """A slow pull or deploy is still running: reporting it as anything else
+  would let a second replacement start beside it."""
+  control, _inbox = _install_control(tmp_path, monkeypatch)
+  monkeypatch.setattr(dc.platform_activation, "deployment_kind", lambda: "self_hosted")
+  old = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+  _write_host_status(
+    control, state="preparing", operation_id="a" * 32, expected_sha="e" * 40,
+    updated_at=old, message="Downloading and checking the official image.",
+  )
+
+  status = await dc.read_rebuild_status()
+
+  assert status["state"] == "preparing"
+  assert status["updated_at"] == old
+  with pytest.raises(dc.DeploymentControlError):
+    dc._ensure_can_rebuild(status)
+
+
+@pytest.mark.asyncio
+async def test_active_stage_reports_the_controller_stage_message(tmp_path, monkeypatch):
+  control, _inbox = _install_control(tmp_path, monkeypatch)
+  monkeypatch.setattr(dc.platform_activation, "deployment_kind", lambda: "self_hosted")
+  _write_host_status(
+    control, state="preparing", operation_id="a" * 32, expected_sha="e" * 40,
+    updated_at=datetime.now(timezone.utc).isoformat(),
+    message="Downloading and checking the official image.",
+  )
+
+  status = await dc.read_rebuild_status()
+
+  assert status["state"] == "preparing"
+  assert status["message"] == "Downloading and checking the official image."
+
+
+@pytest.mark.asyncio
+async def test_withdraw_unclaimed_request_lets_a_retry_through(
+  tmp_path, monkeypatch,
+):
+  _control, inbox = _install_control(tmp_path, monkeypatch)
+  monkeypatch.setattr(dc.platform_activation, "deployment_kind", lambda: "self_hosted")
+  (inbox / "request.json").write_text(
+    json.dumps({"version": 1, "expected_sha": "e" * 40}), encoding="utf-8",
+  )
+
+  status = await dc.withdraw_unclaimed_host_request()
+
+  assert not (inbox / "request.json").exists()
+  assert status["state"] == "idle"
+  dc._ensure_can_rebuild(status)
+
+
+@pytest.mark.asyncio
+async def test_withdraw_absent_request_is_idempotent(tmp_path, monkeypatch):
+  _control, inbox = _install_control(tmp_path, monkeypatch)
+  monkeypatch.setattr(dc.platform_activation, "deployment_kind", lambda: "self_hosted")
+
+  status = await dc.withdraw_unclaimed_host_request()
+
+  assert not (inbox / "request.json").exists()
+  assert status["state"] == "idle"
+
+
+@pytest.mark.asyncio
+async def test_withdraw_is_not_supported_on_railway(monkeypatch):
+  monkeypatch.setattr(dc.platform_activation, "deployment_kind", lambda: "railway")
+  with pytest.raises(dc.DeploymentControlError) as exc:
+    await dc.withdraw_unclaimed_host_request()
+  assert exc.value.code == "not_supported"
