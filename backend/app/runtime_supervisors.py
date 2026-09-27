@@ -494,7 +494,8 @@ class RuntimeSupervisors:
       # launcher (a rollout cannot race thread_resume), and open-file evidence
       # excludes a Codex started outside them. Other agents keep running.
       from app.provider_session_retention import sweep_stale_provider_sessions
-      delay = PROVIDER_SESSION_RETENTION_INTERVAL_SECS
+      # The startup sweep is budget-limited; follow up on any backlog soon.
+      delay = PROVIDER_SESSION_RETENTION_BACKLOG_INTERVAL_SECS
       while True:
         await asyncio.sleep(delay)
         delay = PROVIDER_SESSION_RETENTION_INTERVAL_SECS
