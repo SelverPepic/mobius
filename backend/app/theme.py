@@ -23,24 +23,10 @@ _IMPORT_RE = re.compile(
   r"""@import\s+url\(\s*['"]([^'"]+)['"]\s*\)\s*;[^\S\n]*\n?""",
 )
 
-# The secondary-surface token was renamed --surface2 -> --surface-2 (the
-# standard hyphenated name) with NO compatibility alias: the platform injects
-# and reads only --surface-2. A theme.css saved before the rename still carries
-# --surface2, so we rewrite it — both declarations and var() uses — to the
-# standard name. The negative lookahead keeps this word-boundary-safe: only the
-# exact --surface2 token matches, never a longer identifier that merely shares
-# its prefix (there is none today, but the rule must not be able to corrupt one).
+# The secondary-surface token was renamed --surface2 -> --surface-2 with no
+# compatibility alias. `migrate_theme_surface2_token` rewrites a saved theme once
+# at boot; the lookahead matches only the exact legacy token, never a longer name.
 _LEGACY_SURFACE2_RE = re.compile(r"--surface2(?![\w-])")
-
-
-def _rename_legacy_surface2(css: str) -> str:
-  """Rewrite the pre-rename --surface2 token to the standard --surface-2.
-
-  Purely textual and word-boundary-safe (see `_LEGACY_SURFACE2_RE`); every
-  other byte is preserved. Idempotent — CSS with no --surface2 is returned
-  unchanged, so it is safe to apply on every read and to run repeatedly.
-  """
-  return _LEGACY_SURFACE2_RE.sub("--surface-2", css)
 
 DEFAULT_THEME = """\
 :root {
@@ -125,14 +111,7 @@ def get_theme_css(data_dir: str) -> str:
   if theme_path.exists():
     content = theme_path.read_text(encoding="utf-8").strip()
     if content:
-      # Rename any pre-rename --surface2 token BEFORE augmenting so the
-      # owner's saved custom value wins: once it reads as --surface-2,
-      # _ensure_core_vars sees the core var as defined and does NOT inject the
-      # default. Without this the stale --surface2 line would be ignored and
-      # the served theme would carry the default --surface-2 instead. Cheap
-      # and idempotent; the on-disk source is fixed once by
-      # `migrate_theme_surface2_token` at boot.
-      return _ensure_core_vars(_rename_legacy_surface2(content))
+      return _ensure_core_vars(content)
   return DEFAULT_THEME
 
 
@@ -272,15 +251,12 @@ def migrate_theme_surface2_token(data_dir: str) -> bool:
   --surface2 token to the standard --surface-2.
 
   The secondary-surface token was renamed --surface2 -> --surface-2 with no
-  compatibility alias. A theme.css saved before the rename keeps the owner's
-  custom value under a name the shell no longer reads. `get_theme_css` already
-  renames it on every read, so the SERVED theme is correct without this; this
-  fixes the ON-DISK source so the raw file the theme editor loads verbatim from
-  `/api/storage/shared/theme.css` also carries the standard name and does not
-  silently drift from what the shell paints.
+  compatibility alias, so a theme.css saved before the rename would keep the
+  owner's custom value under a name the shell no longer reads. Boot runs this
+  before anything is served (see startup.py), so the owner's value survives.
 
-  Runs at boot (see startup.py). Reads theme.css, rewrites the token
-  word-boundary-safely (`_rename_legacy_surface2`), and — only when something
+  Reads theme.css, rewrites the token word-boundary-safely
+  (`_LEGACY_SURFACE2_RE`), and — only when something
   actually changed — snapshots the prior file first (the same recovery trail
   the storage write path keeps) and writes the result atomically. Returns True
   when it rewrote the file, False when there was nothing to do: missing file,
@@ -294,7 +270,7 @@ def migrate_theme_surface2_token(data_dir: str) -> bool:
     # Missing file (fresh install using DEFAULT_THEME) or unreadable — nothing
     # to migrate. Never a hard failure: the served theme is already canonical.
     return False
-  migrated = _rename_legacy_surface2(content)
+  migrated = _LEGACY_SURFACE2_RE.sub("--surface-2", content)
   if migrated == content:
     return False
   from app.storage_io import atomic_write

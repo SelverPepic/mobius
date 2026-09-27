@@ -685,9 +685,11 @@ def test_migrate_theme_surface2_leaves_longer_names_untouched(tmp_path):
 
 
 def test_served_theme_uses_surface_2_and_custom_value_wins(tmp_path):
-  """The augmented theme served to the shell and frames contains --surface-2
-  and never --surface2, even when the on-disk file still holds the legacy
-  token, and the owner's saved value wins over the injected default."""
+  """After the boot migration, the augmented theme served to the shell and
+  frames contains --surface-2 and never --surface2, and the owner's saved value
+  wins over the injected default."""
+  from app.theme import migrate_theme_surface2_token
+
   shared = tmp_path / "shared"
   shared.mkdir()
   # Legacy token on disk (pre-migration), with a custom dark value that differs
@@ -696,6 +698,7 @@ def test_served_theme_uses_surface_2_and_custom_value_wins(tmp_path):
     ":root {\n  --bg: #0d0d0d;\n  --text: #ececec;\n  --surface2: #333333;\n}\n",
     encoding="utf-8",
   )
+  assert migrate_theme_surface2_token(str(tmp_path)) is True
   css = get_theme_css(str(tmp_path))
   assert "--surface2" not in css
   assert "--surface-2: #333333" in css  # owner's value wins, not #212121
