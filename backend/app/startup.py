@@ -214,6 +214,20 @@ def _configure_claude_settings_defaults(context: StartupContext) -> None:
     context.logger.info("set Claude settings defaults: %s", ", ".join(added))
 
 
+def _migrate_theme_surface_token(context: StartupContext) -> None:
+  """Rewrite a saved theme.css's legacy --surface2 token to --surface-2.
+
+  Fix-forward for the secondary-surface token rename (no alias): the served
+  theme is already renamed on every read, but this normalizes the on-disk
+  source the theme editor loads verbatim. Idempotent and missing-file-safe;
+  runs before the database phase because it only touches shared/theme.css.
+  """
+  from app.theme import migrate_theme_surface2_token
+
+  if migrate_theme_surface2_token(context.settings.data_dir):
+    context.logger.info("migrated saved theme.css --surface2 -> --surface-2")
+
+
 _SKILL_RECONCILER = Path(__file__).resolve().parents[1] / "scripts" / "init_skills.py"
 
 
@@ -629,6 +643,7 @@ PROCESS_STARTUP_TASKS = (
     _configure_claude_settings_defaults,
   ),
   StartupTask("reconcile platform skills", _reconcile_platform_skills),
+  StartupTask("migrate theme surface token", _migrate_theme_surface_token),
   StartupTask(
     "initialize database",
     _initialize_database,
