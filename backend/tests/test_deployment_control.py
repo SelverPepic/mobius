@@ -1465,7 +1465,15 @@ async def test_mixed_activation_cannot_dispatch_replacement(monkeypatch, deploym
 
 
 @pytest.mark.asyncio
-async def test_python_dependency_replacement_stops_before_source_apply(monkeypatch):
+async def test_python_dependency_update_is_checked_by_prepare_then_replaced(
+  monkeypatch,
+):
+  """A package change installs with the image that carries it.
+
+  Preparation runs the startup check on a frozen copy (refusing source this
+  image cannot load) and publishes nothing before the cutover, so the reviewed
+  replacement no longer refuses a dependency change up front.
+  """
   monkeypatch.setattr(
     dc.platform_activation, "deployment_kind", lambda: "self_hosted",
   )
@@ -1479,20 +1487,23 @@ async def test_python_dependency_replacement_stops_before_source_apply(monkeypat
       "blockers": [],
     },
   )
+  calls = []
+  _install_source_apply(monkeypatch)
 
-  async def forbidden(*_args, **_kwargs):
-    pytest.fail("image-dependent source must not be applied in the old image")
+  async def replace(*, expected_sha, final_check):
+    final_check()
+    calls.append(expected_sha)
+    return {"state": "queued", "expected_sha": expected_sha}
 
-  monkeypatch.setattr(dc.platform_update, "prepare_platform_update", forbidden)
+  monkeypatch.setattr(dc, "_request_self_hosted_rebuild", replace)
 
-  with pytest.raises(dc.DeploymentControlError) as error:
-    await dc.request_reviewed_rebuild(
-      db=None, plan_id="a" * 64, current_sha="1" * 40,
-      target_sha="2" * 40, image_digest=None,
-    )
+  result = await dc.request_reviewed_rebuild(
+    db=None, plan_id="a" * 64, current_sha="1" * 40,
+    target_sha="b" * 40, image_digest=None,
+  )
 
-  assert error.value.code == "external_activation_required"
-  assert "Python packages" in error.value.message
+  assert result["state"] == "queued"
+  assert calls == ["b" * 40]
 
 
 @pytest.mark.asyncio

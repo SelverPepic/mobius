@@ -686,21 +686,6 @@ async def _request_reviewed_rebuild_transaction(
         "This update also needs deployment changes. Resolve it with Möbius before replacing the container.",
         status_code=409,
       )
-    incoming_activation = reviewed.get(
-      "incoming_activation", reviewed["activation"],
-    )
-    if platform_update.activation_changes_python_dependencies(
-      incoming_activation,
-    ):
-      # Source that imports a newly declared package cannot be validated by the
-      # old image. Until the replacement executor can prepare and prove that
-      # source without publishing it first, stop before mutating the checkout.
-      raise DeploymentControlError(
-        "external_activation_required",
-        "This update changes Python packages. It needs a separately verified "
-        "system replacement before its source can be installed safely.",
-        status_code=409,
-      )
     if platform_activation.ActivationLevel.IMAGE_REBUILD.value not in (
       reviewed["activation"]["required_actions"]
     ):

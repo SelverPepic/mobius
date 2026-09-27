@@ -1593,9 +1593,7 @@ def test_boot_leaves_frontend_dependencies_alone_when_the_lock_did_not_change(
   assert _finish_prepared(platform) == "replayed"
 
 
-def test_continue_refuses_new_python_dependencies_before_source_moves(
-  clone_env,
-):
+def _resolve_dependency_update(clone_env):
   origin, platform = clone_env
   served = _local_commit(platform, edits={
     "backend/app/main.py": _MAIN_PY.replace(
@@ -1615,7 +1613,30 @@ def test_continue_refuses_new_python_dependencies_before_source_moves(
     _MAIN_PY.replace("LINE_A = 1", "LINE_A = 'BOTH'"),
   )
   _git(worktree, "add", "backend/app/main.py")
+  return platform, served, worktree
 
+
+def test_continue_prepares_a_dependency_update_whose_source_loads_here(clone_env):
+  platform, served, _worktree = _resolve_dependency_update(clone_env)
+
+  # A routine version bump: the source still loads on this image, so it is
+  # checked like any other and installs with the image that carries it.
+  assert pu.continue_platform_overlay_update(platform) == "prepared"
+  assert pu.read_prepared_update()["requires_image"] is True
+  assert _served_sha(platform) == served
+
+
+def test_continue_refuses_dependency_source_this_image_cannot_load(
+  clone_env, monkeypatch,
+):
+  from app import restart_util
+
+  platform, served, worktree = _resolve_dependency_update(clone_env)
+
+  def fails(platform_root=None):
+    raise restart_util.RestartSourceInvalid("No module named 'new_package'")
+
+  monkeypatch.setattr("app.restart_util.validate_restart_source", fails)
   with pytest.raises(pu.PlatformUpdateError, match="image_rebuild_required"):
     pu.continue_platform_overlay_update(platform)
 

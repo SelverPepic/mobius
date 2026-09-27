@@ -25,7 +25,7 @@ test('routine activation and stale reviews stay with their UI actions', () => {
   }
 })
 
-test('Python dependency updates stop for a separately verified system update', () => {
+test('a Python package change alone installs with its image', () => {
   const preview = {
     incoming_activation: {
       level: 'image_rebuild',
@@ -33,7 +33,11 @@ test('Python dependency updates stop for a separately verified system update', (
       reasons: [{ code: 'python_dependencies' }],
     },
   }
-  assert.match(platformUpdateRepairReason({ preview }), /Python packages/)
+  assert.equal(platformUpdateRepairReason({ preview }), null)
+  assert.match(
+    platformUpdateRepairReason({ preview, errorCode: 'image_rebuild_required' }),
+    /Python packages/,
+  )
 })
 
 test('old Python drift does not block an unrelated reviewed update', () => {

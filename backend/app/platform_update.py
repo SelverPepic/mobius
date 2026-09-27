@@ -2659,9 +2659,6 @@ def _prepare(
   """
   from app.restart_util import RestartSourceInvalid, validate_restart_source
 
-  if _changes_python_dependencies(repo, snapshot, prepared):
-    # The running image cannot check source that imports new packages.
-    raise PlatformUpdateError("image_rebuild_required")
   # The image is owed for this release's changes and for any activation the
   # running image still owes (a Finish after the source already contains the
   # release has no incoming changes but still needs its image).
@@ -2687,6 +2684,12 @@ def _prepare(
   try:
     validate_restart_source(checkout)
   except RestartSourceInvalid as exc:
+    if _changes_python_dependencies(repo, snapshot, prepared):
+      # This source needs packages the running image lacks, so only the new
+      # image could check it. A release whose source still loads here (a
+      # routine version bump) is checked like any other and installs with the
+      # image that carries its packages; boot reverts it if it fails there.
+      raise PlatformUpdateError("image_rebuild_required") from exc
     raise PlatformUpdateError(str(exc)) from exc
   _git("update-ref", _PREPARED_REF, prepared, repo=repo)
   record = PreparedUpdate(

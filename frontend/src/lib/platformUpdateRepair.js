@@ -17,9 +17,10 @@ export function platformUpdateRepairReason({ preview, platform, rebuild, error =
   if (preview?.conflict_paths?.length) {
     return 'This update overlaps your local changes and needs help to finish.'
   }
-  const incomingActivation = preview?.incoming_activation || preview?.activation
-  if (incomingActivation?.reasons?.some(reason => reason?.code === 'python_dependencies')) {
-    return 'This update changes Python packages and needs a separately checked system update.'
+  // A package change alone installs with its image; only source the running
+  // system cannot load (it needs a package that system lacks) stops here.
+  if (errorCode === 'image_rebuild_required') {
+    return 'This update needs Python packages the running system does not have yet.'
   }
   const level = (preview || platform)?.activation?.level
   if (requiresAgentActivation((preview || platform)?.activation) || errorCode === 'external_activation_required') {
