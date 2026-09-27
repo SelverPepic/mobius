@@ -2026,6 +2026,43 @@ def test_unadmitted_activity_restart_reschedules_same_physical_turn(
   assert db.get(models.Chat, parent_id).messages == []
 
 
+def test_wake_recovery_reschedules_an_unadmitted_activity_orphan(
+  db, monkeypatch,
+):
+  """A wake committed but never admitted before a crash stays recoverable
+  through the ordinary wake path: its preliminary delivery envelope must not
+  hide the result from the recovery sweep's selection."""
+  from app.chat_writer import StartActivityContinuation
+
+  parent_id, _child_id, delegation_id = _seed_delegation(
+    db, suffix="activity-orphan",
+    result_blocks=[{"type": "text", "content": "Recover me."}],
+  )
+  root_run_id = _seed_idle_parent_wake_root(db, delegation_id)
+  row = db.get(models.Delegation, delegation_id)
+  run_token = delegations_mod._activity_continuation_run_id(db, row)
+  get_writer().submit(StartActivityContinuation(
+    chat_id=parent_id, run_token=run_token, root_run_id=root_run_id,
+    source_work_id=row.parent_root_run_id, activity_id=delegation_id,
+  )).result(timeout=5)
+  scheduled = []
+
+  def capture_task(coro):
+    coro.close()
+    scheduled.append(run_token)
+    return object()
+
+  monkeypatch.setattr(asyncio, "create_task", capture_task)
+
+  assert asyncio.run(delegations_mod._deliver_parent_wake(
+    parent_id, row.parent_root_run_id,
+  )) is True
+  chat_mod.discard_starting(parent_id)
+  chat_start_mod.remove_broadcast(parent_id)
+
+  assert scheduled == [run_token]
+
+
 def test_admitted_provider_return_crash_keeps_result_for_owner_replay(db):
   from app.chat_writer import (
     AdmitProviderExecution, StartActivityContinuation,
