@@ -18,6 +18,7 @@ import re
 import secrets
 import time
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, TypedDict
 
@@ -77,6 +78,10 @@ _KNOWN_STATES = {
   "no_change", "failed", "rolled_back", "needs_recovery",
 }
 _ACTIVE_STATES = {"queued", "preparing", "replacing", "verifying"}
+# The host path unit (mobius-rebuild.path) claims request.json within seconds.
+# Well past that with the host still idle, the helper is not picking up requests
+# (for example the path unit is not installed or not running).
+_UNCLAIMED_REQUEST_BOUND_S = 120
 _HANDOFF_VERSION = "external-cutover-v1"
 _managed_recovery_tasks: set[asyncio.Task[None]] = set()
 # The Railway handoff this process can still start or cancel. Its nonce lives
@@ -422,15 +427,41 @@ def _read_host_status() -> dict[str, Any]:
       pending = {}
     expected = str(pending.get("expected_sha") or "") if isinstance(pending, dict) else ""
     if _SHA_RE.fullmatch(expected):
-      return {
-        "state": "queued",
+      # The host worker atomically renames request.json out of the inbox before
+      # it acts, so a request still present here was never claimed. Its mtime is
+      # when it was queued; a long-idle request means the path unit is not firing.
+      try:
+        queued_at = datetime.fromtimestamp(request.stat().st_mtime, tz=timezone.utc)
+      except OSError:
+        queued_at = datetime.now(timezone.utc)
+      synthesized = {
         "expected_sha": expected,
-        "message": "Container rebuild queued.",
+        "updated_at": queued_at.isoformat(),
         "handoff": value.get("handoff"),
         # Helpers predating image-owned protected runtime advertised the same
         # handoff version. Preserve their retired capability through this
         # synthesized state so a pending request cannot make them look current.
         "runtime_overlay": value.get("runtime_overlay"),
+      }
+      unclaimed_for = (datetime.now(timezone.utc) - queued_at).total_seconds()
+      if unclaimed_for >= _UNCLAIMED_REQUEST_BOUND_S:
+        # Still queued: nothing may start beside it, but the owner learns why it
+        # is not moving and can withdraw it.
+        return {
+          **synthesized,
+          "state": "queued",
+          "code": "host_helper_unclaimed",
+          "message": (
+            "The host update helper has not picked up this request. Check it "
+            "with `systemctl status mobius-rebuild.path` and, if needed, rerun "
+            "scripts/install-rebuild-helper.sh from the trusted Möbius checkout. "
+            "You can withdraw this request and try again."
+          ),
+        }
+      return {
+        **synthesized,
+        "state": "queued",
+        "message": "Container rebuild queued.",
       }
   return value
 
@@ -497,6 +528,34 @@ def replacement_ready_path(operation_id: str) -> Path:
       status_code=409,
     )
   return _inbox_dir() / f"ready-{operation_id}"
+
+
+async def withdraw_unclaimed_host_request() -> RebuildStatus:
+  """Drop a queued host request the helper has not claimed, so a retry is possible.
+
+  The host worker atomically renames request.json out of the inbox before it
+  acts (see ``mobius-rebuild-host.run``), so a request still present in the inbox
+  was never claimed and removing it cannot interrupt an in-flight replacement.
+  This is the owner's escape from an unclaimed request that ``_write_request``
+  would otherwise keep refusing as ``already_running``. Removing an absent
+  request is a no-op, so the action is idempotent.
+  """
+  if platform_activation.deployment_kind() == "railway":
+    raise DeploymentControlError(
+      "not_supported",
+      "Railway container updates are managed by the account service.",
+      status_code=409,
+    )
+  if not _configured():
+    raise DeploymentControlError(
+      "not_configured",
+      "The host replacement helper is not configured on this deployment.",
+      status_code=409,
+    )
+  await asyncio.to_thread(
+    (_inbox_dir() / "request.json").unlink, missing_ok=True,
+  )
+  return await read_rebuild_status()
 
 
 async def read_rebuild_status() -> RebuildStatus:

@@ -46,6 +46,17 @@ def test_entrypoint_scrubs_managed_credentials_before_starting_the_app():
   ) < source.index("exec $_env_scrub uvicorn")
 
 
+def test_served_tree_loses_group_write_after_boot_writers_before_validation():
+  """A boot-time revert once left every rewritten file 0664 under su's
+  user-private-group umask; the broker check then forced the baked floor on
+  every later boot. Normalize after the last writer, before validation."""
+  source = ENTRYPOINT_PATH.read_text()
+  normalize = source.index("chmod -R go-w /data/platform")
+  assert source.index("git -C /data/platform reset -q --hard $_swap_late") < normalize
+  assert source.index("platform_update.boot_guard_sync()") < normalize
+  assert normalize < source.index("served_runtime_launcher.py \\\n       --check identity_broker")
+
+
 def test_broker_and_app_consumers_share_the_root_owned_socket():
   backend = Path(__file__).parents[1]
   socket = "/run/mobius-identity-broker.sock"

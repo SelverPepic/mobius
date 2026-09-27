@@ -300,6 +300,29 @@ async def rebuild_status(
     ) from exc
 
 
+@router.delete(
+  "/rebuild/request",
+  dependencies=[Depends(reject_cross_site)],
+)
+async def withdraw_host_rebuild_request(
+  _: models.Owner = Depends(get_current_owner_for_lifecycle_control),
+):
+  """Withdraw a queued host request the replacement helper never claimed.
+
+  This is the owner's escape when the host path unit is not picking up requests:
+  removing the unclaimed request.json lets a retry through. It cannot interrupt
+  an in-flight replacement, which has already renamed the request out of the
+  inbox. Returns the fresh rebuild status.
+  """
+  try:
+    return await deployment_control.withdraw_unclaimed_host_request()
+  except deployment_control.DeploymentControlError as exc:
+    raise HTTPException(
+      status_code=exc.status_code,
+      detail={"code": exc.code, "message": exc.message},
+    ) from exc
+
+
 @router.post(
   "/rebuild/prepare",
   dependencies=[Depends(reject_cross_site)],

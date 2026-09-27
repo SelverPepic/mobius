@@ -573,6 +573,13 @@ if [ "$_use_platform" -eq 1 ] && [ "${MOBIUS_TEST_RUNTIME:-0}" != "1" ]; then
   fi
 fi
 
+# Boot-time writers above (update revert, recovery, late-edit merge-back) run
+# as mobius through su, whose login policy grants group write to user-private
+# groups. A served module writable by group or other fails validation below and
+# forces the baked floor on every boot, so keep the served tree owner-writable
+# only before anything validates or serves it.
+chmod -R go-w /data/platform 2>/dev/null || true
+
 # Privileged served source belongs to the same boot choice as the FastAPI
 # process. Validate it before publishing the source marker: an invalid broker
 # makes this boot use the complete baked platform instead of quietly combining

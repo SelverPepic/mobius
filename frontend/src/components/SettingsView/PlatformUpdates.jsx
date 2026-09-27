@@ -2,7 +2,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Alert } from '@openai/apps-sdk-ui/components/Alert'
 import { platformUpdateStatusLabel, platformActivationLevel, reviewedUpdateUsesContainerRebuild } from '../../lib/platformUpdateState.js'
-import { rebuildIsActive, rebuildProgressMessage } from '../../lib/containerRebuild.js'
+import { rebuildIsActive, rebuildAwaitingHostHelper, rebuildStatusLine } from '../../lib/containerRebuild.js'
 import { containerVersionIdentity, platformVersionIdentity } from '../../lib/platformVersionIdentity.js'
 import { formatUpstreamCommitDate } from '../../lib/platformProvenance.js'
 import usePlatformUpdates from './usePlatformUpdates.js'
@@ -91,7 +91,7 @@ export default function PlatformUpdates({ active, refreshToken, onOpenChat, iner
         : restartNeeded
           ? { label: confirmRestart === 'primary' ? 'Confirm restart' : 'Restart to finish', act: () => pressRestart('primary') }
           : { label: phase === 'checking' ? 'Checking…' : 'Check for updates', act: check }
-  const status = activeRebuild ? rebuildProgressMessage(rebuild)
+  const status = activeRebuild ? rebuildStatusLine(rebuild)
     : update.reconnecting ? (update.observingKind === 'apply' ? 'Checking the update…' : 'Restarting Möbius…')
       : !platform ? 'Checking update status…' : platformUpdateStatusLabel(platform)
 
@@ -135,6 +135,15 @@ export default function PlatformUpdates({ active, refreshToken, onOpenChat, iner
       )}
       {activeRebuild && rebuild.status_unavailable && (
         <p className="platform-updates__description">Reconnecting to Möbius. The update is still running.</p>
+      )}
+      {rebuildAwaitingHostHelper(rebuild) && !update.reconnecting && (
+        <div className="platform-updates__description">
+          <p role="status">{rebuild.message}</p>
+          <button type="button" className="settings__btn settings__btn--sm settings__btn--outline"
+            disabled={phase !== 'idle'} onClick={update.withdrawHostRequest}>
+            {phase === 'cancelling' ? 'Withdrawing…' : 'Withdraw request'}
+          </button>
+        </div>
       )}
       {update.reconnecting && (
         <p className="platform-updates__description" role="status">{update.slow
