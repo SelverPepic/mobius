@@ -1643,6 +1643,10 @@ async def _run_codex_sdk_turn(
   task_host_tool_use_id: str | None = None
   helper_rows: CodexHelperRows | None = None
   helper_progress_task: asyncio.Task | None = None
+  # Command output deltas are normally repeated as `aggregated_output` on the
+  # completed item. Retain them only for the lifetime of this turn so a Codex
+  # path that omits that aggregate can still publish one authoritative result.
+  command_output_deltas: dict[str, list[str]] = {}
   helper_host = None
   codex_context = (
     sdk["AsyncCodex"](config=config) if helper_host_key is None else None
@@ -2034,6 +2038,11 @@ async def _run_codex_sdk_turn(
           if payload.delta:
             event = {"type": "tool_output", "content": payload.delta}
             _stamp_notification_item_id(event, payload)
+            tool_use_id = event.get("tool_use_id")
+            if isinstance(tool_use_id, str):
+              command_output_deltas.setdefault(tool_use_id, []).append(
+                payload.delta,
+              )
             bc.publish(event)
           continue
 
@@ -2140,7 +2149,15 @@ async def _run_codex_sdk_turn(
             if item_id and item_id == open_agent_message_item_id:
               open_agent_message_item_id = None
           if not isinstance(item, sdk["CollabAgentToolCallThreadItem"]):
-            for event in _tool_completed_events(item, sdk):
+            streamed_command_output = None
+            if isinstance(item, sdk["CommandExecutionThreadItem"]):
+              item_id = str(getattr(item, "id", None) or "")
+              deltas = command_output_deltas.pop(item_id, []) if item_id else []
+              if deltas and not getattr(item, "aggregated_output", None):
+                streamed_command_output = "".join(deltas)
+            for event in _tool_completed_events(
+              item, sdk, streamed_command_output=streamed_command_output,
+            ):
               _stamp_tool_use_id(event, item)
               bc.publish(event)
           # Also record child links here (idempotent) in case receiver_thread_ids
