@@ -31,15 +31,43 @@ test('parallel helpers collapse into one plural line', () => {
 
 test('other controls read as their activity, not their identifier', () => {
   const cases = [
-    ['finish_agent_work', 'Coordinated'],
-    ['promote_goal', 'Planned'],
-    ['declare_wait', 'Set a wait'],
-    ['request_question', 'Asked you'],
-    ['send_agent_message', 'Exchanged messages'],
+    ['finish_agent_work', 'outcome=Merged', 'Settled a claim: Merged'],
+    ['promote_goal', 'objective=Ship the release', 'Started a Goal: Ship the release'],
+    ['declare_wait', 'description=CI passes, condition_owner=GitHub', 'Set a wait: CI passes'],
+    ['request_question', "questions=[{'question': 'x'}]", 'Asked you'],
+    ['send_agent_message', "recipients=['a'], kind=note, body=Heads up", 'Messaged another chat: Heads up'],
   ]
-  for (const [bare, label] of cases) {
-    const row = tool(`mcp__mobius_control__${bare}`, 'objective=x')
+  for (const [bare, input, label] of cases) {
+    const row = tool(`mcp__mobius_control__${bare}`, input)
     assert.equal(toolCallLabel(row), label)
     assert.doesNotMatch(toolGroupPastSummary([tool('Read', 'a.js'), row]), /mcp__|mobius_control/)
   }
+})
+
+test('a restart request row still reads as words, not an identifier', () => {
+  assert.equal(toolCallLabel(tool('mcp__mobius_control__request_restart', '')), 'Asked to restart Möbius')
+})
+
+test('a Goal update names what it did to the Goal', () => {
+  const goal = (input, status) => toolCallLabel(tool('mcp__mobius_control__update_goal', input, status))
+  assert.equal(goal("tasks=[{'id': 'a'}]"), 'Updated the plan')
+  assert.equal(goal("tasks=[{'id': 'a'}], complete=Verified"), 'Completed the Goal')
+  assert.equal(goal('next_action=Run the check'), 'Left the next step')
+  assert.equal(goal('', 'running'), 'Reading the plan')
+})
+
+test('app and screenshot tools name their target', () => {
+  assert.equal(
+    toolCallLabel(tool('mobius_control:screenshot', 'route=/shell/?app=4, content_only=True')),
+    'Took a screenshot of /shell/?app=4',
+  )
+  assert.equal(toolCallLabel(tool('mcp__mobius_control__apply_app', 'source_dir=/data/apps/notes')), 'Applied app notes')
+  assert.equal(toolCallLabel(tool('mcp__mobius_control__notify_owner', 'title=Ready, body=Built')), 'Notified you: Ready')
+  assert.equal(toolActivityIcon(effectiveToolName(tool('mcp__mobius_control__screenshot', ''))), 'image')
+})
+
+test("an installed app's own tool reads as app work, not an identifier", () => {
+  const row = tool('mcp__mobius_control__memory_search', 'prompt=launch plans, limit=5')
+  assert.equal(toolCallLabel(row), 'Memory search: launch plans')
+  assert.equal(toolGroupPastSummary([row]), 'Used app tools')
 })
