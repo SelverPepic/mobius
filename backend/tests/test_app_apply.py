@@ -71,6 +71,18 @@ def _declare_schedule(source: Path) -> None:
   job.chmod(0o755)
 
 
+def _declare_model_provider(source: Path, **changes) -> dict:
+  manifest = json.loads((source / "mobius.json").read_text())
+  manifest["model_provider"] = {
+    "name": "Example Models", "base_url": "https://models.example.com/v1",
+    "secret_name": "api_key", "default_model": "example/model-a",
+    "models": [{"id": "example/model-a", "label": "Model A"}],
+    **changes,
+  }
+  (source / "mobius.json").write_text(json.dumps(manifest))
+  return manifest["model_provider"]
+
+
 def test_apply_creates_from_manifest_and_commits_exact_source(
   client, auth, db, chat,
 ):
@@ -1495,3 +1507,66 @@ async def test_accepted_update_syncs_every_member_of_a_folder_skill(tmp_path, mo
   assert captured["source_files"] == [
     "contributing/SKILL.md", "contributing/adapter-mobius.md", "contributing/cycle.md",
   ]
+
+
+def test_owner_built_local_app_model_provider_joins_registry_until_removed(
+  client, auth, db,
+):
+  from app import providers
+
+  source = _source()
+  declared = _declare_model_provider(source)
+  data_dir = get_settings().data_dir
+
+  created = _apply(client, auth, source)
+
+  assert created.status_code == 200, created.text
+  app_id = created.json()["app"]["id"]
+  row = db.query(models.App).populate_existing().filter_by(id=app_id).one()
+  assert row.capability_contract["model_provider"] == declared
+  try:
+    providers.sync_app_model_providers(data_dir, force=True)
+    assert providers.provider_of_model("example/model-a") == f"app-{app_id}"
+
+    # An owner grant change re-projects the local contract from app state; it
+    # must keep the declaration the last source apply accepted.
+    patched = client.patch(
+      f"/api/apps/{app_id}", json={"cross_app_access": "read"}, headers=auth,
+    )
+    assert patched.status_code == 200, patched.text
+    row = db.query(models.App).populate_existing().filter_by(id=app_id).one()
+    assert row.capability_contract["model_provider"] == declared
+
+    manifest = json.loads((source / "mobius.json").read_text())
+    manifest.pop("model_provider")
+    (source / "mobius.json").write_text(json.dumps(manifest))
+    removed = _apply(client, auth, source)
+
+    assert removed.status_code == 200, removed.text
+    row = db.query(models.App).populate_existing().filter_by(id=app_id).one()
+    assert "model_provider" not in row.capability_contract
+    providers.sync_app_model_providers(data_dir, force=True)
+    assert providers.provider_of_model("example/model-a") is None
+  finally:
+    providers.invalidate_model_cache()
+
+
+def test_local_apply_refuses_the_protected_broker_model_transport(
+  client, auth, db,
+):
+  source = _source("identity")
+  manifest = json.loads((source / "mobius.json").read_text())
+  manifest["permissions"] = {"identity_manage": True}
+  (source / "mobius.json").write_text(json.dumps(manifest))
+  _declare_model_provider(
+    source, transport="identity_broker", base_url="http://127.0.0.1:8765/v1",
+  )
+  manifest = json.loads((source / "mobius.json").read_text())
+  manifest["model_provider"].pop("secret_name")
+  (source / "mobius.json").write_text(json.dumps(manifest))
+
+  refused = _apply(client, auth, source)
+
+  assert refused.status_code == 422, refused.text
+  assert refused.json()["detail"]["code"] == "local_model_broker"
+  assert db.query(models.App).count() == 0

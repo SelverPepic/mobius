@@ -584,6 +584,7 @@ def _apply_local_manifest_runtime(
     contract_permissions=manifest.get("permissions") or {},
     service=service,
     tools=list(manifest.get("tools") or []),
+    model_provider=manifest.get("model_provider"),
   )
 
 
@@ -709,6 +710,17 @@ async def apply_source_revision(
       )
       if manifest is not None:
         _validate_local_identity(source_path, manifest, app)
+        provider = manifest.get("model_provider")
+        if (not store_managed and isinstance(provider, dict)
+            and provider.get("transport") == "identity_broker"):
+          # The broker signs with the owner's Möbius account, so only the
+          # reviewed Möbius · You package may route turns through it. Local
+          # apps declare their own HTTPS endpoint and app-secret key.
+          raise AppApplyError(
+            "local_model_broker",
+            "Local apps may declare an HTTPS model provider with their own "
+            "app secret, not the protected Möbius broker transport.",
+          )
         schedule = manifest.get("schedule")
         job_name = schedule.get("job") if isinstance(schedule, dict) else None
         if job_name:
