@@ -64,6 +64,7 @@ from app.chat_context import (
   _build_app_context,
   _build_app_report_block,
   _build_resumed_context,
+  _build_stopped_turn_context,
   _build_time_context,
   _chat_has_goal_intent,
   _chat_settings_dict,
@@ -5216,6 +5217,12 @@ async def _run_chat_impl_with_db(
     goal_context = resume_context(db, run_token)
     if goal_context:
       user_message = f"{user_message}\n\n{goal_context}"
+
+  # After an owner Stop, say the cut was not a refusal of the call it ended.
+  if chat_id and run_policy is None:
+    stopped_context = _build_stopped_turn_context(db, chat_id, run_token)
+    if stopped_context:
+      user_message = f"{stopped_context}\n\n{user_message}"
 
   # Per-turn time context (EVERY turn, not just the first) so the agent has a
   # clock + a sense of recency (how long since the user last wrote). Prepended

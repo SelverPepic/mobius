@@ -92,6 +92,37 @@ def _last_user_message_elapsed(db, chat_id: str) -> str | None:
   return None
 
 
+# Stop cuts a running tool call through the CLI's Esc key, which answers the
+# call with its stock rejection ("The user doesn't want to proceed with this
+# tool use… STOP…"). The next turn resumes that session, so without this note
+# the agent reads the owner's Stop as a refusal of that exact call.
+STOPPED_TURN_NOTE = (
+  "[Your previous turn in this chat was ended by the owner's Stop. Stop halts "
+  "all work in progress at once, including any tool call that was running; it "
+  "is not a verdict on that call. A result saying the user doesn't want to "
+  "proceed or rejected the tool use came from the Stop, not from the owner. "
+  "Act on what follows, and re-run an interrupted call if it is still needed.]"
+)
+
+
+def _build_stopped_turn_context(
+  db, chat_id: str, run_token: str | None,
+) -> str | None:
+  """The Stop note when the owner's Stop ended this chat's previous turn."""
+  from app import models
+  query = db.query(models.ChatRun.status).filter(
+    models.ChatRun.chat_id == chat_id,
+  )
+  if run_token:
+    query = query.filter(models.ChatRun.id != run_token)
+  previous = query.order_by(
+    models.ChatRun.started_at.desc(), models.ChatRun.id.desc(),
+  ).first()
+  if previous is None or previous.status != "stopped":
+    return None
+  return STOPPED_TURN_NOTE
+
+
 def _build_time_context(timezone: str | None, elapsed: str | None = None) -> str:
   """A one-line, per-turn time stamp injected into the user message.
 

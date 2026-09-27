@@ -7,12 +7,15 @@ agent only ever saw an IANA timezone NAME, and only on turn 1).
 import re
 import time
 import uuid
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 from app import models, schemas
 from app.chat_context import (
   MOBIUS_SLASH_COMMANDS,
+  STOPPED_TURN_NOTE,
+  _build_stopped_turn_context,
   _build_time_context,
   _chat_has_goal_intent,
   _goal_clear_requested,
@@ -113,6 +116,48 @@ def test_elapsed_ignores_automatic_continuation_marker(monkeypatch):
     db.commit()
 
     assert _last_user_message_elapsed(db, cid) == "3 days ago"
+  finally:
+    db.close()
+
+
+def _chat_with_runs(db, statuses: list[str]) -> tuple[str, str]:
+  """A chat whose runs started in `statuses` order, plus the current run."""
+  cid = f"stopped-turn-{uuid.uuid4()}"
+  db.add(models.Chat(id=cid, title="stopped turn", messages=[]))
+  start = datetime(2026, 9, 27, 10, 0, 0)
+  for i, status in enumerate(statuses):
+    db.add(models.ChatRun(
+      id=f"{cid}-run-{i}", chat_id=cid, status=status,
+      started_at=start + timedelta(minutes=i),
+    ))
+  current = f"{cid}-current"
+  db.add(models.ChatRun(
+    id=current, chat_id=cid, status="running",
+    started_at=start + timedelta(minutes=len(statuses)),
+  ))
+  db.commit()
+  return cid, current
+
+
+def test_turn_after_an_owner_stop_is_told_the_stop_refused_nothing():
+  db = SessionLocal()
+  try:
+    cid, current = _chat_with_runs(db, ["completed", "stopped"])
+    note = _build_stopped_turn_context(db, cid, current)
+    assert note == STOPPED_TURN_NOTE
+    assert "not a verdict on that call" in note
+    assert "re-run an interrupted call if it is still needed" in note
+  finally:
+    db.close()
+
+
+def test_stop_note_covers_only_the_turn_right_after_the_stop():
+  db = SessionLocal()
+  try:
+    cid, current = _chat_with_runs(db, ["stopped", "completed"])
+    assert _build_stopped_turn_context(db, cid, current) is None
+    fresh, first = _chat_with_runs(db, [])
+    assert _build_stopped_turn_context(db, fresh, first) is None
   finally:
     db.close()
 

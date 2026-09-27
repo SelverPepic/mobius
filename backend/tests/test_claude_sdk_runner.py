@@ -484,6 +484,98 @@ async def test_steer_requeries_on_interrupt_terminal(monkeypatch):
   ]
 
 
+_CLI_CUT_TEXT = (
+  "The user doesn't want to proceed with this tool use. The tool use was "
+  "rejected (eg. if it was a file edit, the new_string was NOT written to the "
+  "file). STOP what you are doing and wait for the user to tell you how to "
+  "proceed."
+)
+
+
+@pytest.mark.asyncio
+async def test_command_cut_by_a_steer_shows_as_cut_not_refused(monkeypatch):
+  """The CLI answers a call cut by the steer's interrupt with its refusal
+  text; the chat shows the delivery instead, and not as a failure."""
+  class _Client(_FakeClient):
+    async def receive_response(self):
+      if len(self.queries) == 1:
+        yield _stream_delta("text_delta", text="running it")
+        assert await steer_into_active_turn("cut-label-chat", "helper done")
+        yield UserMessage(content=[
+          ToolResultBlock(
+            tool_use_id="tu-cut", content=_CLI_CUT_TEXT, is_error=True,
+          ),
+        ])
+        yield _interrupt_result()
+        return
+      yield _stream_delta("text_delta", text="re-running")
+      yield _success_result()
+
+  _install_fake_client(monkeypatch, _Client)
+  bus = _ChatBus()
+  await _run_turn("cut-label-chat", bc=bus, prompt="start task")
+
+  outputs = [e for e in bus.events if e["type"] == "tool_output"]
+  assert outputs == [{
+    "type": "tool_output", "content": "Cut to deliver an update",
+    "tool_use_id": "tu-cut", "output_complete": True,
+  }]
+
+
+@pytest.mark.asyncio
+async def test_cut_label_names_the_owner_message_and_stop():
+  class _Client:
+    async def interrupt(self):
+      pass
+
+  person = ActiveClaudeClient(_Client(), chat_id="cut-label-person")
+  await person.steer("why?", [{"role": "user", "cid": "c1"}], ["c1"])
+  assert person.cut_tool_label == "Cut to deliver your message"
+
+  stopped = ActiveClaudeClient(_Client(), chat_id="cut-label-stop")
+  stopped.mark_finished()
+  await stopped.interrupt()
+  assert stopped.cut_tool_label == "Stopped"
+
+  idle = ActiveClaudeClient(_Client(), chat_id="cut-label-idle")
+  assert idle.cut_tool_label is None
+
+
+def test_only_the_cut_result_is_relabelled():
+  msg = UserMessage(content=[
+    ToolResultBlock(tool_use_id="a", content=_CLI_CUT_TEXT, is_error=True),
+    ToolResultBlock(tool_use_id="b", content="real output", is_error=True),
+  ])
+  labelled = claude_sdk_runner._label_cut_tool_results(msg, "Stopped")
+  assert labelled.content[0] == ToolResultBlock(
+    tool_use_id="a", content="Stopped", is_error=False,
+  )
+  assert labelled.content[1] == msg.content[1]
+  untouched = UserMessage(content=[msg.content[1]])
+  assert claude_sdk_runner._label_cut_tool_results(
+    untouched, "Stopped",
+  ) is untouched
+
+
+@pytest.mark.asyncio
+async def test_refusal_text_without_our_cut_is_left_alone(monkeypatch):
+  class _Client(_FakeClient):
+    async def receive_response(self):
+      yield UserMessage(content=[
+        ToolResultBlock(
+          tool_use_id="tu-x", content=_CLI_CUT_TEXT, is_error=True,
+        ),
+      ])
+      yield _success_result()
+
+  _install_fake_client(monkeypatch, _Client)
+  bus = _ChatBus()
+  await _run_turn("cut-label-none", bc=bus, prompt="start task")
+  outputs = [e for e in bus.events if e["type"] == "tool_output"]
+  assert outputs[0]["content"] == _CLI_CUT_TEXT
+  assert outputs[0]["output_exit_code"] == 1
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("session_id", [None, "sess-1"])
 async def test_steer_interrupt_racing_turn_end_is_a_resumable_pause(
@@ -2939,6 +3031,18 @@ async def test_mid_turn_person_message_is_framed_as_owed_a_visible_reply():
     ["peer note"], from_person=False,
   )
   assert context.startswith("New context arrived while you were working.")
+
+
+def test_steer_requery_says_its_interrupt_refused_no_tool_call():
+  # The steer's interrupt makes the CLI answer a running call with "The user
+  # doesn't want to proceed…"; the requery must say nobody refused it.
+  for from_person in (True, False):
+    framed = claude_sdk_runner._steer_redirect_message(
+      ["look at this"], from_person=from_person,
+    )
+    assert "not from anyone refusing the call" in framed
+    assert "Re-run it if it is still needed." in framed
+    assert framed.endswith("look at this")
 
 
 @pytest.mark.asyncio

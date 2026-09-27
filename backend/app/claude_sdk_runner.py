@@ -54,6 +54,7 @@ import re
 from collections import deque
 from collections.abc import Awaitable
 from contextlib import ExitStack
+from dataclasses import replace
 from typing import Any, Literal
 
 from claude_agent_sdk import (
@@ -70,6 +71,7 @@ from claude_agent_sdk.types import (
   RateLimitEvent,
   ResultMessage,
   StreamEvent,
+  ToolResultBlock,
   UserMessage,
 )
 
@@ -77,6 +79,7 @@ from app import activity, generated_files
 from app.claude_events import (
   NativeContinuationTracker,
   _clip_task_text,
+  _format_tool_output,
   dispatch_sdk_message,
   is_root_conversation_message,
 )
@@ -735,6 +738,21 @@ class ActiveClaudeClient:
     return self._interrupt_owner is not None
 
   @property
+  def cut_tool_label(self) -> str | None:
+    """How the chat shows a tool call cut by this turn's own interrupt.
+
+    None for a card end: its fallback interrupt only ends a helper's own
+    generation, so a result it cuts keeps the provider's text.
+    """
+    if self._interrupt_owner == "stop":
+      return "Stopped"
+    if self._interrupt_owner == "steer":
+      if self.steer_from_person:
+        return "Cut to deliver your message"
+      return "Cut to deliver an update"
+    return None
+
+  @property
   def owner_card_end(self) -> bool:
     """Whether a continuation owner-input card ended this turn."""
     return self._interrupt_owner == "card"
@@ -788,26 +806,63 @@ class ActiveClaudeClient:
       self._finished.set_result(None)
 
 
+# Steers and Stop are delivered with `interrupt()`, the CLI's Esc key. The CLI
+# answers a tool call it cuts with its stock rejection, which starts with this
+# prefix and ends "STOP what you are doing". Under a cut Möbius owns, that text
+# never means anyone refused the call, so the agent and the chat are told so.
+_CLI_CUT_RESULT_PREFIX = "The user doesn't want to proceed with this tool use."
+_STEER_CUT_NOTE = (
+  "Möbius interrupted your turn to deliver it. If a tool call was running, "
+  "that delivery cut it: a result saying the user doesn't want to proceed, "
+  "rejected the tool use, or interrupted the request came from the delivery, "
+  "not from anyone refusing the call. Re-run it if it is still needed."
+)
+
+
+def _label_cut_tool_results(sdk_msg: UserMessage, label: str) -> UserMessage:
+  """Show tool calls cut by our own interrupt as `label`, not as refused.
+
+  Only the chat's copy changes: the CLI keeps its own record, and the steer
+  requery or post-Stop note tells the agent the cut was not a refusal. The
+  label is an outcome, not a failure, so it carries no error exit code.
+  """
+  if not isinstance(sdk_msg.content, list):
+    return sdk_msg
+  blocks = [
+    replace(block, content=label, is_error=False)
+    if isinstance(block, ToolResultBlock)
+    and _format_tool_output(block.content).startswith(_CLI_CUT_RESULT_PREFIX)
+    else block
+    for block in sdk_msg.content
+  ]
+  if blocks == sdk_msg.content:
+    return sdk_msg
+  return replace(sdk_msg, content=blocks)
+
+
 def _steer_redirect_message(texts: list[str], *, from_person: bool) -> str:
   """Frame mid-turn input for the requery on the still-connected client.
 
   A person's message is a conversational turn, not context to absorb: framing
   it as "continue the same task" let agents fold a question into their work
   and never answer it where the partner can see. Agent-originated carriers
-  (helper results, peer notes) remain context for the ongoing work.
+  (helper results, peer notes) remain context for the ongoing work. Both say
+  that the interrupt which delivered them is not a refusal of any cut call.
   """
   text = "\n\n".join(texts)
   if from_person:
     return (
-      "The partner sent this message while you were working. Reply to it in "
-      "your visible response before continuing: answer any question and "
-      "acknowledge any correction or change of direction. Then continue the "
-      "task as the message directs:\n\n"
+      "The partner sent this message while you were working. "
+      f"{_STEER_CUT_NOTE} Reply to the message in your visible response "
+      "before continuing: answer any question and acknowledge any correction "
+      "or change of direction. Then continue the task as the message "
+      "directs:\n\n"
       f"{text}"
     )
   return (
-    "New context arrived while you were working. Incorporate it according "
-    "to its stated authority and continue the same task:\n\n"
+    "New context arrived while you were working. "
+    f"{_STEER_CUT_NOTE} Incorporate the context according to its stated "
+    "authority and continue the same task:\n\n"
     f"{text}"
   )
 
@@ -1596,6 +1651,13 @@ async def run_claude_sdk_turn(
             _resets = getattr(sdk_msg.rate_limit_info, "resets_at", None)
             if _resets is not None:
               rate_limit_resets_at = _resets
+          cut_label = active_client.cut_tool_label
+          if (
+            cut_label
+            and isinstance(sdk_msg, UserMessage)
+            and is_root_conversation_message(sdk_msg)
+          ):
+            sdk_msg = _label_cut_tool_results(sdk_msg, cut_label)
           current_session_id, terminal = dispatch_sdk_message(
             sdk_msg,
             bc,

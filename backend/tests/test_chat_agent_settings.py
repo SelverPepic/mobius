@@ -730,6 +730,55 @@ def test_claude_receives_an_owner_goal_command_as_a_plain_request(
   assert not any(line.startswith("/goal") for line in prompt.splitlines())
 
 
+def test_turn_after_an_owner_stop_carries_the_stop_note(client, auth, chat, db):
+  """A Stop cuts the running call with the CLI's "user doesn't want to
+  proceed" rejection; the next turn must say the Stop refused nothing."""
+  from datetime import datetime
+
+  from app import chat as chat_mod, models, schemas
+  from app.chat_context import STOPPED_TURN_NOTE
+
+  db.add(models.ChatRun(
+    id=f"{chat.id}-stopped", chat_id=chat.id, status="stopped",
+    started_at=datetime(2026, 1, 1),
+  ))
+  db.commit()
+  captured = {}
+
+  async def fake_runner(**kwargs):
+    captured.update(kwargs)
+    return {"session_id": "fake-session-id", "cost_usd": 0.0, "error": None}
+
+  async def _scenario():
+    from app.broadcast import create_broadcast
+
+    create_broadcast(chat.id)
+    run_token = _start_provider_turn(chat)
+    await chat_mod._run_chat_impl(
+      messages=[schemas.ChatMessage(role="user", content="carry on")],
+      chat_id=chat.id,
+      session_id=None,
+      provider_id="claude",
+      run_gen=chat_mod.current_run_generation(chat.id),
+      run_token=run_token,
+    )
+
+  with patch(
+         "app.claude_sdk_runner.run_claude_sdk_turn",
+         side_effect=fake_runner,
+       ), \
+       patch(
+         "app.providers.ClaudeProvider.check_auth",
+         return_value=None,
+       ):
+    asyncio.run(_scenario())
+
+  prompt = captured["user_message"]
+  assert prompt.startswith("[Context — current time:")
+  assert STOPPED_TURN_NOTE in prompt
+  assert prompt.index(STOPPED_TURN_NOTE) < prompt.index("carry on")
+
+
 def test_patch_model_only_with_cross_provider_model_switches_provider(
   client, auth, chat, db, monkeypatch,
 ):
