@@ -115,7 +115,7 @@ UPDATE_GOAL_DESCRIPTION = (
   "Advance this chat's Goal in one call. tasks edits the plan as one "
   "revision: a known id changes only the fields given (for example status "
   "completed with a result, and the next task running), a new id adds a task. "
-  "next_action leaves the exact next step before a real handoff. complete "
+  "next_action records the exact next step. complete "
   "records the verified outcome and closes the Goal; it is refused while "
   "tasks or helpers are unfinished. With no arguments it returns the current "
   "plan. goal_id attaches to a named retained Goal instead of the presented one."
@@ -173,8 +173,8 @@ _GOAL_TASK_SCHEMA = {
     ]},
     "depends_on": {"type": "array", "items": {"type": "string"}},
     "parent_id": {"type": "string"},
-    "completion_condition": {"type": "string", "maxLength": 500},
-    "note": {"type": "string", "maxLength": 500},
+    "completion_condition": {"type": "string", "maxLength": 1000},
+    "note": {"type": "string", "maxLength": 1000},
     "result": {"type": "string", "maxLength": 1000},
     "progress": {
       "type": "object",
@@ -262,6 +262,27 @@ def _agent_api_settings() -> tuple[str, str]:
   return base, token
 
 
+def _refusal_message(raw: str) -> str:
+  """The human reason inside a backend refusal, without its wire envelope.
+
+  FastAPI wraps reasons as {"detail": ...}: a string, a typed refusal
+  {"code", "message", ...facts}, or a list of validation issues.
+  """
+  try:
+    detail = json.loads(raw).get("detail", raw)
+  except (json.JSONDecodeError, AttributeError):
+    return raw.strip()[:1000] or "no reason given"
+  if isinstance(detail, dict):
+    detail = detail.get("message") or detail.get("code") or json.dumps(detail)
+  elif isinstance(detail, list):
+    detail = "; ".join(
+      " ".join(str(part) for part in (issue.get("loc") or [])[1:]) + ": " + str(issue.get("msg"))
+      if isinstance(issue, dict) else str(issue)
+      for issue in detail[:5]
+    )
+  return str(detail).strip()[:1000] or "no reason given"
+
+
 def _agent_api_call(
   method: str,
   path: str,
@@ -301,13 +322,10 @@ def _agent_api_json(
     with urlopen(request, timeout=timeout) as response:
       raw = response.read()
   except HTTPError as exc:
-    detail = exc.read().decode("utf-8", errors="replace")[:1000]
-    try:
-      parsed = json.loads(detail)
-      detail = str(parsed.get("detail", detail))
-    except (json.JSONDecodeError, AttributeError):
-      pass
-    raise RuntimeError(f"coordination request failed ({exc.code}): {detail}") from exc
+    raw = exc.read().decode("utf-8", errors="replace")[:4000]
+    raise RuntimeError(
+      f"Refused ({exc.code}): {_refusal_message(raw)}"
+    ) from exc
   except URLError as exc:
     raise RuntimeError(f"coordination request failed: {exc.reason}") from exc
   try:
@@ -456,7 +474,7 @@ def _call_promote_goal(arguments: dict[str, Any]) -> dict | str:
     return "Goal promoted. " + _update_goal({"tasks": arguments["tasks"]})
   except RuntimeError as exc:
     raise RuntimeError(
-      f"Goal promoted, but its plan was refused: {exc}. "
+      f"Goal promoted, but its plan was not saved. {exc}. "
       "Fix the tasks and send them with update_goal."
     ) from exc
 
@@ -495,7 +513,8 @@ def _goal_report(payload: dict[str, Any], *, full: bool) -> str:
         f"- {task.get('id')} [{task.get('status')}]{parent}{depends}: "
         f"{task.get('title')}" + (f" — {detail}" if detail else "")
       )
-    if goal.get("next_action"):
+    # A settled Goal has no next step; its last handoff note is history.
+    if goal.get("next_action") and goal.get("status") == "open":
       lines.append(f"Next action: {goal['next_action']}")
   return "\n".join(lines)
 
@@ -1200,7 +1219,7 @@ _TOOL_DEFINITIONS = {
               "label": {"type": "string", "minLength": 1, "maxLength": 100},
               "description": {"type": "string", "minLength": 1, "maxLength": 500},
               "on_answer": {"type": "string", "enum": ["resume", "close"],
-                "description": "Default resume. Explicit close saves this choice without an agent reply; arrange a durable next owner first if the Goal is unfinished."},
+                "description": "Default resume. Explicit close saves this choice without an agent reply."},
             },
             "required": ["label", "description"], "additionalProperties": False,
           },
@@ -1267,7 +1286,7 @@ _TOOL_DEFINITIONS = {
                 "label": {"type": "string", "minLength": 1, "maxLength": 100},
                 "description": {"type": "string", "minLength": 1, "maxLength": 500},
                 "on_answer": {"type": "string", "enum": ["resume", "close"],
-                "description": "Default resume. Explicit close saves this choice without an agent reply; arrange a durable next owner first if the Goal is unfinished."},},
+                "description": "Default resume. Explicit close saves this choice without an agent reply."},},
             }},
           },
         },
@@ -1734,15 +1753,18 @@ def _cli_call(argv: list[str]) -> int:
   """
   if len(argv) < 2 or argv[0] != "call" or len(argv) > 4:
     print(
-      "usage: mobius_control_mcp.py call <tool_name> [--args-json JSON]",
+      "usage: mobius_control_mcp.py call <tool_name> [--args-json JSON|-]",
       file=sys.stderr,
     )
     return 2
   tool_name = argv[1]
   arguments: dict[str, Any] = {}
   if len(argv) == 4 and argv[2] == "--args-json":
+    # "-" reads the JSON from stdin, so a quoted heredoc can carry commands
+    # and prose literally instead of nesting them inside shell quotes.
+    raw = sys.stdin.read() if argv[3] == "-" else argv[3]
     try:
-      parsed = json.loads(argv[3])
+      parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
       print(f"invalid --args-json: {exc}", file=sys.stderr)
       return 2
@@ -1751,7 +1773,7 @@ def _cli_call(argv: list[str]) -> int:
       return 2
     arguments = parsed
   elif len(argv) > 2:
-    print("usage: mobius_control_mcp.py call <tool_name> [--args-json JSON]",
+    print("usage: mobius_control_mcp.py call <tool_name> [--args-json JSON|-]",
           file=sys.stderr)
     return 2
   result = _call_tool({"name": tool_name, "arguments": arguments})

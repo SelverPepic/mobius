@@ -81,10 +81,13 @@ commit_on_head() {  # <path> <content>: a commit adding one file, branch unmoved
     set -e
     cd /data/platform
     blob=$(printf "%s\n" "$2" | git hash-object -w --stdin)
-    git read-tree --index-output=/tmp/smoke-index HEAD
-    GIT_INDEX_FILE=/tmp/smoke-index git update-index --add --cacheinfo "100644,$blob,$1"
-    tree=$(GIT_INDEX_FILE=/tmp/smoke-index git write-tree)
-    rm -f /tmp/smoke-index
+    # A private index file: --index-output cannot write outside the
+    # repository filesystem, and the shared index must stay untouched.
+    index=$(mktemp -u /tmp/smoke-index.XXXXXX)
+    GIT_INDEX_FILE=$index git read-tree HEAD
+    GIT_INDEX_FILE=$index git update-index --add --cacheinfo "100644,$blob,$1"
+    tree=$(GIT_INDEX_FILE=$index git write-tree)
+    rm -f "$index"
     git -c user.name=smoke -c user.email=smoke@example.invalid \
       commit-tree "$tree" -p HEAD -m "boot transaction smoke: $1"
   ' sh "$1" "$2"

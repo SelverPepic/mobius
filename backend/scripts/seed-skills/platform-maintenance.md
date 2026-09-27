@@ -160,7 +160,7 @@ because `/data/platform` is the persistent served clone. The baked
    If the tool is absent, the same saved-card operation is available through:
 
    ```bash
-   python3 /data/platform/backend/scripts/owner_approval.py --restart
+   python3 /data/platform/backend/scripts/mobius_control_mcp.py call request_restart
    ```
 
    A failed save is not a waiting card and not consent. Retry only the

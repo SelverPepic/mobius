@@ -18,7 +18,6 @@ from app.codex_sdk_runner import _codex_config_overrides
 from app.delegations import (
   RunPolicy,
   background_helper_chat_ids,
-  background_helper_goal_ids,
   delegation_execution_token,
   derived_status,
   ensure_delegation_started,
@@ -780,7 +779,6 @@ import app.chat as chat_mod
 import app.chat_start as chat_start_mod
 import app.delegations as delegations_mod
 from app.delegations import (
-  background_helper_goal_ids,
   serialize_background_helpers,
 )
 from app.chat_writer import PromotePending
@@ -867,7 +865,6 @@ def test_background_helper_projection_owns_waiting_until_parent_wake(
   )
 
   assert background_helper_chat_ids(db, [parent_id]) == {parent_id}
-  assert background_helper_goal_ids(db, parent_id) == {"root-waiting-owner"}
   summary = serialize_background_helpers(db, parent_id)
   assert summary == {
     "count": 1,
@@ -901,7 +898,6 @@ def test_background_helper_projection_owns_waiting_until_parent_wake(
   delegation.delivered_run_id = "child-run-waiting-owner"
   db.commit()
   assert background_helper_chat_ids(db, [parent_id]) == set()
-  assert background_helper_goal_ids(db, parent_id) == set()
   assert serialize_background_helpers(db, parent_id) == {"count": 0, "items": []}
 
 
@@ -1398,6 +1394,71 @@ def _run_activity_checkpoint(
     remove_broadcast(parent_id)
   get_writer().submit(Barrier()).result(timeout=5)
   return disposition, seen_prompts
+
+
+def test_delegated_prompt_keeps_a_leading_goal_command_verbatim(db, monkeypatch):
+  """Only an owner's /goal becomes a plain 'Goal:' request. A helper's task is
+  immutable, hash-bound intent, so text that happens to start with /goal must
+  reach the helper exactly as written."""
+  import hashlib
+  from app import schemas
+  from app.broadcast import create_broadcast, remove_broadcast
+
+  task = "/goal inspect how the literal command is parsed"
+  _parent_id, child_id, delegation_id = _seed_delegation(
+    db, suffix="literal-goal", child_status="running",
+  )
+  child = db.get(models.Chat, child_id)
+  child.messages = [{"role": "user", "content": task}]
+  db.get(models.Delegation, delegation_id).prompt_sha256 = hashlib.sha256(
+    task.encode("utf-8"),
+  ).hexdigest()
+  if db.query(models.Owner).first() is None:
+    db.add(models.Owner(
+      username="literal-goal-owner", hashed_password="unused", provider="claude",
+    ))
+  run_token = "literal-goal-child-run"
+  db.add(models.ChatRun(
+    id=run_token, root_run_id=run_token, chat_id=child_id,
+    status="running", provider="claude", provider_execution_admitted=False,
+  ))
+  db.commit()
+  seen_prompts = []
+
+  async def provider_turn(*, user_message, bc, **_kwargs):
+    seen_prompts.append(user_message)
+    return {"session_id": None, "cost_usd": 0.0, "error": None}
+
+  async def skip_browser_cleanup(_chat_id):
+    return None
+
+  monkeypatch.setattr(
+    chat_mod, "get_provider", lambda _id: _ActivityCheckpointProvider("claude"),
+  )
+  # A helper's Claude turn may run in the parent's shared helper host; either
+  # way the provider receives the same assembled prompt.
+  monkeypatch.setattr("app.claude_sdk_runner.run_claude_sdk_turn", provider_turn)
+  monkeypatch.setattr(
+    "app.claude_helper_host.run_claude_host_turn", provider_turn,
+  )
+  monkeypatch.setattr(chat_mod, "_close_browser_session", skip_browser_cleanup)
+  create_broadcast(child_id)
+  try:
+    asyncio.run(chat_mod._run_chat_impl(
+      messages=[schemas.ChatMessage(role="user", content=task)],
+      chat_id=child_id,
+      session_id=None,
+      provider_id="claude",
+      run_gen=None,
+      run_token=run_token,
+    ))
+  finally:
+    remove_broadcast(child_id)
+
+  assert len(seen_prompts) == 1
+  assert task in seen_prompts[0]
+  assert "Goal: inspect" not in seen_prompts[0]
+  assert not seen_prompts[0].startswith("/goal")
 
 
 @pytest.mark.parametrize("provider_id", ["claude", "codex"])
@@ -2362,16 +2423,16 @@ def test_migration_adds_wake_columns_idempotently(db):
   assert "parent_woken_at" in cols
 
 
-def test_helper_result_admitted_to_a_live_parent_run_no_longer_owns_the_goal(db):
-  """The turn incorporating a helper's result owns the Goal's next move.
+def test_helper_result_admitted_to_a_live_parent_run_no_longer_shows_waiting(db):
+  """The turn incorporating a helper's result owns what happens next.
 
-  Finalize marks the result delivered only when that turn ends, so without this
-  the incorporating turn itself could never complete the Goal.
+  Finalize marks the result delivered only when that turn ends; until then the
+  chat must not still read as waiting on the helper it is already handling.
   """
   parent_id, _child_id, delegation_id = _seed_delegation(
     db, suffix="being-delivered", child_status="completed",
   )
-  assert background_helper_goal_ids(db, parent_id) == {"root-being-delivered"}
+  assert background_helper_chat_ids(db, [parent_id]) == {parent_id}
 
   db.add(make_goal_run(db,
     id="parent-wake-run", root_run_id="root-being-delivered",
@@ -2383,12 +2444,12 @@ def test_helper_result_admitted_to_a_live_parent_run_no_longer_owns_the_goal(db)
     },
   ))
   db.commit()
-  assert background_helper_goal_ids(db, parent_id) == set()
+  assert background_helper_chat_ids(db, [parent_id]) == set()
 
   # A delivery that stopped before Finalize hands ownership back to the helper.
   db.get(models.ChatRun, "parent-wake-run").status = "stopped"
   db.commit()
-  assert background_helper_goal_ids(db, parent_id) == {"root-being-delivered"}
+  assert background_helper_chat_ids(db, [parent_id]) == {parent_id}
 
 
 def test_a_reopened_helper_result_wakes_the_idle_parent_again(

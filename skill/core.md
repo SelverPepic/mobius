@@ -159,9 +159,12 @@ for you** until the owner answers or Stops, and the answer starts the next turn.
   approval. If you are already authorized, proceed; never ask twice for the same
   exact action. A failed save is not a waiting card: surface it or retry the
   identical request.
-- **Never leave an invisible wait.** Before ending with unfinished Goal work:
-  if a read-only check can observe the condition, read the `waiting` skill and
-  declare a durable monitor; if only the partner can act, use the saved owner-input card as the final action with choices such as **Done**, **Need help**, and **Not now**. Never rely on a paused Goal, a prose promise, or "tell me when…".
+- **Never leave an invisible wait.** Nothing resumes an unfinished Goal by
+  itself. Before promising to continue when something happens, arm what will
+  wake you: if a read-only check can observe the condition, read the `waiting`
+  skill and declare a durable monitor. Otherwise end plainly; an idle chat is
+  simply the partner's turn. Never rely on a paused Goal, a prose promise, or
+  "tell me when…".
 - **Restarts.** Publish `request_restart` after the `platform-maintenance`
   preflight; it takes no arguments. An explicit partner request may create the
   card even when nothing needs activation. **Restart now** triggers one
@@ -171,8 +174,10 @@ for you** until the owner answers or Stops, and the answer starts the next turn.
   Restart, or sealed-input card may answer it through that card's endpoint.
   Background and scheduled runs (News, Reflection) never open cards: they put
   questions in their report, and an unanswered one never blocks the next run.
-- If `request_question` is absent, use
-  `python3 /data/platform/backend/scripts/owner_approval.py --questions-json '[{"question":"...","options":[{"label":"...","description":"..."}]}]'`.
+- If a Möbius control tool is absent, the same operation is available as
+  `python3 /data/platform/backend/scripts/mobius_control_mcp.py call <tool> --args-json '<json>'`, for example
+  `call request_question --args-json '{"questions":[{"question":"...","options":[{"label":"...","description":"..."}]}]}'`.
+  `--args-json -` reads the JSON from stdin.
 
 **Claim convergent work once.** Before a public action, shared integration, or
 other exact outcome another chat could independently reach, claim one canonical

@@ -13,8 +13,8 @@ record after interruption instead of replacing unfinished scope.
    isolation avoids repeated input. Parallelism itself is not the saving.
 3. Serialize dependencies, shared writes, plan revisions, and final integration.
 4. Add discoveries beneath their owner; preserve unfinished siblings.
-5. Work in-run; leave a `next_action` only before a handoff. After verifying
-   the outcome, call `update_goal` with `complete`.
+5. Work in-run. After verifying the outcome, call `update_goal` with
+   `complete`.
 
 ## Route and promote
 
@@ -28,7 +28,7 @@ equivalent convenience path: use it only when the tool is absent or an attempted
 tool call returns a failure:
 
 ```bash
-python3 /data/platform/backend/scripts/goal_promote.py 'Outcome and completion condition'
+python3 /data/platform/backend/scripts/mobius_control_mcp.py call promote_goal --args-json '{"objective":"Outcome and completion condition"}'
 ```
 
 ## Plan and work
@@ -45,33 +45,24 @@ running and ready tasks, so there is no separate read. With no arguments it
 returns the full plan.
 
 Statuses are pending, running, completed, blocked, failed, and cancelled; a
-note holds up to 500 characters and a result up to 1000. Work deepest leaves.
+note or result holds up to 1000 characters. Work deepest leaves.
 Children inherit ancestor dependencies and make a parent **Ready to verify**,
 not complete. Verify upward; cancelled prerequisites are settled. Plans may
 change; outcomes may not. Settled tasks do not close the Goal. To work on a
 retained unfinished Goal other than the one shown, pass its `goal_id`; that
 attaches this attempt and cannot reopen closed work.
 
-### Make every unfinished wait explicit
+### When your turn ends
 
-Before ending unfinished, create exactly one owning interaction: for an observable
-condition, read `waiting.md` and declare a durable Wait; for owner action, use the
-saved question tool, which keeps the Goal marked **Waiting for you**. Restart uses
-its dedicated card. A button in an app or the Changes panel is not a handoff,
-and a `blocked` task only records the gate: when only the owner can unblock it
-(an approval, a choice, or a change of scope), put exactly that on the card.
-
-With no gate, keep working. Terminal settlement continues the exact Goal only
-when its saved plan advanced during the admitted turn and still has runnable
-work; otherwise it asks the owner. An unchanged plan is not progress; any real
-plan change is, so never checkpoint just to record it.
+A Goal never continues by itself. When your turn ends, the chat is the
+owner's turn unless something you armed will wake it: a durable Wait (read
+`waiting.md`) for an observable condition, or a helper whose result returns
+here. A decision or approval only the owner can give goes on its saved card; a
+`blocked` task only records that gate.
 
 Work in-run; turns are not a budget. Do not end a run merely to refresh context
-or select the next task. Never end with “tell me when…”, prose status, a bare
-paused Goal, or a custom status card.
-
-Before an unfinished handoff, add `next_action: 'Exact next step'` to your last
-`update_goal` call.
+or select the next task, and never promise to continue later without arming
+what will wake you. Otherwise end with an honest, plain status.
 
 After verifying the original outcome, call `update_goal` with `complete:
 'Verified evidence'` (plus `finished_claims` for exact claimed actions this Goal

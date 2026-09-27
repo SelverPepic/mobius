@@ -223,3 +223,15 @@ def test_a_chat_without_a_goal_is_told_to_promote_first(client, owner_token, db)
 
   assert written.status_code == 409
   assert "Promote one first" in written.json()["detail"]["message"]
+
+
+def test_a_task_note_may_run_to_a_thousand_characters(client, owner_token, db):
+  _, chat_id = _active_goal(client, owner_token, db)
+  _seed_plan(client, db, chat_id)
+
+  kept = _update(client, db, chat_id, {"tasks": [{"id": "inspect", "note": "n" * 1000}]})
+  refused = _update(client, db, chat_id, {"tasks": [{"id": "inspect", "note": "n" * 1001}]})
+
+  assert kept.status_code == 200, kept.text
+  assert refused.status_code == 422
+  assert "at most 1000 characters" in refused.json()["detail"]["message"]

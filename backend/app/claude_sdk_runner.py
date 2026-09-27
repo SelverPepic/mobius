@@ -236,8 +236,8 @@ _CLAUDE_BUILTIN_HELPER_TOOLS = (
   "Task",
 )
 # The tools through which a turn can save an owner-input card: the platform's
-# card tools, plus Bash for the `owner_approval.py` / `secure-input` helper
-# fallbacks, which print the same receipt. Naming them keeps the card-end
+# card tools, plus Bash for the `mobius_control_mcp.py call` / `secure-input`
+# command-line fallbacks, which print the same receipt. Naming them keeps the card-end
 # hook from cutting on an unrelated tool that merely echoes receipt-shaped JSON
 # — notably a Task result quoting a child agent's card.
 _CLAUDE_OWNER_CARD_TOOLS = (

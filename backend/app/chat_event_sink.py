@@ -400,8 +400,6 @@ class ChatEventSink:
     # the next snapshot (or the terminal finalize) appends the continuation as
     # a fresh assistant message.
     self._steering = False
-    # Fresh owner input authorizes one return to unfinished Goal work.
-    self.owner_steer_committed = False
     self._lifecycle_writes: list[tuple[RecordAgentLifecycle, object]] = []
     # Some providers stream command output but omit the final aggregate. Keep
     # only the bounded raw tail needed by protocol receipts; presentation
@@ -1440,9 +1438,6 @@ class ChatEventSink:
       user_msgs, consume_pending_cids,
     )
     stored_messages = stored_result["stored_messages"]
-    self.owner_steer_committed |= bool(
-      stored_result.get("owner_steer_committed", False)
-    )
     try:
       self.bc.publish(steered_into_turn_event(
         stored_messages,
@@ -1607,21 +1602,6 @@ class ChatEventSink:
       block.get("type") == "question"
       and block.get("question_id") == question_id
       and block.get("response_mode") == "continuation"
-      for block in self.assistant_blocks
-    )
-
-  def has_open_continuation_card(self) -> bool:
-    """Whether this turn already handed its next move to the owner.
-
-    QuestionCommit saves the card through the writer's session; terminal Goal
-    settlement may still hold an older Chat in its own identity map. Read the
-    same-turn handoff from its owning sink instead of that cached transcript.
-    A failed save scrubs the card before returning to the caller.
-    """
-    return any(
-      block.get("type") == "question"
-      and block.get("response_mode") == "continuation"
-      and not block.get("answers")
       for block in self.assistant_blocks
     )
 
