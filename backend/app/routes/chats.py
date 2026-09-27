@@ -1939,19 +1939,34 @@ def get_tool_output_by_id(
   # the requested prefix rather than materializing the full original value.
   row = query.with_entities(
     cast(models.ToolOutput.output, Text),
+    models.ToolOutput.created_at,
   ).first()
   if row is None:
     if is_chat_running(chat_id):
       return Response(status_code=202, headers={"Retry-After": "1"})
     raise HTTPException(status_code=404, detail="tool output not found")
 
+  output_chars = tool_output_length(row[0])
+  created_at = row[1]
+  age_days = None
+  if created_at is not None:
+    if created_at.tzinfo is None:
+      created_at = created_at.replace(tzinfo=UTC)
+    age_days = max(0, int(
+      (datetime.now(UTC) - created_at).total_seconds() // 86400
+    ))
+
   if preview:
-    preview_complete = tool_output_length(
-      row[0]
-    ) <= TOOL_OUTPUT_PREVIEW_CHARS
+    preview_complete = output_chars <= TOOL_OUTPUT_PREVIEW_CHARS
     output = decode_tool_output(
       row[0],
       max_chars=TOOL_OUTPUT_PREVIEW_CHARS,
+    )
+    activity.log_event(
+      "tool_output_read",
+      mode="preview",
+      age_days=age_days,
+      chars=output_chars,
     )
     return PlainTextResponse(
       output,
@@ -1960,8 +1975,15 @@ def get_tool_output_by_id(
         "X-Tool-Output-Complete": "1" if preview_complete else "0",
       },
     )
+  output = decode_tool_output(row[0])
+  activity.log_event(
+    "tool_output_read",
+    mode="full",
+    age_days=age_days,
+    chars=output_chars,
+  )
   return PlainTextResponse(
-    decode_tool_output(row[0]),
+    output,
     headers={"Cache-Control": "private, no-store"},
   )
 

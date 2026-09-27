@@ -6,6 +6,7 @@ the exact text on explicit copy. Also covers the reducer
 carrying tool identity + truncation metadata onto the persisted block."""
 import json
 import uuid
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import Text, cast, event as sqlalchemy_event
 
@@ -209,6 +210,46 @@ def test_tool_output_preview_inflates_only_the_bounded_prefix(client, auth, db):
     stored = _raw_tool_output(db, chat_id, "tu_preview")
     assert stored.startswith(TOOL_OUTPUT_STORAGE_PREFIX)
     assert len(stored) < len(big)
+
+
+def test_tool_output_reads_record_content_free_retention_evidence(
+    client, auth, db, monkeypatch,
+):
+    chat_id = str(uuid.uuid4())
+    big = "value signal\n" * 5000
+    db.add(models.Chat(id=chat_id, title="t", messages=[]))
+    db.add(models.ToolOutput(
+        chat_id=chat_id,
+        tool_use_id="tu_value",
+        output=big,
+        created_at=datetime.now(UTC) - timedelta(days=45),
+    ))
+    db.commit()
+    recorded = []
+    monkeypatch.setattr(
+        "app.routes.chats.activity.log_event",
+        lambda event, **fields: recorded.append((event, fields)) or True,
+    )
+
+    preview = client.get(
+        f"/api/chats/{chat_id}/tool-output/tu_value?preview=1",
+        headers=auth,
+    )
+    full = client.get(
+        f"/api/chats/{chat_id}/tool-output/tu_value",
+        headers=auth,
+    )
+
+    assert preview.status_code == 200
+    assert full.status_code == 200
+    assert recorded == [
+        ("tool_output_read", {
+            "mode": "preview", "age_days": 45, "chars": len(big),
+        }),
+        ("tool_output_read", {
+            "mode": "full", "age_days": 45, "chars": len(big),
+        }),
+    ]
 
 
 def test_tool_output_barrier_observes_latest_queued_stash(client, auth, db):

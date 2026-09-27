@@ -25,6 +25,7 @@ read both):
                            "chat_id"?, "duration_ms", "failure"?}
   {"ev":"provider_switch","ts", "chat_id", "provider", "from_provider"}
   {"ev":"chat_log_read",  "ts", "app_id", "scope", "count"}  # app read redacted logs
+  {"ev":"tool_output_read","ts", "mode", "age_days", "chars"}  # age may be null
   {"ev":"slug_collision", "ts", "requested_slug", "assigned_slug", "source"}
 
 `app_id` may be 0 / null for platform-level events (the bootstrap store
@@ -39,6 +40,9 @@ Deliberately NOT recorded: navigation / drawer / scroll / click and
 per-token chat deltas — high-frequency, low-signal UI noise that would
 drown the events that matter against the 90-day retention. `app_open`
 already captures which apps got used; `chat_sent` captures user turns.
+`tool_output_read` is the narrow exception: it records a successful lazy
+sidecar read, without chat/tool identity or content, so retention decisions can
+measure whether old expandable output is actually used instead of guessing.
 
 Rotation: weekly. On each write we check the timestamp of the active
 file's first parseable event; if it is older than 7 days we rename the
