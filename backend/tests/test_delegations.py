@@ -1180,15 +1180,15 @@ def _submit_activity(db, parent_id, delegation_id, root_run_id):
 @pytest.mark.parametrize("provider", ["claude", "codex"])
 @pytest.mark.parametrize("scenario", [
   "answered-question", "sibling-checkpoint",
-  "source-stopped", "nested-parent", "nested-follow-up", "already-delivered",
+  "source-stopped", "source-resumed", "nested-parent", "already-delivered",
 ])
 def test_newer_turn_never_strands_an_undelivered_helper_result(
   db, provider, scenario,
 ):
-  """A newer turn (an answered question card, or another root's automatic
-  checkpoint) does not supersede a helper whose exact result was never
-  delivered. Owner Stop of the source work, nested helper parents, and an
-  already-delivered result keep the chat quiet."""
+  """A newer turn (an answered question card, another root's automatic
+  checkpoint, or a helper's follow-up) does not supersede a helper whose exact
+  result was never delivered. Stopped source work and an already-delivered
+  result keep the chat quiet; resumed source work does not."""
   from app.chat_writer import StartContinuationBlocked
 
   suffix = f"newer-{scenario}-{provider}"
@@ -1201,19 +1201,21 @@ def test_newer_turn_never_strands_an_undelivered_helper_result(
   db.get(models.Delegation, delegation_id).provider = provider
   db.get(models.ChatRun, f"child-run-{suffix}").provider = provider
   source_root = _seed_idle_parent_wake_root(db, delegation_id)
-  if scenario == "source-stopped":
+  if scenario in ("source-stopped", "source-resumed"):
     db.get(models.ChatRun, source_root).status = "stopped"
-  if scenario in ("nested-parent", "nested-follow-up"):
+  if scenario == "source-resumed":
+    # The owner resumed the stopped work; its latest run completed.
+    db.add(make_goal_run(db,
+      id=f"resumed-{suffix}", root_run_id=source_root, chat_id=parent_id,
+      status="completed", provider=provider,
+      started_at=now_naive_utc() + timedelta(seconds=30),
+    ))
+  if scenario == "nested-parent":
+    # A helper whose follow-up turn finished before its own sub-helper did.
     _seed_delegation(db, suffix=f"{suffix}-outer", parent_id="outer-parent",
                      child_status=None)
     outer = db.get(models.Delegation, f"delegation-{suffix}-outer")
     outer.child_chat_id = parent_id
-  if scenario == "nested-follow-up":
-    # The sub-helper finished after the helper's follow-up turn started, so
-    # that turn never saw it. An older undelivered result stays quiet.
-    db.get(models.ChatRun, f"child-run-{suffix}").ended_at = (
-      now_naive_utc() + timedelta(minutes=5)
-    )
   if scenario == "already-delivered":
     db.get(models.Delegation, delegation_id).delivered_run_id = (
       f"child-run-{suffix}"
@@ -1228,7 +1230,6 @@ def test_newer_turn_never_strands_an_undelivered_helper_result(
 
   expected = {
     "source-stopped": "source_stopped",
-    "nested-parent": "parent_not_waiting",
     "already-delivered": "activity_unavailable",
   }.get(scenario)
   if expected is None:

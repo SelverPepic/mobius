@@ -5472,6 +5472,38 @@ def _add_delegation_result_identity(eng) -> None:
         ))
 
 
+def _settle_legacy_nested_helper_results(eng) -> None:
+  """Record results that delegated helpers already handled as delivered.
+
+  Before this migration a helper's own turns never latched its sub-helpers'
+  results (it read them directly instead), so every settled one still looks
+  owed. From now on a helper receives and latches them like any parent, and an
+  owed result may wake it; these historical ones must not revive helpers whose
+  work is long finished. Top-level parents always latched what they received,
+  so their owed results are genuine and stay owed.
+  """
+  from sqlalchemy import inspect as sa_inspect, text
+
+  inspector = sa_inspect(eng)
+  tables = set(inspector.get_table_names())
+  if not {"delegations", "chat_runs"} <= tables:
+    return
+  def latest_child(column: str) -> str:
+    return (
+      f"(SELECT r.{column} FROM chat_runs r "
+      "WHERE r.chat_id = delegations.child_chat_id "
+      "ORDER BY r.started_at DESC, r.id DESC LIMIT 1)"
+    )
+
+  with eng.begin() as conn:
+    conn.execute(text(
+      f"UPDATE delegations SET delivered_run_id = {latest_child('id')} "
+      "WHERE parent_chat_id IN (SELECT child_chat_id FROM delegations) "
+      f"AND {latest_child('status')} IN ('completed', 'failed') "
+      "AND (delivered_run_id IS NULL "
+      f"OR delivered_run_id != {latest_child('id')})"
+    ))
+
 _SCHEMA_MIGRATIONS = (
   # Full IDs are permanent identities, not sequence positions. Append new
   # work in execution order; never renumber a shipped ID to reconcile sources.
@@ -5553,6 +5585,7 @@ _SCHEMA_MIGRATIONS = (
   ("0069_chat_pending_queue_index", _add_chat_pending_queue_index),
   ("0070_delegation_goal_task", _add_delegation_goal_task),
   ("0071_delegation_result_identity", _add_delegation_result_identity),
+  ("0072_settle_nested_helper_results", _settle_legacy_nested_helper_results),
 )
 
 

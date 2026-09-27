@@ -1728,6 +1728,7 @@ def test_run_migrations_records_an_inspectable_append_only_history(tmp_path):
     "0069_chat_pending_queue_index",
     "0070_delegation_goal_task",
     "0071_delegation_result_identity",
+    "0072_settle_nested_helper_results",
   ]
   assert second == first
 
@@ -4600,3 +4601,73 @@ def test_delegation_goal_task_keeps_existing_name_links(tmp_path):
       "SELECT id, goal_task_id FROM delegations"
     )).all())
   assert links == {"old": "audit", "new": None}
+
+
+def test_nested_helper_migration_settles_only_results_a_helper_already_handled(
+  tmp_path,
+):
+  """0072 records settled sub-helper results of delegated parents as delivered.
+
+  Before it, a helper's own turns never latched those results, so they only
+  looked owed. A top-level parent's owed result and a still-running
+  sub-helper stay owed; an already-delivered one keeps its record.
+  """
+  eng = create_engine(f"sqlite:///{tmp_path / 'nested-results.db'}")
+  models.Base.metadata.create_all(eng)
+  with Session(eng) as session:
+    app = models.App(
+      slug="nested-results", source_dir="/tmp/nested-results",
+      name="Nested results", description="", jsx_source="",
+    )
+    session.add(app)
+    session.flush()
+    session.add(models.Chat(id="top", messages=[]))
+
+    def helper(name, parent, status, delivered=None):
+      session.add(models.Chat(
+        id=name, messages=[], created_by_app_id=app.id,
+      ))
+      session.flush()
+      session.add(models.Delegation(
+        id=f"delegation-{name}", app_id=app.id, parent_chat_id=parent,
+        parent_root_run_id="root", task_key=name, child_chat_id=name,
+        provider="claude", scope="read", cwd="/tmp", prompt_sha256="0" * 64,
+        notify_parent_on_complete=True, delivered_run_id=delivered,
+      ))
+      session.add(models.ChatRun(
+        id=f"{name}-run", chat_id=name, status=status, provider="claude",
+        started_at=datetime(2026, 9, 20, 10),
+      ))
+
+    helper("outer", "top", "completed")
+    helper("sub-done", "outer", "completed")
+    helper("sub-failed", "outer", "failed")
+    helper("sub-running", "outer", "running")
+    helper("sub-delivered", "outer", "completed", delivered="sub-delivered-run")
+    session.commit()
+  with eng.begin() as conn:
+    conn.execute(text(
+      "CREATE TABLE IF NOT EXISTS schema_migrations ("
+      "version VARCHAR(128) PRIMARY KEY, applied_at TIMESTAMP NOT NULL)"
+    ))
+    for version in _migration_versions_before(
+      "0072_settle_nested_helper_results",
+    ):
+      conn.execute(text(
+        "INSERT INTO schema_migrations (version, applied_at) VALUES (:v, :at)"
+      ), {"v": version, "at": datetime(2026, 9, 20)})
+
+  run_migrations(eng)
+  run_migrations(eng)
+
+  with eng.connect() as conn:
+    delivered = dict(conn.execute(text(
+      "SELECT id, delivered_run_id FROM delegations"
+    )).all())
+  assert delivered == {
+    "delegation-outer": None,
+    "delegation-sub-done": "sub-done-run",
+    "delegation-sub-failed": "sub-failed-run",
+    "delegation-sub-running": None,
+    "delegation-sub-delivered": "sub-delivered-run",
+  }
