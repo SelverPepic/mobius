@@ -181,6 +181,9 @@ async function fetchChats({ signal, timeoutMs, cache } = {}) {
   const read = ++chatListReads.started
   const res = await api.chats.list({ signal, timeoutMs, cache })
   const data = await jsonOrThrow(res, 'chats fetch failed:')
+  // A replaced read may finish decoding after its abort; its rows never reach
+  // the cache, so it must not count as landed.
+  signal?.throwIfAborted()
   chatListReads.landed = Math.max(chatListReads.landed, read)
   return Array.isArray(data) ? data : []
 }
