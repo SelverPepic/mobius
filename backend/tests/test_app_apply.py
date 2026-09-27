@@ -1118,6 +1118,55 @@ def test_store_local_apply_preserves_reviewed_manifest_authority(
   assert app_git._run(source, "status", "--porcelain").stdout == ""
 
 
+def test_store_ordinary_apply_warns_when_local_package_declarations_diverge(
+  client, auth, db,
+):
+  source = _source()
+  created = _apply(client, auth, source)
+  app_id = created.json()["app"]["id"]
+  row = db.query(models.App).populate_existing().filter_by(id=app_id).one()
+  # Store-managed, with a reviewed contract that matches the current local
+  # manifest (no declared tools). An ordinary apply that only edits code must
+  # stay quiet — the local package hasn't diverged.
+  row.manifest_url = "https://store.example/demo/mobius.json"
+  row.capability_contract = app_apply.contract_from_manifest(
+    json.loads((source / "mobius.json").read_text())
+  )
+  db.commit()
+
+  (source / "index.jsx").write_text(
+    "export default function App() { return <div>code only</div> }\n"
+  )
+  quiet = _apply(client, auth, source)
+  assert quiet.status_code == 200, quiet.text
+  assert quiet.json()["mode"] == "updated"
+  assert quiet.json()["warnings"] == []
+
+  # Declaring a new service-backed tool locally diverges from the reviewed
+  # package. Ordinary apply must warn AND must not silently adopt the tool.
+  manifest = json.loads((source / "mobius.json").read_text())
+  manifest["service"] = {"entry": "service.py"}
+  manifest["source_files"] = ["service.py"]
+  manifest["tools"] = [{
+    "name": "search",
+    "description": "Search things.",
+    "input_schema": {"type": "object", "properties": {}},
+  }]
+  (source / "mobius.json").write_text(json.dumps(manifest))
+  (source / "service.py").write_text("# local service\n")
+  (source / "index.jsx").write_text(
+    "export default function App() { return <div>tool added</div> }\n"
+  )
+
+  diverged = _apply(client, auth, source)
+  assert diverged.status_code == 200, diverged.text
+  assert diverged.json()["warnings"] == [
+    app_apply._STORE_LOCAL_PACKAGE_DIVERGED
+  ]
+  row = db.query(models.App).populate_existing().filter_by(id=app_id).one()
+  assert not (row.capability_contract.get("agent") or {}).get("tools")
+
+
 def test_store_local_package_apply_explicitly_accepts_manifest_authority(
   client, auth, db,
 ):
