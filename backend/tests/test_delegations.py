@@ -1180,7 +1180,7 @@ def _submit_activity(db, parent_id, delegation_id, root_run_id):
 @pytest.mark.parametrize("provider", ["claude", "codex"])
 @pytest.mark.parametrize("scenario", [
   "answered-question", "sibling-checkpoint",
-  "source-stopped", "nested-parent", "already-delivered",
+  "source-stopped", "nested-parent", "nested-follow-up", "already-delivered",
 ])
 def test_newer_turn_never_strands_an_undelivered_helper_result(
   db, provider, scenario,
@@ -1203,11 +1203,17 @@ def test_newer_turn_never_strands_an_undelivered_helper_result(
   source_root = _seed_idle_parent_wake_root(db, delegation_id)
   if scenario == "source-stopped":
     db.get(models.ChatRun, source_root).status = "stopped"
-  if scenario == "nested-parent":
+  if scenario in ("nested-parent", "nested-follow-up"):
     _seed_delegation(db, suffix=f"{suffix}-outer", parent_id="outer-parent",
                      child_status=None)
     outer = db.get(models.Delegation, f"delegation-{suffix}-outer")
     outer.child_chat_id = parent_id
+  if scenario == "nested-follow-up":
+    # The sub-helper finished after the helper's follow-up turn started, so
+    # that turn never saw it. An older undelivered result stays quiet.
+    db.get(models.ChatRun, f"child-run-{suffix}").ended_at = (
+      now_naive_utc() + timedelta(minutes=5)
+    )
   if scenario == "already-delivered":
     db.get(models.Delegation, delegation_id).delivered_run_id = (
       f"child-run-{suffix}"
@@ -1256,6 +1262,43 @@ def test_newer_turn_wake_keeps_the_helpers_own_goal(db):
   assert run.goal_id == "goal-a"
   assert run.goal_objective == "Finish goal A"
   assert run.root_run_id == root
+
+
+@pytest.mark.parametrize("goal_status", ["open", "completed"])
+def test_reopened_goal_is_judged_by_its_status_not_an_old_stop(db, goal_status):
+  """Goal A was stopped, then reopened; its helper finishes after a Goal B
+  turn. The Goal's current status decides, not the historical stop."""
+  from app.chat_writer import StartContinuationBlocked
+
+  suffix = f"reopened-{goal_status}"
+  parent_id, _child_id, delegation_id = _seed_delegation(
+    db, suffix=suffix, parent_root_id=f"goal-{suffix}",
+    result_blocks=[{"type": "text", "content": "Goal A result."}],
+  )
+  earlier = now_naive_utc() - timedelta(minutes=30)
+  db.add(make_goal_run(db,
+    id=f"stopped-{suffix}", root_run_id=f"stopped-{suffix}", chat_id=parent_id,
+    status="stopped", provider="claude", started_at=earlier, ended_at=earlier,
+    goal_objective="Finish goal A", goal_id=f"goal-{suffix}",
+  ))
+  db.commit()
+  root = _seed_idle_parent_wake_root(
+    db, delegation_id, goal_objective="Finish goal A",
+  )
+  db.get(models.ChatGoal, f"goal-{suffix}").status = goal_status
+  db.commit()
+  _seed_later_parent_turn(
+    db, parent_id, f"later-{suffix}", goal_objective="Finish goal B",
+  )
+
+  token, result = _submit_activity(db, parent_id, delegation_id, root)
+
+  if goal_status == "open":
+    assert not isinstance(result, StartContinuationBlocked), result
+    db.expire_all()
+    assert db.get(models.ChatRun, token).goal_id == f"goal-{suffix}"
+  else:
+    assert result == StartContinuationBlocked("goal_closed")
 
 
 def test_activity_scope_keeps_goal_source_distinct_from_physical_root(db):

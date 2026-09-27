@@ -2474,8 +2474,12 @@ async def steer_results_into_running_parent(
       if list(chat.pending_messages or []):
         return False
       rows = _wake_eligible_rows_for_parent(db, parent_chat_id, source_work_id)
-      recorded = _recorded_parent_wake_ids(db, parent_chat_id)
-      rows = [row for row in rows if row.id not in recorded]
+      # A result the live turn already admitted into its context latches only
+      # at Finalize; steering it again would hand the provider a duplicate.
+      skip = _recorded_parent_wake_ids(db, parent_chat_id) | (
+        _delivered_to_live_parent_runs(db, {parent_chat_id})
+      )
+      rows = [row for row in rows if row.id not in skip]
       if not rows:
         return False
       results = settled_result_run_ids(db, [row.id for row in rows])

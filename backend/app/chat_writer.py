@@ -3931,14 +3931,25 @@ class ChatWriterActor:
     # was never delivered: every turn that incorporated it would have latched
     # delivered_run_id atomically. Timing cannot prove that, because scoped
     # activity turns and the per-turn result cap can leave a result unseen.
-    # Owner authority still wins: stopped source work stays stopped. A
-    # delegated helper's later turns are its parent's follow-ups, so a nested
-    # parent keeps the exact-source rule.
+    # Owner authority still wins: stopped source work stays stopped.
+    # A delegated helper additionally needs a result that settled after its
+    # latest turn (for example a follow-up) started. Before helper turns
+    # latched their own sub-helpers' results, none were ever recorded, so an
+    # older undelivered result proves nothing and must not revive the helper.
     if latest_source != cmd.source_work_id and db.query(
       models.Delegation.id,
     ).filter(models.Delegation.child_chat_id == cmd.chat_id).first() is not None:
-      db.rollback()
-      return StartContinuationBlocked("parent_not_waiting")
+      result_run = db.query(ChatRun).filter(
+        ChatRun.chat_id == trigger.child_chat_id,
+      ).order_by(ChatRun.started_at.desc(), ChatRun.id.desc()).first()
+      if (
+        result_run is None
+        or result_run.ended_at is None
+        or latest.started_at is None
+        or result_run.ended_at <= latest.started_at
+      ):
+        db.rollback()
+        return StartContinuationBlocked("parent_not_waiting")
     source_runs = db.query(ChatRun).filter(
       ChatRun.chat_id == cmd.chat_id,
       or_(
@@ -3947,12 +3958,6 @@ class ChatWriterActor:
         ChatRun.goal_id == cmd.source_work_id,
       ),
     )
-    if latest_source != cmd.source_work_id and source_runs.filter(
-      ChatRun.status == "stopped",
-    ).first() is not None:
-      db.rollback()
-      return StartContinuationBlocked("source_stopped")
-
     from app.run_state import _recoverable_result_goal
     source_goal_run = (
       latest if latest_source == cmd.source_work_id
@@ -3960,6 +3965,15 @@ class ChatWriterActor:
         ChatRun.goal_id == cmd.source_work_id,
       ).order_by(ChatRun.started_at.desc(), ChatRun.id.desc()).first()
     )
+    # A Goal's own status is the authority for Goal work (it can be stopped
+    # and reopened); only a plain root is judged by its stopped runs.
+    if (
+      latest_source != cmd.source_work_id
+      and (source_goal_run is None or not source_goal_run.goal_id)
+      and source_runs.filter(ChatRun.status == "stopped").first() is not None
+    ):
+      db.rollback()
+      return StartContinuationBlocked("source_stopped")
     if (
       source_goal_run is not None
       and source_goal_run.goal_id

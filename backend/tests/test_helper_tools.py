@@ -255,6 +255,27 @@ def test_a_result_is_steered_into_the_running_parent_turn_once(db, monkeypatch):
   assert delegations_mod.available_delegation_results(db, parent_id) == []
 
 
+def test_a_result_the_live_turn_already_admitted_is_not_steered_again(
+  db, monkeypatch,
+):
+  """A result admitted into the running turn's opening context latches only at
+  Finalize; the helper's delayed settle hook must not steer it in twice."""
+  parent_id, child_id, delegation_id = _running_parent(db, "steer-admitted")
+  db.get(models.ChatRun, "root-steer-admitted").activity_delivery_json = {
+    "delegation_ids": [delegation_id],
+    "result_run_ids": {delegation_id: "child-run-steer-admitted"},
+    "delivery_contract": delegations_mod.ACTIVITY_DELIVERY_FINALIZE_ATOMIC,
+  }
+  db.commit()
+  steered = _live_parent(monkeypatch, accepted=True)
+
+  asyncio.run(delegations_mod.wake_parent_after_child_settled(child_id))
+
+  assert steered == []
+  db.expire_all()
+  assert db.get(models.Delegation, delegation_id).delivered_run_id is None
+
+
 def test_a_reopened_helper_result_is_steered_again_not_deduplicated(
   db, monkeypatch,
 ):
