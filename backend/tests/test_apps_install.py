@@ -6805,3 +6805,39 @@ def test_ordinary_store_source_apply_preserves_package_assets_and_runtime_manife
   db.refresh(row)
   assert (runtime_root(row) / "mobius.json").read_bytes() == old_manifest
   assert client.get(f"/app-assets/by-id/{row.id}/asset.txt").content == b"accepted static"
+
+
+def test_update_check_offers_manifest_only_release_over_legacy_baseline(
+  client, auth, db, bypass_url_validation,
+):
+  """A migration baseline without mobius.json cannot hide a new release.
+
+  The legacy bridge records only code, so a release that changes nothing but
+  the manifest (version, offline metadata) must still be offered once;
+  installing it replaces the bridge with an exact package record.
+  """
+  base = "https://uc-legacy.test/repo/"
+  m = {**MANIFEST_NEWS, "id": "uc-legacy"}
+  r1 = _install_v1(client, auth, base, m, JSX)
+  assert r1.status_code == 201, r1.text
+  app_id = r1.json()["id"]
+  repo = db.query(models.App).filter(models.App.id == app_id).one().source_dir
+
+  assert "mobius.json" not in app_git.read_ref_tree(Path(repo), "upstream")
+
+  unchanged = _update_check(
+    client, auth, base, app_id, {**m, "version": "1.0.1"}, JSX,
+  )
+  # A plain URL import has no origin to adopt, so it keeps comparing code.
+  assert unchanged.json()["update_available"] is False
+
+  # The migration attaches the catalog repository as origin.
+  subprocess.run(
+    ["git", "-C", repo, "remote", "add", "origin",
+     "https://github.com/example/uc-legacy.git"],
+    check=True,
+  )
+  res = _update_check(client, auth, base, app_id, {**m, "version": "1.0.1"}, JSX)
+
+  assert res.status_code == 200, res.text
+  assert res.json()["update_available"] is True
