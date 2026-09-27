@@ -150,7 +150,7 @@ def _codex_config_overrides() -> list[str]:
   Helpers are Möbius's too: agents delegate with ``spawn_agent`` on the
   Möbius control server, whose helpers run on any provider, outlive the turn,
   and share a helper host (see ``helper_hosts``). Codex's own helper tools are
-  therefore switched off; ``CODEX_NATIVE_HELPERS_OFF`` names the settings that
+  therefore switched off; ``CODEX_NATIVE_HELPERS_OFF`` names the settings this
   requires.
   """
   overrides = list(_CODEX_PROMPT_CONTROL_OVERRIDES)
