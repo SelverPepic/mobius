@@ -2436,13 +2436,16 @@ def _final_tree_merge(repo: Path, source: str, target: str) -> app_git.MergeResu
 
   Reviewed contribution provenance may supply a newer shared base that removes
   duplicate-change conflicts; otherwise it is Git's ordinary three-way merge.
-  Review, Apply and the agent handoff all call this, so the conflict Review
-  predicts is the conflict Apply would park. It writes Git objects only; no
-  ref, index or working tree moves.
+  A local draft of a contribution the release merged in revised form is set
+  aside first, so the merged version arrives instead of a draft-vs-final
+  conflict. Review, Apply and the agent handoff all call this, so the conflict
+  Review predicts is the conflict Apply would park. It writes Git objects only;
+  no ref, index or working tree moves.
   """
+  local = app_git.without_superseded_drafts(repo, source, target)
   return (
-    app_git.merge_with_equivalent_changes(repo, source, target)
-    or app_git.merge_refs(repo, source, target)
+    app_git.merge_with_equivalent_changes(repo, local, target)
+    or app_git.merge_refs(repo, local, target)
   )
 
 

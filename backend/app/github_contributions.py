@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -63,6 +64,9 @@ _PERSONAL_PUBLIC_INPUT_FIELDS = (
   "head_repository", "publication_stage", "submission_mode", "submitter",
   "plan", "quality_review",
 )
+
+log = logging.getLogger(__name__)
+
 _PREPARED_PR_ACTIONS = frozenset(("pr", "pr_update"))
 
 
@@ -879,6 +883,33 @@ def _merged_upstream_sha(record: dict, repo: Path) -> str | None:
   return candidate if _GIT_SHA.fullmatch(candidate) else None
 
 
+def _mark_superseded_draft(
+  record: dict, repo: Path, upstream_sha: str | None,
+) -> str | None:
+  """Hand the updater the live draft a merged, revised contribution replaces.
+
+  Staging records ``source_sync.draft`` only while the live source holds an
+  earlier version than the one reviewed (``diverged``); the merge commit then
+  supersedes that exact draft.
+  """
+  sync = record.get("source_sync") if isinstance(record.get("source_sync"), dict) else {}
+  draft = sync.get("draft") if sync.get("state") == "diverged" else None
+  if not isinstance(draft, dict) or not upstream_sha:
+    return None
+  try:
+    return app_git.mark_draft_superseded(
+      repo,
+      contribution_id=str(record.get("id") or ""),
+      base_sha=str(draft.get("base_sha") or ""),
+      head_sha=str(draft.get("head_sha") or ""),
+      upstream_sha=upstream_sha,
+      draft_ref=draft.get("ref"),
+    )
+  except (OSError, subprocess.SubprocessError, RuntimeError):
+    log.warning("could not record a superseded draft", exc_info=True)
+    return None
+
+
 def _settle_equivalence(record: dict, upstream_sha: str | None = None) -> str | None:
   """Promote or discard the pending witness when GitHub settles the PR."""
   plan = record.get("plan") if isinstance(record.get("plan"), dict) else {}
@@ -888,6 +919,7 @@ def _settle_equivalence(record: dict, upstream_sha: str | None = None) -> str | 
   repo, _review_repo = repos
   digest = str(plan.get("diff_sha256") or "")
   if record.get("status") == "merged":
+    _mark_superseded_draft(record, repo, upstream_sha)
     equivalent = app_git.mark_equivalent_change_landed(
       repo, digest, upstream_sha=upstream_sha,
     )
