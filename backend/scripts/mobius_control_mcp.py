@@ -513,7 +513,8 @@ def _goal_report(payload: dict[str, Any], *, full: bool) -> str:
         f"- {task.get('id')} [{task.get('status')}]{parent}{depends}: "
         f"{task.get('title')}" + (f" — {detail}" if detail else "")
       )
-    if goal.get("next_action"):
+    # A settled Goal has no next step; its last handoff note is history.
+    if goal.get("next_action") and goal.get("status") == "open":
       lines.append(f"Next action: {goal['next_action']}")
   return "\n".join(lines)
 
