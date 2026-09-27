@@ -2867,8 +2867,17 @@ def late_edits_pending() -> bool:
   record = read_prepared_update()
   return (
     record is not None and record["state"] == "swapped"
-    and not record["replayed"]
+    and not _serves_replayed(record)
   )
+
+
+def _serves_replayed(record: PreparedUpdate, repo: Path = PLATFORM_REPO) -> bool:
+  """Whether this server imported the merged-back late edits (or newer)."""
+  served = _served_platform_sha()
+  return bool(record["replayed"] and served and (
+    served == record["replayed"]
+    or _is_ancestor(repo, record["replayed"], served)
+  ))
 
 
 def _swap_position(repo: Path, record: PreparedUpdate, head: str) -> str:
@@ -2877,7 +2886,10 @@ def _swap_position(repo: Path, record: PreparedUpdate, head: str) -> str:
   previous state restored (``not_swapped``), or something else."""
   if head == record["prepared"]:
     return "pending"
-  if head == record["replayed"] or _is_ancestor(repo, record["prepared"], head):
+  if record["replayed"]:
+    if head == record["replayed"] or _is_ancestor(repo, record["replayed"], head):
+      return "replayed"
+  elif _is_ancestor(repo, record["prepared"], head):
     # Nothing but the merge-back moves the checkout between the swap and the
     # first started server, so a descendant of the update is its result even
     # if the process died before recording it.
@@ -3008,12 +3020,14 @@ def complete_platform_swap(repo: Path = PLATFORM_REPO) -> str | None:
       # Boot did not merge the late edits back before this process imported
       # the update (an older image or a failed boot step), so it cannot have
       # loaded them: merge now and record the restart that loads them.
+      # The record stays: this server never loaded the merged tree, so the
+      # next boot must still be able to return a tree that cannot start to
+      # the saved previous state, and resumes wait for that restart.
       outcome = _replay_late_edits(repo, record)
       if outcome == "replayed":
         _record_update_activation(
           repo, _rev(repo, local), recorded_upstream_sha(repo),
         )
-        _clear_prepared_update(repo)
     elif position == "replayed" and record["replayed"] != head:
       _write_prepared_update({**record, "replayed": head})
     # The source moved while the server was down: install a changed
@@ -3035,12 +3049,9 @@ def confirm_platform_swap_loaded(repo: Path = PLATFORM_REPO) -> bool:
   fallback) leaves the record for the next platform boot."""
   with _reconcile_flock():
     record = read_prepared_update()
-    if record is None or record["state"] != "swapped" or not record["replayed"]:
-      return False
-    served = _served_platform_sha()
-    if not served or not (
-      served == record["replayed"]
-      or _is_ancestor(repo, record["replayed"], served)
+    if (
+      record is None or record["state"] != "swapped"
+      or not _serves_replayed(record, repo)
     ):
       return False
     _clear_prepared_update(repo)
@@ -3374,6 +3385,10 @@ def reconcile_clone_sync() -> str:
   hooks. The shell's separate boot guard remains fail-closed if preparation
   fails or is interrupted.
   """
+  # Boot writes the served tree through ``su``, whose login umask can leave
+  # rewritten files group-writable, and the served-runtime check then falls
+  # back to the baked platform. Files written here keep the image's mode.
+  os.umask(0o022)
   try:
     with _reconcile_flock():
       recovery = boot_guard_clean_served_tree(PLATFORM_REPO)
@@ -3416,6 +3431,7 @@ def boot_guard_sync() -> str:
   guard is the final proof that the served tree is clean. Booting after a guard
   error would silently bypass the safety boundary it exists to enforce.
   """
+  os.umask(0o022)  # As in reconcile_clone_sync: never a group-writable tree.
   with _reconcile_flock():
     return boot_guard_clean_served_tree(PLATFORM_REPO)
 
