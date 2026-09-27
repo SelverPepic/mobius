@@ -90,7 +90,6 @@ import {
 } from './workspacePlacement.js'
 import {
   appCrashReportDraft,
-  appUpdateStaleMessage,
   findAppStoreApp,
 } from '../../lib/appRecovery.js'
 import {
@@ -3090,18 +3089,9 @@ export default function Shell({ onInitialVisualReady }) {
       // not cover the composer; actionable update drift uses app_update_stale.
       return
     } else if (ev.type === 'app_update_stale') {
-      // The reviewed candidate changed while a conflict was being resolved.
-      // Keep the prior live version explicit and take the owner back to the
-      // canonical review surface when the bootstrapped store is available.
-      const appStore = findAppStoreApp(appsRef.current)
-      showToast(appUpdateStaleMessage(ev), {
-        variant: 'error',
-        duration: 12000,
-        action: appStore ? {
-          label: 'Open App Store',
-          onAction: () => navToRef.current('canvas', { appId: appStore.id }),
-        } : undefined,
-      })
+      // A reviewed candidate changed while a conflict was being resolved. The
+      // previous version keeps running, so this is never worth interrupting
+      // the owner for; the store's own update check is the discovery surface.
     } else if (ev.type === 'chat_owner_input_changed') {
       if (ev.chatId) {
         markChatOwnerInput(ev.chatId, ownerInputChangeFromEvent(ev))
