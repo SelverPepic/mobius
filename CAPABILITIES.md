@@ -131,8 +131,10 @@ on stdout: `{ "status": 200, "body": ..., "headers": {...} }`. The platform
 owns authentication, immutable source selection, the short-lived app token,
 8 MiB request/response ceilings, timeout, concurrency, and response-header
 safety. Private and public requests use separate serialized lanes so a private
-request can synchronously receive a public callback without deadlocking. Those
-lanes may run at the same time; when both can touch the same state, the app must
+request can synchronously receive a public callback without deadlocking. An
+agent-tool call (below) runs on a third lane that is not serialized per app, so
+several can run at once alongside the two request lanes. When lanes that run at
+the same time can touch the same state, the app must
 provide its own file or database locking.
 The app owns its paths, policy, storage format, and domain behavior. This is a
 reviewed trusted process like an app job, not an operating-system sandbox.
@@ -146,8 +148,13 @@ manifest `id`, repository, or installed slug changes. These are explicit
 install-time grants and do not widen the service app token's accepted
 permissions. The generic routes are the whole contract: the platform does not
 carry app-specific path aliases. Services receive the same `APP_ID`, `APP_SLUG`,
-`APP_STORAGE_DIR`, `API_BASE_URL`, and short-lived
-`APP_TOKEN` environment as other reviewed app-owned processes.
+`APP_STORAGE_DIR`, `API_BASE_URL`, and short-lived `APP_TOKEN` environment as
+other reviewed app-owned processes. A service reached only through an
+authenticated caller (`self` or `apps` access) additionally receives the
+provider-credential locations `DATA_DIR`, `CLAUDE_CONFIG_DIR`, and `CODEX_HOME`,
+so it may run a provider CLI as its scheduled job can; a publicly reachable
+(`public`) service never receives them, so an anonymous visitor cannot spend on
+the owner's provider accounts.
 
 Project output formats are app-owned too. A `project_templates[].artifact_types`
 declaration names the source extensions, preview kind, output path, and reviewed

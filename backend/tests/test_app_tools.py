@@ -357,6 +357,6 @@ def test_every_layer_waits_longer_than_the_one_inside_it():
 def test_every_app_response_shows_the_reviewed_tools(client, auth, db):
   app = _app(db)
   shown = client.get(f"/api/apps/{app.id}", headers=auth).json()
-  assert shown["agent_tools"] == [LOG_TOOL]
+  assert shown["capability_contract"]["agent"]["tools"] == [LOG_TOOL]
   listed = {row["id"]: row for row in client.get("/api/apps/", headers=auth).json()}
-  assert listed[app.id]["agent_tools"] == [LOG_TOOL]
+  assert listed[app.id]["capability_contract"]["agent"]["tools"] == [LOG_TOOL]

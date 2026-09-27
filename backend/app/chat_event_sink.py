@@ -56,6 +56,7 @@ from app.agent_activity import (
   activity_from_app_tool,
   activity_from_command,
   app_tool_result_text,
+  is_app_tool_call,
   activity_from_result,
   activity_from_task_output,
   activity_without_receipt,
@@ -616,11 +617,19 @@ class ChatEventSink:
       return
     pending = self._app_activity_for_tool(event.get("tool_use_id"))
     if event.get("output_complete") and pending is not None:
-      content = app_tool_result_text(
-        event.get("content")
-        if result_content is None
-        else result_content
+      blk = _tool_block_for_event(self.assistant_blocks, event.get("tool_use_id"))
+      content = (
+        event.get("content") if result_content is None else result_content
       )
+      # A provider reports an app tool's result as text (Claude) or as the JSON
+      # of the MCP result object (Codex); its receipt is a line inside that
+      # text. A shell-command activity's output is already that text, so only
+      # unwrap for an app-tool call.
+      if is_app_tool_call(
+        blk.get("tool") if isinstance(blk, dict) else None,
+        self._agent_activity_binding,
+      ):
+        content = app_tool_result_text(content)
       dispatch = background_dispatch(content)
       if dispatch is not None and event.get("output_exit_code") in (None, 0):
         event["app_activity"] = defer_activity(pending, dispatch)
@@ -633,9 +642,6 @@ class ChatEventSink:
         # terminal aggregate. Prefer any transcript-facing streamed tail:
         # App receipts print last, so the streamed tail is sufficient without
         # accumulating unbounded command output in a second buffer.
-        blk = _tool_block_for_event(
-          self.assistant_blocks, event.get("tool_use_id"),
-        )
         streamed = blk.get("output") if isinstance(blk, dict) else None
         if isinstance(streamed, str) and streamed.strip():
           content = streamed

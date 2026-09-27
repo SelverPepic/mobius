@@ -106,13 +106,15 @@ def service_entry(app, service: dict) -> Path:
   return entry
 
 
-def service_environment(app, owner) -> dict[str, str]:
-  # The same allowlist as scheduled app jobs: a reviewed service may run a
-  # provider CLI (Memory's recall navigator does) exactly as its job can.
-  allowed = {
-    "PATH", "LANG", "LC_ALL", "TZ", "HOME",
-    "DATA_DIR", "CLAUDE_CONFIG_DIR", "CODEX_HOME",
-  }
+def service_environment(app, owner, *, provider_credentials: bool) -> dict[str, str]:
+  allowed = {"PATH", "LANG", "LC_ALL", "TZ", "HOME"}
+  if provider_credentials:
+    # A reviewed service reached only through an authenticated caller may run a
+    # provider CLI (Memory's recall navigator does), so it receives the same
+    # credential locations as its scheduled job. A publicly reachable service
+    # never does: an anonymous visitor must not be able to spend on the owner's
+    # provider accounts.
+    allowed |= {"DATA_DIR", "CLAUDE_CONFIG_DIR", "CODEX_HOME"}
   env = {key: value for key, value in os.environ.items() if key in allowed}
   settings = get_settings()
   env.update({
@@ -200,6 +202,13 @@ async def invoke_service(
   service = service_contract(
     app, access="public" if request_envelope.get("public") else "self",
   )
+  # Provider-credential locations reach a service only when every path to it is
+  # authenticated: never on a public invocation, and never for a service the
+  # owner reviewed as publicly reachable.
+  provider_credentials = (
+    not request_envelope.get("public")
+    and service.get("access", "self") != "public"
+  )
   try:
     request_bytes = json.dumps(
       request_envelope, ensure_ascii=False, separators=(",", ":"),
@@ -245,7 +254,7 @@ async def invoke_service(
           stdout=asyncio.subprocess.PIPE,
           stderr=asyncio.subprocess.PIPE,
           cwd=str(entry.parent),
-          env=service_environment(app, owner),
+          env=service_environment(app, owner, provider_credentials=provider_credentials),
           start_new_session=True,
         ))
         try:

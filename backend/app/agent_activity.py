@@ -169,17 +169,28 @@ def _running(command: ActivityCommand) -> dict:
   }
 
 
-def activity_from_app_tool(
+def _declared_app_tool(
   tool: object, binding: AgentActivityBinding,
-) -> dict | None:
-  """Return the running card for a call to an installed app's agent tool."""
+) -> ActivityCommand | None:
   if not isinstance(tool, str):
     return None
   for prefix in _CONTROL_TOOL_PREFIXES:
     if tool.startswith(prefix):
-      declared = binding.by_app_tool.get(tool[len(prefix):])
-      return _running(declared) if declared is not None else None
+      return binding.by_app_tool.get(tool[len(prefix):])
   return None
+
+
+def activity_from_app_tool(
+  tool: object, binding: AgentActivityBinding,
+) -> dict | None:
+  """Return the running card for a call to an installed app's agent tool."""
+  declared = _declared_app_tool(tool, binding)
+  return _running(declared) if declared is not None else None
+
+
+def is_app_tool_call(tool: object, binding: AgentActivityBinding) -> bool:
+  """Whether this tool call is to an installed app's agent tool, not a command."""
+  return _declared_app_tool(tool, binding) is not None
 
 
 def app_tool_result_text(content: object) -> object:

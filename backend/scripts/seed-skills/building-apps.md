@@ -272,7 +272,10 @@ manifest, layered by how always-on they are:
   app's own authority (`backend/app/app_tools.py`). Helpers get the tools too:
   the request's `actor` has `delegated: true` for a helper and
   `access: "read"` for a read-only one, so refuse any change for a read-only
-  caller. Keep tools few.
+  caller. Tool calls run on their own concurrency lane that is NOT serialized
+  per app (unlike a service's private/public requests), so several — from this
+  chat, other chats, or helpers — can reach the service at once; a tool that
+  writes must do its own file or database locking. Keep tools few.
 
 Anything that depends on your app being installed belongs in its fragment (the
 always-on default) and/or its skill (the how-to). A not-installed app then
@@ -281,10 +284,12 @@ prompt in the Skills app.
 
 ### App-owned agent activity cards
 
-An app whose skill asks the agent to run one of its scripts can declare that
-command as an activity. This is presentation only: it grants no storage,
-network, or execution authority. The shell authenticates the app and command;
-the app owns all domain language and result links.
+An app can declare an activity card for either an agent tool it exposes or a
+script its skill asks the agent to run. This is presentation only: it grants no
+storage, network, or execution authority. The shell authenticates the app,
+tool, or command; the app owns all domain language and result links.
+
+The command form names one of its source scripts:
 
 ```json
 "agent_activities": {
@@ -317,6 +322,24 @@ resources. Other receipt fields remain ordinary command output for the agent
 and are ignored by the shell, so a retrieval app can carry its own cursors,
 page metadata, and protocol without teaching the platform any of those
 concepts. Keep the receipt bounded and print it last.
+
+The tool form instead names one of the app's `tools`, so a call to that agent
+tool shows the card while it runs:
+
+```json
+"agent_activities": {
+  "lookup": {
+    "tool": "search",
+    "running_label": "Searching"
+  }
+}
+```
+
+The `tool` must be one of the app's declared `tools`, and each tool triggers at
+most one card. The card settles from the same `MOBIUS_APP_ACTIVITY_V1:` receipt
+line, which the tool's service returns in its result text (the shell reads that
+line whether the provider reports the result as text or as the JSON of an MCP
+result object). Everything else about the receipt is identical.
 
 ---
 
