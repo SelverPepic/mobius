@@ -125,6 +125,8 @@ def test_stop_note_covers_only_the_turn_right_after_a_stop():
   try:
     for earlier, noted in (
       (["completed", "stopped"], True),
+      # A Stop raced by the next send is closed by it as interrupted.
+      (["completed", "interrupted"], True),
       (["stopped", "completed"], False),
       ([], False),
     ):

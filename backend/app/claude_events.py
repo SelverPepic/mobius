@@ -238,15 +238,9 @@ def _format_tool_output(content: Any) -> str:
 
 
 # Möbius delivers a steer or Stop through the CLI's interrupt (its Esc key),
-# and the CLI answers a tool call it cuts with a refusal starting with this
-# prefix. Nobody refused the call: the chat shows why it was cut instead, and
-# the agent is told CUT_CALL_NOT_REFUSED.
+# and the CLI answers a tool call it cuts with an error result starting with
+# this refusal. Nobody refused the call, so the chat shows why it was cut.
 CLI_CUT_RESULT_PREFIX = "The user doesn't want to proceed with this tool use."
-CUT_CALL_NOT_REFUSED = (
-  "If that cut a running tool call, a result saying the user doesn't want to "
-  "proceed or rejected it came from the interruption, not from anyone "
-  "refusing the call; re-run it if it is still needed."
-)
 
 
 def _server_web_search_input(inp: dict[str, Any]) -> str:
@@ -707,7 +701,9 @@ def dispatch_sdk_message(
       if isinstance(block, ToolResultBlock):
         output = _format_tool_output(block.content)
         is_error = block.is_error
-        if cut_label and output.startswith(CLI_CUT_RESULT_PREFIX):
+        if (
+          cut_label and is_error and output.startswith(CLI_CUT_RESULT_PREFIX)
+        ):
           output, is_error = cut_label, False
         # Carry the tool_use_id (matches the ToolUseBlock's .id) so the sink can
         # key a stash of the full output and the block can fetch it by id.

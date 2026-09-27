@@ -517,20 +517,20 @@ async def test_command_cut_by_a_steer_shows_as_cut_not_refused(monkeypatch):
 
   outputs = [e for e in bus.events if e["type"] == "tool_output"]
   assert outputs == [{
-    "type": "tool_output", "content": "Cut to deliver an update",
+    "type": "tool_output", "content": "Cut to deliver a message",
     "tool_use_id": "tu-cut", "output_complete": True,
   }]
 
 
 @pytest.mark.asyncio
-async def test_cut_label_names_the_owner_message_and_stop():
+async def test_cut_label_names_the_steer_and_the_stop():
   class _Client:
     async def interrupt(self):
       pass
 
   person = ActiveClaudeClient(_Client(), chat_id="cut-label-person")
   await person.steer("why?", [{"role": "user", "cid": "c1"}], ["c1"])
-  assert person.cut_tool_label == "Cut to deliver your message"
+  assert person.cut_tool_label == "Cut to deliver a message"
 
   stopped = ActiveClaudeClient(_Client(), chat_id="cut-label-stop")
   stopped.mark_finished()
@@ -545,6 +545,7 @@ def test_only_our_own_cut_relabels_the_cli_refusal():
   msg = UserMessage(content=[
     ToolResultBlock(tool_use_id="cut", content=_CLI_CUT_TEXT, is_error=True),
     ToolResultBlock(tool_use_id="real", content="real output", is_error=True),
+    ToolResultBlock(tool_use_id="said", content=_CLI_CUT_TEXT, is_error=False),
   ])
   for cut_label, shown, exit_code in (
     ("Stopped", "Stopped", None), (None, _CLI_CUT_TEXT, 1),
@@ -554,7 +555,7 @@ def test_only_our_own_cut_relabels_the_cli_refusal():
     assert [
       (e["content"], e.get("output_exit_code"))
       for e in bus.events if e["type"] == "tool_output"
-    ] == [(shown, exit_code), ("real output", 1)]
+    ] == [(shown, exit_code), ("real output", 1), (_CLI_CUT_TEXT, None)]
 
 
 @pytest.mark.asyncio
@@ -3015,13 +3016,15 @@ async def test_mid_turn_person_message_is_framed_as_owed_a_visible_reply():
 
 
 def test_steer_requery_says_its_interrupt_refused_no_tool_call():
+  from app.chat_context import CUT_CALL_NOT_REFUSED
+
   # The steer's interrupt makes the CLI answer a running call with "The user
   # doesn't want to proceed…"; the requery must say nobody refused it.
   for from_person in (True, False):
     framed = claude_sdk_runner._steer_redirect_message(
       ["look at this"], from_person=from_person,
     )
-    assert claude_events.CUT_CALL_NOT_REFUSED in framed
+    assert CUT_CALL_NOT_REFUSED in framed
     assert framed.endswith("look at this")
 
 

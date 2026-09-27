@@ -74,8 +74,8 @@ from claude_agent_sdk.types import (
 )
 
 from app import activity, generated_files
+from app.chat_context import CUT_CALL_NOT_REFUSED
 from app.claude_events import (
-  CUT_CALL_NOT_REFUSED,
   NativeContinuationTracker,
   _clip_task_text,
   dispatch_sdk_message,
@@ -741,9 +741,7 @@ class ActiveClaudeClient:
     if self._interrupt_owner == "stop":
       return "Stopped"
     if self._interrupt_owner == "steer":
-      if self.steer_from_person:
-        return "Cut to deliver your message"
-      return "Cut to deliver an update"
+      return "Cut to deliver a message"
     return None
 
   @property
