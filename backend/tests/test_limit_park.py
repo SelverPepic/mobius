@@ -297,26 +297,6 @@ def test_generic_capacity_error_is_not_misclassified_as_a_busy_model():
   assert sink.events[-1] == {"type": "error", "message": "capacity"}
 
 
-def test_park_exit_resume_incomplete_publishes_calm_resumable_note():
-  """A steer-interrupted turn (error defused to None, resume_incomplete set)
-  publishes a calm, resumable "Paused" note — never a red error block."""
-  sink = _Sink()
-  kwargs = chat_mod._park_exit(
-    sink,
-    {"error": None, "terminal_status": "interrupted", "resume_incomplete": True},
-    None,
-  )
-  assert kwargs == {"parked": False}
-  note = sink.events[-1]
-  assert note["type"] == "error"
-  assert note["resumable"] is True
-  # A `pause` descriptor makes the card render in the calm "Paused" family, not
-  # the danger-red error styling; the kind is distinct from a restart pause.
-  assert note["pause"]["kind"] == "interrupted"
-  assert "resets_at" not in note["pause"]
-  assert "Resume" in note["message"]
-
-
 def test_park_exit_bare_429_synthesizes_the_card_block():
   """A 429 terminal with NO error text still persists a parked card block."""
   sink = _Sink()

@@ -51,9 +51,11 @@ import os
 import signal
 import shutil
 import re
+import uuid
 from collections import deque
 from collections.abc import Awaitable
 from contextlib import ExitStack
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from claude_agent_sdk import (
@@ -444,6 +446,20 @@ def _resumable(
   )
 
 
+@dataclass(eq=False)
+class _QueuedSteer:
+  """One steer written to the CLI's input queue, identified by our uuid."""
+
+  uuid: str
+  user_msgs: list[dict] = field(default_factory=list)
+  consume_cids: list[str] = field(default_factory=list)
+
+
+async def _single_message_stream(message: dict[str, Any]):
+  """One stream-json user message, so `query()` sends our own `uuid`."""
+  yield message
+
+
 class ActiveClaudeClient:
   """Stop/steer handle registered for SDK-backed Claude turns.
 
@@ -472,42 +488,29 @@ class ActiveClaudeClient:
     # interrupt and a provider abort in the same error-shaped terminal, so the
     # runner defuses `stop_reason == "interrupt"` only when an owner is set (an
     # unrequested abort stays a visible error), and only a "stop" owner keeps
-    # the deliberate Stop's own pause note. Stop always wins over a steer.
-    # "steer" and "stop" cut with `client.interrupt()`; "card" normally cuts
-    # without one, from the PostToolUse hook that refuses to continue the agent
-    # loop after a saved owner card (see `claim_owner_card_end`).
-    self._interrupt_owner: Literal["steer", "stop", "card"] | None = None
-    # FIFO of mid-turn steer texts: two rapid sends must both reach Claude
-    # (both are already persisted to the transcript), so a single slot would
-    # silently drop the first. The runner drains the whole list on interrupt.
-    self.pending_steer: list[str] = []
-    # Whether any buffered steer is a person's visible message rather than an
-    # agent-originated carrier (helper result, peer note), which the transcript
-    # marks `hidden`. It decides how the requery frames the text: a person is
-    # owed a visible reply, while machine context is folded into the work.
-    self.steer_from_person = False
-    # Transcript-side payload for the buffered steers: the steered user rows +
-    # any queued rows they consume. The RUNNER drives the transcript split
-    # (seal the pre-interrupt A1, append these user rows, reset the sink for
-    # A2) when the interrupted turn ends — the first point the true A1/A2 cut
-    # is known. The old route-driven split ran at HTTP arrival, before A1 had
-    # streamed, so it sealed an empty A1 and the real A1 then merged with A2
-    # after the steered row on reload (Q1, Q2, A1A2 instead of Q1, A1, Q2, A2).
+    # the deliberate Stop's own pause note. "stop" cuts with
+    # `client.interrupt()`; "card" normally cuts without one, from the
+    # PostToolUse hook that refuses to continue the agent loop after a saved
+    # owner card (see `claim_owner_card_end`). A steer never cuts: see `steer`.
+    self._interrupt_owner: Literal["stop", "card"] | None = None
+    # Steers already written to the CLI's input queue whose echo has not yet
+    # come back, oldest first. The CLI folds each one into the turn at its
+    # next step (or runs it as a follow-up query on the same session when the
+    # turn has already finished) and echoes it with our uuid at that moment;
+    # the runner then moves its rows into the seal buffer below.
+    self._queued_steers: list[_QueuedSteer] = []
+    # Transcript-side payload for steers the CLI has taken in: the steered
+    # user rows + any queued rows they consume. The RUNNER seals them (A1, the
+    # steered rows, then A2) at the exact point the CLI echoed the steer — the
+    # first point the true A1/A2 cut is known. A route-side split at HTTP
+    # arrival sealed an empty A1 and the real A1 then merged with A2 after the
+    # steered row on reload (Q1, Q2, A1A2 instead of Q1, A1, Q2, A2).
     self._steer_user_msgs: list[dict] = []
     self._steer_consume_cids: list[str] = []
-    # One interrupt is in flight: `steer()` has signalled `interrupt()` but the
-    # terminal ResultMessage that ends the interrupted turn has not arrived
-    # yet. Guards the steer cut so a second steer arriving in the drain window
-    # can't fire a duplicate interrupt before the SDK has closed the first; the
-    # runner clears it on the terminal result and drains every buffered steer
-    # text together. Stop's hard `interrupt()` does not consult this — Stop
-    # always cuts immediately.
-    self._interrupt_in_flight = False
-    # The CLI drops an interrupt sent before its query is generating, so a
-    # steer claims its cut at once but sends the interrupt only while the
-    # model is streaming; `mark_generating` sends a cut claimed earlier.
-    self._generating = False
-    self._steer_interrupt: asyncio.Task[None] | None = None
+    # Cleared by the runner, synchronously with its last check for queued
+    # steers, once it will read no further input: a steer accepted after that
+    # point would sit unread in a CLI that is about to be disconnected.
+    self._accepting_steers = True
     self._finished: asyncio.Future[None] = (
       asyncio.get_running_loop().create_future()
     )
@@ -518,114 +521,125 @@ class ActiveClaudeClient:
     user_msgs: list[dict] | None = None,
     consume_pending_cids: list[str] | None = None,
   ) -> bool:
-    """Fires an immediate soft interrupt so a steer lands right away.
+    """Queue mid-turn input into the live turn without cutting its work.
 
-    Claude's SDK cannot append to an in-flight tool loop, and its only
-    mid-turn lever is `interrupt()`. We record the redirect text, then
-    interrupt the live turn NOW — on the same connected client — instead of
-    waiting for the next completed content block. The runner's
-    `receive_response()` loop can be parked inside a long-running tool call,
-    where no `AssistantMessage` arrives for seconds to minutes; deferring the
-    cut to that boundary is what made steering land unpredictably. Interrupting
-    immediately aborts the in-flight step (its work is redone once the model
-    reads the steer) and may seal a partial block, matching Codex's immediate
-    steer. The interrupt's terminal ResultMessage flows to the existing
-    drain-then-requery path in the runner, which seals the pre-steer A1,
-    appends the steered rows, and re-queries the buffered text on the same
-    session (preserving context). Two rapid steers collapse into one interrupt
-    via `_interrupt_in_flight` and drain together. (Stop is the separate
-    teardown path — see `interrupt()`.)
+    The text goes straight into the CLI's input queue, tagged with our own
+    uuid. The CLI folds it into the running turn at its next step — after the
+    in-flight tool call finishes normally — or, when the model is already
+    writing its final answer, runs it as a follow-up query on the same session
+    once that answer ends. Either way it echoes the message (we launch the
+    CLI with `--replay-user-messages`) at the exact moment the model takes it
+    in, and the runner seals the transcript there (see `take_in_queued_steer`).
+
+    Never interrupt here. `client.interrupt()` is the CLI's Esc key: it aborts
+    the running tool and reports it to the model as "The user doesn't want to
+    proceed with this tool use… STOP what you are doing and wait for the
+    user", so every helper result, peer note, or owner aside became a phantom
+    owner rejection that halted the agent. Stop (`interrupt()`) is the only cut.
 
     `user_msgs` / `consume_pending_cids` are the transcript-side payload the
-    runner replays into `sink.split_for_steer` when the interrupted turn
-    ends (seal A1, append these rows, reset for A2). They are buffered here
-    rather than split at the route so A1 is the real pre-interrupt text.
+    runner seals when the CLI takes this steer in (seal A1, append these rows,
+    reset for A2), so A1 is the real pre-steer text.
+
+    Returns False when the runner no longer reads input for this turn; the
+    caller then falls back to after-turn delivery.
     """
-    if self._finished.done():
+    if self._finished.done() or not self._accepting_steers:
       return False
-    # Dedup before buffering. A repeated force-steer of the SAME still-live
-    # pending row (common when the client retries a send right after an
-    # interrupt) re-delivers the same user_msg / consume cid here. The queued
-    # row is not consumed until the interrupt-boundary drain, so without this
-    # guard the buffer grows to [msgA, msgA] and the writer persists the row
-    # twice. A queued row carries a stable `cid` (see schemas.SendMessage.cid),
-    # so keying on cid drops only true re-deliveries and never a genuinely
-    # distinct send — even two sends with identical text carry distinct cids.
-    #
-    # The provider-facing `text` follows the SAME boundary: when every
-    # delivered row is a cid-duplicate, the whole call is a re-delivery and
-    # the redirect text must not queue a second time — otherwise the durable
-    # transcript holds one user message while Claude receives it twice.
-    appended_any = False
-    if user_msgs:
-      from app.chat_writer import cid_of
-      buffered_cids = {cid_of(m) for m in self._steer_user_msgs}
-      for m in user_msgs:
-        mcid = cid_of(m)
-        if mcid is not None and mcid in buffered_cids:
-          continue
-        self._steer_user_msgs.append(m)
-        buffered_cids.add(mcid)
-        appended_any = True
-    if user_msgs and not appended_any:
+    # Dedup before queueing. A repeated force-steer of the SAME still-live
+    # pending row (common when the client retries a send) re-delivers the same
+    # user_msg / consume cid here, before the earlier copy is sealed. Keying on
+    # the stable row `cid` (see schemas.SendMessage.cid) drops only true
+    # re-deliveries, never a distinct send — even two sends with identical text
+    # carry distinct cids. When every delivered row is a duplicate the whole
+    # call is a re-delivery, so the text must not reach Claude a second time
+    # either: the durable transcript holds that message once.
+    from app.chat_writer import cid_of
+    held_rows = [
+      *self._steer_user_msgs,
+      *(row for queued in self._queued_steers for row in queued.user_msgs),
+    ]
+    held_cids = {cid_of(m) for m in held_rows}
+    new_rows = []
+    for m in user_msgs or ():
+      mcid = cid_of(m)
+      if mcid is not None and mcid in held_cids:
+        continue
+      new_rows.append(m)
+      held_cids.add(mcid)
+    if user_msgs and not new_rows:
       return True
-    self.pending_steer.append(text)
-    if any(not m.get("hidden") for m in user_msgs or ()):
-      self.steer_from_person = True
-    if consume_pending_cids:
-      buffered_consume = set(self._steer_consume_cids)
-      for cid in consume_pending_cids:
-        if cid in buffered_consume:
-          continue
-        self._steer_consume_cids.append(cid)
-        buffered_consume.add(cid)
-    # Fire the interrupt immediately (soft interrupt on the same connected
-    # client) so the steer lands now instead of at the next content-block
-    # boundary. The `_interrupt_in_flight` guard collapses two rapid steers
-    # into a single interrupt — both texts drain together when the terminal
-    # ResultMessage arrives. A racing hard Stop resolves `_finished`, so the
-    # guard no-ops rather than interrupting a torn-down client.
-    if not self._interrupt_in_flight and not self._finished.done():
-      self._interrupt_in_flight = True
-      self._interrupt_owner = self._interrupt_owner or "steer"
-      if self._generating:
-        await self._client.interrupt()
+    held_consume = {
+      *self._steer_consume_cids,
+      *(cid for queued in self._queued_steers for cid in queued.consume_cids),
+    }
+    new_consume = [
+      cid for cid in dict.fromkeys(consume_pending_cids or ())
+      if cid not in held_consume
+    ]
+    queued = _QueuedSteer(
+      uuid=str(uuid.uuid4()), user_msgs=new_rows, consume_cids=new_consume,
+    )
+    # Registered before the write so the runner, which may be reading a
+    # terminal right now, keeps reading until the CLI echoes this steer.
+    self._queued_steers.append(queued)
+    framed = _steer_redirect_message(
+      [text], from_person=any(not m.get("hidden") for m in new_rows),
+    )
+    try:
+      await self._client.query(_single_message_stream({
+        "type": "user",
+        "message": {"role": "user", "content": framed},
+        "parent_tool_use_id": None,
+        "uuid": queued.uuid,
+      }))
+    except Exception:
+      # The CLI is gone or closing: nothing was queued, so nothing is owed.
+      if queued in self._queued_steers:
+        self._queued_steers.remove(queued)
+      log.warning(
+        "Claude steer could not be queued chat_id=%s", self.chat_id,
+        exc_info=True,
+      )
+      return False
     return True
 
-  def mark_generating(self) -> None:
-    """Called per root model message; sends a steer cut claimed earlier."""
-    if self._generating:
-      return
-    self._generating = True
-    if self._interrupt_in_flight and self.pending_steer:
-      # Own task: the SDK reader that routes the control response can block
-      # behind a full message buffer while the runner loop awaits.
-      self._steer_interrupt = asyncio.create_task(self._send_steer_interrupt())
+  @property
+  def has_queued_steers(self) -> bool:
+    """Whether the CLI still holds a steer it has not yet taken in."""
+    return bool(self._queued_steers)
 
-  async def _send_steer_interrupt(self) -> None:
-    # A terminal may have drained the steer first; interrupting now would
-    # abort its requery instead.
-    if self._interrupt_in_flight and self.pending_steer:
-      await self._client.interrupt()
+  def take_in_queued_steer(self, message_uuid: str | None) -> bool:
+    """Record that the CLI took in the queued steer echoed as `message_uuid`.
 
-  def take_steer_for_requery(self, *, interrupt_landed: bool) -> list[str]:
-    """Drain buffered steer texts at a terminal; close a landed steer cut.
-
-    Once the steer's own interrupt has produced its terminal, the requery that
-    delivers the steer is fresh model work in the same turn. A "steer" owner
-    left sticky past that point made `claim_owner_card_end` refuse every later
-    card in the turn, so text written after a saved card persisted below it.
-    When the interrupt has NOT landed (a clean terminal won the race), it can
-    still abort the requery segment, so ownership stays to defuse that stray
-    cut. A Stop stays sticky; it always wins.
+    The CLI consumes its queue in order, so the echo of one steer also settles
+    every steer queued before it. Their rows move to the seal buffer that
+    `_seal_steer_split` persists. Returns False for any other user message
+    (the turn's own prompt, a tool result, a CLI-injected notification).
     """
-    self._interrupt_in_flight = False
-    self._generating = False  # a requery starts a new generation window
-    if interrupt_landed and self._interrupt_owner == "steer":
-      self._interrupt_owner = None
-    texts, self.pending_steer = self.pending_steer, []
-    self.steer_from_person = False
-    return texts
+    uuids = [queued.uuid for queued in self._queued_steers]
+    if not message_uuid or message_uuid not in uuids:
+      return False
+    taken = uuids.index(message_uuid) + 1
+    for queued in self._queued_steers[:taken]:
+      self._steer_user_msgs.extend(queued.user_msgs)
+      self._steer_consume_cids.extend(queued.consume_cids)
+    del self._queued_steers[:taken]
+    return True
+
+  def stop_accepting_steers(self) -> None:
+    """Close the turn to new steers; still-queued ones become unread rows.
+
+    The runner calls this in the same synchronous step as its final
+    `has_queued_steers` check, so no steer can slip in between. Rows of a
+    steer the CLI never took in (the turn failed or was stopped first) move
+    to the seal buffer, preserving the turn-end durability catch-all.
+    """
+    self._accepting_steers = False
+    for queued in self._queued_steers:
+      self._steer_user_msgs.extend(queued.user_msgs)
+      self._steer_consume_cids.extend(queued.consume_cids)
+    self._queued_steers = []
 
   def claim_owner_card_end(self) -> bool:
     """Own this turn's end at the saved owner card, cutting no generation yet.
@@ -638,20 +652,17 @@ class ActiveClaudeClient:
     is no post-card generation to interrupt.
 
     Tagged `card` so the terminal branch classifies the result as a clean
-    completion — no steer requery (`pending_steer` stays empty) and no resumable
-    "Paused" note; the chat's durable pending-question marker already owns
-    resumption. Returns False when a Stop or steer already owns the cut, so the
-    caller leaves the loop running and their semantics win.
+    completion — no resumable "Paused" note; the chat's durable
+    pending-question marker already owns resumption. Returns False when a Stop
+    already owns the cut, or when a steer is still queued: the CLI is about to
+    hand that input to the model, so the turn continues to take it in rather
+    than ending at the card with it unread.
     """
     if self._finished.done():
       return False
-    if self._interrupt_owner is not None:
+    if self._interrupt_owner is not None or self._queued_steers:
       return False
     self._interrupt_owner = "card"
-    # A steer arriving in the drain window must not fire an interrupt against a
-    # turn the hook has already ended (mirrors `steer`'s collapse); the terminal
-    # branch clears the flag.
-    self._interrupt_in_flight = True
     return True
 
   def begin_finish_after_owner_card(self) -> Awaitable[None] | None:
@@ -663,15 +674,15 @@ class ActiveClaudeClient:
     card is the case the hook deliberately leaves open — cutting inside a
     subagent's hook would end the child, not the turn, so the child's receipt
     only reaches Möbius later, echoed inside its parent Task tool result. This
-    soft interrupt (the same one `steer` uses) still ends such a turn at its
-    source, accepting the historical race with generation already in flight.
+    soft interrupt still ends such a turn at its source, accepting the
+    historical race with generation already in flight.
     Events emitted during that window still drain through the sink and remain
     visible and durable.
 
     Claim ownership synchronously, before returning the interrupt awaitable:
     the SDK terminal may already be queued behind the tool result and must see
     `card` ownership even if the event loop has not yet run the interrupt task.
-    Defers to a Stop or steer that already owns this turn's cut.
+    Defers to a Stop that already owns this turn's cut, or to a queued steer.
     """
     if not self.claim_owner_card_end():
       return None
@@ -686,11 +697,12 @@ class ActiveClaudeClient:
     bound at the call site; this inner timeout protects any other
     direct caller.
 
-    Stop is the hard, immediate-cut path: it drops the buffered steer
-    ENTIRELY — the provider-facing text (`pending_steer`, so no requery fires
-    for work the user just abandoned) AND the transcript-side rows
-    (`_steer_user_msgs` + `_steer_consume_cids`, so the
-    turn-end seal appends nothing).
+    Stop is the hard, immediate-cut path and the only one that interrupts:
+    it drops every buffered steer ENTIRELY — the provider-facing input (the
+    CLI's interrupt also cancels messages still in its input queue, so no
+    queued steer runs for work the user just abandoned) AND the
+    transcript-side rows (`_queued_steers`, `_steer_user_msgs` +
+    `_steer_consume_cids`, so the turn-end seal appends nothing).
 
     Both halves have to go, because Stop OWNS those rows from here on: a
     deferred steer's row is still a durable entry in `chat.pending_messages`
@@ -703,8 +715,7 @@ class ActiveClaudeClient:
     clear-and-resend path is what preserves them.
     """
     self._interrupt_owner = "stop"
-    self.pending_steer = []
-    self.steer_from_person = False
+    self._queued_steers = []
     self._steer_user_msgs = []
     self._steer_consume_cids = []
     await self._client.interrupt()
@@ -726,7 +737,7 @@ class ActiveClaudeClient:
   def turn_cut_owned(self) -> bool:
     """Whether Möbius — not the provider — ended this turn deliberately.
 
-    True for a steer, a Stop, and a saved owner card, so the terminal branch
+    True for a Stop and a saved owner card, so the terminal branch
     can tell our own ending apart from a provider abort. A card end normally
     cuts through the PostToolUse hook rather than `client.interrupt()`.
     """
@@ -787,7 +798,7 @@ class ActiveClaudeClient:
 
 
 def _steer_redirect_message(texts: list[str], *, from_person: bool) -> str:
-  """Frame mid-turn input for the requery on the still-connected client.
+  """Frame mid-turn input queued into the still-connected client.
 
   A person's message is a conversational turn, not context to absorb: framing
   it as "continue the same task" let agents fold a question into their work
@@ -816,10 +827,10 @@ async def steer_into_active_turn(
   user_msgs: list[dict] | None = None,
   consume_pending_cids: list[str] | None = None,
 ) -> bool:
-  """Interrupts a live Claude SDK turn so it can resume with `text`.
+  """Queues `text` into a live Claude SDK turn without interrupting it.
 
-  `user_msgs` / `consume_pending_cids` are buffered on the handle so the
-  runner can seal A1 and append the steered rows at the interrupt boundary;
+  `user_msgs` / `consume_pending_cids` are held on the handle so the runner
+  can seal A1 and append the steered rows where the CLI echoes the steer;
   see `ActiveClaudeClient.steer`.
   """
   handle = registry.get_handle(chat_id, RunnerKind.CLAUDE_SDK)
@@ -829,20 +840,22 @@ async def steer_into_active_turn(
 
 
 async def _seal_steer_split(bc, active_client, chat_id: str) -> None:
-  """Seal the pre-interrupt A1 and append the buffered steered user row(s).
+  """Seal the pre-steer A1 and append the buffered steered user row(s).
 
-  Called at each requery boundary (so A1 is sealed before the answer A2
-  streams) AND unconditionally in the turn-end `finally` (so a steer that was
-  buffered but never sealed — an exception/early-return before the requery — is
-  still persisted rather than discarded with the handle). A hard Stop is NOT one
-  of those cases: `interrupt()` drops the buffered rows outright because Stop's
-  clear-and-resend path owns them from that point (see `interrupt`), so the
-  finally finds an empty buffer and appends nothing to the turn it just killed.
+  Called when the CLI echoes a queued steer (so A1 is sealed before the
+  answer A2 streams) AND unconditionally in the turn-end `finally` (so a steer
+  that was accepted but never sealed — an exception/early-return before its
+  echo — is still persisted rather than discarded with the handle). A hard
+  Stop is NOT one of those cases: `interrupt()` drops the buffered rows
+  outright because Stop's clear-and-resend path owns them from that point (see
+  `interrupt`), so the finally finds an empty buffer and appends nothing to the
+  turn it just killed.
 
-  A1 is the sink's accumulated pre-interrupt content — complete once the turn
-  closes — so the sink's authoritative `commit_steer_cut` seals it as its own
-  identified message, appends the steered row(s), rotates the segment identity,
-  and publishes the exact A1/A2 snapshots in one operation. Older sink-like
+  A1 is the sink's accumulated pre-steer content — complete at the echo,
+  which arrives only between model steps — so the sink's authoritative
+  `commit_steer_cut` seals it as its own identified message, appends the
+  steered row(s), rotates the segment identity, and publishes the exact A1/A2
+  snapshots in one operation. Older sink-like
   test doubles retain the split-then-publish compatibility path below.
 
   This is the fix for the steer-merge: the route cannot know where A1 ends (at
@@ -1453,7 +1466,13 @@ async def run_claude_sdk_turn(
     # binary-only `workflowKeywordTriggerEnabled`, which we deliberately avoid.
     # Passed via --settings as inline JSON.
     _cli_settings = {"ultracode": True} if _ultracode else {"disableWorkflows": True}
-    options_kwargs["extra_args"] = {"settings": json.dumps(_cli_settings)}
+    options_kwargs["extra_args"] = {
+      "settings": json.dumps(_cli_settings),
+      # Echo each stdin user message at the moment the model takes it in:
+      # the exact point a queued steer is sealed into the transcript (see
+      # `ActiveClaudeClient.steer`).
+      "replay-user-messages": None,
+    }
 
     # A dict-valued SDK mcp_servers option is serialized directly into the CLI
     # argv. Keep credentials out of /proc/cmdline by handing Claude an anonymous
@@ -1586,10 +1605,16 @@ async def run_claude_sdk_turn(
             incoming_session_id = getattr(sdk_msg, "session_id", None)
             if incoming_session_id and incoming_session_id != current_session_id:
               await _persist_session_id(chat_id, incoming_session_id)
-          if isinstance(
-            sdk_msg, (StreamEvent, AssistantMessage),
-          ) and is_root_conversation_message(sdk_msg):
-            active_client.mark_generating()
+          if (
+            isinstance(sdk_msg, UserMessage)
+            and is_root_conversation_message(sdk_msg)
+            and active_client.take_in_queued_steer(sdk_msg.uuid)
+          ):
+            # The CLI echoed a queued steer at the moment the model takes it
+            # in: after the in-flight tool finished, or as the follow-up query
+            # once the previous answer ended. That is the true A1/A2 cut.
+            await _seal_steer_split(bc, active_client, chat_id)
+            continue
           if isinstance(sdk_msg, RateLimitEvent):
             _resets = getattr(sdk_msg.rate_limit_info, "resets_at", None)
             if _resets is not None:
@@ -1602,8 +1627,6 @@ async def run_claude_sdk_turn(
             usage_state=usage_state,
           )
           if terminal is None:
-            # No boundary cut here: a steer already interrupted in `steer()`;
-            # its terminal ResultMessage drives the requery below.
             continue
           if (
             isinstance(sdk_msg, ResultMessage)
@@ -1622,40 +1645,24 @@ async def run_claude_sdk_turn(
             )
           ):
             # Our own cut is not a failure (see `_interrupt_owner`). A
-            # Stop writes its own pause note through the stop flow; a steer
-            # whose interrupt raced turn-end (text already re-queried, nothing
-            # left to requery) ends the turn here as a resumable "Paused".
+            # Stop writes its own pause note through the stop flow.
             terminal["error"] = None
             if active_client.owner_card_end:
               # A continuation owner-input card is the turn's NATURAL terminal:
               # the owner's saved answer resumes the chat, so this is a clean
               # completion — never a resumable "Paused" (which would auto-offer
-              # Resume and race the pending-question wait) and never a steer
-              # requery (`pending_steer` is empty on this path).
+              # Resume and race the pending-question wait). A queued steer
+              # would have refused the card end (`claim_owner_card_end`).
               terminal["terminal_status"] = "completed"
             else:
               terminal["terminal_status"] = "interrupted"
-              if not active_client.interrupt_requested:
-                terminal["resume_incomplete"] = True
-          # Terminal result: the interrupt cycle (if any) is closed, so a
-          # fresh boundary cut or a saved owner card may end a later segment.
-          steer_from_person = active_client.steer_from_person
-          steer_texts = active_client.take_steer_for_requery(
-            interrupt_landed=isinstance(sdk_msg, ResultMessage) and (
-              sdk_msg.stop_reason == "interrupt"
-              or sdk_msg.subtype == "error_during_execution"
-            ),
-          )
-          if steer_texts:
-            # Seal A1 + append the steered row(s) BEFORE the requery so the
-            # answer (A2) lands as a fresh message. The turn-end finally is the
-            # durability catch-all for a steer that never reaches a requery.
-            await _seal_steer_split(bc, active_client, chat_id)
-            await client.query(
-              _steer_redirect_message(
-                steer_texts, from_person=steer_from_person,
-              )
-            )
+          if (
+            active_client.has_queued_steers
+            and not active_client.interrupt_requested
+          ):
+            # A steer is still in the CLI's input queue: the CLI runs it as a
+            # follow-up query on this session now that this answer ended. Keep
+            # reading for its echo (the A1/A2 cut above) and its own result.
             break
           # Do not replay a clean result with no visible reply: no content is
           # not proof that no work ran. The chat finalizer persists a resumable
@@ -1671,28 +1678,14 @@ async def run_claude_sdk_turn(
           ):
             helper_result = terminal
             break
+          # Same synchronous step as the queued-steer check above: from here
+          # on a steer falls back to after-turn delivery instead of queueing
+          # into a CLI that is about to be disconnected.
+          active_client.stop_accepting_steers()
           return terminal
         else:
-          # The stream ended without a terminal ResultMessage. Any buffered
-          # steer still gets delivered here (the boundary cut may not have
-          # fired — e.g. a tool-only turn with no AssistantMessage text
-          # block — so this is the catch-all that preserves the original
-          # pending_steer→requery contract).
-          # No terminal arrived, so a steer interrupt may still be in flight.
-          steer_from_person = active_client.steer_from_person
-          steer_texts = active_client.take_steer_for_requery(
-            interrupt_landed=False,
-          )
-          if steer_texts:
-            # Seal A1 before the requery (see the terminal-result branch); the
-            # turn-end finally covers the no-requery case.
-            await _seal_steer_split(bc, active_client, chat_id)
-            await client.query(
-              _steer_redirect_message(
-                steer_texts, from_person=steer_from_person,
-              )
-            )
-            continue
+          # The stream closed without a terminal ResultMessage; the CLI is
+          # gone, so nothing more can be read or queued for this turn.
           break
 
       # Reached only when the stream ended with no result for the current
@@ -1771,11 +1764,13 @@ async def run_claude_sdk_turn(
         )
       except Exception:
         log.debug("generated-file turn capture failed", exc_info=True)
-      # Durability catch-all: persist any steer that was buffered but never
-      # sealed at a requery boundary — an exception/early return above, or a
-      # hard Stop that cleared pending_steer. Runs before disconnect so the
-      # sink is still live. No-op when nothing is buffered (the normal path
-      # sealed + cleared it already). Never raises (swallowed inside).
+      # Durability catch-all: persist any steer that was accepted but never
+      # sealed at its echo — an exception/early return above left it queued
+      # or buffered. A hard Stop already dropped its rows (see `interrupt`).
+      # Runs before disconnect so the sink is still live. No-op when nothing
+      # is buffered (the normal path sealed + cleared it already). Never
+      # raises (swallowed inside).
+      active_client.stop_accepting_steers()
       await _seal_steer_split(bc, active_client, chat_id)
       current_handle = registry.get_handle(chat_id, RunnerKind.CLAUDE_SDK)
       if current_handle is active_client:

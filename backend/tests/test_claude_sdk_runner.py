@@ -96,6 +96,10 @@ class _FakeClient:
     return None
 
   async def query(self, message):
+    # A steer queues one stream-json message carrying our uuid; keep it
+    # inspectable the way the CLI would receive it.
+    if not isinstance(message, str):
+      message = [item async for item in message]
     self.queries.append(message)
 
   async def interrupt(self):
@@ -354,78 +358,6 @@ def _stream_delta(delta_type: str, **fields: Any) -> StreamEvent:
 
 
 @pytest.mark.asyncio
-async def test_steer_into_active_turn_interrupts_immediately():
-  """A registered Claude handle buffers the steer text AND fires the
-  interrupt immediately (a soft interrupt on the same connected client),
-  rather than deferring the cut to the next content-block boundary — a
-  steer during a long-running tool call must land now, not whenever the
-  tool happens to finish."""
-  calls = []
-
-  class _Client:
-    async def interrupt(self):
-      calls.append("interrupt")
-
-  handle = ActiveClaudeClient(_Client(), chat_id="claude-steer")
-  handle.mark_generating()
-  registry.register(handle)
-  try:
-    assert await steer_into_active_turn("claude-steer", "use blue") is True
-    assert handle.pending_steer == ["use blue"]
-    # The steer interrupts the live turn right away.
-    assert calls == ["interrupt"]
-    # A second rapid steer must QUEUE behind the first (FIFO), not overwrite it
-    # — both texts are already persisted to the transcript, so both must reach
-    # Claude when the runner drains the mailbox. It must NOT fire a second
-    # interrupt: `_interrupt_in_flight` guards the single cut until the first
-    # interrupt's terminal result drains the whole buffer together.
-    assert await steer_into_active_turn("claude-steer", "and bold") is True
-    assert handle.pending_steer == ["use blue", "and bold"]
-    assert calls == ["interrupt"]
-  finally:
-    registry.unregister("claude-steer", handle.kind)
-
-
-@pytest.mark.asyncio
-async def test_steer_before_generation_interrupts_once_streaming(
-  monkeypatch,
-):
-  """The CLI drops an interrupt sent before its query is generating, which
-  used to latch the cut so the steer landed only at natural turn end. A steer
-  in that window must interrupt exactly once, when the model starts streaming."""
-  trace: list[int] = []
-
-  class _Client(_FakeClient):
-    async def query(self, prompt):
-      await super().query(prompt)
-      if len(self.queries) == 1:
-        assert await steer_into_active_turn("early-chat", "use blue") is True
-        trace.append(self.interrupts)
-
-    async def receive_response(self):
-      if len(self.queries) == 1:
-        yield _stream_delta("text_delta", text="starting")
-        while self.interrupts < 1:
-          await asyncio.sleep(0)
-        yield _interrupt_result()
-        return
-      yield _stream_delta("text_delta", text="blue done")
-      yield _success_result()
-
-  clients = _install_fake_client(monkeypatch, _Client)
-  result = await asyncio.wait_for(
-    _run_turn("early-chat", prompt="start task"), timeout=5,
-  )
-
-  client = clients[0]
-  assert trace == [0]
-  assert client.interrupts == 1
-  assert len(client.queries) == 2
-  assert "use blue" in client.queries[1]
-  assert result["error"] is None
-
-
-@pytest.mark.asyncio
 async def test_steer_into_active_turn_missing_or_finished_is_false():
   """Missing or already-finished Claude handles are not steerable."""
   assert await steer_into_active_turn("missing-claude", "x") is False
@@ -441,99 +373,6 @@ async def test_steer_into_active_turn_missing_or_finished_is_false():
     assert await steer_into_active_turn("finished-claude", "x") is False
   finally:
     registry.unregister("finished-claude", handle.kind)
-
-
-@pytest.mark.asyncio
-async def test_steer_requeries_on_interrupt_terminal(monkeypatch):
-  """A steer fired mid-delta interrupts immediately and re-queries on the
-  SAME client when the interrupt's terminal ResultMessage arrives.
-
-  The steer fires its soft interrupt as soon as it is requested (interrupts
-  == 1), even though no completed content block preceded the terminal; the
-  pending_steer -> requery path on the terminal result then delivers the
-  steer text on the same session."""
-  class _Client(_FakeClient):
-    async def receive_response(self):
-      if len(self.queries) == 1:
-        yield _stream_delta("text_delta", text="working")
-        assert await steer_into_active_turn("loop-chat", "use blue") is True
-        yield _interrupt_result()
-        return
-      yield _stream_delta("text_delta", text="blue done")
-      yield _success_result()
-
-  clients = _install_fake_client(monkeypatch, _Client)
-  bus = _ChatBus()
-  result = await _run_turn("loop-chat", bc=bus, prompt="start task")
-
-  client = clients[0]
-  # The steer fired its interrupt immediately when requested; the terminal
-  # ResultMessage then drove the requery.
-  assert client.interrupts == 1
-  assert client.disconnected is True
-  assert client.queries[0] == "start task"
-  assert client.queries[1].startswith(
-    "New context arrived while you were working."
-  )
-  assert "use blue" in client.queries[1]
-  assert result["error"] is None
-  assert result["cost_usd"] == 0.02
-  assert [e for e in bus.events if e["type"] == "text"] == [
-    {"type": "text", "content": "working"},
-    {"type": "text", "content": "blue done"},
-  ]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("session_id", [None, "sess-1"])
-async def test_steer_interrupt_racing_turn_end_is_a_resumable_pause(
-  monkeypatch, session_id,
-):
-  """A steer whose soft interrupt lands AT natural turn-end must not surface
-  the raw "Execution interrupted." provider error, nor re-run the prompt.
-
-  The turn finishes on its own exactly as the steer arrives: the steer buffers
-  its text and fires interrupt(), but the CLEAN end_turn terminal wins the race,
-  so the runner re-queries the steer text (draining pending_steer) and the stray
-  interrupt() then aborts the RE-QUERY turn — whose terminal arrives with
-  pending_steer already empty and no Stop in flight. The runner defuses the
-  error (the interrupt was ours) and marks the turn resume_incomplete so the
-  finalize seam renders a calm resumable note.
-
-  On a RESUME turn (session_id set — the production steer condition) the
-  defused error would also unlock the synthetic-no-op auto-requery guard
-  (`_seal_steer_split` resets `assistant_blocks` to []); the explicit
-  `stop_reason != "interrupt"` guard keeps the runner from silently re-running
-  the ORIGINAL prompt and re-executing its side effects."""
-
-  class _Client(_FakeClient):
-    async def receive_response(self):
-      if len(self.queries) == 1:
-        yield _stream_delta("text_delta", text="working")
-        assert await steer_into_active_turn("steer-race-chat", "use blue") is True
-        yield _success_result()   # natural turn-end wins the race
-        return
-      # Re-query turn: the stray interrupt aborts it with zero accrued blocks.
-      yield _interrupt_result()
-
-  clients = _install_fake_client(monkeypatch, _Client)
-  bus = _ChatBus()
-  # The synthetic-no-op guard keys on the sink's accrued blocks being empty.
-  bus.assistant_blocks = []
-
-  result = await _run_turn(
-    "steer-race-chat", bc=bus, prompt="start task", session_id=session_id,
-  )
-
-  # The original prompt is queried exactly once, then only the steer redirect.
-  client = clients[0]
-  assert client.queries.count("start task") == 1
-  assert len(client.queries) == 2
-  assert client.queries[1].startswith("New context arrived while you were working.")
-  # The raw provider error never surfaces; the turn is a resumable interrupt.
-  assert result["error"] is None
-  assert result["terminal_status"] == "interrupted"
-  assert result["resume_incomplete"] is True
 
 
 def _tool_boundary_interrupt_result(
@@ -785,49 +624,6 @@ async def test_child_agent_card_receipt_still_interrupts_through_the_sink_path()
   await interrupt
   assert client.interrupts == 1
   # The hook arriving afterwards must not fire a second cut.
-  assert handle.claim_owner_card_end() is False
-
-
-@pytest.mark.asyncio
-async def test_owner_card_still_ends_the_turn_after_an_earlier_steer():
-  """A steer's cut closes at its terminal; a later saved card must still end
-  the turn instead of letting post-card text persist below the card."""
-  class _Client:
-    def __init__(self):
-      self.interrupts = 0
-
-    async def interrupt(self):
-      self.interrupts += 1
-
-  client = _Client()
-  handle = ActiveClaudeClient(client, chat_id="steer-then-card")
-  handle.mark_generating()
-  assert await handle.steer("peer note") is True
-  assert handle.claim_owner_card_end() is False  # the steer owns this cut
-
-  # A clean terminal that won the race leaves the stray interrupt owned.
-  assert handle.take_steer_for_requery(interrupt_landed=False) == ["peer note"]
-  assert handle.claim_owner_card_end() is False
-  handle.mark_generating()  # the requery is streaming
-  await handle.steer("second note")
-  assert handle.take_steer_for_requery(interrupt_landed=True) == ["second note"]
-  assert handle.pending_steer == []
-  assert handle.claim_owner_card_end() is True
-  assert handle.owner_card_end is True
-  assert client.interrupts == 2
-
-
-@pytest.mark.asyncio
-async def test_stop_stays_sticky_across_a_steer_requery_boundary():
-  class _Client:
-    async def interrupt(self):
-      pass
-
-  handle = ActiveClaudeClient(_Client(), chat_id="stop-sticky")
-  await handle.steer("note")
-  await handle.interrupt()
-  assert handle.take_steer_for_requery(interrupt_landed=True) == []
-  assert handle.interrupt_requested is True
   assert handle.claim_owner_card_end() is False
 
 
@@ -1332,179 +1128,6 @@ async def test_owner_stop_does_not_hide_other_claude_process_failure(monkeypatch
 
   assert "exit code 1" in result["error"]
   assert result.get("terminal_status") is None
-
-
-@pytest.mark.asyncio
-async def test_steer_interrupts_immediately_not_deferred_to_boundary(
-  monkeypatch,
-):
-  """THE core contract: a steer requested mid-turn interrupts the live turn
-  IMMEDIATELY — it does NOT wait for the next completed content block. The
-  cut lands as soon as the steer is requested (matching Codex's immediate
-  steer), then the interrupt's terminal result re-queries exactly once on
-  the same client.
-
-  The fake stream records the interrupt-call count at the moment each
-  message is dispatched, so the test can assert the interrupt fired the
-  instant the steer arrived (mid-delta), not at a later boundary."""
-  # (message_label, interrupts_observed_when_this_message_was_yielded)
-  interrupt_trace: list[tuple[str, int]] = []
-
-  class _Client(_FakeClient):
-    async def receive_response(self):
-      if len(self.queries) == 1:
-        # First turn: deltas stream, the user steers mid-block — the
-        # interrupt fires RIGHT THEN, so the count is already 1 on the
-        # very next delta (no waiting for a completed block).
-        yield _stream_delta("text_delta", text="thinking ")
-        interrupt_trace.append(("delta-1", self.interrupts))
-        assert await steer_into_active_turn("boundary-chat", "use blue") \
-          is True
-        yield _stream_delta("text_delta", text="about it")
-        interrupt_trace.append(("delta-2-after-steer", self.interrupts))
-        # A completed block still arrives (a few tokens can stream before
-        # the interrupt takes effect); it must NOT fire a second interrupt.
-        yield _assistant_text("thinking about it")
-        interrupt_trace.append(("assistant-boundary", self.interrupts))
-        # The interrupt's terminal result. The runner's drain-then-
-        # requery path delivers the buffered steer here.
-        yield _interrupt_result()
-        return
-      # Second (re-queried) turn completes normally.
-      yield _stream_delta("text_delta", text="blue done")
-      yield _success_result()
-
-  clients = _install_fake_client(monkeypatch, _Client)
-  bus = _ChatBus()
-  result = await _run_turn("boundary-chat", bc=bus, prompt="start task")
-
-  client = clients[0]
-  trace = dict(interrupt_trace)
-  # No interrupt before the steer was requested.
-  assert trace["delta-1"] == 0
-  # The interrupt fired the instant the steer arrived — the next delta
-  # already sees it (this is the whole point of the change).
-  assert trace["delta-2-after-steer"] == 1
-  # Exactly once — the later completed block did not double-interrupt.
-  assert client.interrupts == 1
-  # Exactly one re-query with the buffered steer (no double).
-  assert client.queries[0] == "start task"
-  assert len(client.queries) == 2
-  assert client.queries[1].startswith(
-    "New context arrived while you were working."
-  )
-  assert "use blue" in client.queries[1]
-  assert result["error"] is None
-  assert result["cost_usd"] == 0.02
-  # The finished sentence the user saw before the cut, then the steered
-  # continuation — in order, each emitted once.
-  assert [e for e in bus.events if e["type"] == "text"] == [
-    {"type": "text", "content": "thinking "},
-    {"type": "text", "content": "about it"},
-    {"type": "text", "content": "blue done"},
-  ]
-
-
-@pytest.mark.asyncio
-async def test_steer_interrupts_once_despite_two_rapid_steers(monkeypatch):
-  """Two rapid steers before the interrupt's terminal ResultMessage must
-  fire only ONE interrupt — `_interrupt_in_flight` guards the single cut —
-  and both buffered steers ride the single requery (FIFO, exactly once).
-  Later completed blocks arriving in the drain window must not re-interrupt."""
-  class _Client(_FakeClient):
-    async def receive_response(self):
-      if len(self.queries) == 1:
-        # Two rapid steers: the first fires the interrupt, the second is
-        # guarded by _interrupt_in_flight and only buffers its text.
-        assert await steer_into_active_turn("multi-chat", "use blue") is True
-        assert await steer_into_active_turn("multi-chat", "and bold") is True
-        yield _assistant_text("first block")
-        await asyncio.sleep(0)  # the claimed cut is sent once streaming
-        # The SDK may still emit trailing completed blocks in the drain
-        # window before the interrupt's terminal lands. They must NOT cause
-        # a second interrupt.
-        yield _assistant_text("straggler block")
-        yield _interrupt_result()
-        return
-      yield _stream_delta("text_delta", text="done")
-      yield _success_result()
-
-  clients = _install_fake_client(monkeypatch, _Client)
-  result = await _run_turn("multi-chat", prompt="start task")
-
-  client = clients[0]
-  # Exactly one interrupt despite two steers and two completed blocks in the
-  # drain window — the in-flight guard held.
-  assert client.interrupts == 1
-  # Exactly one requery, carrying BOTH buffered steers in FIFO order.
-  assert len(client.queries) == 2
-  assert "use blue" in client.queries[1]
-  assert "and bold" in client.queries[1]
-  assert client.queries[1].index("use blue") < client.queries[1].index(
-    "and bold"
-  )
-  assert result["error"] is None
-
-
-@pytest.mark.asyncio
-async def test_steer_after_content_already_streamed(monkeypatch):
-  """A steer requested after some content has already streamed still
-  interrupts immediately and re-queries once on the same client."""
-  class _Client(_FakeClient):
-    async def receive_response(self):
-      if len(self.queries) == 1:
-        yield _assistant_text("first block")
-        # Steer arrives after the first block already streamed; it fires
-        # the interrupt immediately all the same.
-        assert await steer_into_active_turn("late-chat", "pivot") is True
-        yield _assistant_text("second block")
-        yield _interrupt_result()
-        return
-      yield _stream_delta("text_delta", text="pivoted")
-      yield _success_result()
-
-  clients = _install_fake_client(monkeypatch, _Client)
-  result = await _run_turn("late-chat", prompt="start task")
-
-  client = clients[0]
-  assert client.interrupts == 1
-  assert len(client.queries) == 2
-  assert "pivot" in client.queries[1]
-  assert result["error"] is None
-
-
-@pytest.mark.asyncio
-async def test_stop_drops_buffered_steer(monkeypatch):
-  """Stop is the hard teardown path: after a steer has already fired its own
-  soft interrupt, a Stop drops the buffered steer entirely (no requery for
-  abandoned work) and fires its own immediate interrupt on top."""
-  del monkeypatch  # this handle-level test needs no SDK patching
-
-  calls: list[str] = []
-
-  class _Client:
-    async def interrupt(self):
-      calls.append("interrupt")
-
-  handle = ActiveClaudeClient(_Client(), chat_id="stop-chat")
-  handle.mark_generating()
-  registry.register(handle)
-  try:
-    # Steer buffers the text and fires its soft interrupt immediately.
-    assert await steer_into_active_turn("stop-chat", "use blue") is True
-    assert handle.pending_steer == ["use blue"]
-    assert calls == ["interrupt"]
-
-    # mark_finished so interrupt()'s _finished wait returns immediately.
-    handle.mark_finished()
-    await handle.interrupt()
-
-    # Stop always cuts immediately — a second interrupt on top of the
-    # steer's — and clears the buffer so no requery fires.
-    assert calls == ["interrupt", "interrupt"]
-    assert handle.pending_steer == []
-  finally:
-    registry.unregister("stop-chat", handle.kind)
 
 
 @pytest.mark.asyncio
@@ -2902,61 +2525,6 @@ def test_claude_text_events_have_no_id_without_message_id():
   assert emitted and all("text_item_id" not in e for e in emitted)
 
 
-@pytest.mark.asyncio
-async def test_mid_turn_person_message_is_framed_as_owed_a_visible_reply():
-  """A person's mid-turn message must not be absorbed as silent context.
-
-  "Continue the same task" framing let agents fold an owner's question into
-  their work and answer it only in hidden thinking. Visible rows are framed
-  as a message needing a visible reply; hidden agent carriers (helper
-  results, peer notes) stay context. The distinction resets with the buffer.
-  """
-  class _Client:
-    async def interrupt(self):
-      pass
-
-  handle = ActiveClaudeClient(_Client(), chat_id="claude-steer-framing")
-  handle.mark_generating()
-
-  await handle.steer(
-    "helper finished", [{"role": "user", "cid": "c1", "hidden": True,
-                         "kind": "delegation_result"}], ["c1"],
-  )
-  assert handle.steer_from_person is False
-  await handle.steer("why not X?", [{"role": "user", "cid": "c2"}], ["c2"])
-  assert handle.steer_from_person is True
-
-  texts = handle.take_steer_for_requery(interrupt_landed=True)
-  assert texts == ["helper finished", "why not X?"]
-  assert handle.steer_from_person is False
-
-  person = claude_sdk_runner._steer_redirect_message(texts, from_person=True)
-  assert person.startswith("The partner sent this message while you were")
-  assert "visible response" in person
-  assert "why not X?" in person and "helper finished" in person
-
-  context = claude_sdk_runner._steer_redirect_message(
-    ["peer note"], from_person=False,
-  )
-  assert context.startswith("New context arrived while you were working.")
-
-
-@pytest.mark.asyncio
-async def test_stop_clears_person_steer_framing():
-  class _Client:
-    async def interrupt(self):
-      pass
-
-  handle = ActiveClaudeClient(_Client(), chat_id="claude-steer-stop")
-  handle.mark_generating()
-  await handle.steer("stop that", [{"role": "user", "cid": "c3"}], ["c3"])
-  assert handle.steer_from_person is True
-  handle.mark_finished()
-  await handle.interrupt()
-  assert handle.pending_steer == []
-  assert handle.steer_from_person is False
-
-
 def _clean_zero_block_result(session_id: str = "sess-1"):
   """A clean, zero-block resume terminal — the synthetic-no-op shape."""
   return ResultMessage(
@@ -3013,3 +2581,262 @@ async def test_rejected_selected_model_does_not_fall_back_silently(monkeypatch):
   assert clients[0].queries == ["hello"]
   assert clients[0].options.model == "claude-opus-4-8"
   assert result["error"] == "Selected model may not exist or you may not have access"
+
+
+# --- Steering queues into the live turn; it never interrupts ----------------
+#
+# `client.interrupt()` is the CLI's Esc key: it aborts the running tool and
+# tells the model "The user doesn't want to proceed with this tool use… STOP".
+# Steering used it, so every helper result, peer note, or owner aside arriving
+# mid-command read to the agent as the owner rejecting its work. A steer now
+# goes into the CLI's input queue; the CLI folds it in after the in-flight
+# step and echoes it (`--replay-user-messages`) at that moment.
+
+
+def _queued_payload(client) -> dict:
+  """The one stream-json message the latest steer wrote to the CLI."""
+  sent = client.queries[-1]
+  assert isinstance(sent, list) and len(sent) == 1
+  return sent[0]
+
+
+def _cli_echo(payload: dict) -> UserMessage:
+  """The CLI's replay of a queued message as the model takes it in."""
+  return UserMessage(
+    content=payload["message"]["content"], uuid=payload["uuid"],
+  )
+
+
+def _tool_call(tool_id: str, command: str) -> AssistantMessage:
+  return AssistantMessage(
+    content=[ToolUseBlock(id=tool_id, name="Bash", input={"command": command})],
+    model="claude-opus",
+    session_id="sess-1",
+  )
+
+
+def _tool_result(tool_id: str, output: str) -> UserMessage:
+  return UserMessage(content=[ToolResultBlock(
+    tool_use_id=tool_id, content=output, is_error=False,
+  )])
+
+
+class _SealRecordingBus(_ChatBus):
+  """Records where the runner seals the steer cut among streamed events."""
+
+  async def commit_steer_cut(self, rows, consume):
+    self.events.append({"type": "seal", "rows": [r["content"] for r in rows],
+                        "consume": list(consume)})
+    return {"ok": True}
+
+
+class _RecordingCli:
+  def __init__(self):
+    self.sent: list[dict] = []
+    self.interrupts = 0
+
+  async def query(self, message):
+    self.sent.extend([item async for item in message])
+
+  async def interrupt(self):
+    self.interrupts += 1
+
+
+def test_claude_cli_is_launched_to_echo_queued_input(monkeypatch):
+  """The echo is the only signal of when the model takes a steer in."""
+  clients = _install_fake_client(monkeypatch)
+  asyncio.run(_run_turn("echo-flag-chat"))
+  assert "replay-user-messages" in clients[0].options.extra_args
+
+
+@pytest.mark.asyncio
+async def test_steer_queues_into_the_live_turn_without_interrupting():
+  cli = _RecordingCli()
+  handle = ActiveClaudeClient(cli, chat_id="claude-steer-queue")
+  registry.register(handle)
+  try:
+    assert await steer_into_active_turn(
+      "claude-steer-queue", "helper finished",
+      [{"role": "user", "cid": "c1", "hidden": True}], ["c1"],
+    ) is True
+    assert await steer_into_active_turn(
+      "claude-steer-queue", "why not X?", [{"role": "user", "cid": "c2"}], ["c2"],
+    ) is True
+  finally:
+    registry.unregister("claude-steer-queue", handle.kind)
+
+  assert cli.interrupts == 0
+  assert handle.has_queued_steers
+  # Each steer is its own queued message with its own uuid, in order.
+  assert [m["type"] for m in cli.sent] == ["user", "user"]
+  assert len({m["uuid"] for m in cli.sent}) == 2
+  helper, person = (m["message"]["content"] for m in cli.sent)
+  # A hidden agent carrier stays context for the work; a person's message is
+  # owed a visible reply.
+  assert helper.startswith("New context arrived while you were working.")
+  assert "helper finished" in helper
+  assert person.startswith("The partner sent this message while you were")
+  assert "visible response" in person and "why not X?" in person
+  # Nothing is sealed until the CLI takes the steer in.
+  assert handle._steer_user_msgs == []
+
+
+@pytest.mark.asyncio
+async def test_re_delivered_steer_row_is_not_queued_twice():
+  cli = _RecordingCli()
+  handle = ActiveClaudeClient(cli, chat_id="claude-steer-dedup")
+  row = {"role": "user", "content": "use blue", "cid": "c1"}
+  assert await handle.steer("use blue", [row], ["c1"]) is True
+  assert await handle.steer("use blue", [dict(row)], ["c1"]) is True
+  assert len(cli.sent) == 1
+  assert handle.take_in_queued_steer(cli.sent[0]["uuid"]) is True
+  # Still a duplicate once taken in and awaiting its seal.
+  assert await handle.steer("use blue", [dict(row)], ["c1"]) is True
+  assert len(cli.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_cli_echo_of_a_later_steer_settles_every_earlier_one():
+  cli = _RecordingCli()
+  handle = ActiveClaudeClient(cli, chat_id="claude-steer-fifo")
+  await handle.steer("one", [{"role": "user", "content": "one", "cid": "a"}], ["a"])
+  await handle.steer("two", [{"role": "user", "content": "two", "cid": "b"}], ["b"])
+  assert handle.take_in_queued_steer("not-ours") is False
+  assert handle.take_in_queued_steer(cli.sent[1]["uuid"]) is True
+  assert [m["content"] for m in handle._steer_user_msgs] == ["one", "two"]
+  assert handle._steer_consume_cids == ["a", "b"]
+  assert not handle.has_queued_steers
+
+
+@pytest.mark.asyncio
+async def test_closed_turn_refuses_steers_for_after_turn_delivery():
+  cli = _RecordingCli()
+  handle = ActiveClaudeClient(cli, chat_id="claude-steer-closed")
+  await handle.steer("late", [{"role": "user", "content": "late", "cid": "a"}])
+  handle.stop_accepting_steers()
+  # An accepted but never-taken-in steer keeps its rows for the turn-end seal.
+  assert [m["content"] for m in handle._steer_user_msgs] == ["late"]
+  assert await handle.steer("later", [{"role": "user", "cid": "b"}]) is False
+  assert len(cli.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_steer_the_cli_cannot_accept_is_not_owed():
+  class _GoneCli(_RecordingCli):
+    async def query(self, message):
+      raise ConnectionError("CLI exited")
+
+  handle = ActiveClaudeClient(_GoneCli(), chat_id="claude-steer-gone")
+  assert await handle.steer("note", [{"role": "user", "cid": "a"}]) is False
+  assert not handle.has_queued_steers
+  assert handle._steer_user_msgs == []
+
+
+@pytest.mark.asyncio
+async def test_stop_is_the_only_cut_and_drops_queued_steers():
+  cli = _RecordingCli()
+  handle = ActiveClaudeClient(cli, chat_id="claude-steer-stop")
+  await handle.steer("stop that", [{"role": "user", "cid": "c3"}], ["c3"])
+  assert cli.interrupts == 0
+  handle.mark_finished()
+  await handle.interrupt()
+  assert cli.interrupts == 1
+  assert handle.interrupt_requested is True
+  assert not handle.has_queued_steers
+  assert handle._steer_user_msgs == [] and handle._steer_consume_cids == []
+
+
+@pytest.mark.asyncio
+async def test_owner_card_end_waits_for_a_queued_steer_to_be_taken_in():
+  """The CLI is about to hand a queued steer to the model, so the turn keeps
+  going to take it in rather than ending at the card with it unread."""
+  cli = _RecordingCli()
+  handle = ActiveClaudeClient(cli, chat_id="claude-steer-card")
+  await handle.steer("peer note", [{"role": "user", "cid": "p1", "hidden": True}])
+  assert handle.claim_owner_card_end() is False
+  assert handle.take_in_queued_steer(cli.sent[0]["uuid"]) is True
+  assert handle.claim_owner_card_end() is True
+  assert handle.owner_card_end is True
+  assert cli.interrupts == 0
+
+
+@pytest.mark.asyncio
+async def test_steer_waits_for_the_running_tool_and_seals_at_the_cli_echo(
+  monkeypatch,
+):
+  """A helper result that arrives while a long command runs must not cut it:
+  the command finishes, and the cut lands where the CLI took the steer in."""
+  class _Client(_FakeClient):
+    async def receive_response(self):
+      yield _tool_call("t1", "sleep 60; sample")
+      assert await steer_into_active_turn(
+        "tool-steer-chat", "helper finished",
+        [{"role": "user", "content": "helper result", "cid": "h1",
+          "hidden": True}],
+      ) is True
+      # The tool runs to completion; no rejection is synthesized.
+      yield _tool_result("t1", "samples done")
+      yield _cli_echo(_queued_payload(self))
+      yield _stream_delta("text_delta", text="folded the helper in")
+      yield _success_result()
+
+  clients = _install_fake_client(monkeypatch, _Client)
+  bus = _SealRecordingBus()
+  result = await _run_turn("tool-steer-chat", bc=bus, prompt="profile the host")
+
+  client = clients[0]
+  assert client.interrupts == 0
+  assert client.queries[0] == "profile the host"
+  assert len(client.queries) == 2  # the prompt and the one queued steer
+  assert result["error"] is None
+  kinds = [
+    e["type"] for e in bus.events if e["type"] in ("tool_output", "seal", "text")
+  ]
+  assert kinds == ["tool_output", "seal", "text"]
+  outputs = [e for e in bus.events if e["type"] == "tool_output"]
+  assert outputs[0]["content"] == "samples done"
+  seal = next(e for e in bus.events if e["type"] == "seal")
+  assert seal["rows"] == ["helper result"]
+
+
+@pytest.mark.asyncio
+async def test_steer_during_the_final_answer_runs_as_a_follow_up_on_the_same_session(
+  monkeypatch,
+):
+  """With no later step to fold into, the CLI runs the queued steer as the
+  next query once the answer ends; the runner reads on instead of returning."""
+  class _Client(_FakeClient):
+    def __init__(self, options):
+      super().__init__(options)
+      self.responses = 0
+
+    async def receive_response(self):
+      self.responses += 1
+      if self.responses == 1:
+        yield _stream_delta("text_delta", text="A1")
+        assert await steer_into_active_turn(
+          "final-steer-chat", "and bold",
+          [{"role": "user", "content": "and bold", "cid": "q2"}], ["q2"],
+        ) is True
+        yield _success_result(cost=0.01)
+        return
+      yield _cli_echo(_queued_payload(self))
+      yield _stream_delta("text_delta", text="A2")
+      yield _success_result(cost=0.03)
+
+  clients = _install_fake_client(monkeypatch, _Client)
+  bus = _SealRecordingBus()
+  result = await _run_turn("final-steer-chat", bc=bus, prompt="write it")
+
+  client = clients[0]
+  assert client.interrupts == 0
+  assert client.responses == 2
+  assert len(client.queries) == 2  # no re-query: the CLI already holds it
+  assert result["error"] is None
+  assert result["cost_usd"] == 0.03
+  assert [
+    e.get("content") or e["type"]
+    for e in bus.events if e["type"] in ("text", "seal")
+  ] == ["A1", "seal", "A2"]
+  # The turn is closed to steers once the runner stops reading.
+  assert await steer_into_active_turn("final-steer-chat", "too late") is False

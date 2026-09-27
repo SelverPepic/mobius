@@ -64,6 +64,14 @@ def _make_active_claude_client(chat_id: str):
   from app.claude_sdk_runner import ActiveClaudeClient
 
   class _Client:
+    """A CLI stand-in: steers land in its input queue, never interrupt it."""
+
+    def __init__(self):
+      self.queued: list[dict] = []
+
+    async def query(self, message):
+      self.queued.extend([item async for item in message])
+
     async def interrupt(self):
       return None
 
@@ -71,6 +79,21 @@ def _make_active_claude_client(chat_id: str):
     return ActiveClaudeClient(_Client(), chat_id=chat_id)
 
   return asyncio.run(_build())
+
+
+def _queued_steer_rows(handle) -> list[dict]:
+  """Rows of steers the CLI holds but has not yet taken into the turn."""
+  return [row for queued in handle._queued_steers for row in queued.user_msgs]
+
+
+def _queued_steer_consume(handle) -> list[str]:
+  return [cid for queued in handle._queued_steers for cid in queued.consume_cids]
+
+
+def _cli_takes_in_steers(handle) -> None:
+  """The CLI echoes its queued steers as the model takes them in."""
+  if handle._queued_steers:
+    assert handle.take_in_queued_steer(handle._queued_steers[-1].uuid)
 
 
 def _patch_codex_steer(monkeypatch, steer) -> None:
@@ -367,8 +390,8 @@ def test_direct_claude_steer_keeps_reserve_until_deferred_cut(
   assert res.json()["cut_deferred"] is True
   chat = _read_chat(chat_id)
   assert [cid_of(row) for row in chat.pending_messages] == [message_cid]
-  assert [cid_of(row) for row in handle._steer_user_msgs] == [message_cid]
-  assert handle._steer_consume_cids == [message_cid]
+  assert [cid_of(row) for row in _queued_steer_rows(handle)] == [message_cid]
+  assert _queued_steer_consume(handle) == [message_cid]
 
 
 def test_pending_question_refuses_force_steer_without_holding_queue(
@@ -949,9 +972,14 @@ def test_stop_drops_the_buffered_steer_instead_of_appending_it():
     # Built inside THIS loop: interrupt() waits on `_finished`, which is
     # loop-bound, so a handle constructed in a throwaway loop cannot be awaited
     # here. mark_finished() stands in for the runner's own teardown.
+    from app.claude_sdk_runner import _QueuedSteer
+
     handle = ActiveClaudeClient(_Client(), chat_id="stopsteer")
     handle.mark_finished()
-    handle.pending_steer = ["Q2"]
+    handle._queued_steers = [_QueuedSteer(
+      uuid="q3", user_msgs=[{"role": "user", "content": "Q3", "cid": "c-q3"}],
+      consume_cids=["c-q3"],
+    )]
     handle._steer_user_msgs = [
       {"role": "user", "content": "Q2", "ts": 10, "cid": "c-q2"}
     ]
@@ -959,7 +987,7 @@ def test_stop_drops_the_buffered_steer_instead_of_appending_it():
 
     await handle.interrupt()
 
-    assert handle.pending_steer == []
+    assert handle._queued_steers == []
     assert handle._steer_user_msgs == []
     assert handle._steer_consume_cids == []
 
@@ -1032,10 +1060,11 @@ def test_claude_force_steer_defers_to_runner_and_reorders(client, auth):
   ]
   assert [m["content"] for m in (chat.pending_messages or [])] == ["use blue"]
   # The steered row is buffered on the handle for the runner.
-  assert [m["content"] for m in handle._steer_user_msgs] == ["use blue"]
+  assert [m["content"] for m in _queued_steer_rows(handle)] == ["use blue"]
 
   async def _drive_runner():
     sink.publish({"type": "text", "content": "A1 pre-interrupt"})
+    _cli_takes_in_steers(handle)
     await _seal_steer_split(sink, handle, chat_id)
     sink.publish({"type": "text", "content": "A2 answer"})
     await sink.finalize()
@@ -1517,11 +1546,11 @@ def test_steers_into_live_claude_turn_reserves_durable_pending(
   reserved_cid = cid_of(chat.pending_messages[0])
   assert [m["role"] for m in chat.messages] == ["user", "assistant"]
 
-  assert [m["content"] for m in handle._steer_user_msgs] == [
+  assert [m["content"] for m in _queued_steer_rows(handle)] == [
     "actually use blue"
   ]
-  assert cid_of(handle._steer_user_msgs[0]) == reserved_cid
-  assert handle._steer_consume_cids == [reserved_cid]
+  assert cid_of(_queued_steer_rows(handle)[0]) == reserved_cid
+  assert _queued_steer_consume(handle) == [reserved_cid]
 
   # NO event at HTTP arrival on the deferred path. The 202's own
   # `pending_messages` (asserted above) is the single signal that keeps the row
@@ -1586,6 +1615,7 @@ def test_claude_runner_splits_steer_at_boundary_not_http_arrival(
     # The interrupted turn ends: the runner seals A1, appends Q2, resets. In
     # production the runner's `bc` IS the sink (chat.py passes `bc=sink`), so
     # the split runs against the live sink here too.
+    _cli_takes_in_steers(handle)
     await _seal_steer_split(sink, handle, chat_id)
     # The requery's answer (A2) streams into the fresh sink and finalizes.
     sink.publish({"type": "text", "content": "A2 answer"})
@@ -1663,6 +1693,7 @@ def test_claude_steer_cut_event_is_published_at_the_seal_not_at_http_arrival(
   async def _drive_runner():
     # The rest of A1 streams AFTER arrival — the duplication window.
     sink.publish({"type": "text", "content": " A1 rest"})
+    _cli_takes_in_steers(handle)
     await _seal_steer_split(sink, handle, chat_id)
     # A2's first block follows the seal. It exists here so the cut's position
     # is pinned from BOTH sides: a cut that slipped in front of a continuation
@@ -1810,7 +1841,7 @@ def test_claude_reserved_row_survives_process_loss_and_sweep(
   assert [cid_of(row) for row in _read_chat(chat_id).pending_messages] == [
     message_cid,
   ]
-  assert [cid_of(row) for row in handle._steer_user_msgs] == [message_cid]
+  assert [cid_of(row) for row in _queued_steer_rows(handle)] == [message_cid]
 
   registry.reset_for_tests()
   bc.mark_completed()

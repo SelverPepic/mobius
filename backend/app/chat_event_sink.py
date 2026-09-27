@@ -1320,8 +1320,8 @@ class ChatEventSink:
     """Split the streaming turn at a steer boundary so reload order is
     Q1, A1, Q2, A2.
 
-    Deterministic for Claude: its steer is interrupt + re-query, a real turn
-    boundary, so the sealed A1 is exactly the pre-interrupt text. For Codex,
+    Deterministic for Claude: the CLI echoes a queued steer only between model
+    steps, so the sealed A1 is exactly the pre-steer text. For Codex,
     `turn.steer()` injects into the SAME running turn with no boundary, so the
     A1/A2 cut is best-effort — a continuation delta already in flight when the
     steer lands can be sealed as the tail of A1 rather than the head of A2.
@@ -1331,7 +1331,7 @@ class ChatEventSink:
     both providers.
 
     Called by the live provider handle after steering delivery is acknowledged:
-    Claude at its interrupt boundary, Codex when ``turn.steer()`` returns.
+    Claude at the CLI's echo of the steer, Codex when ``turn.steer()`` returns.
     Both run on the one FastAPI event loop, so the cut is serialized with this
     sink's ``publish()`` snapshots. The pre-steer assistant text (A1) becomes
     its own trailing assistant message, the steered user message (Q2) is

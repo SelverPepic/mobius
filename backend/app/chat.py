@@ -3888,21 +3888,6 @@ def _park_exit(
       "park_reason": park_reason,
     }
   if not limit:
-    if runner_result is not None and runner_result.get("resume_incomplete"):
-      # A steer's soft interrupt raced turn-end (its text already re-queried and
-      # drained pending_steer), or the CLI interrupted unexpectedly, so the turn
-      # ended with no answer. This is NOT a failure: render a calm, resumable
-      # "Paused" note — the owner taps Resume to continue — instead of a red
-      # "Execution interrupted." error block. The runner already defused the
-      # provider error to None (stop_reason=="interrupt" is always our own
-      # interrupt); an owner Stop writes its own resumable note through the stop
-      # flow and never sets `resume_incomplete`, so this branch is steer-only.
-      sink.publish(_pause_note(
-        "This turn was interrupted before it finished. Tap Resume to continue.",
-        kind="interrupted",
-        resumable=True,
-      ))
-      return {"parked": False}
     if error_text:
       sink.publish({"type": "error", "message": error_text})
     elif runner_result is None:
