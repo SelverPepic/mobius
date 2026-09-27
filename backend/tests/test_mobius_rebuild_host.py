@@ -347,7 +347,9 @@ def test_failed_request_claim_is_terminal_and_retryable(tmp_path, monkeypatch):
 
   assert host.run() == 1
   assert statuses[-1]["state"] == "failed"
-  assert not request.exists()
+  # It was never claimed, so it may be another request by now: it stays for
+  # the owner to withdraw instead of being deleted unverified.
+  assert request.exists()
 
 
 
@@ -603,7 +605,14 @@ def test_the_helper_names_a_request_in_its_status_before_claiming_it(
   assert order[:2] == ["named", "claim"]
 
 
-def test_a_request_withdrawn_before_its_claim_fails_and_spares_the_inbox(
+def _requeue(request: Path, content: str) -> None:
+  """What the app's withdraw-then-Finish does: a new file at the same path."""
+  temp = request.with_name(".app-request.tmp")
+  temp.write_text(content, encoding="utf-8")
+  os.replace(temp, request)
+
+
+def test_a_newer_request_that_replaced_the_one_read_stays_queued(
   tmp_path, monkeypatch,
 ):
   _config, inbox = _worker_paths(tmp_path, monkeypatch)
@@ -613,21 +622,41 @@ def test_a_request_withdrawn_before_its_claim_fails_and_spares_the_inbox(
     "version": 2, "expected_sha": "4" * 40, "nonce": nonce,
   }), encoding="utf-8")
   newer = json.dumps({"version": 2, "expected_sha": "5" * 40, "nonce": "c" * 32})
-
-  def withdrawn_then_requeued(source, _target):
-    if Path(source) == request:
-      # The app withdrew this request and queued a newer one meanwhile.
-      request.write_text(newer, encoding="utf-8")
-      raise FileNotFoundError(source)
-
   statuses = []
-  monkeypatch.setattr(host.os, "replace", withdrawn_then_requeued)
-  monkeypatch.setattr(
-    host, "write_status", lambda _config, **fields: statuses.append(fields) or fields,
-  )
+
+  def status(_config, **fields):
+    statuses.append(fields)
+    if fields.get("state") == "queued":
+      _requeue(request, newer)  # withdrawn and re-queued before the claim
+    return fields
+
+  monkeypatch.setattr(host, "write_status", status)
 
   assert host.run() == 1
-  assert statuses[-1]["state"] == "failed"
-  assert statuses[-1]["code"] == "withdrawn"
+  assert (statuses[-1]["state"], statuses[-1]["code"]) == ("failed", "withdrawn")
   assert statuses[-1]["request_nonce"] == nonce
+  assert request.read_text(encoding="utf-8") == newer
+  assert not list(_config["control_dir"].glob(".request-*"))
+
+
+def test_a_request_queued_after_a_withdrawal_survives_the_failed_claim(
+  tmp_path, monkeypatch,
+):
+  _config, inbox = _worker_paths(tmp_path, monkeypatch)
+  request = inbox / "request.json"
+  request.write_text(json.dumps({
+    "version": 2, "expected_sha": "4" * 40, "nonce": "b" * 32,
+  }), encoding="utf-8")
+  newer = json.dumps({"version": 2, "expected_sha": "5" * 40, "nonce": "c" * 32})
+
+  def status(_config, **fields):
+    if fields.get("state") == "queued":
+      request.unlink()  # withdrawn before the claim
+    elif fields.get("code") == "withdrawn":
+      _requeue(request, newer)  # a newer Finish before the worker cleans up
+    return fields
+
+  monkeypatch.setattr(host, "write_status", status)
+
+  assert host.run() == 1
   assert request.read_text(encoding="utf-8") == newer
