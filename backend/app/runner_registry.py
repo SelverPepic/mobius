@@ -17,7 +17,13 @@ class RunnerKind(str, Enum):
 
 @runtime_checkable
 class RunnerHandle(Protocol):
-  """Protocol implemented by concrete runtime stop handles."""
+  """Protocol implemented by concrete runtime stop handles.
+
+  A handle whose ``stop`` ends its work for good (a helper-host agent that
+  can never be resumed once stopped) also offers
+  ``async suspend(timeout) -> bool``. A planned restart uses it to end the
+  turn and leave that work resumable.
+  """
 
   chat_id: str
   kind: RunnerKind

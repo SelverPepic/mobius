@@ -588,6 +588,10 @@ def _route_diagnostics_to_chat_log(_context: StartupContext) -> None:
   for name, level in (
     ("app.providers.models", logging.WARNING),
     ("moebius.memory", logging.INFO),
+    # Shared helper hosts: starts, exits with stderr, reseeds, and dispatches
+    # that never start a helper are otherwise lost with the process output.
+    ("app.helper_hosts", logging.INFO),
+    ("app.claude_helper_host", logging.INFO),
   ):
     logger = logging.getLogger(name)
     if handler not in logger.handlers:
