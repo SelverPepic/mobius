@@ -217,9 +217,9 @@ def _configure_claude_settings_defaults(context: StartupContext) -> None:
 def _migrate_theme_surface_token(context: StartupContext) -> None:
   """Rewrite a saved theme.css's legacy --surface2 token to --surface-2.
 
-  Fix-forward for the secondary-surface token rename (no alias): the served
-  theme is already renamed on every read, but this normalizes the on-disk
-  source the theme editor loads verbatim. Idempotent and missing-file-safe;
+  Fix-forward for the secondary-surface token rename (no alias). This is the
+  only code that knows the legacy name, so it must run before the theme is
+  served or an owner's saved value is lost. Idempotent and missing-file-safe;
   runs before the database phase because it only touches shared/theme.css.
   """
   from app.theme import migrate_theme_surface2_token
