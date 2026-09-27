@@ -218,21 +218,19 @@ def test_drop_platform_restart_executions_is_idempotent(tmp_path):
   assert "platform_restart_executions" not in inspect(eng).get_table_names()
 
 
-def test_goal_plan_admission_revision_upgrade_is_nullable_and_idempotent(tmp_path):
+def test_retired_goal_admission_revision_migration_stays_idempotent(tmp_path):
+  # Goals no longer earn automatic turns from plan progress. The ledger entry
+  # still runs on fresh and upgraded databases; it only adds the retired
+  # nullable column, which no model maps any more.
   eng = create_engine(f"sqlite:///{tmp_path / 'goal-admission-revision.db'}")
   models.Base.metadata.create_all(eng)
-  with eng.begin() as conn:
-    conn.execute(text(
-      "ALTER TABLE chat_runs DROP COLUMN goal_plan_revision_at_admission"
-    ))
-
   migrations._add_goal_plan_admission_revision(eng)
   migrations._add_goal_plan_admission_revision(eng)
-
-  columns = {
-    column["name"]: column for column in inspect(eng).get_columns("chat_runs")
-  }
-  assert columns["goal_plan_revision_at_admission"]["nullable"] is True
+  cols = {c["name"]: c for c in inspect(eng).get_columns("chat_runs")}
+  assert cols["goal_plan_revision_at_admission"]["nullable"] is True
+  assert (
+    "goal_plan_revision_at_admission" not in models.ChatRun.__table__.columns
+  )
 
 
 def test_retired_progress_lease_migration_stays_idempotent(tmp_path):

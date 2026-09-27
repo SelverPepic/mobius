@@ -155,7 +155,7 @@ test('rendering retains a failed Restart attempt before the card-owned request',
   }, { tools: new Map(), positions: new Map() })
 
   assert.match(html, /chat__tool--failed/)
-  assert.match(html, /mcp__mobius_control__request_restart/)
+  assert.match(html, /Asked to restart Möbius/)
   assert.match(html, /Restart\?/)
 })
 
@@ -186,7 +186,7 @@ test('rendering a compact server projection retains its surviving failed Restart
     chatId: 'chat', messageKey: 'restart-projected',
   }, { tools: new Map(), positions: new Map() })
 
-  assert.match(html, /mcp__mobius_control__request_restart/)
+  assert.match(html, /Asked to restart Möbius/)
   assert.match(html, /\(1 step\)/)
   assert.match(html, /Restart\?/)
 })
@@ -227,7 +227,7 @@ test('a legacy compact projection repairs one sampled-out Restart request', () =
   }, { tools: new Map(), positions: new Map() })
 
   assert.match(html, /\(2 steps\)/)
-  assert.equal((html.match(/mcp__mobius_control__request_restart/g) || []).length, 2)
+  assert.equal((html.match(/Asked to restart Möbius/g) || []).length, 2)
 })
 
 test('a marked compact projection trusts the corrected server count', () => {

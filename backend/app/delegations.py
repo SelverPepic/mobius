@@ -1576,9 +1576,9 @@ def _delivered_to_live_parent_runs(
   """Helper results already handed to a parent run that has not settled.
 
   Finalize marks a result delivered only when that run ends, but from
-  delivery onward the receiving run, not the helper, owns the next move.
-  Otherwise the turn that incorporates a result could never complete its Goal.
-  Only the exact admitted result counts: a follow-up that run sent is owed.
+  delivery onward the receiving run, not the helper, owns the next move, so
+  the chat no longer reads as waiting on that helper. Only the exact admitted
+  result counts: a follow-up that run sent is owed.
   """
   if not parent_chat_ids:
     return set()
@@ -1601,14 +1601,6 @@ def background_helper_chat_ids(db: Session, parent_chat_ids) -> set[str]:
   return {
     row.parent_chat_id
     for row, _status in _self_resuming_helper_rows(db, requested)
-  }
-
-
-def background_helper_goal_ids(db: Session, parent_chat_id: str) -> set[str]:
-  """Logical Goal/root identities owned by this chat's waking helpers."""
-  return {
-    row.parent_root_run_id
-    for row, _status in _self_resuming_helper_rows(db, {parent_chat_id})
   }
 
 

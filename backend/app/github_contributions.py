@@ -956,8 +956,19 @@ def _cleanup_terminal_staging_checkout(record: dict) -> bool:
   roots = (data_dir / "contrib", data_dir / "contributions")
   if not any(repo.is_relative_to(root) for root in roots):
     return False
-  if not repo.exists():
-    return True
+  cleaned = not repo.exists() or _remove_staging_checkout(repo, data_dir)
+  if cleaned and repo.parent.parent in roots:
+    # The per-record folder holds only this checkout by convention. Remove it
+    # once empty; anything else left there is for a person to judge.
+    try:
+      repo.parent.rmdir()
+    except OSError:
+      pass
+  return cleaned
+
+
+def _remove_staging_checkout(repo: Path, data_dir: Path) -> bool:
+  """Remove one validated staging checkout through its owning Git shape."""
   marker = repo / ".git"
   if not marker.exists() or marker.is_symlink():
     return False
@@ -1021,11 +1032,14 @@ def _cleanup_terminal_staging_checkout(record: dict) -> bool:
       common_dir = common_dir.resolve()
     except (OSError, RuntimeError):
       return False
+    # /data/worktrees holds the owner's clones of ordinary GitHub projects,
+    # which the GitHub adapter uses as a review worktree's primary checkout.
     common_roots = (
       data_dir / "platform",
       data_dir / "apps",
       data_dir / "contrib",
       data_dir / "contributions",
+      data_dir / "worktrees",
     )
     if not any(common_dir.is_relative_to(root) for root in common_roots):
       return False

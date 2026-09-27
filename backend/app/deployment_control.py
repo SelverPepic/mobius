@@ -50,6 +50,8 @@ class RebuildStatus(TypedDict):
   image_digest: str | None
   release_source: Literal["applied", "latest_ghcr"]
   updated_at: str | None
+  # The app's nonce for the host request this status reports (self-hosted).
+  request_nonce: str | None
 
 
 class OfficialImageRelease(TypedDict):
@@ -83,6 +85,7 @@ _ACTIVE_STATES = {"queued", "preparing", "replacing", "verifying"}
 # (for example the path unit is not installed or not running).
 _UNCLAIMED_REQUEST_BOUND_S = 120
 _HANDOFF_VERSION = "external-cutover-v1"
+_HOST_REQUEST_VERSION = 2
 _managed_recovery_tasks: set[asyncio.Task[None]] = set()
 # The Railway handoff this process can still start or cancel. Its nonce lives
 # only in that request, and the account service never expires a prepared
@@ -115,6 +118,7 @@ def _empty_status(
     image_digest=None,
     release_source="applied",
     updated_at=None,
+    request_nonce=None,
   )
 
 
@@ -157,6 +161,7 @@ async def _reconcile_ambiguous_managed_start(
       continue
     cancelled = raw.get("cancelled")
     if cancelled is True:
+      await _release_binding({"controller": "railway", "id": operation_id})
       await recover()
       return
     if cancelled is False:
@@ -224,6 +229,7 @@ def _normalize_status(
   if reported_sha and not _SHA_RE.fullmatch(reported_sha):
     reported_sha = ""
   updated_at = str(raw.get("updated_at") or "").strip() or None
+  nonce = str(raw.get("request_nonce") or "").strip()
   return RebuildStatus(
     supported=True,
     deployment="self_hosted",
@@ -236,6 +242,7 @@ def _normalize_status(
     image_digest=None,
     release_source="applied",
     updated_at=updated_at,
+    request_nonce=nonce if _OPERATION_RE.fullmatch(nonce) else None,
   )
 
 
@@ -340,6 +347,7 @@ def _normalize_managed_status(
     image_digest=digest if _DIGEST_RE.fullmatch(digest) else None,
     release_source=release_source,
     updated_at=str(raw.get("updated_at") or "") or None,
+    request_nonce=None,
   )
 
 
@@ -438,6 +446,11 @@ def _read_host_status() -> dict[str, Any]:
         "expected_sha": expected,
         "updated_at": queued_at.isoformat(),
         "handoff": value.get("handoff"),
+        "request_versions": value.get("request_versions"),
+        "request_nonce": (
+          str(pending.get("nonce") or "") or None
+          if isinstance(pending, dict) else None
+        ),
         # Helpers predating image-owned protected runtime advertised the same
         # handoff version. Preserve their retired capability through this
         # synthesized state so a pending request cannot make them look current.
@@ -467,13 +480,17 @@ def _read_host_status() -> dict[str, Any]:
 
 
 def _current_host_controller(raw: dict[str, Any]) -> bool:
+  # Request version 2 carries the app's nonce, which the helper echoes so only
+  # that exact replacement can confirm an update (``reconcile_bound_operation``).
+  versions = raw.get("request_versions")
   return (
     raw.get("handoff") == _HANDOFF_VERSION
     and not raw.get("runtime_overlay")
+    and isinstance(versions, list) and _HOST_REQUEST_VERSION in versions
   )
 
 
-def _write_request(expected_sha: str) -> None:
+def _write_request(expected_sha: str, nonce: str) -> None:
   inbox = _inbox_dir()
   request = inbox / "request.json"
   if request.exists():
@@ -484,7 +501,8 @@ def _write_request(expected_sha: str) -> None:
     )
   temp = inbox / f".request-{secrets.token_hex(12)}.tmp"
   payload = json.dumps(
-    {"version": 1, "expected_sha": expected_sha}, separators=(",", ":"),
+    {"version": _HOST_REQUEST_VERSION, "expected_sha": expected_sha, "nonce": nonce},
+    separators=(",", ":"),
   )
   try:
     fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -552,10 +570,30 @@ async def withdraw_unclaimed_host_request() -> RebuildStatus:
       "The host replacement helper is not configured on this deployment.",
       status_code=409,
     )
-  await asyncio.to_thread(
-    (_inbox_dir() / "request.json").unlink, missing_ok=True,
-  )
+  withdrawn = await asyncio.to_thread(_claim_unclaimed_request)
+  nonce = str(withdrawn.get("nonce") or "") if withdrawn else ""
+  if _OPERATION_RE.fullmatch(nonce):
+    # The helper never saw it, so its binding can never be confirmed.
+    await _release_binding({"controller": "host", "id": nonce})
   return await read_rebuild_status()
+
+
+def _claim_unclaimed_request() -> dict | None:
+  """Take the queued request out of the inbox atomically, racing the helper's
+  own claim; returns its payload when this call won."""
+  inbox = _inbox_dir()
+  claimed = inbox / f".withdrawn-{secrets.token_hex(12)}.json"
+  try:
+    os.replace(inbox / "request.json", claimed)
+  except FileNotFoundError:
+    return None
+  try:
+    value = json.loads(claimed.read_text(encoding="utf-8"))
+  except (OSError, UnicodeError, json.JSONDecodeError):
+    value = None
+  finally:
+    claimed.unlink(missing_ok=True)
+  return value if isinstance(value, dict) else {}
 
 
 async def read_rebuild_status() -> RebuildStatus:
@@ -603,6 +641,183 @@ async def read_rebuild_status() -> RebuildStatus:
   return _normalize_status(raw)
 
 
+def _bound_operation() -> dict | None:
+  record = platform_update.read_prepared_update()
+  return record["operation"] if record else None
+
+
+async def _bind_operation(
+  expected_sha: str, operation: dict, replacing: dict | None,
+) -> None:
+  try:
+    await asyncio.to_thread(
+      lambda: platform_update.bind_update_operation(
+        expected_sha, operation, replacing=replacing,
+      ),
+    )
+  except platform_update.PlatformUpdateError as exc:
+    if str(exc) == "update_operation_bound":
+      raise DeploymentControlError(
+        "already_running",
+        "Another request to finish this update is already under way.",
+        status_code=409,
+      ) from exc
+    raise DeploymentControlError(
+      "update_plan_stale",
+      "Möbius changed since this preview. Refresh and review the update again.",
+      status_code=409,
+    ) from exc
+
+
+async def _release_binding(operation: dict) -> None:
+  """Release exactly ``operation`` once its replacement definitively ended
+  without starting."""
+  record = await asyncio.to_thread(platform_update.read_prepared_update)
+  if record is not None:
+    await asyncio.to_thread(
+      platform_update.unbind_update_operation, record["target"], operation,
+    )
+
+
+def _host_request_ended(nonce: str) -> bool:
+  """Whether the host helper can no longer start the request with ``nonce``.
+
+  The helper publishes a request's nonce in its status before it takes the
+  request out of the inbox (``mobius-rebuild-host.run``). So a request that
+  is neither still queued nor named by the status was never claimed and can
+  never run; one the status names has ended once that status is terminal.
+  Read the inbox first: a request gone from it is already in the status.
+  """
+  try:
+    pending = json.loads((_inbox_dir() / "request.json").read_text(encoding="utf-8"))
+  except FileNotFoundError:
+    pending = None
+  except (OSError, UnicodeError, json.JSONDecodeError):
+    return False
+  if isinstance(pending, dict) and pending.get("nonce") == nonce:
+    return False
+  try:
+    status = json.loads(_status_path().read_text(encoding="utf-8"))
+  except (OSError, UnicodeError, json.JSONDecodeError):
+    return False
+  if not isinstance(status, dict):
+    return False
+  if status.get("request_nonce") == nonce:
+    return str(status.get("state") or "idle") not in _ACTIVE_STATES
+  return True
+
+
+async def _binding_ended(operation: dict) -> bool:
+  """Proof that a bound replacement can no longer start or succeed: the
+  exact operation reported terminal, or (Railway) a newer operation reported,
+  or (host) the request provably never claimed. Merely seeing nothing
+  running is not proof: a host request may be claimed but not yet reported."""
+  if operation["controller"] == "host":
+    return await asyncio.to_thread(_host_request_ended, operation["id"])
+  try:
+    status = await read_rebuild_status()
+  except DeploymentControlError:
+    return False
+  if not status.get("supported") or status.get("state") in _ACTIVE_STATES:
+    return False
+  return True
+
+
+async def release_ended_binding() -> None:
+  """Before cancelling a prepared update, release a binding whose
+  replacement provably ended. Anything short of that proof keeps it, and
+  cancelling then refuses."""
+  operation = await asyncio.to_thread(_bound_operation)
+  if operation is not None and await _binding_ended(operation):
+    await _release_binding(operation)
+
+
+_settle_window_ends: float | None = None
+
+
+async def keep_settling_update() -> None:
+  """The owner keeps a settling update only when its replacement can no
+  longer confirm it: the bounded check after boot has ended and the
+  controller reports that exact operation neither running nor succeeded."""
+  if _settle_window_ends is not None and time.monotonic() < _settle_window_ends:
+    raise DeploymentControlError(
+      "confirmation_pending",
+      "Möbius is still confirming the new container. Try again later.",
+      status_code=409,
+    )
+  record = await asyncio.to_thread(platform_update.read_prepared_update)
+  try:
+    status: dict | None = dict(await read_rebuild_status())
+  except DeploymentControlError:
+    status = None
+  if (
+    record is not None and status is not None
+    and platform_update.status_reports_bound_operation(status, record)
+  ):
+    if status.get("state") in _ACTIVE_STATES:
+      raise DeploymentControlError(
+        "already_running",
+        "The container replacement is still running. Wait for it to finish.",
+        status_code=409,
+      )
+    if status.get("state") == "succeeded":
+      await asyncio.to_thread(platform_update.reconcile_bound_operation, status)
+      return
+  try:
+    await asyncio.to_thread(platform_update.keep_settling_update)
+  except platform_update.PlatformUpdateError as exc:
+    raise DeploymentControlError(
+      str(exc), "This update is no longer waiting for confirmation.",
+      status_code=409,
+    ) from exc
+
+
+async def settle_image_update() -> str | None:
+  """Apply the bound replacement's outcome to the prepared update, if the
+  controller reports one. The status is read here; the decision and the
+  record change belong to ``platform_update.reconcile_bound_operation``."""
+  if not await asyncio.to_thread(_bound_operation):
+    return None
+  try:
+    status = await read_rebuild_status()
+  except DeploymentControlError:
+    return None
+  return await asyncio.to_thread(
+    platform_update.reconcile_bound_operation, dict(status),
+  )
+
+
+async def settle_image_update_after_boot(
+  *, interval: float = 15.0, timeout: float = 30 * 60,
+) -> None:
+  """After startup, keep applying the bound replacement's outcome until it
+  settles or the bound elapses, so confirmation never depends on Settings
+  being open. Past the bound, Settings offers the owner's explicit decision
+  (``keep_settling_update``)."""
+  deadline = time.monotonic() + timeout
+  while time.monotonic() < deadline:
+    if not await asyncio.to_thread(_bound_operation):
+      return
+    try:
+      outcome = await settle_image_update()
+    except Exception:
+      log.warning("could not check the bound platform update replacement", exc_info=True)
+      outcome = None
+    if outcome:
+      log.info("platform update replacement settled: %s", outcome)
+      return
+    await asyncio.sleep(interval)
+
+
+def schedule_settle_image_update_after_boot(timeout: float = 30 * 60) -> None:
+  """Keep the post-boot confirmation check alive until it settles."""
+  global _settle_window_ends
+  _settle_window_ends = time.monotonic() + timeout
+  task = asyncio.create_task(settle_image_update_after_boot(timeout=timeout))
+  _managed_recovery_tasks.add(task)
+  task.add_done_callback(_managed_recovery_tasks.discard)
+
+
 def _ensure_can_rebuild(status: RebuildStatus) -> None:
   """Reject a rebuild the current controller cannot complete before mutation."""
   if not status.get("supported"):
@@ -632,12 +847,27 @@ async def _request_self_hosted_rebuild(
       status_code=409,
     )
   _ensure_can_rebuild(await read_rebuild_status())
+  # A binding left by an attempt that provably ended may be replaced.
+  stale = await asyncio.to_thread(_bound_operation)
+  replacing = stale if stale and await _binding_ended(stale) else None
   await asyncio.to_thread(final_check)
-  await asyncio.to_thread(_write_request, expected_sha)
+  nonce = secrets.token_hex(16)
+  operation = {"controller": "host", "id": nonce}
+  # Bind before the helper can see the request: only this replacement's
+  # success may retire the prepared update.
+  await _bind_operation(expected_sha, operation, replacing)
+  try:
+    await asyncio.to_thread(_write_request, expected_sha, nonce)
+  except BaseException:
+    await asyncio.to_thread(
+      platform_update.unbind_update_operation, expected_sha, operation,
+    )
+    raise
   return _normalize_status({
     "state": "queued",
     "expected_sha": expected_sha,
     "message": "Container rebuild queued.",
+    "request_nonce": nonce,
   }, expected_sha=expected_sha)
 
 
@@ -750,10 +980,10 @@ async def _request_reviewed_rebuild_transaction(
     )
     if platform_update.activation_changes_python_dependencies(
       incoming_activation,
-    ):
-      # Source that imports a newly declared package cannot be validated by the
-      # old image. Until the replacement executor can prepare and prove that
-      # source without publishing it first, stop before mutating the checkout.
+    ) and not platform_update.image_activates_updates():
+      # Source that imports a newly declared package runs only on the image
+      # that has it. This image predates the boot transaction that lets that
+      # image swap the source in (and revert it if the image is not kept).
       raise DeploymentControlError(
         "external_activation_required",
         "This update changes Python packages. It needs a separately verified "
@@ -798,6 +1028,13 @@ async def _request_reviewed_rebuild_transaction(
     raise DeploymentControlError(
       "activation_changed",
       "This update no longer requires a container rebuild. Refresh the review.",
+      status_code=409,
+    )
+  if platform_update.frozen_image_sha() == target_sha:
+    # The target image is already running; its own boot swaps the update in.
+    raise DeploymentControlError(
+      "restart_to_finish",
+      "This container already runs the update's image. Restart Möbius to finish it.",
       status_code=409,
     )
   if deployment != "railway":
@@ -867,8 +1104,13 @@ async def _request_managed_rebuild(
   )
   _verify_managed_release_echo(prepared, expected_sha, expected_digest)
   if prepared.get("state") == "no_change":
-    return _normalize_managed_status(
-      prepared, image_digest=expected_digest,
+    # Finish already asks for a restart when this image is the target, so the
+    # account service and this container disagree about what is running.
+    raise DeploymentControlError(
+      "controller_inconsistent",
+      "The account service reports this container already runs the update's "
+      "image, but this container is a different version. Try again shortly.",
+      status_code=409,
     )
   operation_id = str(prepared.get("operation_id") or "")
   handoff_nonce = str(prepared.get("handoff_nonce") or "")
@@ -877,6 +1119,13 @@ async def _request_managed_rebuild(
     raise DeploymentControlError(
       "controller_invalid_response", "The managed replacement handoff is incomplete."
     )
+  # Bind before the drain: only this replacement's success may retire the
+  # prepared update, never an earlier attempt at the same release.
+  # The account service runs one replacement at a time, so after this fresh
+  # prepare a binding left on the record belongs to an attempt that ended.
+  operation = {"controller": "railway", "id": operation_id}
+  replacing = await asyncio.to_thread(_bound_operation)
+  await _bind_operation(expected_sha, operation, replacing)
   _managed_handoff = operation_id
   drained = False
   provider_start_attempted = False
@@ -915,6 +1164,10 @@ async def _request_managed_rebuild(
     )
   except Exception as exc:
     code = exc.code if isinstance(exc, DeploymentControlError) else None
+    if not (drained and provider_start_attempted and code != "controller_rejected"):
+      # The replacement definitively never started; only an ambiguous start
+      # keeps its binding, for the account service's outcome to settle.
+      await _release_binding(operation)
     if drained and (
       not provider_start_attempted or code == "controller_rejected"
     ):

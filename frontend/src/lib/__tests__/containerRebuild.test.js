@@ -86,9 +86,9 @@ test('only the unclaimed host request offers a withdraw action', () => {
 
 test('elapsed time reads from the controller updated_at', () => {
   const now = Date.parse('2026-01-01T00:10:00Z')
-  assert.equal(rebuildStartedAgo({ updated_at: '2026-01-01T00:09:30Z' }, now), 'started just now')
-  assert.equal(rebuildStartedAgo({ updated_at: '2026-01-01T00:07:00Z' }, now), 'started 3 min ago')
-  assert.equal(rebuildStartedAgo({ updated_at: '2025-12-31T22:10:00Z' }, now), 'started about 2 hours ago')
+  assert.equal(rebuildStartedAgo({ updated_at: '2026-01-01T00:09:30Z' }, now), 'just entered this stage')
+  assert.equal(rebuildStartedAgo({ updated_at: '2026-01-01T00:07:00Z' }, now), 'in this stage for 3 min')
+  assert.equal(rebuildStartedAgo({ updated_at: '2025-12-31T22:10:00Z' }, now), 'in this stage for about 2 hours')
   assert.equal(rebuildStartedAgo({ updated_at: '' }, now), '')
   assert.equal(rebuildStartedAgo({}, now), '')
 })
@@ -100,12 +100,12 @@ test('active status line surfaces the real stage message and elapsed time', () =
       { state: 'preparing', message: 'Selecting the verified Möbius image.', updated_at: '2026-01-01T00:02:00Z' },
       now,
     ),
-    'Selecting the verified Möbius image. (started 3 min ago)',
+    'Selecting the verified Möbius image. (in this stage for 3 min)',
   )
   // Falls back to fixed copy only when the controller sent no message.
   assert.equal(
     rebuildStatusLine({ state: 'preparing', updated_at: '2026-01-01T00:05:00Z' }, now),
-    'Preparing the system update… (started just now)',
+    'Preparing the system update… (just entered this stage)',
   )
 })
 
@@ -119,5 +119,5 @@ test('an unclaimed host request keeps the fixed line; its guidance is the descri
     },
     now,
   )
-  assert.equal(line, 'Preparing the system update… (started 4 min ago)')
+  assert.equal(line, 'Preparing the system update… (in this stage for 4 min)')
 })

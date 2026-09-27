@@ -18,6 +18,23 @@ from app import deployment_control as dc
 _TEST_DIGEST = "sha256:" + "d" * 64
 
 
+@pytest.fixture(autouse=True)
+def bound_operations(monkeypatch):
+  """Replacement requests bind their exact operation to the prepared update;
+  record those bindings instead of requiring a prepared checkout."""
+  calls = []
+  monkeypatch.setattr(
+    dc.platform_update, "bind_update_operation",
+    lambda target, operation, **_kw: calls.append(("bind", target, operation)),
+  )
+  monkeypatch.setattr(
+    dc.platform_update, "unbind_update_operation",
+    lambda target, operation, **_kw: calls.append(("unbind", target, operation)),
+  )
+  monkeypatch.setattr(dc.platform_update, "frozen_image_sha", lambda: None)
+  return calls
+
+
 def _prepared_record(target="b" * 40):
   return {
     "state": "prepared", "snapshot": "1" * 40, "prepared": "e" * 40,
@@ -61,7 +78,7 @@ def _install_control(tmp_path, monkeypatch):
   inbox = control / "inbox"
   inbox.mkdir(parents=True)
   (control / "status.json").write_text(
-    '{"state":"idle","handoff":"external-cutover-v1"}',
+    '{"state":"idle","handoff":"external-cutover-v1","request_versions":[1,2]}',
     encoding="utf-8",
   )
   monkeypatch.setattr(dc, "_control_dir", lambda: control)
@@ -1102,7 +1119,9 @@ async def test_definitive_rejection_owns_recovery_until_restart_settles(
 
 
 @pytest.mark.asyncio
-async def test_self_hosted_dispatch_writes_only_the_reviewed_sha(tmp_path, monkeypatch):
+async def test_self_hosted_dispatch_writes_only_the_reviewed_sha(
+  tmp_path, monkeypatch, bound_operations,
+):
   _control, inbox = _install_control(tmp_path, monkeypatch)
   monkeypatch.setattr(dc.platform_activation, "deployment_kind", lambda: "self_hosted")
   checks = []
@@ -1120,9 +1139,14 @@ async def test_self_hosted_dispatch_writes_only_the_reviewed_sha(tmp_path, monke
   assert checks[0] != request_thread
 
   assert status["state"] == "queued"
-  assert json.loads((inbox / "request.json").read_text()) == {
-    "version": 1, "expected_sha": "c" * 40,
+  request = json.loads((inbox / "request.json").read_text())
+  # The request carries the nonce bound to the prepared update first.
+  assert request == {
+    "version": 2, "expected_sha": "c" * 40, "nonce": status["request_nonce"],
   }
+  assert bound_operations == [
+    ("bind", "c" * 40, {"controller": "host", "id": request["nonce"]}),
+  ]
 
 
 @pytest.mark.asyncio
@@ -1130,7 +1154,7 @@ async def test_queued_request_masks_the_previous_terminal_status(tmp_path, monke
   control, inbox = _install_control(tmp_path, monkeypatch)
   (control / "status.json").write_text(
     '{"state":"succeeded","operation_id":"old",'
-    '"handoff":"external-cutover-v1"}', encoding="utf-8",
+    '"handoff":"external-cutover-v1","request_versions":[1,2]}', encoding="utf-8",
   )
   (inbox / "request.json").write_text(json.dumps({
     "version": 1, "expected_sha": "e" * 40,
@@ -1151,7 +1175,7 @@ async def test_retired_runtime_overlay_helper_cannot_replace_current_image(
   control, inbox = _install_control(tmp_path, monkeypatch)
   (control / "status.json").write_text(json.dumps({
     "state": "succeeded" if pending_request else "idle",
-    "handoff": "external-cutover-v1",
+    "handoff": "external-cutover-v1", "request_versions": [1, 2],
     "runtime_overlay": "active-runtime-v1",
   }), encoding="utf-8")
   if pending_request:
@@ -1373,7 +1397,7 @@ def test_concurrent_request_never_overwrites_an_already_reviewed_target(tmp_path
 
   monkeypatch.setattr(dc.os, "link", another_request_wins)
   with pytest.raises(dc.DeploymentControlError) as exc:
-    dc._write_request("a" * 40)
+    dc._write_request("a" * 40, "0" * 32)
   assert exc.value.code == "already_running"
   assert json.loads((inbox / "request.json").read_text())["expected_sha"] == "b" * 40
   assert sorted(path.name for path in inbox.iterdir()) == ["request.json"]
@@ -1599,7 +1623,7 @@ async def test_compatible_deployment_source_does_not_block_reviewed_replacement(
 
 
 def _write_host_status(control, **fields):
-  base = {"handoff": "external-cutover-v1"}
+  base = {"handoff": "external-cutover-v1", "request_versions": [1, 2]}
   base.update(fields)
   (control / "status.json").write_text(json.dumps(base), encoding="utf-8")
 
@@ -1722,3 +1746,257 @@ async def test_withdraw_is_not_supported_on_railway(monkeypatch):
   with pytest.raises(dc.DeploymentControlError) as exc:
     await dc.withdraw_unclaimed_host_request()
   assert exc.value.code == "not_supported"
+
+
+@pytest.mark.asyncio
+async def test_a_host_helper_without_request_nonces_must_be_reinstalled(
+  tmp_path, monkeypatch,
+):
+  """Only a helper that echoes the app's nonce lets the exact replacement
+  confirm an update, so an older helper is reported as needing an upgrade."""
+  control, _inbox = _install_control(tmp_path, monkeypatch)
+  _write_host_status(control, state="idle", request_versions=[1])
+  monkeypatch.setattr(dc.platform_activation, "deployment_kind", lambda: "self_hosted")
+
+  status = await dc.read_rebuild_status()
+
+  assert status["supported"] is False
+  assert status["code"] == "controller_upgrade_required"
+
+
+@pytest.mark.asyncio
+async def test_finish_restarts_instead_of_replacing_when_the_target_image_runs(
+  monkeypatch,
+):
+  _install_reviewed_image_plan(monkeypatch)
+  monkeypatch.setattr(
+    dc.platform_update, "read_prepared_update", lambda: _prepared_record("b" * 40),
+  )
+  monkeypatch.setattr(dc.platform_update, "frozen_image_sha", lambda: "b" * 40)
+  monkeypatch.setattr(dc.platform_activation, "deployment_kind", lambda: "self_hosted")
+
+  with pytest.raises(dc.DeploymentControlError) as exc:
+    await dc.request_reviewed_rebuild(
+      db=None, plan_id="p", current_sha="a" * 40, target_sha="b" * 40,
+      image_digest=None,
+    )
+
+  assert exc.value.code == "restart_to_finish"
+
+
+@pytest.mark.asyncio
+async def test_railway_reporting_no_change_for_another_image_is_inconsistent(
+  tmp_path, monkeypatch, bound_operations,
+):
+  _install_managed_cutover_marker(tmp_path, monkeypatch)
+  monkeypatch.setattr(
+    dc, "get_settings", lambda: type("S", (), {"data_dir": str(tmp_path)})(),
+  )
+  monkeypatch.setattr(
+    dc, "_managed_request",
+    lambda _method, _suffix, _payload=None: {
+      "state": "no_change", "expected_sha": "a" * 40, "image_digest": _TEST_DIGEST,
+    },
+  )
+
+  with pytest.raises(dc.DeploymentControlError) as exc:
+    await dc._request_managed_rebuild("a" * 40, _TEST_DIGEST)
+
+  assert exc.value.code == "controller_inconsistent"
+  assert bound_operations == []
+
+
+@pytest.mark.asyncio
+async def test_package_updates_wait_for_an_image_that_runs_the_boot_transaction(
+  monkeypatch,
+):
+  monkeypatch.setattr(
+    dc.platform_update, "reviewed_container_rebuild_plan",
+    lambda **plan: {
+      **plan, "blockers": [],
+      "activation": {
+        "level": "image_rebuild", "required_actions": ["image_rebuild"],
+        "reasons": [{"code": "python_dependencies"}],
+      },
+    },
+  )
+  monkeypatch.setattr(dc.platform_update, "read_prepared_update", lambda: None)
+  monkeypatch.setattr(dc.platform_activation, "deployment_kind", lambda: "self_hosted")
+  monkeypatch.setattr(dc.platform_update, "image_activates_updates", lambda: False)
+
+  with pytest.raises(dc.DeploymentControlError) as exc:
+    await dc.request_reviewed_rebuild(
+      db=None, plan_id="p", current_sha="a" * 40, target_sha="b" * 40,
+      image_digest=None,
+    )
+  assert exc.value.code == "external_activation_required"
+
+  monkeypatch.setattr(dc.platform_update, "image_activates_updates", lambda: True)
+  _install_source_apply(monkeypatch)
+  prepared = []
+
+  async def request(**kwargs):
+    prepared.append(kwargs)
+    return {"state": "queued"}
+
+  monkeypatch.setattr(dc, "_request_self_hosted_rebuild", request)
+  await dc.request_reviewed_rebuild(
+    db=None, plan_id="p", current_sha="a" * 40, target_sha="b" * 40,
+    image_digest=None,
+  )
+  assert prepared
+
+
+@pytest.mark.asyncio
+async def test_a_request_that_is_never_published_releases_its_binding(
+  tmp_path, monkeypatch, bound_operations,
+):
+  control, inbox = _install_control(tmp_path, monkeypatch)
+  monkeypatch.setattr(dc.platform_activation, "deployment_kind", lambda: "self_hosted")
+  (inbox / "request.json").write_text("{}", encoding="utf-8")  # another request won
+  monkeypatch.setattr(dc, "read_rebuild_status", lambda: _idle_host_status())
+
+  with pytest.raises(dc.DeploymentControlError):
+    await dc._request_self_hosted_rebuild(
+      expected_sha="c" * 40, final_check=lambda: None,
+    )
+
+  bound = bound_operations[0][2]
+  assert bound_operations == [
+    ("bind", "c" * 40, bound), ("unbind", "c" * 40, bound),
+  ]
+
+
+async def _idle_host_status():
+  return {"supported": True, "state": "idle"}
+
+
+@pytest.mark.asyncio
+async def test_withdrawing_an_unclaimed_request_releases_exactly_its_binding(
+  tmp_path, monkeypatch, bound_operations,
+):
+  control, inbox = _install_control(tmp_path, monkeypatch)
+  monkeypatch.setattr(dc.platform_activation, "deployment_kind", lambda: "self_hosted")
+  monkeypatch.setattr(
+    dc.platform_update, "read_prepared_update", lambda: _prepared_record("c" * 40),
+  )
+  nonce = "e" * 32
+  (inbox / "request.json").write_text(json.dumps({
+    "version": 2, "expected_sha": "c" * 40, "nonce": nonce,
+  }), encoding="utf-8")
+
+  await dc.withdraw_unclaimed_host_request()
+
+  assert not (inbox / "request.json").exists()
+  assert bound_operations == [
+    ("unbind", "c" * 40, {"controller": "host", "id": nonce}),
+  ]
+  # A request the helper already claimed is not ours to release.
+  bound_operations.clear()
+  await dc.withdraw_unclaimed_host_request()
+  assert bound_operations == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["queued", "replacing", "verifying"])
+async def test_the_owner_cannot_keep_an_update_while_its_replacement_runs(
+  monkeypatch, state,
+):
+  record = {**_prepared_record("c" * 40), "state": "swapped",
+            "operation": {"controller": "host", "id": "e" * 32}}
+  monkeypatch.setattr(dc.platform_update, "read_prepared_update", lambda: record)
+
+  async def status():
+    return {"state": state, "expected_sha": "c" * 40, "request_nonce": "e" * 32,
+            "operation_id": "x", "image_digest": None}
+
+  monkeypatch.setattr(dc, "read_rebuild_status", status)
+  monkeypatch.setattr(
+    dc.platform_update, "status_reports_bound_operation", lambda _s, _r: True,
+  )
+  kept = []
+  monkeypatch.setattr(dc.platform_update, "keep_settling_update", lambda: kept.append(1))
+
+  with pytest.raises(dc.DeploymentControlError) as exc:
+    await dc.keep_settling_update()
+
+  assert exc.value.code == "already_running"
+  assert kept == []
+
+
+@pytest.mark.asyncio
+async def test_the_owner_cannot_keep_an_update_during_its_confirmation_window(
+  monkeypatch,
+):
+  monkeypatch.setattr(dc, "_settle_window_ends", dc.time.monotonic() + 60)
+  with pytest.raises(dc.DeploymentControlError) as exc:
+    await dc.keep_settling_update()
+  assert exc.value.code == "confirmation_pending"
+
+
+@pytest.mark.asyncio
+async def test_cancel_releases_a_binding_only_when_no_replacement_runs(
+  monkeypatch, bound_operations,
+):
+  operation = {"controller": "railway", "id": "replace_1"}
+  monkeypatch.setattr(
+    dc.platform_update, "read_prepared_update",
+    lambda: {**_prepared_record("c" * 40), "operation": operation},
+  )
+
+  async def active():
+    return {"supported": True, "state": "replacing"}
+
+  monkeypatch.setattr(dc, "read_rebuild_status", active)
+  await dc.release_ended_binding()
+  assert bound_operations == []
+
+  async def idle():
+    return {"supported": True, "state": "failed"}
+
+  monkeypatch.setattr(dc, "read_rebuild_status", idle)
+  await dc.release_ended_binding()
+  assert bound_operations == [("unbind", "c" * 40, operation)]
+
+
+@pytest.mark.parametrize(("queued", "status", "ended"), [
+  ({"nonce": "e" * 32}, {"state": "idle"}, False),  # still queued
+  (None, {"state": "preparing", "request_nonce": "e" * 32}, False),  # claimed
+  (None, {"state": "failed", "request_nonce": "e" * 32}, True),
+  (None, {"state": "succeeded", "request_nonce": "e" * 32}, True),
+  # Gone from the inbox yet never named: the helper never claimed it.
+  (None, {"state": "succeeded", "request_nonce": "f" * 32}, True),
+  ({"nonce": "f" * 32}, {"state": "idle"}, True),
+])
+def test_a_host_binding_ends_only_with_proof_the_request_cannot_run(
+  tmp_path, monkeypatch, queued, status, ended,
+):
+  control, inbox = _install_control(tmp_path, monkeypatch)
+  if queued:
+    (inbox / "request.json").write_text(json.dumps({
+      "version": 2, "expected_sha": "c" * 40, **queued,
+    }), encoding="utf-8")
+  (control / "status.json").write_text(json.dumps(status), encoding="utf-8")
+
+  assert dc._host_request_ended("e" * 32) is ended
+
+
+@pytest.mark.asyncio
+async def test_seeing_nothing_running_does_not_release_a_host_binding(
+  tmp_path, monkeypatch, bound_operations,
+):
+  """A just-claimed request can look idle for a moment; only the inbox and
+  the exact nonce prove its replacement ended."""
+  control, inbox = _install_control(tmp_path, monkeypatch)
+  nonce = "e" * 32
+  monkeypatch.setattr(
+    dc.platform_update, "read_prepared_update",
+    lambda: {**_prepared_record("c" * 40), "operation": {"controller": "host", "id": nonce}},
+  )
+  (control / "status.json").write_text(
+    json.dumps({"state": "preparing", "request_nonce": nonce}), encoding="utf-8",
+  )
+
+  await dc.release_ended_binding()
+
+  assert bound_operations == []

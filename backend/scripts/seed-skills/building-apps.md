@@ -222,8 +222,7 @@ imports `index.jsx`):
 ### Deleting an app — reversible for 7 days
 
 ```bash
-python "$SCRIPTS_DIR/list_apps.py" --name "<exact display name>"
-python "$SCRIPTS_DIR/delete_app.py" <id> --confirm
+python "$SCRIPTS_DIR/delete_app.py" <id> --confirm   # id from list_apps name: "<exact display name>"
 ```
 
 Delete is a **soft delete**: the app is tombstoned and its saved data is kept for
