@@ -1881,6 +1881,26 @@ def mark_results_delivered(
   return changed
 
 
+def record_result_read_by_parent(db: Session, row: models.Delegation) -> bool:
+  """Record that the parent agent read this helper's settled result; no commit.
+
+  An agent can read a finished helper's result in-turn (the `list_agents`
+  control tool) before automatic delivery reaches it — a helper waiting on its
+  own sub-helpers must, because a Claude helper host is never steerable. That
+  read is receipt: without this record the result still looked owed when the
+  reader's turn ended, so the wake sweep started the reader again and it
+  repeated its whole final report to its own parent. Only the current settled
+  result is marked, so a follow-up that is still running stays owed.
+  """
+  results = settled_result_run_ids(db, [row.id])
+  if not results:
+    return False
+  return bool(mark_results_delivered(
+    db, results, incorporated=True,
+    filters=(models.Delegation.parent_chat_id == row.parent_chat_id,),
+  ))
+
+
 def _wake_recovery_groups(
   db: Session,
   *,

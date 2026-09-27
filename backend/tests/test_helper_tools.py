@@ -124,6 +124,9 @@ def test_message_stop_and_list_address_helpers_by_name(monkeypatch):
   assert control._call_stop_agent({"helper": "del-2"})["status"] == "cancelled"
   assert [h["helper"] for h in control._call_list_agents({})["helpers"]] == ["review", "scan"]
   assert control._call_list_agents({"helper": "scan"})["result"] == "All good."
+  # Reading one helper's result goes through the agent-side read, which
+  # records receipt; the bare listing stays a plain read.
+  assert ("POST", "/api/delegations/del-2/result-read", {}) in calls
   with pytest.raises(ValueError, match="No helper"):
     control._call_stop_agent({"helper": "missing"})
 
@@ -208,6 +211,67 @@ def test_a_working_or_stopped_helper_cannot_be_messaged(client, owner_token, db)
                      json={"message": "x"}, headers=headers)
   assert busy.status_code == 409 and "still working" in busy.text
   assert gone.status_code == 409 and "stopped" in gone.text
+
+
+def test_an_agent_reading_a_settled_result_is_not_woken_to_receive_it_again(
+  client, owner_token, db,
+):
+  """A helper read its sub-helpers' results itself, finished, and was woken 2 s
+  later to 'receive' them, so it repeated its whole report to its parent."""
+  parent_id, _child_id, delegation_id = _seed_delegation(
+    db, suffix="read-in-turn",
+    result_blocks=[{"type": "text", "content": "Sub-helper findings."}],
+  )
+  row = db.get(models.Delegation, delegation_id)
+  assert delegations_mod.available_delegation_results(db, parent_id)
+
+  response = client.post(
+    f"/api/delegations/{delegation_id}/result-read", json={},
+    headers={"Authorization": f"Bearer {owner_token}"},
+  )
+
+  assert response.status_code == 200, response.text
+  assert "Sub-helper findings." in response.json()["result"]
+  db.expire_all()
+  row = db.get(models.Delegation, delegation_id)
+  assert row.delivered_run_id == row.incorporated_run_id is not None
+  assert delegations_mod.available_delegation_results(db, parent_id) == []
+  assert delegations_mod._wake_eligible_rows_for_parent(
+    db, parent_id, row.parent_root_run_id,
+  ) == []
+
+
+def test_viewing_a_helper_does_not_count_as_its_parent_receiving_the_result(
+  client, owner_token, db,
+):
+  parent_id, _child_id, delegation_id = _seed_delegation(
+    db, suffix="view-only",
+    result_blocks=[{"type": "text", "content": "Still owed."}],
+  )
+  response = client.get(
+    f"/api/delegations/{delegation_id}",
+    headers={"Authorization": f"Bearer {owner_token}"},
+  )
+  assert response.status_code == 200, response.text
+  db.expire_all()
+  assert db.get(models.Delegation, delegation_id).delivered_run_id is None
+  assert delegations_mod.available_delegation_results(db, parent_id)
+
+
+def test_reading_a_helper_that_is_still_working_leaves_its_result_owed(
+  client, owner_token, db,
+):
+  _parent_id, _child_id, delegation_id = _seed_delegation(
+    db, suffix="read-running", child_status="running",
+  )
+  response = client.post(
+    f"/api/delegations/{delegation_id}/result-read", json={},
+    headers={"Authorization": f"Bearer {owner_token}"},
+  )
+  assert response.status_code == 200, response.text
+  db.expire_all()
+  row = db.get(models.Delegation, delegation_id)
+  assert row.delivered_run_id is None and row.incorporated_run_id is None
 
 
 # ----------------------------------------------------------------- live delivery
