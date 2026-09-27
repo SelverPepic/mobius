@@ -5157,11 +5157,13 @@ async def _run_chat_impl_with_db(
   )
 
   # Helper completion is durable activity, not human conversation. Ordinary
-  # owner turns intentionally receive every available result in this chat;
+  # turns intentionally receive every available result in this chat;
   # automatic activity continuations are bound to their exact source work so
-  # one logical root cannot admit or consume a sibling root's result.
+  # one logical root cannot admit or consume a sibling root's result. A
+  # delegated helper that started its own helpers is their parent too: its
+  # turns receive and latch those results exactly like a top-level chat's.
   activity_results: tuple[tuple[str, str], ...] = ()
-  if run_policy is None and chat_id:
+  if chat_id:
     from app.delegations import (
       activity_continuation_delivery_source_work_id,
       build_delegation_result_context,

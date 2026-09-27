@@ -2553,8 +2553,10 @@ async def _deliver_parent_wake_once(
 
   Busy, owner-question, parked, stopped, and superseded parents retain the
   durable result without queueing machine-authored input. A normal later turn
-  receives it from provider context. Existing hidden carriers remain eligible
-  only for their exact pre-upgrade recovery path.
+  receives it from provider context. A later owner turn does not supersede an
+  undelivered result, unless the owner stopped the helper's source work.
+  Existing hidden carriers remain eligible only for their exact pre-upgrade
+  recovery path.
   """
   import app.chat_queue as chat_queue
   from app.chat import is_chat_running

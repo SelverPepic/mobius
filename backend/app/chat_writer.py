@@ -3923,19 +3923,54 @@ class ChatWriterActor:
       (latest.goal_id or latest.root_run_id or latest.id)
       if latest is not None else None
     )
-    if (
-      latest is None
-      or latest.status != "completed"
-      or latest_source != cmd.source_work_id
-    ):
+    if latest is None or latest.status != "completed":
       db.rollback()
       return StartContinuationBlocked("parent_not_waiting")
+    # A newer turn (for example an answered question card) does not supersede
+    # the helper. The trigger query above already proved this exact result
+    # was never delivered: every turn that incorporated it would have latched
+    # delivered_run_id atomically. Timing cannot prove that, because scoped
+    # activity turns and the per-turn result cap can leave a result unseen.
+    # Owner authority still wins: stopped source work stays stopped. A
+    # delegated helper's later turns are its parent's follow-ups, so a nested
+    # parent keeps the exact-source rule.
+    if latest_source != cmd.source_work_id and db.query(
+      models.Delegation.id,
+    ).filter(models.Delegation.child_chat_id == cmd.chat_id).first() is not None:
+      db.rollback()
+      return StartContinuationBlocked("parent_not_waiting")
+    source_runs = db.query(ChatRun).filter(
+      ChatRun.chat_id == cmd.chat_id,
+      or_(
+        ChatRun.id == cmd.root_run_id,
+        ChatRun.root_run_id == cmd.root_run_id,
+        ChatRun.goal_id == cmd.source_work_id,
+      ),
+    )
+    if latest_source != cmd.source_work_id and source_runs.filter(
+      ChatRun.status == "stopped",
+    ).first() is not None:
+      db.rollback()
+      return StartContinuationBlocked("source_stopped")
 
-    if latest.goal_id:
-      from app.run_state import _recoverable_result_goal
-      if _recoverable_result_goal(db, cmd.chat_id, latest)[0] is None:
-        db.rollback()
-        return StartContinuationBlocked("goal_closed")
+    from app.run_state import _recoverable_result_goal
+    source_goal_run = (
+      latest if latest_source == cmd.source_work_id
+      else source_runs.filter(
+        ChatRun.goal_id == cmd.source_work_id,
+      ).order_by(ChatRun.started_at.desc(), ChatRun.id.desc()).first()
+    )
+    if (
+      source_goal_run is not None
+      and source_goal_run.goal_id
+      and _recoverable_result_goal(db, cmd.chat_id, source_goal_run)[0] is None
+    ):
+      db.rollback()
+      return StartContinuationBlocked("goal_closed")
+    goal_id = source_goal_run.goal_id if source_goal_run is not None else None
+    goal_objective = (
+      source_goal_run.goal_objective if source_goal_run is not None else None
+    )
 
     existing = list(chat.messages or [])
     try:
@@ -3961,7 +3996,7 @@ class ChatWriterActor:
     chat.active_assistant_message_id = cmd.run_token
     chat.updated_at = started_at
     provider = chat.provider or "claude"
-    admit_goal(db, cmd.chat_id, latest.goal_id, latest.goal_objective)
+    admit_goal(db, cmd.chat_id, goal_id, goal_objective)
     db.add(ChatRun(
       id=cmd.run_token,
       chat_id=cmd.chat_id,
@@ -3970,8 +4005,8 @@ class ChatWriterActor:
       provider=provider,
       started_at=started_at,
       initiated_by_app_id=None,
-      goal_objective=latest.goal_objective,
-      goal_id=latest.goal_id,
+      goal_objective=goal_objective,
+      goal_id=goal_id,
       activity_delivery_json={
         "delegation_ids": [trigger.id],
         "source_work_id": cmd.source_work_id,
