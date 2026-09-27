@@ -1021,11 +1021,14 @@ def _cleanup_terminal_staging_checkout(record: dict) -> bool:
       common_dir = common_dir.resolve()
     except (OSError, RuntimeError):
       return False
+    # /data/worktrees holds the owner's clones of ordinary GitHub projects,
+    # which the GitHub adapter uses as a review worktree's primary checkout.
     common_roots = (
       data_dir / "platform",
       data_dir / "apps",
       data_dir / "contrib",
       data_dir / "contributions",
+      data_dir / "worktrees",
     )
     if not any(common_dir.is_relative_to(root) for root in common_roots):
       return False
