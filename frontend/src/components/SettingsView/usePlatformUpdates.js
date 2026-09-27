@@ -297,11 +297,53 @@ export default function usePlatformUpdates({ active, refreshToken, onOpenChat })
     finally { pending.current = false; setPhase('idle') }
   }
 
+  // Until an update is swapped in the live source is untouched, so dropping it
+  // is always safe; it is the exit from a resolver that cannot finish.
+  async function cancel() {
+    if (pending.current || busy) return
+    pending.current = true
+    setPhase('cancelling'); setError('')
+    try {
+      await responseBody(await api.platform.cancelUnfinishedUpdate())
+      await refreshPlatform()
+    } catch (cause) { setError(cause.message || 'Could not cancel this update.') }
+    finally { pending.current = false; setPhase('idle') }
+  }
+
+  // The owner's decision to keep a new container whose replacement can no
+  // longer be confirmed; the server allows it only while that container runs
+  // the update.
+  async function keepSettling() {
+    if (pending.current || busy) return
+    pending.current = true
+    setPhase('cancelling'); setError('')
+    try {
+      await responseBody(await api.platform.keepSettlingUpdate())
+      await refreshPlatform()
+    } catch (cause) { setError(cause.message || 'Could not keep this version.') }
+    finally { pending.current = false; setPhase('idle') }
+  }
+
+  // Withdraw a queued host request the replacement helper never claimed. The
+  // helper renames request.json before acting, so this never interrupts an
+  // in-flight replacement; it clears the block that refuses a retry.
+  async function withdrawHostRequest() {
+    if (pending.current) return
+    pending.current = true
+    setPhase('cancelling'); setError(''); setErrorCode('')
+    try {
+      const body = await responseBody(await api.admin.withdrawRebuildRequest())
+      if (body && typeof body.state === 'string') setRebuild(body)
+      await refreshPlatform()
+    } catch (cause) { setError(cause.message || 'Could not withdraw this request.') }
+    finally { pending.current = false; setPhase('idle') }
+  }
+
   const clearError = useCallback(() => { setError(''); setErrorCode('') }, [])
 
   return {
     platform, cachedPlatform, rebuild, version: versionQuery.data, phase, busy, error, errorCode, checkResult,
-    progress, reconnecting: !!reconnect, observingKind: reconnect?.kind, slow, check, execute, restart, resolve,
-    clearError,
+    progress, reconnecting: !!reconnect, observingKind: reconnect?.kind, slow, check, execute, restart, resolve, cancel,
+    withdrawHostRequest, keepSettling, clearError,
   }
 }

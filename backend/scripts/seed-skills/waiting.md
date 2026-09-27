@@ -10,9 +10,11 @@ recurring work is a cron app.)
 
 ## When to declare a wait
 
-- You promised follow-through that depends on an external event: "I'll merge
-  when checks go green", "I'll reply once the PR lands", "I'll verify after
-  the deploy".
+- You promised follow-through that depends on an external event: "I'll check
+  the site once the deploy's health URL returns 200", "I'll import the export
+  when the file appears", "I'll upgrade once the package release is out",
+  "I'll tell you when the status page shows the incident resolved", or "I'll
+  reply once the pull request merges".
 - You want to check back on something after a period of time without the
   partner having to prompt you.
 
@@ -25,10 +27,8 @@ When NOT to use it:
   an owner question already parks the turn durably and keeps the action visible.
   For an outside-chat action, use concrete choices such as **Done**, **Need
   help**, and **Not now**, adapted to the task. Do not end with only “tell me
-  when…”. A private review, prepared record, or deployment cannot change by
-  itself when nobody has been asked to approve or start it; do not monitor that
-  inert state. Open-ended or destructive confirmations still follow core
-  policy.
+  when…”. Don't monitor state nobody has been asked to change. Open-ended or
+  destructive confirmations still follow core policy.
 - **Recurring scheduled work** — that's a cron app (`cron.md`), not a wait.
   A wait fires once.
 
@@ -40,24 +40,24 @@ just to discover that nothing changed. Use a timer when elapsed time is the
 condition or no safe read-only check is available.
 
 Use the first-class `declare_wait` tool from Möbius control (and `cancel_wait`
-to disarm). The `chat_wait.py` helper below is resilience, not an equivalent
+to disarm). The command-line form below is resilience, not an equivalent
 convenience path: use it only when the tool is absent or an attempted tool call
 returns a failure. Both arm the same wait.
 
 ```json
 {
-  "description": "the gate PR through the merge queue",
-  "condition_owner": "GitHub merge queue",
-  "command": "gh pr view 123 --repo owner/repo --json state -q .state | grep -qx MERGED",
-  "interval_secs": 300,
+  "description": "the new deploy answering its health check",
+  "condition_owner": "the hosting provider's deploy",
+  "command": "test \"$(curl -s -o /dev/null -w '%{http_code}' https://app.example.com/health)\" = 200",
+  "interval_secs": 120,
   "deadline_secs": 1800
 }
 ```
 
-For a pull request's CI, use `/data/platform/scripts/pr-checks.sh owner/repo PR
-SHA` as the command. It fails at once when SHA is not the PR's public head (a
-rejected update was never published, or a newer commit replaced it) instead of
-waiting on checks that will never run.
+A pull request works the same way: `gh pr view 123 --repo owner/repo --json
+state -q .state | grep -qx MERGED` waits for a merge, and
+`/data/platform/scripts/pr-checks.sh owner/repo PR SHA` waits for that exact
+commit's checks to finish.
 
 - The check command must be **read-only** and exit **0 exactly when the
   condition is met**. An ordinary unmet result is **exit 1 with no diagnostic
@@ -70,7 +70,8 @@ waiting on checks that will never run.
   environment. Do not query the live application database directly; use the
   stable owning interface or a purpose-built read-only helper instead.
 - `interval_secs` / `--interval` (default 300, min 60): match it to how fast
-  the state actually changes — a ~10-minute merge queue deserves ~300s, not 60s.
+  the state actually changes; something that takes ten minutes does not need
+  a check every minute.
 - `condition_owner` / `--owner` is required for command waits: name the
   system, person, or durable agent expected to make the condition true. A
   monitor proves only that someone will check; it never proves that work is
@@ -88,18 +89,19 @@ observation window", "delay_secs": 1800}`.
 The partner sees each armed wait as a "Waiting…" chip in the chat and can
 cancel it too.
 
-Fallback helper, only when the tool is absent or failed (same arguments as
-flags; `list` shows this chat's armed waits and `cancel <id>` disarms one):
+Fallback, only when the tool is absent or failed: the same arguments as JSON.
+A quoted heredoc carries the check command literally:
 
 ```bash
-python3 /data/platform/backend/scripts/chat_wait.py declare \
-  'the gate PR through the merge queue' \
-  --owner 'GitHub merge queue' \
-  --command 'gh pr view 123 --repo owner/repo --json state -q .state | grep -qx MERGED' \
-  --interval 300 --deadline 1800
-python3 /data/platform/backend/scripts/chat_wait.py declare \
-  'review the agreed 30-minute observation window' --in 1800
+python3 /data/platform/backend/scripts/mobius_control_mcp.py call declare_wait --args-json - <<'JSON'
+{"description": "the new deploy answering its health check",
+ "condition_owner": "the hosting provider's deploy",
+ "command": "test \"$(curl -s -o /dev/null -w '%{http_code}' https://app.example.com/health)\" = 200",
+ "interval_secs": 120, "deadline_secs": 1800}
+JSON
 ```
+
+`call cancel_wait --args-json '{"wait_id":"..."}'` disarms one.
 
 ## What happens on resume
 

@@ -713,6 +713,11 @@ export const api = {
   },
   chats: {
     list: (options = {}) => apiFetch('/chats', options),
+    // The drawer rows for just these chats: same projection as `list`.
+    rows: (ids, options = {}) => apiFetch(
+      `/chats?${ids.map(id => `ids=${encodeURIComponent(id)}`).join('&')}`,
+      options,
+    ),
     search: (query, options = {}) => apiFetch(
       `/chats/search?q=${encodeURIComponent(query)}`,
       { timeoutMs: 10000, ...options },
@@ -1338,6 +1343,18 @@ export const api = {
       { method: 'DELETE' },
     ),
   },
+  events: {
+    // `keepalive` lets the report sent as the page hides outlive the page
+    // being frozen or unloaded; a lost "hidden" report would withhold pushes.
+    reportVisibleApps: (subscriptionId, sequence, appIds) => apiFetch(
+      `/events/system/${encodeURIComponent(subscriptionId)}/visible-apps`,
+      {
+        method: 'POST',
+        keepalive: true,
+        body: JSON.stringify({ sequence, app_ids: appIds }),
+      },
+    ),
+  },
   notifications: {
     // Cursor pagination: `before` is the last row id of the previous page.
     list: ({ before, limit } = {}) => {
@@ -1364,6 +1381,8 @@ export const api = {
   admin: {
     restart: () => apiFetch('/admin/restart', { method: 'POST' }),
     rebuildStatus: () => apiFetch('/admin/rebuild'),
+    // Drop an unclaimed host request so a stalled self-hosted update can retry.
+    withdrawRebuildRequest: () => apiFetch('/admin/rebuild/request', { method: 'DELETE' }),
   },
   platform: {
     status: () => apiFetch('/platform/status'),
@@ -1376,6 +1395,12 @@ export const api = {
       body: JSON.stringify(plan),
     }),
     rebuild: (plan) => apiFetch('/platform/rebuild', {
+      method: 'POST',
+      body: JSON.stringify(plan),
+    }),
+    cancelUnfinishedUpdate: () => apiFetch('/platform/unfinished-update', { method: 'DELETE' }),
+    keepSettlingUpdate: () => apiFetch('/platform/unfinished-update/keep', { method: 'POST' }),
+    parkForAgent: (plan) => apiFetch('/platform/park-for-agent', {
       method: 'POST',
       body: JSON.stringify(plan),
     }),

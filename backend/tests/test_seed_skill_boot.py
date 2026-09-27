@@ -279,7 +279,7 @@ def test_app_owned_historical_name_is_never_retired(boot):
 def test_missing_history_never_guesses_legacy_ownership(boot):
   module, seed, skills, archive, repo = boot
   _commit(repo, "v1")
-  module._source_revision = lambda: None
+  module.PLATFORM_REPO = repo / "missing"
   (seed / "sample.md").write_text("v2")
   skills.mkdir(parents=True)
   (skills / "sample.md").write_text("v1")
@@ -295,11 +295,10 @@ def test_missing_history_never_guesses_legacy_ownership(boot):
 
 def test_history_from_another_revision_cannot_authorize_overwrite(boot):
   module, seed, skills, _, repo = boot
-  applied = _commit(repo, "v2")
+  _commit(repo, "v2")
   _git(repo, "checkout", "-q", "-b", "elsewhere")
   _commit(repo, "edit on another revision")
   _git(repo, "checkout", "-q", "main")
-  assert module._source_revision() == applied
   (seed / "sample.md").write_text("v2")
   skills.mkdir(parents=True)
   (skills / "sample.md").write_text("edit on another revision")
@@ -406,3 +405,38 @@ def test_review_decision_rejects_changed_skill(boot):
 
   assert (skills / "sample.md").read_text() == "new edit"
   assert not archive.exists()
+
+
+def test_app_folder_skill_records_do_not_block_seed_reconcile(boot):
+  """The installer records folder-skill members as `<id>/<member>.md`."""
+  module, seed, skills, archive, repo = boot
+  _commit(repo, "v1")
+  module.BUILD_SHA = _commit(repo, remove=True)
+  (seed / "fresh.md").write_text("fresh")
+  (seed / "tools.md").write_text("platform tools")
+  skills.mkdir(parents=True)
+  (skills / "sample.md").write_text("v1")
+  (skills / ".app-skills.json").write_text(json.dumps({
+    "tools/SKILL.md": {"app_id": 7, "active": False},
+    "tools/mode.md": {"app_id": 7, "active": False},
+  }))
+
+  module.init()
+
+  assert (skills / "fresh.md").read_text() == "fresh"
+  assert not (skills / "tools.md").exists()
+  assert not (skills / "sample.md").exists()
+  assert len(list(archive.glob("sample-*.md"))) == 1
+
+
+@pytest.mark.parametrize("name", ["../escape.md", "tools/nested/x.md", "Tools/SKILL.md"])
+def test_malformed_app_skill_path_still_blocks_all_mutation(boot, name):
+  module, seed, skills, _, repo = boot
+  module.BUILD_SHA = _commit(repo, "v1")
+  (seed / "sample.md").write_text("v1")
+  skills.mkdir(parents=True)
+  (skills / ".app-skills.json").write_text(json.dumps({name: {"app_id": 7}}))
+
+  module.init()
+
+  assert not (skills / "sample.md").exists()

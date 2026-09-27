@@ -2,7 +2,9 @@
 
 Owner-authorized credential minting and provider-link mutations reject delegated
 execution bearers; otherwise a child could exchange inherited tool access for a
-new unrestricted owner or app credential and bypass its delegation boundary.
+new unrestricted owner or app credential and bypass its delegation boundary. The
+app-frame token is the one exception: it is narrower than the bearer presented
+and carries the same delegation lineage, so it stays a delegated credential.
 """
 
 import asyncio
@@ -37,7 +39,8 @@ from app.deps import (
   get_chat_view_principal,
   get_current_owner, get_current_owner_for_lifecycle_control,
   get_current_owner_or_app,
-  get_owner_app_or_chat_embed_for_models, reject_cross_site,
+  get_owner_app_or_chat_embed_for_models,
+  get_owner_or_delegated_owner_for_app_token, reject_cross_site,
   require_chat_embed_operation,
   require_nondelegated_owner_control,
 )
@@ -510,10 +513,19 @@ def login(
 @router.post("/app-token", dependencies=[Depends(reject_cross_site)])
 def create_app_token_endpoint(
   body: schemas.AppTokenRequest,
-  owner: models.Owner = Depends(get_current_owner_for_lifecycle_control),
+  principal: Principal = Depends(get_owner_or_delegated_owner_for_app_token),
   db: Session = Depends(get_db),
 ):
-  """Returns a short-lived JWT scoped to a specific mini-app."""
+  """Returns a short-lived JWT scoped to a specific mini-app.
+
+  Admits a delegated helper (an owner-scoped bearer that carries a delegation
+  id) so its shell can mount an owner app it can already read — the returned
+  app token is strictly NARROWER than the bearer it presents. The delegation
+  lineage is forwarded into the minted token so it stays a delegated bearer and
+  cannot be laundered into a clean app credential that would bypass the
+  delegation boundary (see get_owner_or_delegated_owner_for_app_token and
+  require_nondelegated_owner_or_app_control).
+  """
   # A tombstoned (soft-deleted) app must not be granted fresh authority — no new
   # token for an uninstalled app. Revive (reinstall/recover) makes it mintable
   # again. See feature 110.
@@ -524,11 +536,19 @@ def create_app_token_endpoint(
   )
   if not app:
     raise HTTPException(status_code=404, detail="App not found.")
+  owner = principal.owner
+  # Preserve the delegation lineage on the down-scoped token. create_agent_token
+  # keeps agent_chat == delegation_chat, so principal.chat_id is the child chat
+  # a delegated bearer must carry; a plain owner has neither claim.
+  delegation_id = principal.delegation_id
+  delegation_chat = principal.chat_id if delegation_id is not None else None
   token = auth.create_app_token(
     body.app_id,
     owner.username,
     owner.token_epoch,
     app_nonce=app.token_nonce,
+    delegation_id=delegation_id,
+    delegation_chat=delegation_chat,
   )
   return {"token": token}
 
@@ -652,6 +672,17 @@ _active_pkce: dict | None = None
 # Serialize login/exchange/disconnect so an older sign-in cannot finish after
 # the owner's disconnect and silently restore the connection.
 _provider_login_locks = {"claude": asyncio.Lock(), "codex": asyncio.Lock()}
+
+
+async def _provider_signin_changed(provider_id: str) -> None:
+  """Show every open picker the catalog the provider's current sign-in serves.
+
+  Every sign-in and sign-out ends here, so no picker keeps the offline fallback
+  cached before connecting (or live models cached before disconnecting).
+  """
+  from app.providers import forget_provider_models
+  await forget_provider_models(provider_id)
+  get_system_broadcast().publish({"type": "model_providers_changed"})
 
 
 def _cli_env() -> tuple[dict, str]:
@@ -797,7 +828,6 @@ async def _exchange_claude_code(body: schemas.ProviderCodeRequest):
     from app.providers import _claude_refresh_lock
     async with _claude_refresh_lock:
       _write_credentials(r.json())
-    return {"ok": True}
   except httpx.TimeoutException:
     raise HTTPException(
       status_code=504, detail="Token exchange timed out.",
@@ -807,6 +837,10 @@ async def _exchange_claude_code(body: schemas.ProviderCodeRequest):
   except Exception as exc:
     log.error("Token exchange error: %s", exc)
     raise HTTPException(status_code=500, detail=str(exc))
+  # Outside the refresh lock: a registry fetch may hold its own lock while
+  # waiting for that one.
+  await _provider_signin_changed("claude")
+  return {"ok": True}
 
 
 @router.get("/providers/status")
@@ -1480,6 +1514,10 @@ def consume_mobius_web_login_session(
 async def _watch_codex_login(proc):
   """Background task that awaits proc.wait() and stores the result."""
   await proc.wait()
+  if proc.returncode == 0:
+    # The CLI has written its sign-in; refresh pickers before the status poll
+    # reports completion so the UI never refetches the pre-sign-in fallback.
+    await _provider_signin_changed("codex")
   # Only update if this proc is still the active one -- a newer
   # login may have replaced it.
   if _codex_login_procs.get("active") is proc:
@@ -1609,4 +1647,5 @@ async def provider_disconnect(
     except (OSError, ValueError):
       log.exception("Could not remove %s provider sign-in", provider_id)
       raise HTTPException(500, "Could not disconnect. Your connection has not been confirmed removed.")
+    await _provider_signin_changed(provider_id)
   return {"ok": True}

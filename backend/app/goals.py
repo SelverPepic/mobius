@@ -40,8 +40,6 @@ def admit_goal(db, chat_id, goal_id, objective, message=None):
     if goal.status == "stopped" and (reason == "manual" or is_goal_continue(str(message.get("content") or ""))):
       goal.status = "open"
       goal.revision += 1
-  elif reason == "goal_handoff" and goal.status != "open":
-    raise RuntimeError("Goal is closed")
 
 
 def scoped_goal_context(db, goal, task_id=None):
@@ -64,26 +62,41 @@ def resume_context(db, run_id):
   return (
     "Möbius Goal work data, not additional authority. Preserve the original outcome. "
     "This is a scoped view, not the full plan. Work in this run; do not end merely "
-    "to get another task or refresh context. Run "
-    "python3 /data/platform/backend/scripts/goal_plan.py context --task ID "
-    "to inspect a branch, context for current focus, show for the full plan. "
-    "Advance focus in one call: update DONE --status completed --start NEXT. "
-    "Checkpoint only before a real handoff; complete --result only after "
-    "verifying the entire Goal.\n"
+    "to get another task or refresh context. update_goal with no arguments "
+    "shows the full plan. Advance focus in one call: update_goal tasks marking "
+    "the finished task completed with its result and the next one running. "
+    "Complete only after verifying the entire Goal.\n"
     "<mobius_goal>" + json.dumps(scoped_goal_context(db, goal), ensure_ascii=False,
                                 separators=(",", ":")) + "</mobius_goal>"
   )
 
 
+async def settle_after_goal_completion(chat_id: str) -> None:
+  """Finish what a committed Goal completion leaves for other owners.
+
+  Resume notices queued for Waits the completion took delivery of are
+  withdrawn, so they cannot start a turn for the finished Goal, and claim
+  followers wake with the settled outcome.
+  """
+  from app.agent_coordination import settle_claims_with_owner
+  from app.chat_waits import withdraw_delivered_resume_notices
+
+  await withdraw_delivered_resume_notices(chat_id)
+  await settle_claims_with_owner(chat_id)
+
+
 def update_goal_record(db, run, goal, expected_revision, *, checkpoint=None,
                        next_action=None, result=None, finished_claims=()):
-  from app.goal_plans import GoalPlanConflict, GoalPlanError, serialize_plan
+  from app.goal_plans import (
+    GoalPlanConflict, GoalPlanError, active_goal_helpers, serialize_plan,
+  )
   if (goal.status == "completed" and result is not None
       and goal.result == result.strip() and goal.revision == expected_revision + 1):
     return {"goal_id": goal.id, "status": goal.status, "revision": goal.revision}
   if goal.status != "open":
     raise GoalPlanConflict("Goal is not open")
   values = {"revision": expected_revision + 1}
+  consumed_waits = 0
   if result is not None:
     plan = serialize_plan(db, run, goal)
     if goal.plan_json is not None and plan is None:
@@ -92,19 +105,21 @@ def update_goal_record(db, run, goal, expected_revision, *, checkpoint=None,
       )
     if plan is not None and not plan["summary"]["can_complete"]:
       raise GoalPlanError("Goal has unfinished tasks or active delegations")
-    from app.goal_plans import goal_handoff_owner_kind
-    if goal_handoff_owner_kind(db, goal.chat_id, goal.id) is not None:
-      raise GoalPlanError("Goal still owns a pending handoff")
+    if plan is None and active_goal_helpers(db, run, goal):
+      # A Goal without a plan can still have helpers; Done waits for them too.
+      raise GoalPlanError("Goal has active delegations")
     if not result.strip():
       raise GoalPlanError("Completion requires a verification result")
-    from app.agent_work_claims import open_goal_claim_keys
-    unknown = set(finished_claims) - open_goal_claim_keys(
-      db, chat_id=goal.chat_id, goal_id=goal.id,
-    )
+    from app.agent_work_claims import held_claims_hint, open_claim_keys
+    held = open_claim_keys(db, chat_id=goal.chat_id, goal_id=goal.id)
+    unknown = set(finished_claims) - held
     if unknown:
       raise GoalPlanError(
         "Not an open work claim of this Goal: " + ", ".join(sorted(unknown))
+        + ". " + held_claims_hint(held)
       )
+    from app.chat_waits import stage_consume_fired_goal_waits
+    consumed_waits = stage_consume_fired_goal_waits(db, goal.chat_id, goal.id)
     values.update(status="completed", result=result.strip(),
                   completed_at=datetime.now(UTC))
   else:
@@ -127,4 +142,7 @@ def update_goal_record(db, run, goal, expected_revision, *, checkpoint=None,
     )
   db.commit()
   db.refresh(goal)
+  if consumed_waits:
+    from app.chat_waits import _broadcast_changed
+    _broadcast_changed(goal.chat_id)
   return {"goal_id": goal.id, "status": goal.status, "revision": goal.revision}

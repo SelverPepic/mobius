@@ -88,9 +88,6 @@ class InstallPassRedeemRequest(BaseModel):
 # 'none' on both; the agent opts an app in when the partner asks.
 ShareLevel = Literal["none", "read", "write"]
 ChatLogAccess = Literal["none", "summary", "summary_with_deleted"]
-UpdateResolutionPolicy = Literal[
-  "preserve_local", "accept_reviewed_upstream_exact",
-]
 
 
 class AppApply(BaseModel):
@@ -108,33 +105,6 @@ class AppResolveUpdate(BaseModel):
   model_config = ConfigDict(extra="forbid")
 
   source_dir: str = Field(min_length=1, max_length=512)
-  reviewed_tree_oid: str | None = Field(
-    default=None, pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$",
-  )
-
-
-class AppUpdateResolutionPolicy(BaseModel):
-  model_config = ConfigDict(extra="forbid")
-
-  source_dir: str = Field(min_length=1, max_length=512)
-  policy: UpdateResolutionPolicy
-
-
-class AppUpdateResolutionPolicyOut(BaseModel):
-  policy: UpdateResolutionPolicy
-  conflict_paths: list[str] = Field(default_factory=list)
-
-
-class AppUpdateResolutionReview(BaseModel):
-  model_config = ConfigDict(extra="forbid")
-
-  source_dir: str = Field(min_length=1, max_length=512)
-
-
-class AppUpdateResolutionReviewOut(BaseModel):
-  upstream_commit: str
-  tree_oid: str
-  diff: str
 
 
 class AppUpdate(BaseModel):
@@ -259,11 +229,18 @@ class AppOut(BaseModel):
   # Root-level manifest file composed into the agent prompt while this app is
   # live. Informational so install UIs can surface the privileged declaration.
   system_prompt_file: str | None = None
-  system_app: bool = False
   chat_log_access: ChatLogAccess = "none"
   capability_contract: dict | None = None
   created_at: datetime
   updated_at: datetime
+
+  @computed_field
+  @property
+  def agent_tools(self) -> list[dict]:
+    """Reviewed agent tools this app contributes to every agent run."""
+    from app.app_capabilities import agent_tools_from_contract
+
+    return agent_tools_from_contract(self.capability_contract)
 
   @computed_field
   @property
@@ -500,21 +477,6 @@ class AppScheduleOut(BaseModel):
   server_timezone: str = "UTC"
 
 
-class ConflictFile(BaseModel):
-  path: str
-  merged_with_markers: str
-
-
-class UpdatePreviewOut(BaseModel):
-  app_id: int
-  status: Literal["clean", "conflict"]
-  upstream_version: str | None = None
-  upstream_commit: str
-  conflict_paths: list[str] = Field(default_factory=list)
-  conflicts: list[ConflictFile] = Field(default_factory=list)
-  upstream_diff: str | None = None
-
-
 class UpdateCandidatePreviewOut(BaseModel):
   """One candidate owns both executable-source and capability review."""
 
@@ -541,10 +503,10 @@ class UpdateCheckOut(BaseModel):
   comparison into an update decision.
 
   A durable conflict receipt has two materially different states. In
-  `needs_resolution`, upstream is not yet incorporated into local source (or a
-  materialized merge still has conflicts). In `replay_pending`, source was
-  resolved and committed but the canonical installer still has to promote the
-  bundle/metadata transaction. Only the former should open a resolver chat.
+  `needs_resolution`, the private resolution checkout has not yet committed an
+  answer that contains upstream. In `replay_pending`, it has, and only the
+  canonical installer's bundle/metadata promotion remains. Only the former
+  should open a resolver chat.
   `needs_resolution` remains as a derived rolling-deploy compatibility field;
   new consumers should use `pending_update_state`. `unknown` means a receipt
   proves an update is pending but Git could not safely classify its resolution
@@ -576,9 +538,10 @@ class AppConflictResolverChatOut(BaseModel):
 
 
 class AppConflictResolverChatRequest(BaseModel):
-  model_config = ConfigDict(extra="forbid")
-
-  resolution_policy: UpdateResolutionPolicy
+  # The published App Store still names the one resolution there is: keep
+  # local work while taking the update. Any other choice is refused rather
+  # than silently replaced.
+  resolution_policy: Literal["preserve_local"] | None = None
 
 
 class ProviderCodeRequest(BaseModel):
@@ -897,6 +860,14 @@ class NotificationSendRequest(BaseModel):
   # with just {title, body}. Apps should pass 'app' + their id.
   source_type: str = "agent"
   source_id: str | None = None
+  # Groups this notification with earlier ones carrying the same tag (e.g. one
+  # conversation): a newer push replaces the older OS notification instead of
+  # stacking beside it. push.py namespaces it by source before delivery, so a
+  # sender can only ever replace its own notifications. Same shape as a shell
+  # app intent (sw-push.js _safeTarget), so an app can reuse its target intent.
+  tag: str | None = Field(
+    default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$",
+  )
 
   @field_validator("target")
   @classmethod

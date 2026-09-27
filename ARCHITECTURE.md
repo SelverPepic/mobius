@@ -136,9 +136,49 @@ upstream trees once, records the reconciled tree as one local commit on the
 target, and keeps the previous local tip reachable for recovery. A conflict
 stays in an isolated worktree while the old checkout remains served. Working
 edits are carried through as a transient commit and returned uncommitted.
-Finishing a resolution runs the same final-tree merge again with the resolver's
-answer as one input, so live edits made meanwhile are merged in, or re-parked
-with fresh markers when they overlap the answer.
+
+**Prepared updates swap at shutdown, or on their own image's boot.** An update
+an agent resolves on the isolated copy (a committed conflict, or blockers
+handed over with **Fix with an agent**) and every combined source-and-container
+update are *prepared*, not applied: the answer is committed on the reviewed
+release and recorded in `.platform-prepared-update.json`. The live checkout
+keeps serving its snapshot, and nothing edited afterwards enters the update.
+A restart-only update is checked with the same startup check boot runs and is
+swapped in by the shutdown drain: it pauses every chat, saves the live state as
+one commit under `refs/mobius/update-late`, and points the checkout at the
+prepared commit, crash-safe through the reconcile marker.
+
+An update that needs a new image (for example new Python packages or agent
+CLIs) is never swapped in by the outgoing container. The image owns its
+packages, so only a boot of exactly that image activates the source it
+requires: the entrypoint runs the image's own boot transaction
+(`app/platform_boot.py`) from the baked checkout, not from `/data/platform`,
+before the boot guard and the decisive import probe. On the target image it
+swaps the update in; on any other image (a replacement the controller rolled
+back) it returns a swapped-in update to its own saved `late` state, sets aside
+anything made on the update since it booted under
+`refs/mobius/platform-set-aside/`, and restores the bookkeeping the swap
+replaced. The same transaction merges late edits back (in-progress edits
+return uncommitted; a conflict parks on a frozen copy for one resolver chat,
+and automatic chat resumes wait until it is merged) and finishes a swap
+interrupted at any point. If the resulting tree fails its import probe, the
+transaction returns it to the saved state and the server reports the update
+failed. It publishes its `BOOT_PROTOCOL` for the running server, which lifts
+the refusal of package-changing updates only when its own image, the rollback
+target, understands the record it prepares.
+
+The record of an image-requiring update is bound to its exact replacement (the
+Railway operation, or an app nonce the self-hosted helper echoes) and settles
+only when that operation reports success while the target image serves the
+merged platform tree; until then Settings shows it as settling and refuses
+other updates, and the owner may keep it explicitly if the controller is
+unavailable. When the target image is already running, finishing takes a
+restart, not another replacement. Starting an older image under source from a
+newer release's packages (historical image-only rollback) is unsupported: the
+boot refuses it. While an update is parked or prepared, Settings offers only
+Finish update for it and plans for other releases are refused. A conflict with
+the owner's own uncommitted edits during an ordinary Apply still finishes on
+the live checkout under the reconcile lock.
 
 **"Update available" is an ancestry question, not a version-string compare:** an update is available iff `upstream`'s tip is **not yet an ancestor of `main`** (a new release has not been incorporated). This is the content question — "does my working tree already contain this release" — that a `image_sha != recorded_sha` proxy can't answer on a customized instance, and it's what eliminates phantom "update available" rows after a deploy that changed nothing the owner hadn't already.
 
@@ -200,7 +240,6 @@ FastAPI app. `main.py` is the factory (CORS, rate limiting, routers, static serv
 | `pending_questions.py` | Shared `PendingQuestion` dataclass for AskUserQuestion interception (split out to break the `questions`↔runner import cycle; the registry itself lives in `questions.py`) |
 | `tool_summaries.py` | Tool-input summary strings (shared by SDK + subprocess paths) |
 | `tool_sources.py` | `normalize_tool_sources()` — normalizes provider web-search results into bounded `{title, url, snippet}` metadata stored on WebSearch blocks and rendered once in the message-level Sources row; an iterative count/depth budget and HTTP(S)-only URL gate keep provider payload cost fixed before SSE or persistence |
-| `sdk_emit.py` | Helpers for emitting "unknown" SDK events on the SSE wire |
 | `restart_util.py` | `restart_this_worker()` — arms a daemon SIGKILL fallback, then SIGTERMs its own pid; shared by `/api/admin/restart` and `/api/platform/restart` so the two restart paths can't drift. Pairs with uvicorn's `--timeout-graceful-shutdown 10` (entrypoint.sh) — without a bound, an open chat SSE stream held graceful shutdown open forever and the container never cycled (6ac51b0) |
 
 ### Mini-apps, storage, files
@@ -511,7 +550,7 @@ The chat is large and self-contained; its hooks live beside it, not in `src/hook
 
 ## In-product agent context — three layers
 
-The in-product agent is a first-class reader of this code, and its behavior has three layers. (1) **Base constitution** — the live platform checkout's `skill/core.md`; `chat._read_skill_text()` caches only this tracked platform text for the process lifetime, so edits and platform updates take effect after a server restart. `/app/skill/core.md` is only the image-baked degraded-boot fallback when the live checkout is unavailable. (2) **Installed system-app contributions** — a manifest may declare one root-level `system_prompt` markdown file only with explicit `system_app: true`. When a chat starts its first turn, live (`deleted_at IS NULL`) app fragments are composed in stable id order with its effective base constitution and stored as one content-addressed prompt snapshot. Every later turn, provider switch, and compaction uses those exact bytes. Install, update, and uninstall affect chats started afterwards, while an existing chat keeps the prompt it began with. (3) **On-demand skills** — `/data/shared/skills/*.md`; platform skills reconcile against `.seed-skills.json` at server start, preserving local changes, while app-owned skills arrive through manifests and are deactivated/restored with their owner app. Independently of optional apps, every chat maintains its name, a bounded `## Digest`, and an uncapped cumulative `## Summary` under `/data/shared/memory/chats/<id>/index.md`. New sessions receive only recent descriptions + Digests. The working agent writes that note through its run-bound `checkpoint_chat` tool; there is no turn-end summarizer. Compaction prefers the chat's cumulative Summary. The optional Memory app owns graph instructions, its skill, reader, seeds, builder, Git publisher, and retrieval telemetry; no router/fact note is injected. Uninstall changes future chat prompts and removes the skill/jobs while leaving existing prompt snapshots and core chat summaries intact.
+The in-product agent is a first-class reader of this code, and its behavior has three layers. (1) **Base constitution** — the live platform checkout's `skill/core.md`; `chat._read_skill_text()` caches only this tracked platform text for the process lifetime, so edits and platform updates take effect after a server restart. `/app/skill/core.md` is only the image-baked degraded-boot fallback when the live checkout is unavailable. (2) **Installed-app contributions** — any app's manifest may declare one root-level `system_prompt` markdown file; install review is the consent. When a chat starts its first turn, live (`deleted_at IS NULL`) app fragments are composed in stable id order with its effective base constitution and stored as one content-addressed prompt snapshot. Every later turn, provider switch, and compaction uses those exact bytes. Install, update, and uninstall affect chats started afterwards, while an existing chat keeps the prompt it began with. (3) **On-demand skills** — `/data/shared/skills/*.md`; platform skills reconcile against `.seed-skills.json` at server start, preserving local changes, while app-owned skills arrive through manifests and are deactivated/restored with their owner app. Independently of optional apps, every chat maintains its name, a bounded `## Digest`, and an uncapped cumulative `## Summary` under `/data/shared/memory/chats/<id>/index.md`. New sessions receive only recent descriptions + Digests. The working agent writes that note through its run-bound `checkpoint_chat` tool; there is no turn-end summarizer. Compaction prefers the chat's cumulative Summary. The optional Memory app owns graph instructions, its skill, reader, seeds, builder, Git publisher, and retrieval telemetry; no router/fact note is injected. Uninstall changes future chat prompts and removes the skill/jobs while leaving existing prompt snapshots and core chat summaries intact.
 
 Platform skill reconciliation is a server startup step, not part of the source
 updater or the image. The served checkout applies its own
@@ -1134,7 +1173,7 @@ recovery prompt reconstructed from that exact control. A stable client control
 id makes manual retries idempotent without inventing owner speech. Existing
 transcript-backed recoveries remain readable for safe replay across upgrades;
 generic coordinator continuations retain their exact supplied content and
-replay contract. Goal rollover remains owned by its existing plan/FIFO path.
+replay contract.
 
 The sweep is cheap: one indexed due-row query immediately at boot, on
 `chat_run_finished`, and on a 60-second fallback. Startup captures the boot
@@ -1152,7 +1191,7 @@ column remains only as an internal latch: it defaults on and is cleared solely
 by `delegations.mark_cancelled`, so a cancelled delegated child cannot
 resurrect itself when the boot sweep claims restart parks.
 
-### Goal handoff ownership is exact and singular
+### A Goal is a note, a checklist, and Done
 
 `ChatGoal` owns the stable objective, revision-checked plan, checkpoint, next
 step, and explicit outcome. `ChatRun.goal_id` attaches each execution attempt
@@ -1162,47 +1201,41 @@ can reopen stopped work but stale deliveries cannot. Migration 0063 copies
 historical plans without deleting run snapshots and leaves uncertain work open.
 
 The writer admits Goal identity and the attempt in the same transaction.
-Execution turns are not a budget, but unfinished intent alone cannot authorize
-another provider invocation. Every Goal-bound run checkpoints the `ChatGoal`
-revision at provider admission. At clean settlement, a new exact durable owner
-gets the next move; otherwise automatic rollover requires that revision to have
-advanced beyond the checkpoint. A legacy or unknown checkpoint proves nothing.
-Stop, completion, provider failures and usage-limit handling keep their existing
-boundaries. The legacy `automatic_remaining` column is inert historical schema,
-never read or updated by admission.
+Execution turns are not a budget, and an unfinished Goal never schedules its
+own next turn. Goal work moves only through what already wakes a chat: owner
+input, a Wait result, a helper result, peer or activation delivery, and
+restart or usage-limit recovery. A turn that ends cleanly needs no Goal
+handoff: nothing checks it, and an idle unfinished Goal is simply the owner's
+turn. The Goal record reports only its own lifecycle (`active` while a turn
+runs, `paused` while idle or stopped, `completed`); who moves next is derived
+from chat state the client already holds — an open card, armed Waits, running
+helpers — never from a per-Goal ownership query. Retired automatic-continuation
+bookkeeping (`goal_plan_revision_at_admission`, the `automatic_remaining`
+column) is inert historical schema.
 
 Persisted plans use the same task validation as plan writes. An unreadable
-plan keeps its Goal open, cannot authorize automatic handoff or completion,
-and can be repaired through a fully validated, revision-checked replacement.
+plan keeps its Goal open, cannot authorize completion, and can be repaired
+through a fully validated, revision-checked replacement. Identical normalized
+plan writes are revision no-ops.
 
-`goal_plans.goal_handoff_owner_kind` is the shared exact-identity query for
-both Goal presentation and turn settlement. It recognizes an owner question,
-Wait (including a settled result awaiting delivery), or wake-enabled helper only when that actor belongs to the same
-`goal_id`; an unrelated question or background operation in the chat cannot
-hide an orphaned Goal. The writer's terminal promotion checks ownership after
-question persistence. Identical normalized plan writes are revision no-ops, so
-rewriting unchanged state cannot manufacture permission to continue. Without
-durable plan progress, the terminal path saves an owner reconciliation question
-instead of starting another turn. Automatic Goal controls keep their causal
-place in the existing pending FIFO, but the writer translates them into an
-ephemeral provider prompt and never appends them as owner transcript rows.
-
-A result retains ownership until delivery. Provider-native Goal execution is
-disabled: one Möbius attempt starts one ordinary provider turn. Legacy native
-controllers are retired before resuming their conversation, not recreated in
-parallel.
+Provider-native Goal execution is disabled: one Möbius attempt starts one
+ordinary provider turn. Legacy native controllers are retired before resuming
+their conversation, not recreated in parallel.
 
 Every Goal attempt receives a deterministic hierarchical view even with no
 provider history: original objective, checkpoint, current task, ancestor
 requirements, direct children, sibling summaries and relevant prerequisites.
 The deepest running work selects focus; concurrent branches select their common
-ancestor. Other descendants remain stored, not injected. `goal_plan.py context
---task ID` navigates with the same read-only projection during a run; `show`
-retains full-plan access. No model summarizer, delta cache, extra focus record,
+ancestor. Other descendants remain stored, not injected. `update_goal` with
+no arguments returns the full plan without attaching the run; every write
+through it attaches the run first and applies all task edits as one revision.
+No model summarizer, delta cache, extra focus record,
 or duplicate copy of the incoming message is involved. Agents continue working
 in their current run rather than ending turns to refresh context. Task additions and updates operate on the existing record. Completion
 is an explicit revision-checked operation with verification evidence and no
-unfinished tasks or outstanding handoff. A green plan alone is not completion.
+unfinished tasks or running helpers. It takes delivery of the Goal's fired
+Waits so they do not wake a finished Goal; an open card or armed Wait does not
+block it. A green plan alone is not completion.
 
 Workspace `AgentWorkClaim` rows are narrower: they serialize one shared action
 across otherwise independent chats. They do not replace a chat's Goal, a
@@ -1322,7 +1355,7 @@ exists and is useful even when the Memory app is not installed. Its consumers:
   bounded Digest from the ~10 most-recently-modified chats
   (`backend/app/memory.py`); the fenced path lets the agent deliberately open a
   relevant full note. Facts and cumulative Summaries are not injected.
-- **Knowledge graph (installed Memory system app).** The app requests structurally
+- **Knowledge graph (installed Memory app).** The app requests structurally
   redacted chat text through its declared API permission, writes a complete graph to
   a same-filesystem staging tree, and atomically advances a JSON `.ready` pointer to
   an immutable generation containing `mocs/`, `notes/`, and `graph.json`. Its confined
@@ -1421,7 +1454,8 @@ Three frontend gates must stay aligned. `StreamingMessage.jsx` renders live ques
 Ordinary choices use `mobius_control.request_question` and
 `POST /api/chats/{id}/question`; approvals use `mobius_control.request_approval`
 and `POST /api/chats/{id}/approval`. Both tools share
-`backend/scripts/owner_approval.py` and `save_owner_question`.
+the control server's `owner_approval.py` library and `save_owner_question`
+(`mobius_control_mcp.py call <tool>` is the command-line fallback).
 This is an application decision, not the provider's sandbox-permission or
 clarifying-question protocol. The route uses the active `ChatEventSink` and
 `QuestionCommit` to save an ordinary question with
@@ -1457,9 +1491,9 @@ exact retries acknowledge it without clearing a newer card. Existing queued
 follow-ups use ordinary idle admission or the publisher's terminal drain.
 Stop remains authoritative and quiet closure cannot revive stopped work.
 
-Quiet closure cannot remove the sole next owner of an unfinished Goal: it
-requires completed work or an exact-Goal wait, helper, or queued continuation.
-An unrelated follow-up does not count; conflicts preserve the card and choice.
+Quiet closure cannot strand an approval's exact work claim: a card whose
+`action_key` still names an active claim needs a reply so its agent can
+complete or release the claim; conflicts preserve the card and choice.
 Legacy save-only answers cannot bypass typed-card semantics: the writer checks
 its actual matched card, including unkeyed requests racing a newly saved card.
 The frontend settles quiet replies without replacing the stream, touching the
@@ -1544,11 +1578,7 @@ message. Repeated steps are bounded by activity variety rather than raw call
 count. Only an explicit disclosure resolves that exact range through
 `GET /api/chats/{id}/activity-detail`; the live assistant stays self-contained.
 Mounted runtime reconciliation uses `GET /api/chats/{id}/runtime`, whose ORM
-projection raiseloads every unrequested field. Goal handoff classification
-reads only the pending-question identity in the ordinary no-question case;
-an open continuation card explicitly resolves its author from the transcript
-so an unrelated question cannot own that Goal. It must not reload the full
-Chat for each Goal status check. Both projections carry `updated_at` as the
+projection raiseloads every unrequested field. Both projections carry `updated_at` as the
 detail-snapshot version. On activation, a retained ChatView reads the runtime
 projection first and reuses its painted transcript only when those explicit
 versions match; a missing or changed version fails closed to the compact detail
@@ -1738,12 +1768,16 @@ invocation, and persists a bounded lifecycle marker on that ordinary tool
 block. A completed script prints a final
 `MOBIUS_APP_ACTIVITY_V1:{...}` JSON line with the same `activity_id`, a
 `succeeded|empty|failed` status, required `label`, and optional `detail`,
-`warning`, and resources (`label`, optional `summary` and own-app `intent`).
-The shell owns identity, bounds, persistence, safe own-app navigation, and the
-generic card; every domain concept and all additional protocol fields stay in
-the app. The declaration is not included in the capability contract and grants
-no data, network, or execution permission. Old Memory V1/V2 receipts remain a
-read-only transcript compatibility path, never a live provider interface.
+`warning`, resources (`label`, optional `summary` and own-app `intent`), and
+`operation_key`. Receipts from one app sharing an `operation_key` are the pages
+of one operation; the chat renders them as one row at render time only
+(`foldAppActivityOperations`), so stored blocks and cold-transcript preparation
+keep every page. The shell owns identity, bounds, persistence, safe own-app
+navigation, and the generic card; every domain concept and all additional
+protocol fields stay in the app. The declaration is not included in the
+capability contract and grants no data, network, or execution permission. Old
+Memory V1/V2 receipts remain a read-only transcript compatibility path, never a
+live provider interface.
 
 ## Testing — determinism principle
 

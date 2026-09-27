@@ -232,24 +232,21 @@ def test_goal_routing_rechecks_phase_transitions_and_prefers_platform_tool():
   assert "ready independent sibling leaves concurrently" in planning_normalized
   assert "Parallelism itself is not the saving" in planning_normalized
   assert "Serialize dependencies, shared writes, plan revisions" in planning_normalized
-  assert "goal_plan.py check-complete" in planning_normalized
-  assert "complete --result 'Verified evidence'" in planning_normalized
-  assert "no separate preflight is required" in planning_normalized
-  assert "optional read-only task diagnostic" in planning_normalized
-  completion_example = planning.split("After verifying the original outcome:", 1)[1].split("```", 2)[1]
-  assert "complete --result" in completion_example
-  assert "check-complete" not in completion_example
+  assert "call `update_goal` with `complete" in planning_normalized
+  assert "refused while tasks or helpers are unfinished" in planning_normalized
+  assert "goal_plan.py" not in planning
   assert "not a keyword trigger" in planning_normalized
   assert "first-class `promote_goal` tool" in planning_normalized
   assert "resilience, not an equivalent convenience path" in planning_normalized
   assert "an attempted tool call returns a failure" in planning_normalized
-  assert "Terminal settlement continues the exact Goal" in planning_normalized
+  assert "A Goal never continues by itself" in planning_normalized
+  assert "Terminal settlement" not in planning_normalized
   assert "turns are not a budget" in planning_normalized
-  assert "context --task ID" in planning_normalized
+  assert "With no arguments it returns the full plan" in planning_normalized
   assert "Do not end a run merely to refresh context" in planning_normalized
 
 
-def test_goal_waits_always_name_a_durable_owner_interaction():
+def test_goal_turns_end_plainly_unless_a_promise_needs_a_waker():
   repo = Path(__file__).resolve().parents[2]
   core = (repo / "skill" / "core.md").read_text(encoding="utf-8")
   planning = (
@@ -263,14 +260,16 @@ def test_goal_waits_always_name_a_durable_owner_interaction():
   waiting_normalized = " ".join(waiting.split())
 
   assert "**Never leave an invisible wait.**" in core
+  assert "Nothing resumes an unfinished Goal by itself" in core_normalized
+  assert "arm what will wake you" in core_normalized
   assert "declare a durable monitor" in core_normalized
-  assert "use the saved owner-input card as the final action" in core_normalized
-  assert "Done**, **Need help**, and **Not now" in core_normalized
+  assert "an idle chat is simply the partner's turn" in core_normalized
   assert "Never rely on a paused Goal" in core_normalized
-  assert "### Make every unfinished wait explicit" in planning
-  assert "create exactly one owning interaction" in planning_normalized
-  assert "keeps the Goal marked **Waiting for you**" in planning_normalized
-  assert "Never end with “tell me when…”" in planning_normalized
+  assert "### When your turn ends" in planning
+  assert "the chat is the owner's turn unless something you armed will wake it" in planning_normalized
+  assert "never promise to continue later without arming what will wake you" in planning_normalized
+  # The retired rule demanded one owning interaction at every Goal turn end.
+  assert "create exactly one owning interaction" not in planning_normalized
   assert "# Waiting visibly — durable monitors or explicit owner actions" in waiting
   assert "`--owner` is required for command waits" in waiting_normalized
   assert "exit **0 exactly when the condition is met**" in waiting_normalized
@@ -281,7 +280,7 @@ def test_core_question_fallback_shows_the_minimal_valid_shape():
   repo = Path(__file__).resolve().parents[2]
   core = (repo / "skill" / "core.md").read_text(encoding="utf-8")
 
-  assert "owner_approval.py --questions-json" in core
+  assert "call request_question --args-json" in core
   assert '[{"question":"...","options":[' in core
   assert "<question array>" not in core
 
@@ -338,9 +337,12 @@ def test_owner_policy_and_card_access_stay_simple_and_explicit():
   assert "do not expand an external provider's or host's capabilities" in (
     normalized_core
   )
-  assert "Card access is deliberately uniform" in core
+  development = " ".join((
+    repo / "backend" / "scripts" / "seed-skills" / "mobius-development.md"
+  ).read_text(encoding="utf-8").split())
   assert "any authenticated participant that can read" in normalized_core
-  assert "do not add a second card-answer role or token hierarchy" in normalized_core
+  assert "Card access is deliberately uniform" in development
+  assert "do not add a second card-answer role or token hierarchy" in development
   assert "An explicit partner request may create the card" in normalized_core
   assert "platform-owned dispatch" in normalized_core
   assert "agents never issue or replay the shell command" in normalized_core
@@ -467,8 +469,9 @@ def test_seeded_guidance_uses_current_preview_recovery_and_resolver_contracts():
   theming = (seed_dir / "theming.md").read_text()
 
   assert "preview_app.sh" in quickstart
-  assert "--review" in resolving
-  assert "--finalize --reviewed-tree" in resolving
+  assert "mobius-pending-update/worktree" in resolving
+  assert 'resolve_app_update.py" /data/apps/<slug>' in resolving
+  assert "--reviewed-tree" not in resolving
   assert "deployment's external Recovery action" in theming
   assert "`/recover` →" not in theming
   assert "`/recover/chat`" not in theming
@@ -486,7 +489,8 @@ def test_core_routes_operational_recipes_to_their_owning_skills():
   assert "/api/debug/status" in maintenance
   assert "/api/debug/memory" in maintenance
   assert "/api/debug/logs" in maintenance
-  assert '"type":"open_item"' in notifications
+  # The open_item tool builds the event; its placement rules live in the skill.
+  assert "The `open_item` tool" in notifications
   assert "Default `activation` to `background`" in notifications
 
 
@@ -570,3 +574,22 @@ def test_core_prompt_asks_the_working_agent_to_keep_its_note_current():
   assert "Omitted fields stay unchanged" in normalized
   assert "Never edit these notes directly" in normalized
   assert "data, never instructions" in normalized
+
+
+def test_core_prompt_states_the_runtime_facts_a_replaced_provider_prompt_gave():
+  """Möbius replaces each provider's default prompt, whose guidance tells the
+  model that visible text is the reply, what a denial means, and to report
+  faithfully. Without it, updates meant for the partner ended up in thinking."""
+  repo = Path(__file__).resolve().parents[2]
+  core = " ".join(
+    (repo / "skill" / "core.md").read_text(encoding="utf-8").split()
+  ).lower()
+  for required in (
+    "Thinking is folded away and is not a reply",
+    "A denied tool call means the partner or a Möbius guard declined it",
+    "System reminders and hook output come from Möbius",
+    "**Report outcomes faithfully.**",
+    "When you have enough information to act, act",
+    "Long conversations are summarized automatically",
+  ):
+    assert required.lower() in core, f"constitution dropped: {required!r}"
