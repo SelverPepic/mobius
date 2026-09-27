@@ -2379,25 +2379,32 @@ export default function Shell({ onInitialVisualReady }) {
   // Run and wait events each change a few rows. Re-reading the complete list
   // per event sent ~1 MB to every open window while agents worked, so events
   // refresh just their rows (see chatRowRefresh.js for the ordering rules).
-  const chatRowRefresh = useMemo(() => createChatRowRefresh({
-    readRows: async ids => jsonOrThrow(
-      await api.chats.rows(ids, { cache: 'no-store' }), 'chat rows fetch failed:',
-    ),
-    applyRows: (ids, fresh) => {
-      projectChatList(rows => reconcileCreatedChats(
-        withRefreshedChatRows(rows, ids, fresh),
-      ))
-      // Scoped reads never refill the offline list copy; drop the stale one so
-      // a cold offline start keeps the fresher persisted list.
-      void invalidateShellListCache('chats')
-    },
-    refreshAll: refreshChats,
-    fullReadInFlight: () => queryClient.isFetching({ queryKey: chatQueries.keys.all }) > 0,
-    fullReadsStarted: chatQueries.list.readsStarted,
-    batchMs: CHAT_ROW_REFRESH_BATCH_MS,
-  }), [projectChatList, queryClient, reconcileCreatedChats, refreshChats])
-  useEffect(() => () => chatRowRefresh.cancel(), [chatRowRefresh])
-  const refreshChatRows = chatRowRefresh.request
+  const chatRowRefreshRef = useRef(null)
+  useEffect(() => {
+    const refresh = createChatRowRefresh({
+      readRows: async ids => jsonOrThrow(
+        await api.chats.rows(ids, { cache: 'no-store' }), 'chat rows fetch failed:',
+      ),
+      applyRows: (ids, fresh) => {
+        projectChatList(rows => reconcileCreatedChats(
+          withRefreshedChatRows(rows, ids, fresh),
+        ))
+        // Scoped reads never refill the offline list copy; drop the stale one so
+        // a cold offline start keeps the fresher persisted list.
+        void invalidateShellListCache('chats')
+      },
+      refreshAll: refreshChats,
+      fullReadInFlight: () => queryClient.isFetching({ queryKey: chatQueries.keys.all }) > 0,
+      fullReadMark: chatQueries.list.readMark,
+      fullReadLandedSince: chatQueries.list.readLandedSince,
+      batchMs: CHAT_ROW_REFRESH_BATCH_MS,
+    })
+    chatRowRefreshRef.current = refresh
+    return () => refresh.cancel()
+  }, [projectChatList, queryClient, reconcileCreatedChats, refreshChats])
+  const refreshChatRows = useCallback(
+    chatId => chatRowRefreshRef.current?.request(chatId), [],
+  )
   const markChatOwnerActivity = useCallback((chatId) => {
     const at = new Date().toISOString()
     projectChatList(rows => withChatOwnerActivity(rows, chatId, at))

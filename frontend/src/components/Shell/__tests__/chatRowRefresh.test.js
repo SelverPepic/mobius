@@ -7,7 +7,8 @@ function harness({ fullReadInFlight = () => false } = {}) {
   const reads = []
   const applied = []
   let refreshedAll = 0
-  let fullReads = 0
+  let started = 0
+  let landed = 0
   const refresh = createChatRowRefresh({
     readRows: ids => new Promise((resolve, reject) => {
       reads.push({ ids, resolve, reject })
@@ -15,7 +16,8 @@ function harness({ fullReadInFlight = () => false } = {}) {
     applyRows: (ids, rows) => applied.push({ ids, rows }),
     refreshAll: async () => { refreshedAll += 1 },
     fullReadInFlight,
-    fullReadsStarted: () => fullReads,
+    fullReadMark: () => started,
+    fullReadLandedSince: mark => landed > mark,
     schedule: fn => { timers.push(fn); return timers.length },
     unschedule: () => {},
   })
@@ -23,7 +25,8 @@ function harness({ fullReadInFlight = () => false } = {}) {
   return {
     refresh, timers, reads, applied, settle,
     fireTimer: () => timers.shift()(),
-    startFullRead: () => { fullReads += 1 },
+    startFullRead: () => ++started,
+    landFullRead: read => { landed = Math.max(landed, read) },
     get refreshedAll() { return refreshedAll },
   }
 }
@@ -65,15 +68,39 @@ test('a complete read already in flight turns the batch into a fresh complete re
   assert.equal(h.refreshedAll, 1)
 })
 
-test('a complete read started during the scoped read supersedes its answer', async () => {
+test('a complete read that starts and lands during the scoped read supersedes it', async () => {
   const h = harness()
   h.refresh.request('a')
   h.fireTimer()
-  h.startFullRead()
+  h.landFullRead(h.startFullRead())
   h.reads[0].resolve([{ id: 'a', running: true }])
   await h.settle()
   assert.deepEqual(h.applied, [])
   assert.equal(h.refreshedAll, 0)
+})
+
+test('a complete read that has not landed does not suppress the scoped answer', async () => {
+  // It may fail or be cancelled (chat creation cancels list reads); if it
+  // lands later it is newer and overwrites these rows anyway.
+  const h = harness()
+  h.refresh.request('server-created')
+  h.fireTimer()
+  h.startFullRead()
+  h.reads[0].resolve([{ id: 'server-created' }])
+  await h.settle()
+  assert.deepEqual(h.applied, [{ ids: ['server-created'], rows: [{ id: 'server-created' }] }])
+})
+
+test('cancel is final even while a scoped read is in flight', async () => {
+  const h = harness()
+  h.refresh.request('a')
+  h.fireTimer()
+  h.refresh.request('b')
+  h.refresh.cancel()
+  h.reads[0].resolve([{ id: 'a' }])
+  await h.settle()
+  assert.deepEqual(h.applied, [])
+  assert.equal(h.timers.length, 0)
 })
 
 test('a failed scoped read, such as one over the id bound, becomes a complete read', async () => {

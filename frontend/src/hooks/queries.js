@@ -172,14 +172,16 @@ function useProjectTemplatesQuery() {
   return useQuery({ queryKey: projectTemplatesKey, queryFn: fetchProjectTemplates })
 }
 
-// Complete list reads started so far. A scoped row read compares it before and
-// after its request: a complete read that started meanwhile supersedes it.
-let chatListReadsStarted = 0
+// Complete list reads are numbered as they start; `landed` is the newest one
+// that returned a list. A scoped row read marks the count before its request
+// and yields only to a complete read that started after that mark and landed.
+const chatListReads = { started: 0, landed: 0 }
 
 async function fetchChats({ signal, timeoutMs, cache } = {}) {
-  chatListReadsStarted += 1
+  const read = ++chatListReads.started
   const res = await api.chats.list({ signal, timeoutMs, cache })
   const data = await jsonOrThrow(res, 'chats fetch failed:')
+  chatListReads.landed = Math.max(chatListReads.landed, read)
   return Array.isArray(data) ? data : []
 }
 
@@ -622,7 +624,8 @@ export const chatQueries = {
   list: {
     key: chatsKey,
     fetch: fetchChats,
-    readsStarted: () => chatListReadsStarted,
+    readMark: () => chatListReads.started,
+    readLandedSince: mark => chatListReads.landed > mark,
     useQuery: useChatsQuery,
     invalidate: (queryClient) => queryClient.invalidateQueries({ queryKey: chatsKey }),
   },
