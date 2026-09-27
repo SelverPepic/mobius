@@ -7,11 +7,13 @@ thread as a normal cold-resume case. This owner applies Möbius's 14-day provide
 default to Codex rollout files, then bounds Codex's own SQLite stores and
 scratch space under the same lock (codex_store_compaction).
 
-Concurrency has two layers: web callers close runner admission while idle, and
-this filesystem owner takes the exclusive side of the cross-process Codex lock.
-Every launcher, including standalone Reflection, holds the shared side for its
-full process lifetime. Startup can therefore reclaim before SQLite opens while
-still skipping safely if an external Codex process is already active.
+Concurrency waits only for Codex. This filesystem owner takes the exclusive
+side of the cross-process Codex lock, whose shared side every launcher,
+including standalone Reflection, holds for its full process lifetime, and it
+also skips while any process holds a file under CODEX_HOME open, which covers a
+Codex started outside those launchers. Other agents are never paused. Startup
+can therefore reclaim before SQLite opens while still skipping safely if an
+external Codex process is already active.
 """
 
 from __future__ import annotations
@@ -31,8 +33,8 @@ DEFAULT_RETENTION_DAYS = {
   "codex": 14,
 }
 MAX_FILES_PER_SWEEP = 10_000
-# Codex launches wait on the sweep lock and the periodic sweep holds runner
-# admission, so one pass does bounded store work; a backlog resumes next pass.
+# Codex launches wait on the sweep lock, so one pass does bounded store work;
+# a backlog resumes on the next pass.
 STORE_COMPACTION_BUDGET_SECONDS = 10.0
 
 
