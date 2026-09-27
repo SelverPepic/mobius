@@ -36,7 +36,7 @@ Review the exact changed paths and use the smallest matching action:
 | Changed surface | Smallest activation |
 |---|---|
 | `/data/shared/theme.css` | Hot-reloads after the theme notification. No build or restart. |
-| Mini-app source under `/data/apps/<slug>/` | Run `apply_app.py`; the compiled app live-swaps. No shell rebuild or server restart. |
+| Mini-app source under `/data/apps/<slug>/` | Call `apply_app`; the compiled app live-swaps. No shell rebuild or server restart. |
 | `frontend/src/` and other frontend build inputs | The watcher rebuilds the served shell, then `shell_apply_now` applies it. A normal save triggers this automatically; source arriving through Git needs a changed frontend file touched. No server restart. |
 | `backend/app/*.py` | After compile checks, tests, and commit, one server restart loads the settled backend revision. |
 | `skill/core.md` | A server restart refreshes the cached constitution for new agent sessions only; existing sessions keep their immutable prompt snapshot. Unless new sessions need the rule immediately, leave it pending for the next separately approved restart. |

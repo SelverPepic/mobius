@@ -33,6 +33,9 @@ def test_control_server_configs_share_one_script_and_no_secret_arguments():
     # Non-secret helper context: the agent's provider (spawn_agent default),
     # its delegation, and the Subagents app helper.
     "MOBIUS_AGENT_PROVIDER", "MOBIUS_DELEGATION_ID", "MOBIUS_SUBAGENT_HELPER",
+    # Non-secret capture context for the screenshot tool.
+    "VIEWPORT_WIDTH", "VIEWPORT_HEIGHT", "VIEWPORT_PIXEL_RATIO",
+    "AGENT_BROWSER_SESSION",
   }
   assert "default_tools_approval_mode" not in codex_server
   assert codex_server["tools"] == {
@@ -665,6 +668,7 @@ def test_saved_card_tools_instruct_the_agent_to_end_at_the_card():
     control.REQUEST_APPROVAL_TOOL,
     control.REQUEST_QUESTION_TOOL,
     control.REQUEST_RESTART_TOOL,
+    control.REQUEST_SECRET_TOOL,
   ):
     description = control._TOOL_DEFINITIONS[name]["description"].lower()
     assert description.count(instruction) == 1
@@ -804,3 +808,161 @@ def test_app_tool_timeouts_are_ordered_service_then_control_then_provider():
     < control.APP_TOOL_CALL_TIMEOUT_SECONDS
     < platform_tools.CONTROL_TOOL_TIMEOUT_SECONDS
   )
+
+
+def _recording_api(monkeypatch, control, reply=None):
+  sent = []
+  def call(method, path, payload=None, *, timeout=10):
+    sent.append((method, path, payload))
+    return reply if reply is not None else {}
+  monkeypatch.setenv("CHAT_ID", "chat-1")
+  monkeypatch.setattr(control, "_agent_api_call", call)
+  monkeypatch.setattr(control, "_agent_api_json", call)
+  return sent
+
+
+def test_notify_owner_defaults_the_tap_to_this_chat_inside_the_installed_app(monkeypatch):
+  control = _control_module()
+  sent = _recording_api(monkeypatch, control)
+
+  text = control._call_notify_owner({"title": "Ready", "body": "Your app is built."})
+
+  assert sent == [("POST", "/api/notifications/send", {
+    "source_id": "chat-1", "target": "/shell/?chat=chat-1",
+    "title": "Ready", "body": "Your app is built.",
+  })]
+  assert "/shell/?chat=chat-1" in text
+  control._call_notify_owner({"title": "t", "body": "b", "target": "/shell/?app=7"})
+  assert sent[-1][2]["target"] == "/shell/?app=7"
+  with pytest.raises(ValueError, match="needs: body"):
+    control._call_notify_owner({"title": "t"})
+
+
+def test_open_item_places_beside_this_chat_in_the_background_by_default(monkeypatch):
+  control = _control_module()
+  sent = _recording_api(monkeypatch, control)
+
+  control._call_open_item({"kind": "app", "id": 42})
+
+  assert sent == [("POST", "/api/notify", {
+    "type": "open_item", "itemKind": "app", "itemId": "42",
+    "sourceKind": "chat", "sourceId": "chat-1",
+    "placement": "beside-source", "activation": "background",
+  })]
+
+
+def test_request_secret_saves_a_sealed_card_and_never_offers_reveal(monkeypatch):
+  control = _control_module()
+  saved = []
+  monkeypatch.setattr(control._SECURE_INPUT, "_request_saved", lambda spec, command, action, cwd=None: (
+    saved.append((spec, command, action, cwd)) or {"state": "waiting_for_owner"}
+  ))
+
+  control._call_request_secret({
+    "title": "Connect service",
+    "fields": [{"name": "api_key", "type": "password", "label": "API key"}],
+    "command": ["python3", "/data/apps/x/store.py"],
+  })
+  control._call_request_secret({"preset": "owner_credentials"})
+
+  spec, command, action, cwd = saved[0]
+  assert spec["mode"] == "sealed" and action == "run" and cwd == "/data"
+  assert command == ["python3", "/data/apps/x/store.py"]
+  assert saved[1][2] == "owner-credentials"
+  assert saved[1][0] is control._SECURE_INPUT.OWNER_CREDENTIALS_SPEC
+  schema = control._TOOL_DEFINITIONS[control.REQUEST_SECRET_TOOL]["inputSchema"]
+  assert "mode" not in schema["properties"]
+  with pytest.raises(ValueError, match="does not take: mode"):
+    control._call_request_secret({"mode": "reveal", "title": "x"})
+  with pytest.raises(ValueError, match="argv list"):
+    control._call_request_secret({
+      "title": "x", "fields": [{"name": "a", "type": "text", "label": "A"}],
+      "command": "python3 leak.py",
+    })
+
+
+def test_list_apps_narrows_by_one_exact_filter(monkeypatch):
+  control = _control_module()
+  _recording_api(monkeypatch, control, reply=[
+    {"id": 1, "name": "Notes", "slug": "notes", "source_dir": "/data/apps/notes"},
+    {"id": 2, "name": "Notes", "slug": "notes-2", "source_dir": "/data/apps/notes-2"},
+  ])
+
+  assert control._call_list_apps({"slug": "notes-2", "with_source_dir": True}) == [
+    {"id": 2, "name": "Notes", "slug": "notes-2", "source_dir": "/data/apps/notes-2"},
+  ]
+  assert [app["id"] for app in control._call_list_apps({"name": "Notes"})] == [1, 2]
+  with pytest.raises(ValueError, match="at most one"):
+    control._call_list_apps({"slug": "a", "name": "b"})
+
+
+def test_apply_app_publishes_the_directory_and_returns_where_to_open_it(
+  monkeypatch, tmp_path,
+):
+  control = _control_module()
+  sent = _recording_api(monkeypatch, control, reply={
+    "mode": "updated", "warnings": [],
+    "app": {"id": 9, "name": "Notes", "slug": "notes", "source_dir": str(tmp_path)},
+  })
+
+  receipt = control._call_apply_app({"source_dir": str(tmp_path)})
+
+  assert sent == [("POST", "/api/apps/apply", {
+    "source_dir": str(tmp_path.resolve()), "chat_id": "chat-1",
+  })]
+  assert receipt["app_id"] == 9 and receipt["open_path"] == "/shell/?app=9"
+  with pytest.raises(ValueError, match="existing absolute directory"):
+    control._call_apply_app({"source_dir": "relative/path"})
+
+
+def test_helpers_may_build_apps_but_not_reach_the_owner(monkeypatch):
+  control = _control_module()
+  for name in control.APP_TOOLS:
+    assert name in control.DELEGATED_TOOLS
+  for name in (
+    control.NOTIFY_OWNER_TOOL, control.OPEN_ITEM_TOOL, control.REQUEST_SECRET_TOOL,
+  ):
+    assert name in control.OWNER_TOOLS and name not in control.DELEGATED_TOOLS
+
+
+def test_screenshot_returns_the_image_and_the_owner_embed_line(monkeypatch, tmp_path):
+  control = _control_module()
+  shot = tmp_path / "shot.png"
+  shot.write_bytes(b"\x89PNG fake")
+  calls = []
+
+  class Done:
+    returncode = 0
+    stdout = (
+      f"{shot}\nPASTE into your reply (the partner cannot see the PNG otherwise): "
+      "![screenshot](/api/chats/c/media/shot.png)\n"
+    )
+    stderr = ""
+
+  monkeypatch.setattr(control.subprocess, "run", lambda command, **kw: calls.append(command) or Done())
+
+  result = control._call_tool({"name": "screenshot", "arguments": {
+    "route": "/app/4", "content_only": True,
+  }})
+
+  assert calls[0][-2:] == ["--content-only", "/app/4"]
+  image, note = result["content"]
+  assert image["type"] == "image" and image["mimeType"] == "image/png"
+  assert "![screenshot](/api/chats/c/media/shot.png)" in note["text"]
+  refused = control._call_tool({"name": "screenshot", "arguments": {"route": "https://x"}})
+  assert refused["isError"] is True
+
+
+def test_screenshot_in_a_read_only_sandbox_says_why_it_cannot_capture(monkeypatch):
+  control = _control_module()
+
+  class Denied:
+    returncode = 1
+    stdout = ""
+    stderr = "mkdir: cannot create directory '/data/chats/x/media': Permission denied"
+
+  monkeypatch.setattr(control.subprocess, "run", lambda command, **kw: Denied())
+  result = control._call_tool({"name": "screenshot", "arguments": {"route": "/"}})
+
+  assert result["isError"] is True
+  assert "needs write access" in result["content"][0]["text"]

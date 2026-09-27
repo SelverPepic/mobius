@@ -8,7 +8,9 @@ substantially more memory than this small control surface needs.
 
 from __future__ import annotations
 
+import base64
 import importlib.util
+import subprocess
 import json
 import os
 import sys
@@ -44,6 +46,15 @@ SEND_AGENT_MESSAGE_TOOL = "send_agent_message"
 CLAIM_AGENT_WORK_TOOL = "claim_agent_work"
 FINISH_AGENT_WORK_TOOL = "finish_agent_work"
 CHECKPOINT_CHAT_TOOL = "checkpoint_chat"
+NOTIFY_OWNER_TOOL = "notify_owner"
+OPEN_ITEM_TOOL = "open_item"
+REQUEST_SECRET_TOOL = "request_secret"
+LIST_APPS_TOOL = "list_apps"
+APPLY_APP_TOOL = "apply_app"
+SCREENSHOT_TOOL = "screenshot"
+# App building is ordinary work a helper may do too; owner-facing interaction
+# (pushes, workspace placement, cards) stays with the top-level turn.
+APP_TOOLS = (LIST_APPS_TOOL, APPLY_APP_TOOL, SCREENSHOT_TOOL)
 PEER_TOOLS = (
   LIST_AGENT_PEERS_TOOL,
   SEND_AGENT_MESSAGE_TOOL,
@@ -74,8 +85,15 @@ OWNER_TOOLS = (
   REQUEST_RESTART_TOOL,
   *WORK_OWNERSHIP_TOOLS,
   CHECKPOINT_CHAT_TOOL,
+  NOTIFY_OWNER_TOOL,
+  OPEN_ITEM_TOOL,
+  REQUEST_SECRET_TOOL,
+  *APP_TOOLS,
 )
-DELEGATED_TOOLS = (*HELPER_TOOLS, *PEER_TOOLS, *WORK_OWNERSHIP_TOOLS, CHECKPOINT_CHAT_TOOL)
+DELEGATED_TOOLS = (
+  *HELPER_TOOLS, *PEER_TOOLS, *WORK_OWNERSHIP_TOOLS, CHECKPOINT_CHAT_TOOL,
+  *APP_TOOLS,
+)
 # A helper turn's identity when it runs inside a shared helper host: the
 # process environment belongs to the whole host, so the turn's own values
 # come from a private per-turn file (see backend app/helper_hosts.py).
@@ -157,6 +175,7 @@ def _helper_module(filename: str, module_name: str) -> ModuleType:
 _GOALS = _helper_module("goal_promote.py", "mobius_goal_promote")
 _WAITS = _helper_module("chat_wait.py", "mobius_chat_wait")
 _APPROVALS = _helper_module("owner_approval.py", "mobius_owner_approval")
+_SECURE_INPUT = _helper_module("secure-input.py", "mobius_secure_input")
 
 
 def _promote_goal(objective: str) -> dict:
@@ -223,6 +242,20 @@ def _agent_api_call(
   *,
   timeout: float = 10,
 ) -> dict[str, Any]:
+  """Call one run-bound local endpoint that answers with a JSON object."""
+  result = _agent_api_json(method, path, payload, timeout=timeout)
+  if not isinstance(result, dict):
+    raise RuntimeError("coordination request returned an invalid object")
+  return result
+
+
+def _agent_api_json(
+  method: str,
+  path: str,
+  payload: dict[str, Any] | None = None,
+  *,
+  timeout: float = 10,
+) -> Any:
   """Call one run-bound local endpoint without importing the backend app."""
   base, token = _agent_api_settings()
   request = Request(
@@ -251,12 +284,9 @@ def _agent_api_call(
   except URLError as exc:
     raise RuntimeError(f"coordination request failed: {exc.reason}") from exc
   try:
-    result = json.loads(raw) if raw else {}
+    return json.loads(raw) if raw else {}
   except json.JSONDecodeError as exc:
     raise RuntimeError("coordination request returned malformed data") from exc
-  if not isinstance(result, dict):
-    raise RuntimeError("coordination request returned an invalid object")
-  return result
 
 
 def _response(message_id: Any, result: Any) -> dict[str, Any]:
@@ -275,7 +305,13 @@ def _error(
   }
 
 
+class ToolContent(list):
+  """MCP content blocks a handler returns as-is (for example an image)."""
+
+
 def _tool_result(value: Any, *, is_error: bool = False) -> dict[str, Any]:
+  if isinstance(value, ToolContent):
+    return {"content": list(value), "isError": is_error}
   text = value if isinstance(value, str) else json.dumps(
     value,
     ensure_ascii=False,
@@ -767,6 +803,180 @@ def _call_checkpoint_chat(arguments: dict[str, Any]) -> str:
   return "Saved."
 
 
+def _chat_id() -> str:
+  chat_id = os.environ.get("CHAT_ID") or ""
+  if not chat_id:
+    raise RuntimeError("missing environment: CHAT_ID")
+  return chat_id
+
+
+def _require_args(name: str, arguments: dict[str, Any], allowed: set[str],
+                  required: tuple[str, ...] = ()) -> None:
+  unknown = set(arguments) - allowed
+  if unknown:
+    raise ValueError(f"{name} does not take: {', '.join(sorted(unknown))}")
+  missing = [key for key in sorted(required) if not arguments.get(key)]
+  if missing:
+    raise ValueError(f"{name} needs: {', '.join(missing)}")
+
+
+def _call_notify_owner(arguments: dict[str, Any]) -> str:
+  _require_args(
+    NOTIFY_OWNER_TOOL, arguments,
+    {"title", "body", "target", "tag", "actions"}, ("title", "body"),
+  )
+  chat_id = _chat_id()
+  # The in-shell form keeps a cold tap inside the installed app; a bare
+  # /chat/<id> link escapes the service worker and opens a browser tab.
+  payload = {"source_id": chat_id, "target": f"/shell/?chat={chat_id}", **arguments}
+  _agent_api_call("POST", "/api/notifications/send", payload)
+  return f"Sent. Tapping it opens {payload['target']}."
+
+
+def _call_open_item(arguments: dict[str, Any]) -> str:
+  _require_args(OPEN_ITEM_TOOL, arguments, {"kind", "id", "activation"}, ("kind", "id"))
+  activation = arguments.get("activation", "background")
+  _agent_api_call("POST", "/api/notify", {
+    "type": "open_item",
+    "itemKind": arguments["kind"],
+    "itemId": str(arguments["id"]),
+    "sourceKind": "chat",
+    "sourceId": _chat_id(),
+    "placement": "beside-source",
+    "activation": activation,
+  })
+  return (
+    f"Opened {arguments['kind']} {arguments['id']} in the owner's workspace "
+    f"({activation}). It is live-only; add notify_owner if they may be away."
+  )
+
+
+def _call_request_secret(arguments: dict[str, Any]) -> dict:
+  secure = _SECURE_INPUT
+  if arguments.get("preset") == "owner_credentials":
+    if set(arguments) != {"preset"}:
+      raise ValueError("the owner_credentials preset takes no other arguments")
+    spec, command, action = (
+      secure.OWNER_CREDENTIALS_SPEC, secure._owner_credentials_consumer(),
+      "owner-credentials",
+    )
+    cwd = None
+  else:
+    if "preset" in arguments:
+      raise ValueError("preset must be owner_credentials")
+    _require_args(
+      REQUEST_SECRET_TOOL, arguments,
+      {"title", "description", "fields", "command", "cwd"},
+      ("title", "fields", "command"),
+    )
+    command = arguments["command"]
+    if not isinstance(command, list) or not all(isinstance(part, str) for part in command):
+      raise ValueError("command must be an argv list of strings")
+    spec = {
+      "mode": "sealed",
+      "title": arguments["title"],
+      "description": arguments.get("description", ""),
+      "fields": arguments["fields"],
+    }
+    action = "run"
+    cwd = arguments.get("cwd") or "/data"
+    if not cwd.startswith("/"):
+      raise ValueError("cwd must be an absolute path")
+  return secure._request_saved(spec, command, action, cwd=cwd)
+
+
+def _call_list_apps(arguments: dict[str, Any]) -> list[dict[str, Any]]:
+  filters = {"id", "slug", "name", "source_dir", "chat_id"}
+  _require_args(LIST_APPS_TOOL, arguments, {*filters, "with_source_dir"})
+  given = {key: arguments[key] for key in filters if key in arguments}
+  if len(given) > 1:
+    raise ValueError("list_apps takes at most one exact filter")
+  apps = _agent_api_json("GET", "/api/apps/", timeout=30)
+  if not isinstance(apps, list):
+    raise RuntimeError("the app list was not a list")
+  compact = []
+  for app in apps:
+    if not isinstance(app, dict) or any(app.get(k) != v for k, v in given.items()):
+      continue
+    item = {"id": app.get("id"), "name": app.get("name"), "slug": app.get("slug")}
+    if arguments.get("with_source_dir"):
+      item["source_dir"] = app.get("source_dir")
+    compact.append(item)
+  return compact
+
+
+def _call_apply_app(arguments: dict[str, Any]) -> dict[str, Any]:
+  _require_args(
+    APPLY_APP_TOOL, arguments, {"source_dir", "accept_local_package"}, ("source_dir",),
+  )
+  source = Path(arguments["source_dir"])
+  if not source.is_absolute() or not source.is_dir():
+    raise ValueError("source_dir must be an existing absolute directory")
+  payload: dict[str, Any] = {
+    "source_dir": str(source.resolve()), "chat_id": os.environ.get("CHAT_ID") or None,
+  }
+  if arguments.get("accept_local_package"):
+    payload["accept_local_package"] = True
+  result = _agent_api_call("POST", "/api/apps/apply", payload, timeout=120)
+  app = result.get("app")
+  if not isinstance(app, dict) or not isinstance(app.get("id"), int):
+    raise RuntimeError("App apply response did not include a numeric app id.")
+  return {
+    "mode": result.get("mode"), "app_id": app["id"], "name": app.get("name"),
+    "slug": app.get("slug"), "source_dir": app.get("source_dir"),
+    "open_path": f"/shell/?app={app['id']}",
+    "warnings": result.get("warnings") or [],
+  }
+
+
+SCREENSHOT_SCRIPT = Path(__file__).with_name("agent-screenshot.sh")
+SCREENSHOT_TIMEOUT_SECONDS = 150
+
+
+def _call_screenshot(arguments: dict[str, Any]) -> ToolContent:
+  """Capture through the authenticated helper and hand back the image itself.
+
+  The helper keeps its auth, freshness, and atomic-output checks; the image
+  lands in this chat's served media so the embed line works for the owner.
+  """
+  _require_args(SCREENSHOT_TOOL, arguments, {"route", "content_only"}, ("route",))
+  route = arguments["route"]
+  if not isinstance(route, str) or not route.startswith("/"):
+    raise ValueError("route must be a path such as /app/42 or /settings")
+  command = ["bash", str(SCREENSHOT_SCRIPT)]
+  if arguments.get("content_only"):
+    command.append("--content-only")
+  command.append(route)
+  try:
+    done = subprocess.run(
+      command, capture_output=True, text=True, timeout=SCREENSHOT_TIMEOUT_SECONDS,
+    )
+  except subprocess.TimeoutExpired as exc:
+    raise RuntimeError("screenshot timed out; nothing was captured") from exc
+  lines = [line for line in done.stdout.splitlines() if line.strip()]
+  if done.returncode != 0 or not lines:
+    output = (done.stderr or done.stdout).strip()
+    if "Permission denied" in output:
+      # A read-only sandbox (for example an access=read helper) also confines
+      # this server, and a capture must write its image and browser profile.
+      raise RuntimeError(
+        "screenshot needs write access: it saves the image and a browser "
+        "profile, which this read-only run cannot do."
+      )
+    raise RuntimeError("screenshot failed: " + " / ".join(output.splitlines()[-3:]))
+  image = Path(lines[0])
+  embed = next((line.split(": ", 1)[1] for line in lines if "![screenshot](" in line), None)
+  note = (
+    f"Saved {image}. To show the owner, paste {embed} before describing it."
+    if embed else f"Saved {image}; it is outside chat media, so it cannot be embedded."
+  )
+  return ToolContent([
+    {"type": "image", "data": base64.b64encode(image.read_bytes()).decode("ascii"),
+     "mimeType": "image/png"},
+    {"type": "text", "text": note},
+  ])
+
+
 _TOOL_DEFINITIONS = {
   CHECKPOINT_CHAT_TOOL: {
     "name": CHECKPOINT_CHAT_TOOL,
@@ -974,6 +1184,152 @@ _TOOL_DEFINITIONS = {
       }},
     },
   },
+  SCREENSHOT_TOOL: {
+    "name": SCREENSHOT_TOOL,
+    "description": (
+      "Capture an authenticated Möbius route at the owner's viewport and "
+      "return the image to you: /shell/?app=42 (an app in the shell), "
+      "/shell/?chat=<id>, / (the shell), or /apps/<slug>/ (an app's own "
+      "page). It writes the image, so read-only runs cannot use it. "
+      "content_only hides product "
+      "overlays for this capture. The owner sees nothing until you paste the "
+      "returned embed line into your reply before describing the shot. Takes "
+      "several seconds; keep captures purposeful."
+    ),
+    "inputSchema": {
+      "type": "object", "additionalProperties": False, "required": ["route"],
+      "properties": {
+        "route": {"type": "string", "pattern": "^/"},
+        "content_only": {"type": "boolean"},
+      },
+    },
+  },
+  NOTIFY_OWNER_TOOL: {
+    "name": NOTIFY_OWNER_TOOL,
+    "description": (
+      "Send the owner a push notification for a meaningful event: a finished "
+      "long task, an error or question that needs them, or when they asked to "
+      "be told. Not for routine confirmations. target defaults to this chat's "
+      "in-app link; use /shell/?app=ID for an app. tag groups pushes about one "
+      "thing so a newer one replaces the older. The push is skipped while the "
+      "owner is viewing this chat. Never fire one from a script under test."
+    ),
+    "inputSchema": {
+      "type": "object", "additionalProperties": False,
+      "required": ["title", "body"],
+      "properties": {
+        "title": {"type": "string", "minLength": 1, "maxLength": 200},
+        "body": {"type": "string", "minLength": 1, "maxLength": 1000},
+        "target": {"type": "string", "description": "In-shell path, e.g. /shell/?app=42."},
+        "tag": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$"},
+        "actions": {
+          "type": "array", "maxItems": 2,
+          "items": {
+            "type": "object", "additionalProperties": False,
+            "required": ["action", "title", "target"],
+            "properties": {
+              "action": {"type": "string"}, "title": {"type": "string"},
+              "target": {"type": "string"},
+            },
+          },
+        },
+      },
+    },
+  },
+  OPEN_ITEM_TOOL: {
+    "name": OPEN_ITEM_TOOL,
+    "description": (
+      "Open an app (numeric id) or a chat in the owner's live workspace beside "
+      "this chat. activation defaults to background; use foreground only when "
+      "the owner just asked to open that exact item. It is live-only and never "
+      "stored, so pair it with notify_owner when they may be away. Say it is "
+      "open in their workspace; never describe the layout."
+    ),
+    "inputSchema": {
+      "type": "object", "additionalProperties": False,
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": {"type": "string", "enum": ["app", "chat"]},
+        "id": {"type": ["string", "integer"]},
+        "activation": {"type": "string", "enum": ["background", "foreground"]},
+      },
+    },
+  },
+  REQUEST_SECRET_TOOL: {
+    "name": REQUEST_SECRET_TOOL,
+    "description": (
+      "Ask the owner for a password, API key, token, or other secret through a "
+      "sealed card. Submitted values go once, as one JSON object on stdin, to "
+      "the consumer command you prepared; they never reach the AI provider or "
+      "the transcript. The consumer runs from cwd with a minimal environment "
+      "and no agent credentials, must not log or persist the values, and its "
+      "output is discarded. preset owner_credentials asks for the owner's "
+      "sign-in change instead. Returns a receipt, NOT the values. "
+      f"{SAVED_CARD_TERMINAL_INSTRUCTION} "
+      "Put explanation and closeout before this call. Never in background work."
+    ),
+    "inputSchema": {
+      "type": "object", "additionalProperties": False,
+      "properties": {
+        "preset": {"type": "string", "enum": ["owner_credentials"]},
+        "title": {"type": "string", "minLength": 1, "maxLength": 200},
+        "description": {"type": "string", "maxLength": 1000},
+        "fields": {
+          "type": "array", "minItems": 1, "maxItems": 8,
+          "items": {
+            "type": "object", "additionalProperties": False,
+            "required": ["name", "type", "label"],
+            "properties": {
+              "name": {"type": "string"},
+              "type": {"type": "string", "enum": ["text", "password"]},
+              "label": {"type": "string"},
+              "autocomplete": {"type": "string"},
+            },
+          },
+        },
+        "command": {
+          "type": "array", "items": {"type": "string"}, "minItems": 1,
+          "description": "Consumer argv, e.g. [\"python3\", \"/data/apps/x/store_key.py\"].",
+        },
+        "cwd": {"type": "string", "description": "Absolute working directory; default /data."},
+      },
+    },
+  },
+  LIST_APPS_TOOL: {
+    "name": LIST_APPS_TOOL,
+    "description": (
+      "List installed apps as id, name and slug. One exact filter (id, slug, "
+      "name, source_dir, or chat_id) narrows it. Names are not unique: act on "
+      "the numeric id. with_source_dir adds each app's source directory."
+    ),
+    "inputSchema": {
+      "type": "object", "additionalProperties": False,
+      "properties": {
+        "id": {"type": "integer"}, "slug": {"type": "string"},
+        "name": {"type": "string"}, "source_dir": {"type": "string"},
+        "chat_id": {"type": "string"}, "with_source_dir": {"type": "boolean"},
+      },
+    },
+  },
+  APPLY_APP_TOOL: {
+    "name": APPLY_APP_TOOL,
+    "description": (
+      "Validate, compile, and publish one mini-app source directory as its new "
+      "live revision, creating the app on first use. Call it once the first "
+      "slice works and after each coherent revision; it owns the commit and the "
+      "live swap, so do not git-commit app source yourself. Set "
+      "accept_local_package only when the owner explicitly chose to make a "
+      "Store app's local manifest authoritative."
+    ),
+    "inputSchema": {
+      "type": "object", "additionalProperties": False,
+      "required": ["source_dir"],
+      "properties": {
+        "source_dir": {"type": "string", "description": "e.g. /data/apps/<slug>"},
+        "accept_local_package": {"type": "boolean"},
+      },
+    },
+  },
   PROMOTE_GOAL_TOOL: {
     "name": PROMOTE_GOAL_TOOL,
     "description": PROMOTE_GOAL_DESCRIPTION,
@@ -1166,6 +1522,12 @@ _TOOL_HANDLERS = {
   CLAIM_AGENT_WORK_TOOL: _call_claim_agent_work,
   FINISH_AGENT_WORK_TOOL: _call_finish_agent_work,
   CHECKPOINT_CHAT_TOOL: _call_checkpoint_chat,
+  NOTIFY_OWNER_TOOL: _call_notify_owner,
+  OPEN_ITEM_TOOL: _call_open_item,
+  REQUEST_SECRET_TOOL: _call_request_secret,
+  LIST_APPS_TOOL: _call_list_apps,
+  APPLY_APP_TOOL: _call_apply_app,
+  SCREENSHOT_TOOL: _call_screenshot,
 }
 
 

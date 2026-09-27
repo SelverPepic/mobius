@@ -490,7 +490,8 @@ def test_core_routes_operational_recipes_to_their_owning_skills():
   assert "/api/debug/status" in maintenance
   assert "/api/debug/memory" in maintenance
   assert "/api/debug/logs" in maintenance
-  assert '"type":"open_item"' in notifications
+  # The open_item tool builds the event; its placement rules live in the skill.
+  assert "The `open_item` tool" in notifications
   assert "Default `activation` to `background`" in notifications
 
 

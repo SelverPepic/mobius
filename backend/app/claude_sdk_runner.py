@@ -87,6 +87,7 @@ from app.platform_tools import (
   CONTROL_SERVER_NAME,
   QUESTION_TOOL_NAME,
   RESTART_TOOL_NAME,
+  SECRET_TOOL_NAME,
 )
 from app.process_groups import (
   isolated_process_group_id,
@@ -234,15 +235,16 @@ _CLAUDE_BUILTIN_HELPER_TOOLS = (
   "Agent",
   "Task",
 )
-# The tools through which a turn can save an owner-input card: the three
-# platform control tools, plus Bash for the `owner_approval.py` / `secure-input`
-# helper fallbacks, which print the same receipt. Naming them keeps the card-end
+# The tools through which a turn can save an owner-input card: the platform's
+# card tools, plus Bash for the `owner_approval.py` / `secure-input` helper
+# fallbacks, which print the same receipt. Naming them keeps the card-end
 # hook from cutting on an unrelated tool that merely echoes receipt-shaped JSON
 # — notably a Task result quoting a child agent's card.
 _CLAUDE_OWNER_CARD_TOOLS = (
   f"mcp__{CONTROL_SERVER_NAME}__{APPROVAL_TOOL_NAME}",
   f"mcp__{CONTROL_SERVER_NAME}__{QUESTION_TOOL_NAME}",
   f"mcp__{CONTROL_SERVER_NAME}__{RESTART_TOOL_NAME}",
+  f"mcp__{CONTROL_SERVER_NAME}__{SECRET_TOOL_NAME}",
   "Bash",
 )
 
