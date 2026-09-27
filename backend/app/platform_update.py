@@ -3437,6 +3437,8 @@ def complete_platform_swap(repo: Path = PLATFORM_REPO) -> str | None:
   the late edits back first. Returns ``replayed``, ``conflict`` (parked for
   the resolver), ``reverted``, ``not_swapped``, ``unknown``, or None.
   """
+  if read_prepared_update() is None:
+    return None  # Nothing to finish; no lock, as on most boots.
   with _reconcile_flock():
     record = read_prepared_update()
     if record is None:
@@ -3502,6 +3504,8 @@ def confirm_platform_swap_loaded(repo: Path = PLATFORM_REPO) -> bool:
   back. A server started from other source (the baked floor) leaves the record
   for the next platform boot.
   """
+  if read_prepared_update() is None:
+    return False
   with _reconcile_flock():
     record = read_prepared_update()
     if (

@@ -5902,3 +5902,35 @@ def test_startup_refuses_a_checkout_it_cannot_place_on_images_without_the_transa
 
   with pytest.raises(pu.BootTransactionError):
     pu.complete_platform_swap(platform)
+
+
+def test_startup_takes_no_update_lock_when_no_update_is_pending(clone_env, monkeypatch):
+  """Most boots have no update; startup must not need a writable lock then."""
+  blocked = Path(os.environ["MOBIUS_BUILD_INFO_PATH"]).parent / "not-a-dir"
+  blocked.write_text("")
+  monkeypatch.setattr(pu, "RECONCILE_LOCK", blocked / ".reconcile.lock")
+
+  assert pu.complete_platform_swap() is None
+  assert pu.confirm_platform_swap_loaded() is False
+
+
+@pytest.mark.asyncio
+async def test_only_an_unplaced_swap_stops_startup(monkeypatch):
+  import logging
+
+  from app import startup
+
+  context = SimpleNamespace(logger=logging.getLogger("test"))
+
+  def disk_full():
+    raise OSError("disk full")
+
+  monkeypatch.setattr(pu, "complete_platform_swap", disk_full)
+  await startup._complete_platform_swap(context)  # best effort, as before
+
+  def unplaced():
+    raise pu.BootTransactionError("unplaced")
+
+  monkeypatch.setattr(pu, "complete_platform_swap", unplaced)
+  with pytest.raises(pu.BootTransactionError):
+    await startup._complete_platform_swap(context)

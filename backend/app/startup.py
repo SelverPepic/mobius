@@ -371,7 +371,15 @@ async def _complete_platform_swap(context: StartupContext) -> None:
 
   from app import platform_update
 
-  outcome = await asyncio.to_thread(platform_update.complete_platform_swap)
+  try:
+    outcome = await asyncio.to_thread(platform_update.complete_platform_swap)
+  except platform_update.BootTransactionError:
+    raise  # This task's failure reason: never resume on an unplaced checkout.
+  except Exception:
+    # Anything else stays best effort, as before: resumes remain held while
+    # the swap's late edits are not loaded (``late_edits_pending``).
+    context.logger.exception("platform update swap could not be finished")
+    return
   if outcome:
     context.logger.info("platform update swap: %s", outcome)
   if outcome == "conflict":
