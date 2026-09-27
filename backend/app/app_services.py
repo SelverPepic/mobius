@@ -3,7 +3,10 @@
 The platform owns authentication, accepted-runtime identity, process limits,
 and revocation. The app owns the request paths and domain behavior behind one
 small JSON protocol. This is deliberately not a framework or an import hook:
-one request starts one reviewed Python entrypoint and receives one JSON reply.
+every request runs in its own process from one reviewed Python entrypoint and
+receives one JSON reply. An entry that declares ``MOBIUS_PRELOAD = True`` has
+its module setup run once and each request forked from it (``service_preload``);
+every other entry, and any request no preloaded host can take, is spawned.
 """
 
 from __future__ import annotations
@@ -24,7 +27,7 @@ from pathlib import Path
 
 from fastapi import HTTPException
 
-from app import auth, models
+from app import auth, models, service_preload
 from app.applied_app_runtime import AppliedRuntimeUnavailable, hold_runtime, runtime_root
 from app.config import get_settings
 from app.manifest_contract import SERVICE_REQUEST_MAX_BYTES
@@ -192,6 +195,72 @@ def _response_headers(value) -> dict[str, str]:
   return headers
 
 
+async def _run_spawned(
+  entry: Path, environment: dict[str, str], request_bytes: bytes, timeout_seconds: float,
+) -> tuple[bytes, bytes, int]:
+  """Run one request in a fresh interpreter; return (stdout, stderr, exit code)."""
+  try:
+    spawn = asyncio.create_task(asyncio.create_subprocess_exec(
+      sys.executable,
+      str(entry),
+      stdin=asyncio.subprocess.PIPE,
+      stdout=asyncio.subprocess.PIPE,
+      stderr=asyncio.subprocess.PIPE,
+      cwd=str(entry.parent),
+      env=environment,
+      start_new_session=True,
+    ))
+    try:
+      process = await asyncio.shield(spawn)
+    except asyncio.CancelledError:
+      # Admission can be cancelled after the OS child exists but before
+      # asyncio returns its handle. Finish recovery before releasing the
+      # runtime pin, even if shutdown cancels this request again.
+
+      async def recover_spawn() -> None:
+        try:
+          process = await asyncio.shield(spawn)
+        except OSError:
+          pass
+        else:
+          await _stop_process(process)
+
+      recovery = asyncio.create_task(recover_spawn())
+      while not recovery.done():
+        try:
+          await asyncio.shield(recovery)
+        except asyncio.CancelledError:
+          continue
+      raise
+  except OSError as exc:
+    raise HTTPException(502, "App service could not start.") from exc
+  assert process.stdin is not None
+  assert process.stdout is not None
+  assert process.stderr is not None
+  stdout_task = asyncio.create_task(_read_bounded(process.stdout, MAX_RESPONSE_BYTES))
+  stderr_task = asyncio.create_task(_read_bounded(process.stderr, MAX_ERROR_BYTES))
+  write_task = asyncio.create_task(_write_request(process.stdin, request_bytes))
+  try:
+    _written, stdout, stderr, returncode = await asyncio.wait_for(
+      asyncio.gather(write_task, stdout_task, stderr_task, process.wait()),
+      timeout=timeout_seconds,
+    )
+  except (TimeoutError, ValueError) as exc:
+    await _stop_process(process, write_task, stdout_task, stderr_task)
+    raise HTTPException(503, "App service exceeded its execution limits.")
+  except OSError as exc:
+    await _stop_process(process, write_task, stdout_task, stderr_task)
+    raise HTTPException(502, "App service failed before accepting its request.") from exc
+  except asyncio.CancelledError:
+    await _stop_process(process, write_task, stdout_task, stderr_task)
+    raise
+  try:
+    os.killpg(process.pid, signal.SIGKILL)
+  except ProcessLookupError:
+    pass
+  return stdout, stderr, returncode
+
+
 async def invoke_service(
   app, owner, request_envelope: dict, *,
   timeout_seconds: float = SERVICE_TIMEOUT_SECONDS,
@@ -237,65 +306,24 @@ async def invoke_service(
   try:
     async with slot, _global_slots[lane]:
       entry = service_entry(app, service)
-      try:
-        spawn = asyncio.create_task(asyncio.create_subprocess_exec(
-          sys.executable,
-          str(entry),
-          stdin=asyncio.subprocess.PIPE,
-          stdout=asyncio.subprocess.PIPE,
-          stderr=asyncio.subprocess.PIPE,
-          cwd=str(entry.parent),
-          env=service_environment(app, owner),
-          start_new_session=True,
-        ))
+      environment = service_environment(app, owner)
+      outcome = None
+      host = service_preload.ready_host(app, entry, environment)
+      if host is not None:
         try:
-          process = await asyncio.shield(spawn)
-        except asyncio.CancelledError:
-          # Admission can be cancelled after the OS child exists but before
-          # asyncio returns its handle. Finish recovery before releasing the
-          # runtime pin, even if shutdown cancels this request again.
-
-          async def recover_spawn() -> None:
-            try:
-              process = await asyncio.shield(spawn)
-            except OSError:
-              pass
-            else:
-              await _stop_process(process)
-
-          recovery = asyncio.create_task(recover_spawn())
-          while not recovery.done():
-            try:
-              await asyncio.shield(recovery)
-            except asyncio.CancelledError:
-              continue
-          raise
-      except OSError as exc:
-        raise HTTPException(502, "App service could not start.") from exc
-      assert process.stdin is not None
-      assert process.stdout is not None
-      assert process.stderr is not None
-      stdout_task = asyncio.create_task(_read_bounded(process.stdout, MAX_RESPONSE_BYTES))
-      stderr_task = asyncio.create_task(_read_bounded(process.stderr, MAX_ERROR_BYTES))
-      write_task = asyncio.create_task(_write_request(process.stdin, request_bytes))
-      try:
-        _written, stdout, stderr, returncode = await asyncio.wait_for(
-          asyncio.gather(write_task, stdout_task, stderr_task, process.wait()),
-          timeout=timeout_seconds,
-        )
-      except (TimeoutError, ValueError) as exc:
-        await _stop_process(process, write_task, stdout_task, stderr_task)
-        raise HTTPException(503, "App service exceeded its execution limits.")
-      except OSError as exc:
-        await _stop_process(process, write_task, stdout_task, stderr_task)
-        raise HTTPException(502, "App service failed before accepting its request.") from exc
-      except asyncio.CancelledError:
-        await _stop_process(process, write_task, stdout_task, stderr_task)
-        raise
-      try:
-        os.killpg(process.pid, signal.SIGKILL)
-      except ProcessLookupError:
-        pass
+          outcome = await service_preload.run(
+            host, environment, request_bytes, timeout_seconds=timeout_seconds,
+            max_stdout=MAX_RESPONSE_BYTES, max_stderr=MAX_ERROR_BYTES,
+          )
+        except service_preload.PreloadUnavailable:
+          outcome = None
+        except (TimeoutError, ValueError) as exc:
+          raise HTTPException(503, "App service exceeded its execution limits.") from exc
+        except OSError as exc:
+          raise HTTPException(502, "App service failed before accepting its request.") from exc
+      if outcome is None:
+        outcome = await _run_spawned(entry, environment, request_bytes, timeout_seconds)
+      stdout, stderr, returncode = outcome
       if returncode != 0:
         detail = stderr.decode("utf-8", errors="replace").strip()[-1000:]
         log.warning("App service %s failed: %s", app.slug, detail or "no diagnostics")

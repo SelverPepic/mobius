@@ -137,6 +137,17 @@ provide its own file or database locking.
 The app owns its paths, policy, storage format, and domain behavior. This is a
 reviewed trusted process like an app job, not an operating-system sandbox.
 
+Starting a fresh interpreter costs most services far more than their work
+(roughly a second for a FastAPI entry). An entry can declare a top-level
+`MOBIUS_PRELOAD = True` and end with its `if __name__ == "__main__":` block.
+The platform then runs the module-level setup once per accepted revision and
+forks a fresh process for each request that runs only that block, with the
+request's own environment, stdio, token, deadline, and process group. The
+declaration is a promise that module-level code reads no per-request value
+(such as `APP_TOKEN`) and starts no threads; read those inside the main block
+or its callees. A request that no preloaded process can take is spawned as
+usual, so the declaration never changes what a request can do.
+
 Same-app calls use `/api/apps/{app_id}/service/{path}`. An app can expose a
 reviewed service to other installed apps at `/api/services/{service_id}/{path}`
 by setting `access` to `apps`, or additionally expose anonymous calls at
