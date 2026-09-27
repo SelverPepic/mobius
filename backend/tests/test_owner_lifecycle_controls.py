@@ -472,10 +472,6 @@ def test_delegated_bearer_cannot_enter_host_or_platform_lifecycle(
       headers=delegated_auth,
     ),
     client.post(
-      "/api/auth/app-token", json={"app_id": app_id},
-      headers=delegated_auth,
-    ),
-    client.post(
       "/api/auth/app-job-token", json={"app_id": app_id},
       headers=delegated_auth,
     ),
@@ -495,6 +491,17 @@ def test_delegated_bearer_cannot_enter_host_or_platform_lifecycle(
   assert calls == []
   db.expire_all()
   assert db.query(models.Owner).one().token_epoch == 0
+
+  # The one credential a delegated bearer may mint is the app-frame token its
+  # shell needs to mount an app it can already read, and only because that
+  # narrower token keeps the delegation lineage: it stays refused wherever a
+  # delegated bearer is (see test_app_token).
+  minted = client.post(
+    "/api/auth/app-token", json={"app_id": app_id}, headers=delegated_auth,
+  )
+  assert minted.status_code == 200, minted.text
+  claims = auth_mod.decode_access_token(minted.json()["token"])
+  assert claims["scope"] == "app" and claims["delegation_id"]
 
 
 def test_owner_restart_routes_refuse_source_that_would_boot_to_recovery(

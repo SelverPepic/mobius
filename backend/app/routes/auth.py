@@ -2,7 +2,9 @@
 
 Owner-authorized credential minting and provider-link mutations reject delegated
 execution bearers; otherwise a child could exchange inherited tool access for a
-new unrestricted owner or app credential and bypass its delegation boundary.
+new unrestricted owner or app credential and bypass its delegation boundary. The
+app-frame token is the one exception: it is narrower than the bearer presented
+and carries the same delegation lineage, so it stays a delegated credential.
 """
 
 import asyncio
