@@ -495,7 +495,8 @@ def _goal_report(payload: dict[str, Any], *, full: bool) -> str:
         f"- {task.get('id')} [{task.get('status')}]{parent}{depends}: "
         f"{task.get('title')}" + (f" — {detail}" if detail else "")
       )
-    if goal.get("next_action"):
+    # A settled Goal has no next step; its last handoff note is history.
+    if goal.get("next_action") and goal.get("status") == "open":
       lines.append(f"Next action: {goal['next_action']}")
   return "\n".join(lines)
 
@@ -1734,15 +1735,18 @@ def _cli_call(argv: list[str]) -> int:
   """
   if len(argv) < 2 or argv[0] != "call" or len(argv) > 4:
     print(
-      "usage: mobius_control_mcp.py call <tool_name> [--args-json JSON]",
+      "usage: mobius_control_mcp.py call <tool_name> [--args-json JSON|-]",
       file=sys.stderr,
     )
     return 2
   tool_name = argv[1]
   arguments: dict[str, Any] = {}
   if len(argv) == 4 and argv[2] == "--args-json":
+    # "-" reads the JSON from stdin, so a quoted heredoc can carry commands
+    # and prose literally instead of nesting them inside shell quotes.
+    raw = sys.stdin.read() if argv[3] == "-" else argv[3]
     try:
-      parsed = json.loads(argv[3])
+      parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
       print(f"invalid --args-json: {exc}", file=sys.stderr)
       return 2
@@ -1751,7 +1755,7 @@ def _cli_call(argv: list[str]) -> int:
       return 2
     arguments = parsed
   elif len(argv) > 2:
-    print("usage: mobius_control_mcp.py call <tool_name> [--args-json JSON]",
+    print("usage: mobius_control_mcp.py call <tool_name> [--args-json JSON|-]",
           file=sys.stderr)
     return 2
   result = _call_tool({"name": tool_name, "arguments": arguments})

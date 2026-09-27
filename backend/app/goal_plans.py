@@ -1022,31 +1022,3 @@ def edit_plan(
     db, physical=physical, root=root,
     expected_revision=root.revision, tasks=tasks,
   )
-
-
-def update_task(
-  db: Session,
-  *,
-  physical: models.ChatRun,
-  root: models.ChatGoal,
-  expected_revision: int,
-  task_id: str,
-  changes: dict[str, Any],
-) -> dict[str, Any]:
-  existing = serialize_plan(db, physical, root)
-  if existing is None:
-    raise GoalPlanError("this Goal does not have a plan yet")
-  tasks = existing["tasks"]
-  target = next((task for task in tasks if task["id"] == task_id), None)
-  if target is None:
-    raise GoalPlanError(f"unknown task id: {task_id}")
-  for key, value in changes.items():
-    if value is not None:
-      target[key] = value
-  return replace_plan(
-    db,
-    physical=physical,
-    root=root,
-    expected_revision=expected_revision,
-    tasks=tasks,
-  )

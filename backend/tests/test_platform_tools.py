@@ -174,6 +174,17 @@ def test_update_goal_reports_compactly_and_rejects_unknown_arguments(monkeypatch
     control._call_update_goal({"owner": "x"})
 
 
+def test_a_settled_goal_does_not_offer_its_old_next_action(monkeypatch):
+  control = _control_module()
+  monkeypatch.setenv("CHAT_ID", "chat-1")
+  goal = {"id": "g", "revision": 9, "objective": "Ship", "next_action": "Run the probe"}
+  for status, shown in (("open", True), ("completed", False)):
+    monkeypatch.setattr(control, "_agent_api_call", lambda *a, **k: {
+      "goal": {**goal, "status": status}, "plan": None,
+    })
+    assert ("Next action: Run the probe" in control._call_update_goal({})) is shown
+
+
 def test_platform_control_tools_are_marked_always_loaded(monkeypatch):
   """Claude Code defers MCP tools behind a search round trip by default, so the
   control tools every owner turn is told to use carry the always-load meta."""

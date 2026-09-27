@@ -1,13 +1,15 @@
-#!/usr/bin/env python3
-"""Attach the current physical agent turn to a platform-owned Goal."""
+"""Promote the current agent turn into a platform-owned Goal (control library).
+
+Agents call this through the Möbius control tools. When a provider cannot
+surface those tools, the one command-line fallback for every control is
+`python3 /data/platform/backend/scripts/mobius_control_mcp.py call <tool>
+--args-json '<json>'` (or `--args-json -` to read the JSON from stdin).
+"""
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
-import sys
-from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
@@ -84,24 +86,3 @@ PLAN_NEXT_ACTION = (
   "the same tool advances and completes it. The Goal record does not execute "
   "a prose checklist."
 )
-
-
-def main() -> int:
-  parser = argparse.ArgumentParser(
-    description="Promote the current request into a platform-owned Goal.",
-  )
-  parser.add_argument(
-    "objective",
-    help="concise outcome and observable completion condition",
-  )
-  result = promote_goal(parser.parse_args().objective)
-  if result["state"] == "active":
-    print("Goal promotion verified: this turn already owns the Goal.")
-  else:
-    print("Goal promotion verified: this turn now owns the Goal.")
-  print(f"Next: {PLAN_NEXT_ACTION}")
-  return 0
-
-
-if __name__ == "__main__":
-  sys.exit(main())

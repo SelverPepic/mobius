@@ -277,7 +277,7 @@ def test_core_question_fallback_shows_the_minimal_valid_shape():
   repo = Path(__file__).resolve().parents[2]
   core = (repo / "skill" / "core.md").read_text(encoding="utf-8")
 
-  assert "owner_approval.py --questions-json" in core
+  assert "call request_question --args-json" in core
   assert '[{"question":"...","options":[' in core
   assert "<question array>" not in core
 

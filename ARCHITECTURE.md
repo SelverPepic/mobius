@@ -1437,7 +1437,8 @@ Three frontend gates must stay aligned. `StreamingMessage.jsx` renders live ques
 Ordinary choices use `mobius_control.request_question` and
 `POST /api/chats/{id}/question`; approvals use `mobius_control.request_approval`
 and `POST /api/chats/{id}/approval`. Both tools share
-`backend/scripts/owner_approval.py` and `save_owner_question`.
+the control server's `owner_approval.py` library and `save_owner_question`
+(`mobius_control_mcp.py call <tool>` is the command-line fallback).
 This is an application decision, not the provider's sandbox-permission or
 clarifying-question protocol. The route uses the active `ChatEventSink` and
 `QuestionCommit` to save an ordinary question with

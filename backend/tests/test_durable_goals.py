@@ -221,13 +221,13 @@ def test_api_branch_add_and_completion_fence(client, db, chat):
   owner = db.query(models.Owner).first()
   headers={"Authorization":"Bearer "+create_agent_token(
     chat.id, owner.username, owner.token_epoch, run_id=run.id)}
-  added=client.post(f"/api/chats/{chat.id}/goal-plan/tasks",headers=headers,json={
-    "expected_revision":1,"task":{"id":"kanban","title":"Verify Kanban",
-        "parent_id":"deploy","status":"pending","depends_on":[]}})
+  added=client.post(f"/api/chats/{chat.id}/goal/update",headers=headers,json={
+    "tasks":[{"id":"kanban","title":"Verify Kanban",
+        "parent_id":"deploy","status":"pending","depends_on":[]}]})
   assert added.status_code == 200,added.text
   assert [t["id"] for t in added.json()["plan"]["tasks"]] == ["deploy","kanban"]
-  completion=client.patch(f"/api/chats/{chat.id}/goal",headers=headers,json={
-    "goal_id":goal.id,"expected_revision":2,"result":"Unverified claim"})
+  completion=client.post(f"/api/chats/{chat.id}/goal/update",headers=headers,json={
+    "complete":"Unverified claim"})
   assert completion.status_code == 422,completion.text
   db.expire_all()
   assert goal.status == "open"

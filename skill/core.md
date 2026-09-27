@@ -171,8 +171,10 @@ for you** until the owner answers or Stops, and the answer starts the next turn.
   Restart, or sealed-input card may answer it through that card's endpoint.
   Background and scheduled runs (News, Reflection) never open cards: they put
   questions in their report, and an unanswered one never blocks the next run.
-- If `request_question` is absent, use
-  `python3 /data/platform/backend/scripts/owner_approval.py --questions-json '[{"question":"...","options":[{"label":"...","description":"..."}]}]'`.
+- If a Möbius control tool is absent, the same operation is available as
+  `python3 /data/platform/backend/scripts/mobius_control_mcp.py call <tool> --args-json '<json>'`, for example
+  `call request_question --args-json '{"questions":[{"question":"...","options":[{"label":"...","description":"..."}]}]}'`.
+  `--args-json -` reads the JSON from stdin.
 
 **Claim convergent work once.** Before a public action, shared integration, or
 other exact outcome another chat could independently reach, claim one canonical

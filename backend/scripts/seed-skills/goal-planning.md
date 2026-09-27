@@ -28,7 +28,7 @@ equivalent convenience path: use it only when the tool is absent or an attempted
 tool call returns a failure:
 
 ```bash
-python3 /data/platform/backend/scripts/goal_promote.py 'Outcome and completion condition'
+python3 /data/platform/backend/scripts/mobius_control_mcp.py call promote_goal --args-json '{"objective":"Outcome and completion condition"}'
 ```
 
 ## Plan and work
