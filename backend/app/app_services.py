@@ -137,17 +137,7 @@ def service_environment(app, owner) -> dict[str, str]:
   return env
 
 
-async def _read_bounded(stream, limit: int) -> bytes:
-  chunks: list[bytes] = []
-  total = 0
-  while True:
-    chunk = await stream.read(64 * 1024)
-    if not chunk:
-      return b"".join(chunks)
-    total += len(chunk)
-    if total > limit:
-      raise ValueError("output limit exceeded")
-    chunks.append(chunk)
+_read_bounded = service_preload.read_bounded
 
 
 async def _write_request(stream, body: bytes) -> None:
@@ -316,7 +306,7 @@ async def invoke_service(
             max_stdout=MAX_RESPONSE_BYTES, max_stderr=MAX_ERROR_BYTES,
           )
         except service_preload.PreloadUnavailable:
-          outcome = None
+          pass
         except (TimeoutError, ValueError) as exc:
           raise HTTPException(503, "App service exceeded its execution limits.") from exc
         except OSError as exc:

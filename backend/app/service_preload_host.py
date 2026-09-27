@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import __future__
 import ast
+import atexit
+import gc
 import json
 import os
 import signal
@@ -126,11 +128,21 @@ def _run_request(per_request, namespace) -> int:
   try:
     exec(per_request, namespace)
   except SystemExit as exc:
-    return _exit_code(exc.code)
+    code = _exit_code(exc.code)
   except BaseException:
     traceback.print_exc()
-    return 1
-  return 0
+    code = 1
+  else:
+    code = 0
+  # What the interpreter does between the main module finishing and exit:
+  # wait for non-daemon threads (including executor workers), then run
+  # atexit handlers, so work a request handed off is not cut short.
+  try:
+    threading._shutdown()
+  except BaseException:
+    traceback.print_exc()
+  atexit._run_exitfuncs()
+  return code
 
 
 def _serve_child(per_request, namespace, environment: dict, fds: list[int]) -> None:
@@ -156,7 +168,7 @@ def _serve_child(per_request, namespace, environment: dict, fds: list[int]) -> N
     traceback.print_exc()
     code = 1
   finally:
-    for stream in (sys.stdout, sys.stderr):
+    for stream in (sys.stdout, sys.stderr, sys.__stdout__, sys.__stderr__):
       try:
         stream.flush()
       except BaseException:
@@ -172,10 +184,14 @@ def _serve_child(per_request, namespace, environment: dict, fds: list[int]) -> N
 
 
 def main() -> int:
-  control = socket.socket(fileno=int(os.environ.pop("MOBIUS_PRELOAD_CONTROL_FD")))
+  control_fd = int(os.environ.pop("MOBIUS_PRELOAD_CONTROL_FD"))
+  # Some event loops ignore close_fds when spawning; start from stdio and the
+  # control socket only, so no request inherits the backend's descriptors.
+  os.closerange(3, control_fd)
+  os.closerange(control_fd + 1, os.sysconf("SC_OPEN_MAX"))
+  control = socket.socket(fileno=control_fd)
   entry = os.environ.pop("MOBIUS_PRELOAD_ENTRY")
   root = os.path.dirname(entry)
-  os.chdir(root)
   sys.path[0] = root
   sys.argv = [entry]
   try:
@@ -190,6 +206,10 @@ def main() -> int:
     return 1
   sys.stdout.flush()
   sys.stderr.flush()
+  # Keep the setup's objects out of collection so children do not dirty (and
+  # copy) the pages they share with the host.
+  gc.collect()
+  gc.freeze()
   # The kernel reaps finished children; the platform reads each exit code
   # from that child's own status socket.
   signal.signal(signal.SIGCHLD, signal.SIG_IGN)

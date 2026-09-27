@@ -30,6 +30,25 @@ if __name__ == "__main__":
     raise SystemExit(request["code"])
   if mode == "crash":
     raise RuntimeError("boom")
+  if mode == "subprocess":
+    import subprocess
+    print(json.dumps({"status": 200, "body": {"child": subprocess.run(["sh", "-c", "exit 7"]).returncode}}))
+    raise SystemExit(0)
+  if mode == "handoff":
+    import atexit, threading
+    def late(name):
+      time.sleep(0.2)
+      open(os.path.join(request["dir"], name), "w").write("done")
+    threading.Thread(target=late, args=("thread",)).start()
+    atexit.register(lambda: open(os.path.join(request["dir"], "atexit"), "w").write("done"))
+    print(json.dumps({"status": 200, "body": {}}))
+    raise SystemExit(0)
+  if mode == "loud":
+    sys.stdout.write("x" * 200000)
+    raise SystemExit(0)
+  if mode == "fds":
+    print(json.dumps({"status": 200, "body": {"fds": sorted(int(fd) for fd in os.listdir("/proc/self/fd"))}}))
+    raise SystemExit(0)
   if mode == "hang":
     import subprocess
     worker = subprocess.Popen(["sleep", "30"])
@@ -140,7 +159,7 @@ async def test_a_request_past_its_deadline_is_killed_with_everything_it_started(
   with pytest.raises(TimeoutError):
     await service_preload.run(
       host, _environment(tmp_path), json.dumps({"mode": "hang", "pid_file": str(pid_file)}).encode(),
-      timeout_seconds=1, max_stdout=1 << 20, max_stderr=1 << 16,
+      timeout_seconds=3, max_stdout=1 << 20, max_stderr=1 << 16,
     )
   worker = int(pid_file.read_text())
   deadline = time.monotonic() + 5
@@ -149,6 +168,55 @@ async def test_a_request_past_its_deadline_is_killed_with_everything_it_started(
   assert _gone(worker)
   # The host itself keeps serving.
   assert (await _request(host, tmp_path))[2] == 0
+
+
+@pytest.mark.asyncio
+async def test_child_processes_report_their_real_exit_status(tmp_path):
+  # The host ignores SIGCHLD; each request child must restore it or
+  # subprocess results would read as 0.
+  host = await service_preload.start((909, "rev-a"), "demo", _entry(tmp_path), _environment(tmp_path))
+  stdout, stderr, code = await _request(host, tmp_path, mode="subprocess")
+  assert code == 0, stderr
+  assert json.loads(stdout)["body"]["child"] == 7
+
+
+@pytest.mark.asyncio
+async def test_a_request_finishes_its_threads_and_atexit_work_like_a_spawn(tmp_path):
+  host = await service_preload.start((910, "rev-a"), "demo", _entry(tmp_path), _environment(tmp_path))
+  _stdout, stderr, code = await _request(host, tmp_path, mode="handoff", dir=str(tmp_path))
+  assert code == 0, stderr
+  assert (tmp_path / "thread").read_text() == "done"
+  assert (tmp_path / "atexit").read_text() == "done"
+
+
+@pytest.mark.asyncio
+async def test_output_beyond_its_limit_ends_the_request(tmp_path):
+  host = await service_preload.start((911, "rev-a"), "demo", _entry(tmp_path), _environment(tmp_path))
+  with pytest.raises(ValueError):
+    await service_preload.run(
+      host, _environment(tmp_path), json.dumps({"mode": "loud"}).encode(),
+      timeout_seconds=10, max_stdout=1024, max_stderr=1024,
+    )
+  assert (await _request(host, tmp_path))[2] == 0
+
+
+@pytest.mark.asyncio
+async def test_concurrent_requests_each_run_in_their_own_process(tmp_path):
+  host = await service_preload.start((912, "rev-a"), "demo", _entry(tmp_path), _environment(tmp_path))
+  replies = await asyncio.gather(*(_request(host, tmp_path, token=f"t{n}") for n in range(6)))
+  bodies = [json.loads(stdout)["body"] for stdout, _stderr, _code in replies]
+  assert sorted(body["token"] for body in bodies) == sorted(f"t{n}" for n in range(6))
+  assert len({body["pid"] for body in bodies}) == 6
+  assert host.in_flight == 0
+
+
+@pytest.mark.asyncio
+async def test_a_request_child_holds_only_its_own_descriptors(tmp_path):
+  host = await service_preload.start((913, "rev-a"), "demo", _entry(tmp_path), _environment(tmp_path))
+  stdout, stderr, code = await _request(host, tmp_path, mode="fds")
+  assert code == 0, stderr
+  # stdin/stdout, stderr, the status socket, and the directory being listed.
+  assert len(json.loads(stdout)["body"]["fds"]) <= 5
 
 
 @pytest.mark.asyncio
@@ -219,3 +287,24 @@ async def test_invoke_service_switches_to_the_preloaded_host_once_it_is_ready(tm
   assert (907, "rev-a") not in service_preload._hosts
   await asyncio.gather(*service_preload._starting.values())
   assert (907, "rev-b") in service_preload._hosts
+
+
+def test_the_production_event_loop_starts_hosts_with_only_their_own_descriptors(tmp_path):
+  # The backend runs on uvloop, which ignores close_fds when spawning; the
+  # host must still hand each request nothing but its own descriptors.
+  uvloop = pytest.importorskip("uvloop")
+  entry = _entry(tmp_path)
+
+  async def scenario():
+    inherited = open(os.devnull)  # a descriptor a careless spawn would leak
+    try:
+      host = await service_preload.start((914, "rev-a"), "demo", entry, _environment(tmp_path))
+      stdout, stderr, code = await _request(host, tmp_path, mode="fds")
+      assert code == 0, stderr
+      assert len(json.loads(stdout)["body"]["fds"]) <= 5
+    finally:
+      inherited.close()
+      await service_preload.shutdown()
+
+  with asyncio.Runner(loop_factory=uvloop.new_event_loop) as runner:
+    runner.run(scenario())
