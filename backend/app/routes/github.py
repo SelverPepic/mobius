@@ -1708,8 +1708,9 @@ def _stage_inputs(
         "An Autopilot round restages only its open pull request.",
         code="not_stageable",
       )
-    action = str(plan.get("action") or "pr")
-  if (action == "pr_update" or in_place) and (
+    # Whatever action first published it, a public PR is now updated in place.
+    action = "pr_update"
+  if action == "pr_update" and (
     body.title is not None or body.body_draft is not None
   ):
     raise ContributionSubmitError(
@@ -1731,7 +1732,7 @@ def _stage_inputs(
     )
   _validate_branch(branch)
   live = None
-  if action == "pr_update" and not in_place:
+  if action == "pr_update":
     live = _autopilot_live_target(*_prepared_existing_pr_target(previous))
     if live.get("error"):
       raise ContributionSubmitError(

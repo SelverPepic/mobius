@@ -411,6 +411,7 @@ def test_closing_an_unmerged_contribution_releases_its_draft_pin(staging):
 
 def test_autopilot_round_restages_its_open_pr_in_place(staging, monkeypatch):
   from app import contribution_autopilot
+  from app.github_contributions import _assert_reviewed_existing_pr_metadata
 
   record = staging["new_record"]().json()["record"]
   path = (
@@ -422,6 +423,12 @@ def test_autopilot_round_restages_its_open_pr_in_place(staging, monkeypatch):
     "url": "https://github.com/octo/project/pull/7",
     "head_repository": "octo/project",
   }))
+  live = {
+    "error": None, "head_sha": record["plan"]["head_sha"], "base_branch": "main",
+    "base_sha": staging["base"], "title": "Add a greeting",
+    "body": "Adds a greeting.",
+  }
+  monkeypatch.setattr(github_routes, "_autopilot_live_target", lambda *_: live)
   monkeypatch.setattr(contribution_autopilot, "get_row", lambda *_: object())
   monkeypatch.setattr(
     contribution_autopilot, "verify_claim",
@@ -434,7 +441,12 @@ def test_autopilot_round_restages_its_open_pr_in_place(staging, monkeypatch):
   assert response.status_code == 200, response.text
   updated = response.json()["record"]
   assert updated["status"] == "open"
-  assert updated["plan"]["action"] == "pr"
+  # A PR first sent as "pr" is updated as "pr_update", carrying the exact
+  # live text /autopilot/update requires before it pushes.
+  assert updated["plan"]["action"] == "pr_update"
+  _assert_reviewed_existing_pr_metadata(
+    updated, live_title=live["title"], live_body=live["body"],
+  )
   assert updated["plan"]["head_sha"] == _git(staging["worktree"], "rev-parse", "HEAD")
   # The published revision reaches the live copy, as for any restage.
   assert response.json()["source_sync"]["state"] == "adopted"
