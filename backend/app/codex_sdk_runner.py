@@ -1573,7 +1573,9 @@ async def _run_codex_sdk_turn(
     ),
   )
   config_overrides = _codex_config_overrides()
-  config_overrides.extend(get_provider(provider_id).codex_config_overrides())
+  config_overrides.extend(
+    get_provider(provider_id, data_dir=runtime_data_dir).codex_config_overrides()
+  )
   # A read Delegation may write only Codex's own state, its deliverable
   # directory, and scratch space; the rest of /data stays read-only.
   launch_args = _codex_app_server_launch_args(

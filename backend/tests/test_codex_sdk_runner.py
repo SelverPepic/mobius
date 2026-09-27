@@ -4582,6 +4582,78 @@ def test_explicit_data_dir_keeps_out_of_band_runner_off_server_settings(
   }
 
 
+def test_explicit_data_dir_configures_sdk_without_server_settings(
+  monkeypatch, tmp_path,
+):
+  """The real runner body must resolve its provider from the explicit data_dir,
+  never global server settings.
+
+  The lock-wrapper test above stubs out `_run_codex_sdk_turn`, so it never
+  reaches provider resolution. This drives the actual body: a scheduled caller
+  (nightly Reflection) hands an explicit `data_dir` and runs with no live
+  server config. Regression guard for #1317, which routed the config-override
+  lookup through `get_provider` -> `sync_app_model_providers(get_settings()
+  .data_dir)`, reintroducing a server-settings read on this path; the runner
+  now threads its `data_dir` into `get_provider`.
+  """
+  from app import config
+
+  completed_turn = SimpleNamespace(id="turn-1", usage=None, error=None)
+  notifications = [
+    SimpleNamespace(
+      method="turn/completed",
+      payload=_FakeTurnCompletedNotification(completed_turn),
+    ),
+  ]
+  resumed_thread = _FakeThread("thread-1", _FakeTurnHandle(notifications))
+
+  class FakeAsyncCodex:
+    last = None
+
+    def __init__(self, config=None):
+      self.config = config
+      type(self).last = self
+
+    async def __aenter__(self):
+      return self
+
+    async def __aexit__(self, *_a):
+      return None
+
+    async def thread_resume(self, *_args, **_kwargs):
+      return resumed_thread
+
+  monkeypatch.setattr(
+    codex_sdk_runner, "_sdk_imports", lambda: _fake_sdk(FakeAsyncCodex),
+  )
+  monkeypatch.setattr(
+    config,
+    "get_settings",
+    lambda: pytest.fail("explicit data_dir must not load server settings"),
+  )
+
+  result = asyncio.run(codex_sdk_runner.run_codex_sdk_turn(
+    user_message="nightly",
+    session_id="thread-1",
+    base_env={},
+    cwd=str(tmp_path),
+    chat_id="reflection-nightly",
+    bc=_FakeBroadcast(),
+    pending_questions={},
+    db=None,
+    system_prompt="constitution",
+    data_dir=str(tmp_path),
+  ))
+
+  assert result["error"] is None
+  # The inner turn actually ran (so provider/config-override resolution was
+  # exercised), and its config was derived from the explicit data_dir.
+  assert resumed_thread.turn_args is not None
+  assert FakeAsyncCodex.last.config.kwargs["env"]["CODEX_HOME"] == str(
+    tmp_path / "cli-auth" / "codex"
+  )
+
+
 def test_run_codex_sdk_turn_reseeds_lost_session_and_records_event(monkeypatch):
   # A lost Codex session — thread_resume returns a DIFFERENT thread id than
   # requested — must reseed like the Claude runner: no error, continue on the
