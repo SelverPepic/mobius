@@ -1107,6 +1107,76 @@ async def test_stop_during_helper_phase_ends_the_turn_without_the_followup(
   assert len(clients[0].read) == 3
 
 
+@pytest.mark.asyncio
+async def test_resumed_turn_reads_past_the_inherited_task_notification_result(
+  monkeypatch,
+):
+  """A task left running by the previous CLI process does not end this turn.
+
+  On resume Claude reports that task as stopped and closes its own model-less
+  turn for it before reading the new query (observed with Claude Code 2.1).
+  Taking that empty result as the answer drops the resumed turn with no reply.
+  """
+
+  inherited = TaskNotificationMessage(
+    subtype="task_notification", data={}, task_id="old-shell",
+    status="stopped", output_file="/tmp/old-shell",
+    summary="Background shell command didn't finish",
+    uuid="done-old-shell", session_id="sess-resumed", tool_use_id="old-bash",
+  )
+  empty = ResultMessage(
+    subtype="success", duration_ms=1, duration_api_ms=0, is_error=False,
+    num_turns=0, session_id="sess-resumed", stop_reason=None,
+    total_cost_usd=0.0, usage={"input_tokens": 0, "output_tokens": 0},
+    result="",
+  )
+
+  class _Client(_OneStreamClient):
+    def _messages(self):
+      return [
+        inherited,
+        empty,
+        AssistantMessage(
+          content=[TextBlock(text="Resumed the owner's work.")],
+          model="claude-sonnet", session_id="sess-resumed",
+        ),
+        _success_result("sess-resumed", cost=0.05),
+      ]
+
+  clients = _install_fake_client(monkeypatch, _Client)
+  monkeypatch.setattr(
+    claude_sdk_runner, "_persist_session_id", _ignore_session_persistence,
+  )
+  bus = _Bus()
+
+  result = await _run_turn(
+    "inherited-notification", bc=bus, prompt="resume", cwd="/data",
+  )
+
+  assert result["cost_usd"] == 0.05
+  assert not result.get("error")
+  assert len(clients[0].read) == 4
+  assert next(
+    event for event in bus.events if event["type"] == "text_final"
+  )["content"] == "Resumed the owner's work."
+
+
+def test_inherited_notification_marks_only_its_own_model_less_result():
+  tracker = claude_events.NativeContinuationTracker()
+  tracker.task_started("own-shell", "local_bash", "spawn-own")
+  tracker.task_finished("own-shell")
+  assert tracker.is_inherited_notification_result(0, False) is False
+
+  tracker.task_finished("old-shell")
+  # An error or a result with model turns still belongs to the query.
+  assert tracker.is_inherited_notification_result(0, True) is False
+  tracker.task_finished("old-shell")
+  assert tracker.is_inherited_notification_result(2, False) is False
+  tracker.task_finished("old-shell")
+  assert tracker.is_inherited_notification_result(0, False) is True
+  assert tracker.is_inherited_notification_result(0, False) is False
+
+
 def test_native_continuation_defers_only_a_result_not_seen_while_active():
   fast = claude_events.NativeContinuationTracker()
   fast.task_started("fast", "local_agent", "spawn-fast")

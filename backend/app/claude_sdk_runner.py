@@ -1605,6 +1605,15 @@ async def run_claude_sdk_turn(
             # No boundary cut here: a steer already interrupted in `steer()`;
             # its terminal ResultMessage drives the requery below.
             continue
+          if isinstance(
+            sdk_msg, ResultMessage,
+          ) and native_work.is_inherited_notification_result(
+            sdk_msg.num_turns, sdk_msg.is_error,
+          ):
+            # A resumed session answered a task its previous process left
+            # unsettled before reading this turn's query. That empty result is
+            # not this turn's answer; keep reading the same stream for it.
+            break
           if (
             isinstance(sdk_msg, ResultMessage)
             and active_client.turn_cut_owned
