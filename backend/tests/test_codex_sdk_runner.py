@@ -4730,3 +4730,57 @@ def test_running_codex_helper_row_shows_what_its_child_is_doing(monkeypatch):
   progress = [e for e in bus.events if e.get("type") == "task_progress"]
   assert progress and progress[0]["last_tool_name"] == "Bash"
   assert progress[0]["task_id"] == start["task_id"]
+
+
+@pytest.mark.parametrize("admitted", [True, False])
+def test_codex_turn_admits_once_the_thread_is_ready(monkeypatch, admitted):
+  """Admission marks the turn's inputs delivered, so it follows a real start;
+  a refused admission never sends the turn."""
+  completed_turn = SimpleNamespace(id="turn-a", usage=None, error=None)
+  notifications = [SimpleNamespace(
+    method="turn/completed",
+    payload=_FakeTurnCompletedNotification(completed_turn),
+  )]
+  thread = _FakeThread("thread-a", _FakeTurnHandle(notifications))
+  events: list[str] = []
+
+  class FakeAsyncCodex:
+    def __init__(self, config=None):
+      self.config = config
+
+    async def __aenter__(self):
+      return self
+
+    async def __aexit__(self, _exc_type, _exc, _tb):
+      return None
+
+    async def thread_resume(self, *_args, **_kwargs):
+      events.append("thread")
+      return thread
+
+  async def admit() -> bool:
+    events.append("admit")
+    return admitted
+
+  monkeypatch.setattr(
+    codex_sdk_runner, "_sdk_imports", lambda: _fake_sdk(FakeAsyncCodex),
+  )
+  result = asyncio.run(codex_sdk_runner.run_codex_sdk_turn(
+    user_message="hello",
+    session_id="thread-a",
+    base_env={},
+    cwd="/tmp",
+    chat_id="chat-admit",
+    bc=_FakeBroadcast(),
+    pending_questions={},
+    db=None,
+    admit=admit,
+  ))
+
+  assert events == ["thread", "admit"]
+  if admitted:
+    assert thread.turn_args is not None
+    assert not result.get("superseded")
+  else:
+    assert thread.turn_args is None
+    assert result["superseded"] is True

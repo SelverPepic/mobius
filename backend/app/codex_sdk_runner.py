@@ -1428,6 +1428,7 @@ async def _run_codex_sdk_turn(
   data_dir: str | None = None,
   coordination_enabled: bool = True,
   helper_host_key=None,
+  admit: Callable[[], Awaitable[bool]] | None = None,
 ) -> RunnerResult:
   """Runs one Codex SDK turn and publishes Möbius-shaped events.
 
@@ -1888,6 +1889,10 @@ async def _run_codex_sdk_turn(
           )
         if resumed_context:
           user_message = f"{resumed_context}\n\n{user_message}"
+      # Admission marks this turn's inputs delivered, so it waits until the
+      # Codex thread is ready: a turn that never started consumes nothing.
+      if admit is not None and not await admit():
+        return {**aborted_result(), "superseded": True}
       bc.publish({
         "type": "session_init",
         "session_id": current_session_id,
@@ -2460,6 +2465,7 @@ async def run_codex_sdk_turn(
   data_dir: str | None = None,
   coordination_enabled: bool = True,
   helper_host_key=None,
+  admit: Callable[[], Awaitable[bool]] | None = None,
 ) -> RunnerResult:
   """Hold cross-process rollout ownership around one strict Codex call.
 
@@ -2496,6 +2502,7 @@ async def run_codex_sdk_turn(
       data_dir=data_dir,
       coordination_enabled=coordination_enabled,
       helper_host_key=helper_host_key,
+      admit=admit,
     )
   finally:
     ownership.release()

@@ -1355,7 +1355,11 @@ def _run_activity_checkpoint(
 
   seen_prompts = []
 
-  async def provider_turn(*, user_message, bc, **_kwargs):
+  async def provider_turn(*, user_message, bc, admit=None, **_kwargs):
+    # Like the real runners: admit once the provider is up, before the prompt.
+    if admit is not None and not await admit():
+      return {"session_id": None, "cost_usd": None, "error": None,
+              "superseded": True}
     seen_prompts.append(user_message)
     bc.publish({"type": "text", "content": response})
     if before_provider_return is not None:
