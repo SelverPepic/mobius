@@ -27,7 +27,6 @@ const chatAppArtifactsKey = chatId => [
 const projectsKey = ['projects']
 const projectTemplatesKey = ['projects', 'templates']
 const chatsKey = ['chats']
-const CHAT_LIST_FOCUS_REVALIDATE_MS = 5 * 60_000
 const chatUsageRootKey = ['chat-usage']
 const chatUsageKey = chatId => [...chatUsageRootKey, chatId]
 const chatCurrentUsageRootKey = ['chat-current-usage']
@@ -173,7 +172,12 @@ function useProjectTemplatesQuery() {
   return useQuery({ queryKey: projectTemplatesKey, queryFn: fetchProjectTemplates })
 }
 
+// Complete list reads started so far. A scoped row read compares it before and
+// after its request: a complete read that started meanwhile supersedes it.
+let chatListReadsStarted = 0
+
 async function fetchChats({ signal, timeoutMs, cache } = {}) {
+  chatListReadsStarted += 1
   const res = await api.chats.list({ signal, timeoutMs, cache })
   const data = await jsonOrThrow(res, 'chats fetch failed:')
   return Array.isArray(data) ? data : []
@@ -249,15 +253,9 @@ function useChatsQuery({ reconcile } = {}) {
     // The system stream accelerates drawer updates, but its process-local
     // events are intentionally not replayed after a restart and browsers may
     // suspend it without a clean disconnect. The list is the durable owner of
-    // running and owner-input state, so every network reconnect revalidates it,
-    // and a return to the window does once the list is older than
-    // CHAT_LIST_FOCUS_REVALIDATE_MS. Event row refreshes keep a live window's
-    // list current, so revalidating on every focus only re-sent ~1 MB.
-    refetchOnWindowFocus: query => (
-      Date.now() - query.state.dataUpdatedAt > CHAT_LIST_FOCUS_REVALIDATE_MS
-        ? 'always'
-        : false
-    ),
+    // running and owner-input state, so every real return/reconnect revalidates
+    // it even when the persisted query snapshot is still inside staleTime.
+    refetchOnWindowFocus: 'always',
     refetchOnReconnect: 'always',
   })
 }
@@ -624,6 +622,7 @@ export const chatQueries = {
   list: {
     key: chatsKey,
     fetch: fetchChats,
+    readsStarted: () => chatListReadsStarted,
     useQuery: useChatsQuery,
     invalidate: (queryClient) => queryClient.invalidateQueries({ queryKey: chatsKey }),
   },

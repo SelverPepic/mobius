@@ -140,6 +140,7 @@ import {
   withChatRunState,
   withRefreshedChatRows,
 } from './chatListProjection.js'
+import { createChatRowRefresh } from './chatRowRefresh.js'
 import {
   clearComposerDraft,
   consumeComposerHandoff,
@@ -215,8 +216,6 @@ const EMPTY_LIST = Object.freeze([])
 const SYSTEM_RECONNECT_LIST_TIMEOUT_MS = 5_000
 // Run/wait events arriving this close together share one scoped rows read.
 const CHAT_ROW_REFRESH_BATCH_MS = 250
-// Matches the server's per-request id bound; a larger burst reads the full list.
-const CHAT_ROW_REFRESH_MAX_IDS = 200
 // Mode timing lives with the pure snapshot geometry in workspaceView.js; browser
 // transition completion owns its lifetime, so Shell has no animation timers.
 const SettingsView = lazy(() => import('../SettingsView/SettingsView.jsx'))
@@ -2378,41 +2377,27 @@ export default function Shell({ onInitialVisualReady }) {
     })
   }, [queryClient])
   // Run and wait events each change a few rows. Re-reading the complete list
-  // per event sent ~1 MB per event to every open window while agents worked,
-  // so a burst of events coalesces into one read of just those rows. Full
-  // reads remain the owner of first load, reconnects, and list mutations.
-  const pendingChatRowIdsRef = useRef(new Set())
-  const chatRowRefreshTimerRef = useRef(null)
-  const refreshChatRows = useCallback((chatId) => {
-    if (chatId == null) return
-    pendingChatRowIdsRef.current.add(String(chatId))
-    if (chatRowRefreshTimerRef.current != null) return
-    chatRowRefreshTimerRef.current = setTimeout(async () => {
-      chatRowRefreshTimerRef.current = null
-      const ids = [...pendingChatRowIdsRef.current]
-      pendingChatRowIdsRef.current = new Set()
-      // A full read already in flight began before these events and would
-      // overwrite their rows on arrival, so replace it with a fresh full read.
-      if (
-        ids.length > CHAT_ROW_REFRESH_MAX_IDS
-        || queryClient.isFetching({ queryKey: chatQueries.keys.all }) > 0
-      ) {
-        void refreshChats()
-        return
-      }
-      try {
-        const fresh = await jsonOrThrow(
-          await api.chats.rows(ids), 'chat rows fetch failed:',
-        )
-        projectChatList(rows => reconcileCreatedChats(
-          withRefreshedChatRows(rows, ids, fresh),
-        ))
-      } catch {
-        void refreshChats()
-      }
-    }, CHAT_ROW_REFRESH_BATCH_MS)
-  }, [projectChatList, queryClient, reconcileCreatedChats, refreshChats])
-  useEffect(() => () => clearTimeout(chatRowRefreshTimerRef.current), [])
+  // per event sent ~1 MB to every open window while agents worked, so events
+  // refresh just their rows (see chatRowRefresh.js for the ordering rules).
+  const chatRowRefresh = useMemo(() => createChatRowRefresh({
+    readRows: async ids => jsonOrThrow(
+      await api.chats.rows(ids, { cache: 'no-store' }), 'chat rows fetch failed:',
+    ),
+    applyRows: (ids, fresh) => {
+      projectChatList(rows => reconcileCreatedChats(
+        withRefreshedChatRows(rows, ids, fresh),
+      ))
+      // Scoped reads never refill the offline list copy; drop the stale one so
+      // a cold offline start keeps the fresher persisted list.
+      void invalidateShellListCache('chats')
+    },
+    refreshAll: refreshChats,
+    fullReadInFlight: () => queryClient.isFetching({ queryKey: chatQueries.keys.all }) > 0,
+    fullReadsStarted: chatQueries.list.readsStarted,
+    batchMs: CHAT_ROW_REFRESH_BATCH_MS,
+  }), [projectChatList, queryClient, reconcileCreatedChats, refreshChats])
+  useEffect(() => () => chatRowRefresh.cancel(), [chatRowRefresh])
+  const refreshChatRows = chatRowRefresh.request
   const markChatOwnerActivity = useCallback((chatId) => {
     const at = new Date().toISOString()
     projectChatList(rows => withChatOwnerActivity(rows, chatId, at))

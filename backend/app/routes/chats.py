@@ -795,7 +795,9 @@ def list_chats(
       status_code=422,
       detail=f"At most {_MAX_CHAT_SUMMARY_IDS} chat ids per request.",
     )
-  record_memory_checkpoint_once("shell_chat_list_first_request")
+  if ids is None:
+    # Startup memory evidence describes the complete drawer read, not a row refresh.
+    record_memory_checkpoint_once("shell_chat_list_first_request")
 
   # Pinned chats sort first (newest pin at top of the pinned group),
   # then unpinned by owner-send recency. `activity_at` is the drawer
@@ -873,10 +875,11 @@ def list_chats(
     db, (chat.id for chat in chats),
   )
   secure_input_chats = secure_inputs.pending_chat_ids()
-  record_memory_checkpoint_once(
-    "shell_chat_list_first_response",
-    chat_count=len(chats),
-  )
+  if ids is None:
+    record_memory_checkpoint_once(
+      "shell_chat_list_first_response",
+      chat_count=len(chats),
+    )
   return [
     _owner_chat_summary(
       chat,

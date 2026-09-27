@@ -578,7 +578,7 @@ def test_chat_list_ids_refresh_returns_only_those_visible_rows(
   hidden_row = db.get(models.Chat, hidden)
   hidden_row.agent_settings_json = {"drawer_hidden": True}
   db.commit()
-  assert client.delete(f"/api/chats/{deleted}", headers=auth).status_code in (200, 204)
+  assert client.delete(f"/api/chats/{deleted}", headers=auth).status_code == 204
 
   scoped = client.get(
     "/api/chats",
@@ -592,12 +592,15 @@ def test_chat_list_ids_refresh_returns_only_those_visible_rows(
 
 
 def test_chat_list_ids_refresh_is_bounded(client, auth):
-  response = client.get(
-    "/api/chats",
-    params=[("ids", f"chat-{n}") for n in range(201)],
-    headers=auth,
-  )
-  assert response.status_code == 422
+  def scoped(count):
+    return client.get(
+      "/api/chats",
+      params=[("ids", f"chat-{n}") for n in range(count)],
+      headers=auth,
+    )
+
+  assert scoped(200).status_code == 200
+  assert scoped(201).status_code == 422
 
 
 def test_chat_failure_attention_is_listed_and_acknowledged_by_version(
