@@ -2118,6 +2118,15 @@ export default function Shell({ onInitialVisualReady }) {
     () => appAttentionIds(apps, newAppIds, visibleAppIds),
     [apps, newAppIds, visibleAppIds],
   )
+  // Report the owner's timezone so plain daily app schedules fire at that
+  // wall time for them. Automated browsers (agent screenshots) run on the
+  // server's clock and do not speak for the owner, so they never report.
+  useEffect(() => {
+    if (typeof navigator !== 'undefined' && navigator.webdriver) return
+    let zone = ''
+    try { zone = Intl.DateTimeFormat().resolvedOptions().timeZone || '' } catch (_) {}
+    if (zone) api.owner.timezone.save(zone).catch(() => {})
+  }, [])
   // First-sign-in walkthrough. The query result is the source of
   // truth — backend persists completion via
   // POST /api/owner/walkthrough/complete. We render the overlay iff
