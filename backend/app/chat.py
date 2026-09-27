@@ -118,6 +118,7 @@ from app.events import (
 )
 from app.providers import (
   DEFAULT_PROVIDER,
+  MobiusProvider,
   authenticated_provider_ids,
   effective_agent_settings,
   get_provider,
@@ -5609,6 +5610,58 @@ async def _run_chat_impl_with_db(
       _publish_chat_run_finished(chat_id)
     db.close()
     return disposition
+  # Möbius trial preflight. `check_auth` stays green for a LINKED account whose
+  # trial merely isn't usable (never activated, ended, ineligible, or out of
+  # credit) so the model row stays visible and selectable in the picker. But
+  # sending such a turn only reaches the broker as a raw error with a dead-end
+  # Resume, so intercept it here: persist plain-language guidance that opens
+  # Möbius · You instead of calling the model. A usable trial — or a state that
+  # can't be authoritatively read (signed out / account service unreachable) —
+  # falls through to the normal path.
+  if isinstance(provider, MobiusProvider):
+    trial_block = None
+    try:
+      from app.routes.identity import mobius_trial_resolution
+      gate_owner = db.query(models.Owner).first()
+      resolution = (
+        await mobius_trial_resolution(db, gate_owner.id) if gate_owner else None
+      )
+      if resolution and not resolution["usable"]:
+        trial_block = resolution["message"]
+    except Exception:
+      log.exception("mobius trial preflight failed chat_id=%s", chat_id)
+    if trial_block:
+      await _record_run_metrics(
+        chat_id=chat_id,
+        run_token=run_token or "",
+        provider_session_id=None,
+        cost_usd=0.0,
+        usage=_NO_AGENT_USAGE_METRICS,
+      )
+      # Metrics are ordered through the writer actor and may await its ack.
+      # Stop can supersede this run before any sink exists; revalidate before
+      # installing one so a stale turn cannot publish guidance after Stop.
+      if _run_generation_superseded(chat_id, run_gen):
+        _log_superseded_run(chat_id, "mobius-trial-gate")
+        db.close()
+        return chat_queue.TerminalDisposition.STALE_NO_ACTION
+      sink = _ChatEventSink(
+        bc, chat_id, run_token=run_token,
+        agent_activity_binding=agent_activity_binding,
+      )
+      register_active_sink(chat_id, sink)
+      sink.publish({"type": "text", "content": trial_block})
+      return await _complete_turn(
+        bc=bc,
+        sink=sink,
+        db=db,
+        chat_id=chat_id,
+        run_gen=run_gen,
+        provider_id=provider_id,
+        cost_usd=0,
+        close_browser=False,
+        provider_free=True,
+      )
   helper_host_key = _helper_host_key(
     db, run_policy, provider_id=provider_id, connector_plan=connector_turn_plan,
   )

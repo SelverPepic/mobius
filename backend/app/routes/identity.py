@@ -504,6 +504,80 @@ async def _agent_remote(
   return _agent_contract(payload)
 
 
+# The Möbius · You app owns trial activation ("Activate $2 trial"). Chat
+# guidance and provider labels point owners there through the shell's
+# ordinary app deep link rather than duplicating that flow.
+MOBIUS_YOU_OPEN_ACTION = "/shell/?app=identity"
+
+
+def mobius_trial_message(state: str, available_units: int) -> str | None:
+  """Owner-facing guidance when a linked Möbius trial cannot serve a turn.
+
+  ``state`` is the account-service trial lifecycle
+  (``ready``/``active``/``expired``/``ineligible``) and ``available_units`` is
+  the account's whole spendable balance: trial credit plus any top-up or plan
+  credit. Credit is what serves a turn, so any positive balance returns
+  ``None`` whatever the trial state. With no credit, the trial state picks the
+  plain-language message; its trailing Markdown link renders as an "Open
+  Möbius · You" action, so an unusable account never reaches the model and
+  hits a raw broker error.
+  """
+  if available_units > 0:
+    return None
+  open_link = f"[Open Möbius · You]({MOBIUS_YOU_OPEN_ACTION})"
+  if state == "ready":
+    return (
+      "Your Möbius trial isn't activated yet. "
+      f"{open_link} to activate your $2 trial."
+    )
+  if state == "expired":
+    return f"Your Möbius trial has ended. {open_link} to see your options."
+  if state == "ineligible":
+    return (
+      "This account isn't eligible for the Möbius trial. "
+      f"{open_link} to see your options."
+    )
+  if state == "active":
+    return (
+      "Your Möbius trial has no remaining credit. "
+      f"{open_link} to see your options."
+    )
+  return None
+
+
+async def mobius_trial_resolution(db: Session, owner_id: int) -> dict | None:
+  """Resolve whether the owner's Möbius trial can serve a turn.
+
+  Returns ``None`` when the trial state cannot be authoritatively determined —
+  the owner is signed out (the credential preflight already guides linking) or
+  the account service was unreachable (a transient error must never block a
+  send or mislabel the picker). Otherwise returns
+  ``{"state", "usable", "needs_activation", "message"}`` where ``message`` is
+  the chat guidance (``None`` when usable) and the other fields drive the
+  provider-status labels.
+  """
+  try:
+    remote = await _agent_remote(db, owner_id, "GET")
+  except HTTPException:
+    return None
+  if remote is None:
+    return None
+  trial = remote.get("trial") if isinstance(remote, dict) else None
+  balance = remote.get("balance") if isinstance(remote, dict) else None
+  state = str((trial or {}).get("state") or "")
+  if state not in {"ready", "active", "expired", "ineligible"}:
+    return None
+  available = (balance or {}).get("available_units")
+  if isinstance(available, bool) or not isinstance(available, int):
+    available = 0
+  return {
+    "state": state,
+    "usable": available > 0,
+    "needs_activation": state == "ready" and available <= 0,
+    "message": mobius_trial_message(state, available),
+  }
+
+
 async def resolve_handle_hosts(
   db: Session, owner_id: int, handle: str,
 ) -> list[str] | None:

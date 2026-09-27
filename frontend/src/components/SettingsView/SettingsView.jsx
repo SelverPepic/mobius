@@ -11,6 +11,7 @@ import { stopShellInstallPassPreparation } from '../../lib/shellInstallPass.js'
 import { captureLayoutSpace, clientLengthToLayout } from '../../lib/layoutSpace.js'
 import {
   PROVIDER_AVAILABILITY_PHASE,
+  mobiusTrialAttention,
   resolveProviderAvailability,
 } from '../../lib/providerAvailability.js'
 import * as themeService from '../../lib/themeService.js'
@@ -319,6 +320,11 @@ export default function SettingsView({
   const mobiusAvailable = providerStatusQuery.data?.mobius?.available === true
   const mobiusAuthenticated = configuredProviders.has('mobius')
   const mobiusTrial = providerStatusQuery.data?.mobius?.trial
+  // The account service's trial lifecycle is authoritative for whether the
+  // trial can be used at all (never activated / ended / ineligible / no
+  // credit); when present it overrides the balance-expiry heuristic below so
+  // the row can't show a false "Trial active".
+  const mobiusAttention = mobiusTrialAttention(providerStatusQuery.data?.mobius)
   const mobiusExpiryRaw = mobiusTrial?.trial_expires_at
     || mobiusTrial?.account?.trial_expires_at
     || mobiusTrial?.balance?.grants?.find(grant => grant?.kind === 'trial')?.expires_at
@@ -415,12 +421,16 @@ export default function SettingsView({
   const mobiusAllowance = providerAllowance('mobius', mobiusUsageQuery.data)
   const mobiusTrialSubtitle = mobiusAuthenticated
     ? (
-        mobiusExpired
-          ? 'Trial expired'
+        mobiusAttention
+          ? mobiusAttention.subtitle
           : (
-              typeof mobiusAllowance.usedPercent === 'number'
-                ? providerAllowanceSummary('mobius', mobiusAllowance)
-                : formatTrialTimeLeft(mobiusExpiryRaw) || 'Trial usage unavailable'
+              mobiusExpired
+                ? 'Trial expired'
+                : (
+                    typeof mobiusAllowance.usedPercent === 'number'
+                      ? providerAllowanceSummary('mobius', mobiusAllowance)
+                      : formatTrialTimeLeft(mobiusExpiryRaw) || 'Trial usage unavailable'
+                  )
             )
       )
     : 'Sign in from Möbius · You to activate your trial.'
@@ -1070,9 +1080,11 @@ export default function SettingsView({
                     connected={mobiusAuthenticated}
                     subtitle={mobiusTrialSubtitle}
                     statusNode={(
-                      <StatusDot color={mobiusAuthenticated && !mobiusExpired ? '--green' : '--muted'}>
+                      <StatusDot color={mobiusAuthenticated && !mobiusExpired && !mobiusAttention ? '--green' : '--muted'}>
                         {mobiusAuthenticated
-                          ? (mobiusExpired ? 'Trial expired' : 'Trial active')
+                          ? (mobiusAttention
+                              ? mobiusAttention.label
+                              : (mobiusExpired ? 'Trial expired' : 'Trial active'))
                           : 'Sign in from Möbius · You'}
                       </StatusDot>
                     )}

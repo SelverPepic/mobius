@@ -535,6 +535,7 @@ export default function ComposerPopover({
                 providerSwitchState={providerSwitchState}
                 settingsSaveTailRef={settingsSaveTailRef}
                 providerUsage={providerUsage}
+                onOpenMobiusYou={() => handleOpenAppArtifact('identity')}
               />
             </div>
           )}

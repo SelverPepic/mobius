@@ -1402,3 +1402,94 @@ def test_linked_profile_mutation_uses_the_authoritative_response_once(
     "https://www.mobius.you/api/account/v1/identity/profile",
     {"handle": "new_handle"},
   )]
+
+
+def test_mobius_trial_message_is_worded_per_state_and_points_at_the_app():
+  from app.routes.identity import MOBIUS_YOU_OPEN_ACTION, mobius_trial_message
+
+  # Credit serves a turn whatever the trial state: a top-up keeps an ended or
+  # never-activated trial usable.
+  for state in ("active", "expired", "ready", "ineligible"):
+    assert mobius_trial_message(state, 5) is None
+  # Each unusable state gets distinct wording plus the Open Möbius · You link.
+  ready = mobius_trial_message("ready", 0)
+  expired = mobius_trial_message("expired", 0)
+  ineligible = mobius_trial_message("ineligible", 0)
+  no_credit = mobius_trial_message("active", 0)
+  assert "activate your $2 trial" in ready
+  assert "has ended" in expired
+  assert "isn't eligible" in ineligible
+  assert "no remaining credit" in no_credit
+  for message in (ready, expired, ineligible, no_credit):
+    assert MOBIUS_YOU_OPEN_ACTION in message
+    assert "Open Möbius · You" in message
+
+
+@pytest.mark.asyncio
+async def test_mobius_trial_resolution_classifies_state_and_balance(db, monkeypatch):
+  from app.routes import identity
+
+  async def _remote(payload):
+    async def remote(_db, _owner_id, _method):
+      return payload
+    return remote
+
+  # ready → not usable, needs activation, guidance present.
+  monkeypatch.setattr(identity, "_agent_remote", await _remote(
+    {"trial": {"state": "ready"}, "balance": {"available_units": 0}},
+  ))
+  res = await identity.mobius_trial_resolution(db, 1)
+  assert res == {
+    "state": "ready", "usable": False, "needs_activation": True,
+    "message": res["message"],
+  }
+  assert res["message"]
+
+  # active with credit → usable, no guidance.
+  monkeypatch.setattr(identity, "_agent_remote", await _remote(
+    {"trial": {"state": "active"}, "balance": {"available_units": 500}},
+  ))
+  res = await identity.mobius_trial_resolution(db, 1)
+  assert res["usable"] is True and res["message"] is None
+
+  # An ended trial with top-up credit is usable and asks for nothing.
+  monkeypatch.setattr(identity, "_agent_remote", await _remote(
+    {"trial": {"state": "expired"}, "balance": {"available_units": 1_250_000}},
+  ))
+  res = await identity.mobius_trial_resolution(db, 1)
+  assert res == {
+    "state": "expired", "usable": True, "needs_activation": False, "message": None,
+  }
+
+  # A never-activated account with top-up credit is usable too.
+  monkeypatch.setattr(identity, "_agent_remote", await _remote(
+    {"trial": {"state": "ready"}, "balance": {"available_units": 2_000_000}},
+  ))
+  res = await identity.mobius_trial_resolution(db, 1)
+  assert res["usable"] is True and res["needs_activation"] is False
+  assert res["message"] is None
+
+  # active with zero credit → not usable.
+  monkeypatch.setattr(identity, "_agent_remote", await _remote(
+    {"trial": {"state": "active"}, "balance": {"available_units": 0}},
+  ))
+  res = await identity.mobius_trial_resolution(db, 1)
+  assert res["usable"] is False and res["message"]
+
+
+@pytest.mark.asyncio
+async def test_mobius_trial_resolution_is_none_when_state_is_indeterminate(db, monkeypatch):
+  """Signed out or an unreachable account service must never block or mislabel."""
+  from app.routes import identity
+
+  async def signed_out(_db, _owner_id, _method):
+    return None
+
+  monkeypatch.setattr(identity, "_agent_remote", signed_out)
+  assert await identity.mobius_trial_resolution(db, 1) is None
+
+  async def unavailable(_db, _owner_id, _method):
+    raise HTTPException(502, "The Möbius account service could not be reached.")
+
+  monkeypatch.setattr(identity, "_agent_remote", unavailable)
+  assert await identity.mobius_trial_resolution(db, 1) is None

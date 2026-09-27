@@ -669,8 +669,17 @@ def test_providers_status_accepts_app_token(client, auth):
   assert body["mobius"]["configured"] is False
 
 
+def _restore_mobius_provider_after_test(monkeypatch, providers):
+  """Syncing a test app's model provider rewrites the process-wide Möbius
+  provider; record its current declaration so teardown puts it back and later
+  tests see the provider they expect."""
+  provider = providers.PROVIDERS["mobius"]
+  for name in ("app_id", "declaration", "name", "switch_efforts"):
+    monkeypatch.setattr(provider, name, getattr(provider, name))
+
+
 def test_mobius_provider_is_available_only_with_identity_app_installed(
-  client, auth,
+  client, auth, monkeypatch,
 ):
   from app import models
   from app.config import get_settings
@@ -692,6 +701,7 @@ def test_mobius_provider_is_available_only_with_identity_app_installed(
       "models": [{"id": "inkling", "label": "Evolve"}],
     }}
     session.commit()
+  _restore_mobius_provider_after_test(monkeypatch, providers)
   providers.sync_app_model_providers(get_settings().data_dir, force=True)
 
   installed = client.get("/api/auth/providers/status", headers=auth).json()
@@ -741,6 +751,7 @@ def test_providers_status_hides_mobius_trial_from_app_principals(
       "models": [{"id": "inkling", "label": "Evolve"}],
     }}
     session.commit()
+  _restore_mobius_provider_after_test(monkeypatch, providers)
   providers.sync_app_model_providers(get_settings().data_dir, force=True)
 
   # Fake a linked subscription carrying a real trial balance.
@@ -748,7 +759,7 @@ def test_providers_status_hides_mobius_trial_from_app_principals(
     "spendable_units": 500,
     "grants": [{"amount": 500, "expires_at": "2026-12-31"}],
   }
-  monkeypatch.setattr(providers.PROVIDERS["mobius"], "check_auth", lambda data_dir: None)
+  monkeypatch.setattr(MobiusProvider, "check_auth", lambda self, data_dir: None)
   monkeypatch.setattr(MobiusProvider, "trial_status", lambda self: balance)
 
   # The owner sees the trial balance.
@@ -768,6 +779,68 @@ def test_providers_status_hides_mobius_trial_from_app_principals(
   assert app_body["mobius"]["available"] is True
   assert app_body["mobius"]["configured"] is True
   assert "trial" not in app_body["mobius"]
+
+
+def test_providers_status_exposes_mobius_trial_lifecycle_state(
+  client, auth, monkeypatch,
+):
+  """A linked-but-not-yet-usable trial stays configured/selectable, but the
+  endpoint surfaces the real lifecycle so the UI can show an accurate label and
+  activation affordance instead of a false 'Trial active'. The lifecycle is
+  owner-only, like the balance."""
+  from app import models, providers
+  from app.config import get_settings
+  from app.database import SessionLocal
+  from app.providers import MobiusProvider
+  from app.routes import identity as identity_mod
+
+  app = create_local_app(
+    client, auth, name="Möbius · You", description="Account",
+  )
+  with SessionLocal() as session:
+    row = session.query(models.App).filter(models.App.id == app["id"]).one()
+    row.slug = "identity"
+    row.capability_contract = {"model_provider": {
+      "name": "Möbius", "transport": "identity_broker",
+      "base_url": "http://127.0.0.1:8765/v1", "default_model": "inkling",
+      "models": [{"id": "inkling", "label": "Evolve"}],
+    }}
+    session.commit()
+  _restore_mobius_provider_after_test(monkeypatch, providers)
+  providers.sync_app_model_providers(get_settings().data_dir, force=True)
+
+  monkeypatch.setattr(MobiusProvider, "check_auth", lambda self, data_dir: None)
+  monkeypatch.setattr(MobiusProvider, "trial_status", lambda self: {})
+
+  async def not_activated(_db, _owner_id):
+    return {
+      "state": "ready", "usable": False, "needs_activation": True,
+      "message": "Your Möbius trial isn't activated yet.",
+    }
+
+  monkeypatch.setattr(identity_mod, "mobius_trial_resolution", not_activated)
+
+  owner_body = client.get("/api/auth/providers/status", headers=auth).json()
+  # Still visible and selectable — the row must not be hidden.
+  assert owner_body["mobius"]["configured"] is True
+  assert owner_body["mobius"]["available"] is True
+  # The real lifecycle is now exposed to the owner.
+  assert owner_body["mobius"]["trial_state"] == "ready"
+  assert owner_body["mobius"]["needs_activation"] is True
+  assert owner_body["mobius"]["trial_usable"] is False
+
+  # An app-scoped principal shares availability but never the lifecycle state.
+  from app.auth import create_access_token
+  app_token = create_access_token(
+    {"sub": "test", "scope": "app", "app_id": app["id"]},
+  )
+  app_body = client.get(
+    "/api/auth/providers/status",
+    headers={"Authorization": f"Bearer {app_token}"},
+  ).json()
+  assert app_body["mobius"]["configured"] is True
+  assert "trial_state" not in app_body["mobius"]
+  assert "needs_activation" not in app_body["mobius"]
 
 
 def test_providers_status_rejects_empty_claude_oauth_record(

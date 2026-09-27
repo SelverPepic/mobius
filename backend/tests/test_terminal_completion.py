@@ -279,6 +279,98 @@ def test_provider_entry_requires_durable_admission_ack(
   assert entered == ([] if ack_failure else [token])
 
 
+def test_mobius_trial_gate_blocks_unusable_trial_with_guidance(monkeypatch):
+  """A LINKED Möbius account whose trial can't serve a turn (here: never
+  activated) must not reach the model. `check_auth` stays green so the row
+  stays selectable; the send-path gate instead persists plain-language
+  guidance that opens Möbius · You as a provider-free assistant message."""
+  from app.routes import identity as identity_mod
+
+  cid, token = "mobius-trial-gate", "rt-mobius-trial-gate"
+  _seed_provider_turn(monkeypatch, "mobius", cid, token)
+
+  entered = []
+
+  async def codex_runner(**_kwargs):
+    entered.append(token)
+    return {"cost_usd": 0.0}
+
+  monkeypatch.setattr(
+    importlib.import_module("app.codex_sdk_runner"),
+    "run_codex_sdk_turn", codex_runner,
+  )
+
+  guidance = (
+    "Your Möbius trial isn't activated yet. "
+    "[Open Möbius · You](/shell/?app=identity) to activate your $2 trial."
+  )
+
+  async def fake_resolution(_db, _owner_id):
+    return {
+      "state": "ready", "usable": False, "needs_activation": True,
+      "message": guidance,
+    }
+
+  monkeypatch.setattr(identity_mod, "mobius_trial_resolution", fake_resolution)
+
+  chat_mod.mark_starting(cid)
+  _run_real_chat(
+    cid, run_token=token, provider_id="mobius",
+    run_gen=chat_mod.current_run_generation(cid),
+  )
+  _drain_actor()
+
+  # The model was never invoked...
+  assert entered == []
+  # ...and the guidance is the settled, provider-free assistant response.
+  state = _load(cid)
+  assert state["running"] is False
+  text_blocks = [
+    block["content"]
+    for message in state["messages"]
+    if message.get("role") == "assistant"
+    for block in message.get("blocks", [])
+    if block.get("type") == "text"
+  ]
+  assert text_blocks == [guidance]
+
+
+def test_mobius_trial_gate_allows_a_usable_trial_through(monkeypatch):
+  """A usable trial (or an indeterminate state) must reach the model."""
+  from app.routes import identity as identity_mod
+
+  cid, token = "mobius-trial-usable", "rt-mobius-trial-usable"
+  _seed_provider_turn(monkeypatch, "mobius", cid, token)
+
+  entered = []
+
+  async def codex_runner(**_kwargs):
+    entered.append(token)
+    return {"cost_usd": 0.0, "session_id": "sess"}
+
+  monkeypatch.setattr(
+    importlib.import_module("app.codex_sdk_runner"),
+    "run_codex_sdk_turn", codex_runner,
+  )
+
+  async def usable(_db, _owner_id):
+    return {
+      "state": "active", "usable": True, "needs_activation": False,
+      "message": None,
+    }
+
+  monkeypatch.setattr(identity_mod, "mobius_trial_resolution", usable)
+
+  chat_mod.mark_starting(cid)
+  _run_real_chat(
+    cid, run_token=token, provider_id="mobius",
+    run_gen=chat_mod.current_run_generation(cid),
+  )
+  _drain_actor()
+
+  assert entered == [token]
+
+
 # -- 1. empty-queue final continuation CLEARS the marker -----------------
 def test_empty_queue_terminal_clears_marker(monkeypatch):
   """A normal turn with an empty pending queue: the marker is cleared
