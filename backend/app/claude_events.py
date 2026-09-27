@@ -237,6 +237,18 @@ def _format_tool_output(content: Any) -> str:
   return json.dumps(content, ensure_ascii=True)
 
 
+# Möbius delivers a steer or Stop through the CLI's interrupt (its Esc key),
+# and the CLI answers a tool call it cuts with a refusal starting with this
+# prefix. Nobody refused the call: the chat shows why it was cut instead, and
+# the agent is told CUT_CALL_NOT_REFUSED.
+CLI_CUT_RESULT_PREFIX = "The user doesn't want to proceed with this tool use."
+CUT_CALL_NOT_REFUSED = (
+  "If that cut a running tool call, a result saying the user doesn't want to "
+  "proceed or rejected it came from the interruption, not from anyone "
+  "refusing the call; re-run it if it is still needed."
+)
+
+
 def _server_web_search_input(inp: dict[str, Any]) -> str:
   """Return the displayed query from Claude's server web_search input."""
   if not isinstance(inp, dict):
@@ -341,8 +353,12 @@ def dispatch_sdk_message(
   current_session_id: str | None,
   native_work: NativeContinuationTracker | None = None,
   usage_state: dict[str, Any] | None = None,
+  cut_label: str | None = None,
 ) -> tuple[str | None, dict | None]:
   """Translates one SDK message into broadcast events.
+
+  ``cut_label`` is how the chat shows a tool call this turn's own steer or
+  Stop cut, in place of the CLI's refusal text.
 
   Returns ``(new_session_id, terminal_result_or_None)``. When the
   message is a ResultMessage, the caller receives the final result
@@ -690,6 +706,9 @@ def dispatch_sdk_message(
     for block in content:
       if isinstance(block, ToolResultBlock):
         output = _format_tool_output(block.content)
+        is_error = block.is_error
+        if cut_label and output.startswith(CLI_CUT_RESULT_PREFIX):
+          output, is_error = cut_label, False
         # Carry the tool_use_id (matches the ToolUseBlock's .id) so the sink can
         # key a stash of the full output and the block can fetch it by id.
         bc.publish({
@@ -697,7 +716,7 @@ def dispatch_sdk_message(
           "content": output,
           "tool_use_id": block.tool_use_id,
           "output_complete": True,
-          **({"output_exit_code": 1} if block.is_error else {}),
+          **({"output_exit_code": 1} if is_error else {}),
         })
         if output.startswith("Web search results for query"):
           sources = sources_from_websearch_text(output)

@@ -12,6 +12,7 @@ from pathlib import Path
 from sqlalchemy.orm import Session
 
 from app import models, schemas
+from app.claude_events import CUT_CALL_NOT_REFUSED
 from app.continuations import (
   continuation_actor_label,
   is_continuation_message,
@@ -92,24 +93,15 @@ def _last_user_message_elapsed(db, chat_id: str) -> str | None:
   return None
 
 
-# Stop cuts a running tool call through the CLI's Esc key, which answers the
-# call with its stock rejection ("The user doesn't want to proceed with this
-# tool use… STOP…"). The next turn resumes that session, so without this note
-# the agent reads the owner's Stop as a refusal of that exact call.
 STOPPED_TURN_NOTE = (
-  "[Your previous turn in this chat was ended by the owner's Stop. Stop halts "
-  "all work in progress at once, including any tool call that was running; it "
-  "is not a verdict on that call. A result saying the user doesn't want to "
-  "proceed or rejected the tool use came from the Stop, not from the owner. "
-  "Act on what follows, and re-run an interrupted call if it is still needed.]"
+  f"[The owner's Stop ended your previous turn. {CUT_CALL_NOT_REFUSED}]"
 )
 
 
 def _build_stopped_turn_context(
   db, chat_id: str, run_token: str | None,
 ) -> str | None:
-  """The Stop note when the owner's Stop ended this chat's previous turn."""
-  from app import models
+  """The Stop note, for the first turn after an owner Stop."""
   query = db.query(models.ChatRun.status).filter(
     models.ChatRun.chat_id == chat_id,
   )

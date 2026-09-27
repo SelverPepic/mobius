@@ -541,39 +541,20 @@ async def test_cut_label_names_the_owner_message_and_stop():
   assert idle.cut_tool_label is None
 
 
-def test_only_the_cut_result_is_relabelled():
+def test_only_our_own_cut_relabels_the_cli_refusal():
   msg = UserMessage(content=[
-    ToolResultBlock(tool_use_id="a", content=_CLI_CUT_TEXT, is_error=True),
-    ToolResultBlock(tool_use_id="b", content="real output", is_error=True),
+    ToolResultBlock(tool_use_id="cut", content=_CLI_CUT_TEXT, is_error=True),
+    ToolResultBlock(tool_use_id="real", content="real output", is_error=True),
   ])
-  labelled = claude_sdk_runner._label_cut_tool_results(msg, "Stopped")
-  assert labelled.content[0] == ToolResultBlock(
-    tool_use_id="a", content="Stopped", is_error=False,
-  )
-  assert labelled.content[1] == msg.content[1]
-  untouched = UserMessage(content=[msg.content[1]])
-  assert claude_sdk_runner._label_cut_tool_results(
-    untouched, "Stopped",
-  ) is untouched
-
-
-@pytest.mark.asyncio
-async def test_refusal_text_without_our_cut_is_left_alone(monkeypatch):
-  class _Client(_FakeClient):
-    async def receive_response(self):
-      yield UserMessage(content=[
-        ToolResultBlock(
-          tool_use_id="tu-x", content=_CLI_CUT_TEXT, is_error=True,
-        ),
-      ])
-      yield _success_result()
-
-  _install_fake_client(monkeypatch, _Client)
-  bus = _ChatBus()
-  await _run_turn("cut-label-none", bc=bus, prompt="start task")
-  outputs = [e for e in bus.events if e["type"] == "tool_output"]
-  assert outputs[0]["content"] == _CLI_CUT_TEXT
-  assert outputs[0]["output_exit_code"] == 1
+  for cut_label, shown, exit_code in (
+    ("Stopped", "Stopped", None), (None, _CLI_CUT_TEXT, 1),
+  ):
+    bus = _Bus()
+    dispatch_sdk_message(msg, bus, None, cut_label=cut_label)
+    assert [
+      (e["content"], e.get("output_exit_code"))
+      for e in bus.events if e["type"] == "tool_output"
+    ] == [(shown, exit_code), ("real output", 1)]
 
 
 @pytest.mark.asyncio
@@ -3040,8 +3021,7 @@ def test_steer_requery_says_its_interrupt_refused_no_tool_call():
     framed = claude_sdk_runner._steer_redirect_message(
       ["look at this"], from_person=from_person,
     )
-    assert "not from anyone refusing the call" in framed
-    assert "Re-run it if it is still needed." in framed
+    assert claude_events.CUT_CALL_NOT_REFUSED in framed
     assert framed.endswith("look at this")
 
 

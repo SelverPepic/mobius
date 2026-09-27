@@ -5218,7 +5218,7 @@ async def _run_chat_impl_with_db(
     if goal_context:
       user_message = f"{user_message}\n\n{goal_context}"
 
-  # After an owner Stop, say the cut was not a refusal of the call it ended.
+  # A Stop is not a refusal of the tool call it cut.
   if chat_id and run_policy is None:
     stopped_context = _build_stopped_turn_context(db, chat_id, run_token)
     if stopped_context:
