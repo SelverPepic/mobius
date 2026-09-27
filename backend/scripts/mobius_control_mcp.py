@@ -216,6 +216,27 @@ def _agent_api_settings() -> tuple[str, str]:
   return base, token
 
 
+def _refusal_message(raw: str) -> str:
+  """The human reason inside a backend refusal, without its wire envelope.
+
+  FastAPI wraps reasons as {"detail": ...}: a string, a typed refusal
+  {"code", "message", ...facts}, or a list of validation issues.
+  """
+  try:
+    detail = json.loads(raw).get("detail", raw)
+  except (json.JSONDecodeError, AttributeError):
+    return raw.strip()[:1000] or "no reason given"
+  if isinstance(detail, dict):
+    detail = detail.get("message") or detail.get("code") or json.dumps(detail)
+  elif isinstance(detail, list):
+    detail = "; ".join(
+      " ".join(str(part) for part in (issue.get("loc") or [])[1:]) + ": " + str(issue.get("msg"))
+      if isinstance(issue, dict) else str(issue)
+      for issue in detail[:5]
+    )
+  return str(detail).strip()[:1000] or "no reason given"
+
+
 def _agent_api_call(
   method: str,
   path: str,
@@ -241,13 +262,10 @@ def _agent_api_call(
     with urlopen(request, timeout=timeout) as response:
       raw = response.read()
   except HTTPError as exc:
-    detail = exc.read().decode("utf-8", errors="replace")[:1000]
-    try:
-      parsed = json.loads(detail)
-      detail = str(parsed.get("detail", detail))
-    except (json.JSONDecodeError, AttributeError):
-      pass
-    raise RuntimeError(f"coordination request failed ({exc.code}): {detail}") from exc
+    raw = exc.read().decode("utf-8", errors="replace")[:4000]
+    raise RuntimeError(
+      f"Refused ({exc.code}): {_refusal_message(raw)}"
+    ) from exc
   except URLError as exc:
     raise RuntimeError(f"coordination request failed: {exc.reason}") from exc
   try:

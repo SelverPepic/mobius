@@ -804,3 +804,18 @@ def test_app_tool_timeouts_are_ordered_service_then_control_then_provider():
     < control.APP_TOOL_CALL_TIMEOUT_SECONDS
     < platform_tools.CONTROL_TOOL_TIMEOUT_SECONDS
   )
+
+
+@pytest.mark.parametrize(("body", "reason"), [
+  ('{"detail":{"code":"invalid_plan","message":"note for a must be at most 1000 characters","task_id":"a"}}',
+   "note for a must be at most 1000 characters"),
+  ('{"detail":"A recipient is not an addressable Möbius peer."}',
+   "A recipient is not an addressable Möbius peer."),
+  ('{"detail":[{"loc":["body","tasks",0,"id"],"msg":"Field required"}]}',
+   "tasks 0 id: Field required"),
+  ("<html>Bad Gateway</html>", "<html>Bad Gateway</html>"),
+])
+def test_refusals_read_as_their_reason_not_the_wire_envelope(body, reason):
+  control = _control_module()
+  assert control._refusal_message(body) == reason
+  assert "{" not in control._refusal_message(body) or body.startswith("<")

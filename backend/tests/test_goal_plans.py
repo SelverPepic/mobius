@@ -1802,3 +1802,11 @@ def test_helper_without_a_goal_is_unfiled_and_cannot_name_a_task(db):
   assert helper_plan_task(db, "plain-chat", None) is None
   with pytest.raises(GoalPlanError, match="no active Goal plan"):
     helper_plan_task(db, "plain-chat", "r2")
+
+
+def test_a_task_note_may_run_to_a_thousand_characters():
+  from app.goal_plans import GoalPlanError, normalize_tasks
+
+  assert normalize_tasks([{"id": "a", "title": "A", "note": "n" * 1000}])[0]["note"] == "n" * 1000
+  with pytest.raises(GoalPlanError, match="at most 1000 characters"):
+    normalize_tasks([{"id": "a", "title": "A", "note": "n" * 1001}])
