@@ -604,12 +604,21 @@ def test_long_local_history_merges_once_and_never_replays_commits(
   assert original != result.pre_sha
 
 
+def _boot_started_server(platform: Path, source: str = "platform") -> None:
+  """What the boot script records once it has chosen what uvicorn serves."""
+  pu.SERVING_SOURCE_FILE.write_text(source + "\n")
+  pu.SERVING_SHA_FILE.write_text(_served_sha(platform) + "\n")
+
+
 def _finish_prepared(platform: Path) -> str | None:
-  """Swap the prepared update in at a cutover, then complete it at boot:
-  once before the server imports anything, once when it has started."""
+  """Swap the prepared update in at a cutover, then boot: merge late edits
+  back before import, start the server, finish before resumes, confirm."""
   assert pu.swap_in_prepared_update(cutover=True, repo=platform)
+  before_import = pu.replay_late_edits_before_import(platform)
+  _boot_started_server(platform)
   outcome = pu.complete_platform_swap(platform)
-  assert pu.complete_platform_swap(platform) == outcome
+  assert before_import == outcome
+  pu.confirm_platform_swap_loaded(platform)
   return outcome
 
 
@@ -948,52 +957,110 @@ def test_uncommitted_late_edits_survive_a_conflicting_late_commit(clone_env):
   ).stdout
 
 
+def _swapped_with_late_commit(platform: Path, origin: Path) -> tuple[str, str]:
+  _served, target, _worktree = _park_resolved_line_a_conflict(platform, origin)
+  assert pu.continue_platform_overlay_update(platform) == "prepared"
+  _local_commit(platform, edits={"backend/app/late.py": "LATE = 1\n"})
+  assert pu.swap_in_prepared_update(cutover=True, repo=platform)
+  return target, pu.read_prepared_update()["late"]
+
+
 def test_late_edits_merge_back_before_the_server_imports_the_update(
   clone_env, monkeypatch,
 ):
   """The boot script's pre-start step merges late edits back, so the server
   that starts next loads the update and the edits together."""
   origin, platform = clone_env
-  _served, target, _worktree = _park_resolved_line_a_conflict(platform, origin)
-  assert pu.continue_platform_overlay_update(platform) == "prepared"
-  late = _local_commit(platform, edits={"backend/app/late.py": "LATE = 1\n"})
-  assert pu.swap_in_prepared_update(cutover=True, repo=platform)
+  target, _late = _swapped_with_late_commit(platform, origin)
   monkeypatch.setattr(pu, "PLATFORM_REPO", platform)
 
   assert "swap=replayed" in pu.reconcile_clone_sync()
 
   assert (platform / "backend/app/late.py").read_text() == "LATE = 1\n"
   assert pu._is_ancestor(platform, target, _served_sha(platform))
-  # Kept until a server has started on it, so the boot script can still
-  # return a merged tree that cannot start; resumes are not held meanwhile.
-  record = pu.read_prepared_update()
-  assert record["state"] == "swapped" and record["replayed"] == _served_sha(platform)
   assert not pu.late_edits_pending()
+  # Only a started server confirms: repeating boot or startup keeps the
+  # rollback record, and so does a server started from the baked fallback.
+  assert pu.replay_late_edits_before_import(platform) == "replayed"
+  _boot_started_server(platform, source="baked")
   assert pu.complete_platform_swap(platform) == "replayed"
+  assert not pu.confirm_platform_swap_loaded(platform)
+  assert pu.read_prepared_update()["replayed"] == _served_sha(platform)
+
+  _boot_started_server(platform)
+  assert pu.confirm_platform_swap_loaded(platform)
   assert pu.read_prepared_update() is None
-  assert late != _served_sha(platform)
 
 
 def test_a_merged_back_tree_that_cannot_start_returns_to_the_previous_state(
   clone_env, tmp_path,
 ):
   origin, platform = clone_env
-  _served, target, _worktree = _park_resolved_line_a_conflict(platform, origin)
-  assert pu.continue_platform_overlay_update(platform) == "prepared"
-  _local_commit(platform, edits={"backend/app/late.py": "LATE = 1\n"})
-  assert pu.swap_in_prepared_update(cutover=True, repo=platform)
-  late = pu.read_prepared_update()["late"]
-  assert pu.complete_platform_swap(platform) == "replayed"  # before import
+  target, late = _swapped_with_late_commit(platform, origin)
+  assert pu.replay_late_edits_before_import(platform) == "replayed"
 
   # The server could not import it; the next boot's check fails and the
   # boot script returns to the saved previous state.
   assert _run_boot_revert(tmp_path, platform, pu.PREPARED_UPDATE_PATH) == 0
 
   assert _served_sha(platform) == late
+  assert pu.replay_late_edits_before_import(platform) is None
   assert pu.complete_platform_swap(platform) == "reverted"
   assert (platform / "backend/app/late.py").read_text() == "LATE = 1\n"
   assert pu.read_prepared_update()["state"] == "prepared"
   assert pu._read_rolled_back_flag()["target"] == target
+
+
+@pytest.mark.parametrize("killed_in", ["_clear_reconcile_pre", "_restore_working_edits"])
+def test_a_merge_back_killed_midway_finishes_on_the_next_boot(
+  clone_env, monkeypatch, killed_in,
+):
+  origin, platform = clone_env
+  target, _late = _swapped_with_late_commit(platform, origin)
+  (platform / "notes.txt").write_text("in progress\n")
+  real = getattr(pu, killed_in)
+  calls = []
+
+  def killed(*args, **kwargs):
+    if not calls:
+      calls.append(killed_in)
+      raise KeyboardInterrupt("killed")
+    return real(*args, **kwargs)
+
+  monkeypatch.setattr(pu, killed_in, killed)
+  with pytest.raises(KeyboardInterrupt):
+    pu.replay_late_edits_before_import(platform)
+
+  # Next boot: the guard recovers the checkout, then the merge-back runs or
+  # is recognised as done; never "not swapped", never offered again.
+  pu.boot_guard_clean_served_tree(platform)
+  assert pu.replay_late_edits_before_import(platform) == "replayed"
+  assert (platform / "backend/app/late.py").read_text() == "LATE = 1\n"
+  assert pu._is_ancestor(platform, target, _served_sha(platform))
+  assert pu.read_prepared_update()["replayed"] == _served_sha(platform)
+  _boot_started_server(platform)
+  assert pu.complete_platform_swap(platform) == "replayed"
+  assert pu.confirm_platform_swap_loaded(platform)
+  assert pu.unfinished_update(platform) is None
+
+
+def test_startup_merges_late_edits_boot_missed_and_records_the_restart(
+  clone_env,
+):
+  """An older image or a failed boot step leaves the merge-back to the
+  started server, which already imported the update: say a restart is owed."""
+  origin, platform = clone_env
+  _target, _late = _swapped_with_late_commit(platform, origin)
+  _boot_started_server(platform)  # started on the update without the edits
+  booted = _served_sha(platform)
+
+  assert pu.complete_platform_swap(platform) == "replayed"
+
+  assert (platform / "backend/app/late.py").read_text() == "LATE = 1\n"
+  assert pu.read_prepared_update() is None
+  marker = pu._read_activation_marker()
+  assert marker["target_sha"] == _served_sha(platform) != booted
+  assert "backend/app/late.py" in marker["paths"]
 
 
 def test_a_parked_late_edit_conflict_is_not_merged_again_on_the_next_boot(
@@ -1011,35 +1078,57 @@ def test_a_parked_late_edit_conflict_is_not_merged_again_on_the_next_boot(
   (worktree / "backend/app/main.py").write_text(answer)
 
   # A restart while the resolver works keeps its parked merge and progress.
+  assert pu.replay_late_edits_before_import(platform) == "conflict"
   assert pu.complete_platform_swap(platform) == "conflict"
   assert (worktree / "backend/app/main.py").read_text() == answer
   assert pu.late_edits_pending()
 
 
-def test_finishing_a_late_edit_conflict_records_the_restart_that_loads_it(
-  clone_env,
-):
-  origin, platform = clone_env
+def _resolvable_late_conflict(platform: Path, origin: Path) -> tuple[str, Path]:
   _park_resolved_line_a_conflict(platform, origin)
   _local_commit(platform, edits={
     "backend/app/main.py": _MAIN_PY.replace("LINE_A = 1", "LINE_A = 'LATE'"),
   }, msg="late conflicting commit")
   assert pu.continue_platform_overlay_update(platform) == "prepared"
   assert _finish_prepared(platform) == "conflict"
-  booted = _served_sha(platform)
-  pu.SERVING_SOURCE_FILE.write_text("platform\n")
-  pu.SERVING_SHA_FILE.write_text(booted + "\n")  # the server started without them
+  booted = _served_sha(platform)  # the server started without the edits
   worktree = Path(pu._read_conflict_flag()["overlay"]["worktree"])
   (worktree / "backend/app/main.py").write_text(
     _MAIN_PY.replace("LINE_A = 1", "LINE_A = 'RESOLVED AND LATE'"),
   )
   _git(worktree, "add", "backend/app/main.py")
+  return booted, worktree
+
+
+def test_finishing_a_late_edit_conflict_records_the_restart_that_loads_it(
+  clone_env,
+):
+  origin, platform = clone_env
+  booted, _worktree = _resolvable_late_conflict(platform, origin)
 
   assert pu.continue_platform_overlay_update(platform) == "updated"
 
   marker = pu._read_activation_marker()
   assert marker["target_sha"] == _served_sha(platform) != booted
   assert "backend/app/main.py" in marker["paths"]
+
+
+def test_a_late_edit_resolution_that_cannot_record_its_restart_stays_pending(
+  clone_env, monkeypatch,
+):
+  origin, platform = clone_env
+  _booted, _worktree = _resolvable_late_conflict(platform, origin)
+
+  def unavailable(*args, **kwargs):
+    raise OSError("disk full")
+
+  monkeypatch.setattr(pu, "_record_update_activation", unavailable)
+  with pytest.raises(OSError):
+    pu.continue_platform_overlay_update(platform)
+
+  # Nothing claims the edits are loaded: resumes stay held for the next boot.
+  assert pu.read_prepared_update()["state"] == "swapped"
+  assert pu.late_edits_pending()
 
 
 def test_late_uncommitted_edits_stay_uncommitted_after_the_swap(clone_env):

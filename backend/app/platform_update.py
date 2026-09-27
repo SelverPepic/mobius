@@ -2871,94 +2871,180 @@ def late_edits_pending() -> bool:
   )
 
 
-def complete_platform_swap(repo: Path = PLATFORM_REPO) -> str | None:
-  """At boot, finish a swap: merge late edits back or park them.
-
-  The boot script calls this before uvicorn imports anything (through
-  ``reconcile_clone_sync``), so a clean merge-back is what the server loads;
-  the startup task calls it again to confirm. Returns ``replayed``,
-  ``conflict`` (parked for the resolver), ``reverted`` (the boot script
-  returned to the previous version), or None.
-  """
-  record = read_prepared_update()
-  if record is None:
-    return None
-  local = _local_branch(repo)
-  if record["state"] == "swapped" and record["replayed"]:
-    # A server started on the merged-back source: the boot script returns a
-    # tree that cannot start to ``late`` (state reverted) before this runs.
-    _clear_prepared_update(repo)
+def _swap_position(repo: Path, record: PreparedUpdate, head: str) -> str:
+  """Where the checkout stands after a swap: the booted update awaiting its
+  late edits (``pending``), those edits merged back (``replayed``), the saved
+  previous state restored (``not_swapped``), or something else."""
+  if head == record["prepared"]:
+    return "pending"
+  if head == record["replayed"] or _is_ancestor(repo, record["prepared"], head):
+    # Nothing but the merge-back moves the checkout between the swap and the
+    # first started server, so a descendant of the update is its result even
+    # if the process died before recording it.
     return "replayed"
-  if record["state"] == "swapped" and (
+  if head in {record["late"], record["late_committed"]}:
+    return "not_swapped"
+  return "unknown"
+
+
+def _replay_parked(record: PreparedUpdate) -> bool:
+  return record["state"] == "swapped" and bool(
     ((_read_conflict_flag() or {}).get("overlay") or {}).get("replay")
-  ):
-    # Already parked for its resolver: merging again would overwrite it.
-    return "conflict"
-  unswapped = PreparedUpdate(
-    **{
-      **record, "state": "prepared", "late": None, "late_committed": None,
-      "replayed": None,
-    },
   )
-  if record["state"] == "reverted":
-    # The previous version is back with its recent edits. The update stays
-    # prepared, so the owner can retry Finish (often an interrupted cutover)
-    # or cancel it.
-    _write_rolled_back_flag(
-      record["target"],
-      "The updated version failed its startup check, so Möbius returned to "
-      "the previous version with your recent edits.",
+
+
+def _replay_late_edits(repo: Path, record: PreparedUpdate) -> str:
+  """Merge late edits onto the booted update, or park them; the caller holds
+  the reconcile lock and has checked the checkout is exactly the update."""
+  local = _local_branch(repo)
+  head = record["prepared"]
+  # Late edits are local work and the booted update is the incoming
+  # release: the same merge Apply uses, so in-progress edits come back
+  # uncommitted and a conflict parks for a resolver on a frozen copy.
+  late_committed = record["late_committed"] or record["late"]
+  carried = _Carried(
+    served=late_committed, pre=record["late"],
+    working=record["late"] if record["late"] != late_committed else None,
+  )
+  outcome = _merged_candidate(
+    repo, carried, head,
+    app_git.merge_refs(repo, late_committed, head, merge_base=record["snapshot"]),
+    right=head, base=record["snapshot"],
+    reconciliation=app_git.ReconciliationReceipt(),
+  )
+  if isinstance(outcome, ReconcileResult):
+    flag = _read_conflict_flag() or {}
+    _write_conflict_flag(
+      head, list(flag.get("paths") or []),
+      overlay={**(flag.get("overlay") or {}), "replay": True, "live": head},
     )
+    return "conflict"
+  if outcome.tip != head:
+    _activate_candidate(repo, local, head, outcome.tip)
+    _clear_reconcile_pre()
     _restore_working_edits(repo, local)
-    _write_prepared_update(unswapped)
-    return "reverted"
-  if record["state"] != "swapped" or not record["late"]:
-    return None
+  _write_prepared_update({**record, "replayed": _rev(repo, local)})
+  return "replayed"
+
+
+def replay_late_edits_before_import(repo: Path = PLATFORM_REPO) -> str | None:
+  """Boot, before uvicorn imports anything: merge a swap's late edits back so
+  the server loads the update and them together.
+
+  Only files and the checkout change here; the started server confirms the
+  result (``confirm_platform_swap_loaded``), and until then the record stays
+  swapped so the boot script can still return a tree that cannot start to
+  the saved previous state. Safe to repeat after a crash at any point.
+  """
   with _reconcile_flock():
+    record = read_prepared_update()
+    if record is None or record["state"] != "swapped" or not record["late"]:
+      return None
+    if _replay_parked(record):
+      return "conflict"
+    head = _rev(repo, _local_branch(repo))
+    position = _swap_position(repo, record, head)
+    if position == "pending":
+      return _replay_late_edits(repo, record)
+    if position == "replayed":
+      if record["replayed"] != head:
+        _write_prepared_update({**record, "replayed": head})
+      return "replayed"
+    return None  # The started server's startup task handles the rest.
+
+
+def complete_platform_swap(repo: Path = PLATFORM_REPO) -> str | None:
+  """Startup, before chats resume: finish what boot left of a swap.
+
+  Returns ``replayed`` (late edits are back; the loaded server confirms at
+  the end of startup), ``conflict`` (parked for the resolver), ``reverted``
+  (the boot script returned to the previous version), ``not_swapped``,
+  ``unknown``, or None.
+  """
+  with _reconcile_flock():
+    record = read_prepared_update()
+    if record is None:
+      return None
+    local = _local_branch(repo)
+    unswapped = PreparedUpdate(
+      **{
+        **record, "state": "prepared", "late": None, "late_committed": None,
+        "replayed": None,
+      },
+    )
+    if record["state"] == "reverted":
+      # The previous version is back with its recent edits. The update stays
+      # prepared, so the owner can retry Finish (often an interrupted cutover)
+      # or cancel it.
+      _write_rolled_back_flag(
+        record["target"],
+        "The updated version failed its startup check, so Möbius returned to "
+        "the previous version with your recent edits.",
+      )
+      _restore_working_edits(repo, local)
+      _write_prepared_update(unswapped)
+      return "reverted"
+    if record["state"] != "swapped" or not record["late"]:
+      return None
     head = _rev(repo, local)
-    if head != record["prepared"]:
+    position = "parked" if _replay_parked(record) else _swap_position(
+      repo, record, head,
+    )
+    if position == "not_swapped":
       # The checkout never moved (the swap failed or boot restored it), so
       # there is nothing to merge back: the update is still just prepared.
       _restore_working_edits(repo, local)
       _write_prepared_update(unswapped)
       return "not_swapped"
+    if position == "unknown":
+      log.error(
+        "platform: the checkout at %s is neither the swapped update, its "
+        "merge-back, nor the saved previous state; leaving it for review.",
+        _short(head),
+      )
+      return "unknown"
+    outcome = "conflict" if position == "parked" else "replayed"
+    if position == "pending":
+      # Boot did not merge the late edits back before this process imported
+      # the update (an older image or a failed boot step), so it cannot have
+      # loaded them: merge now and record the restart that loads them.
+      outcome = _replay_late_edits(repo, record)
+      if outcome == "replayed":
+        _record_update_activation(
+          repo, _rev(repo, local), recorded_upstream_sha(repo),
+        )
+        _clear_prepared_update(repo)
+    elif position == "replayed" and record["replayed"] != head:
+      _write_prepared_update({**record, "replayed": head})
     # The source moved while the server was down: install a changed
-    # dependency lock now; the shell is rebuilt once late edits are back.
-    moved = _activation_paths_between(repo, record["late"], head)
+    # dependency lock, then drop the stamp so the watcher's startup check
+    # rebuilds the shell against it.
+    moved = _activation_paths_between(repo, record["late"], _rev(repo, local))
     if any(path in _FRONTEND_DEPENDENCY_INPUTS for path in moved):
       installed, error = _sync_frontend_dependencies(repo)
       if not installed:
         log.error("platform: frontend dependencies for the update failed: %s", error)
-    # Late edits are local work and the booted update is the incoming
-    # release: the same merge Apply uses, so in-progress edits come back
-    # uncommitted and a conflict parks for a resolver on a frozen copy.
-    late_committed = record["late_committed"] or record["late"]
-    carried = _Carried(
-      served=late_committed, pre=record["late"],
-      working=record["late"] if record["late"] != late_committed else None,
-    )
-    outcome = _merged_candidate(
-      repo, carried, head,
-      app_git.merge_refs(repo, late_committed, head, merge_base=record["snapshot"]),
-      right=head, base=record["snapshot"],
-      reconciliation=app_git.ReconciliationReceipt(),
-    )
-    if isinstance(outcome, ReconcileResult):
-      flag = _read_conflict_flag() or {}
-      _write_conflict_flag(
-        head, list(flag.get("paths") or []),
-        overlay={**(flag.get("overlay") or {}), "replay": True, "live": head},
-      )
-      _invalidate_frontend_build_stamp(repo)
-      return "conflict"
-    if outcome.tip != head:
-      _activate_candidate(repo, local, head, outcome.tip)
-      _clear_reconcile_pre()
-      _restore_working_edits(repo, local)
-    # Dropping the stamp makes the watcher's startup check rebuild the shell.
     _invalidate_frontend_build_stamp(repo)
-    _write_prepared_update({**record, "replayed": _rev(repo, local)})
-    return "replayed"
+    return outcome
+
+
+def confirm_platform_swap_loaded(repo: Path = PLATFORM_REPO) -> bool:
+  """End of startup: the late edits merged back before import are what this
+  server is running, so the boot script no longer needs to be able to return
+  to the previous state. A server started from another source (the baked
+  fallback) leaves the record for the next platform boot."""
+  with _reconcile_flock():
+    record = read_prepared_update()
+    if record is None or record["state"] != "swapped" or not record["replayed"]:
+      return False
+    served = _served_platform_sha()
+    if not served or not (
+      served == record["replayed"]
+      or _is_ancestor(repo, record["replayed"], served)
+    ):
+      return False
+    _clear_prepared_update(repo)
+    return True
 
 
 def _net_overlay_commit(repo: Path, target: str, tree: str, source: str) -> str:
@@ -3110,10 +3196,10 @@ def continue_platform_overlay_update(repo: Path = PLATFORM_REPO) -> str:
         if parked.get("replay"):
           # The server booted before these edits returned, so it still owes
           # the restart that loads them.
-          _clear_prepared_update(repo)
           _record_update_activation(
             repo, result.new_sha, recorded_upstream_sha(repo),
           )
+          _clear_prepared_update(repo)
         else:
           _record_update_activation(repo, result.new_sha, target)
       return result.status
@@ -3299,7 +3385,7 @@ def reconcile_clone_sync() -> str:
       hook_refresh = _refresh_git_hooks(PLATFORM_REPO, source)
     # Edits made on the previous version merge back before uvicorn imports
     # the swapped-in update, so the server loads both on this boot.
-    swap = complete_platform_swap(PLATFORM_REPO)
+    swap = replay_late_edits_before_import(PLATFORM_REPO)
     summary = f"startup[installed] head={_short(_rev(PLATFORM_REPO, 'HEAD'))} {recovery}"
     if swap:
       summary += f" swap={swap}"
