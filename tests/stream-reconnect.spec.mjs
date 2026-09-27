@@ -638,7 +638,7 @@ test.describe('Stream reconnection', () => {
     await expect(page.locator('[data-chat-surface="painted"] button[aria-label="Stop"]')).toHaveCount(0)
   })
 
-    test('9. The connection status stays above the composer pill on wake failure', async ({ page }) => {
+    test('9. The Retry stays above the composer pill once the stream gives up', async ({ page }) => {
     await page.addInitScript(() => {
       const realFetch = window.fetch.bind(window)
       let streamCount = 0
@@ -655,38 +655,18 @@ test.describe('Stream reconnection', () => {
     })
 
     await setupChat(page)
-    // A wake failure shows the connection status only while the backend claims
-    // a live run, and both the runtime poll and the detail read retire the
-    // transport once they report settled. Registered after setupChat so its
-    // idle wait (no Stop) still settles.
-    await page.route(/\/api\/chats\/[0-9a-f-]+\/runtime(?:\?.*)?$/, route => {
-      if (route.request().method() !== 'GET') return route.fallback()
-      return route.fulfill({
-        status: 200,
-        contentType: 'application/json',
-        body: JSON.stringify({
-          ...runtimeSnapshot({ running: true }),
-          run_id: 'stream-reconnect-wake-run',
-          active_goal_objective: null,
-          updated_at: null,
-        }),
-      })
-    })
-    await page.route(/\/api\/chats\/[0-9a-f-]+(?:\?.*)?$/, async route => {
-      if (route.request().method() !== 'GET') return route.fallback()
-      const response = await route.fetch()
-      let body = null
-      try { body = await response.json() } catch { return route.fulfill({ response }) }
-      return route.fulfill({
-        response,
-        body: JSON.stringify({ ...body, running: true, pending_question_id: null }),
-      })
-    })
+    // With the backend unreachable no runtime verdict can repair the stream,
+    // so it gives up and keeps its Retry. Registered after setupChat so its
+    // idle wait still settles.
+    await page.route(/\/api\/chats\/[0-9a-f-]+(?:\/runtime)?(?:\?.*)?$/, route => (
+      route.request().method() === 'GET'
+        ? route.fulfill({ status: 503, contentType: 'application/json', body: '{"detail":"unavailable"}' })
+        : route.fallback()
+    ))
     await send(page, 'retry button layout')
 
-    // A wake failure keeps the connection status on screen while the run is
-    // live; its Retry (when mounted) is inside it, so the status is measured.
-    await expect(page.locator('[data-chat-surface="painted"] .connection-status')).toBeVisible({
+    // The chat shows only the actionable notice, once retries are exhausted.
+    await expect(page.locator('[data-chat-surface="painted"] .connection-status__retry')).toBeVisible({
       timeout: 25000,
     })
     await expect(page.locator('[data-chat-surface="painted"] .chat__pill'))
@@ -1196,13 +1176,12 @@ test.describe('Stream reconnection', () => {
     await submitBtn.click()
 
     // The answer stays inside this same durable goal run. Even after this
-    // browser exhausts its reconnects, the connection warning must not retire
+    // browser exhausts its reconnects, connection loss must not retire
     // the goal while the authoritative runtime still reports `running:true`.
     await expect(goalRail).toContainText(`Goal · ${GOAL}`)
-    // Connection trouble must surface as the status without retiring the goal;
-    // the goal rail on both sides is the guarantee.
-    await expect(page.locator('[data-chat-surface="painted"] .connection-status'))
-      .toBeVisible({ timeout: 25000 })
+    // Reconnecting is silent in the chat (the shell badge owns it); wait until
+    // the stream's retries have run out: the first attach plus three retries.
+    await expect.poll(() => streamRequestCount, { timeout: 25000 }).toBeGreaterThanOrEqual(4)
     await expect(goalRail).toContainText(`Goal · ${GOAL}`)
 
     // Answering MUST POST the answer payload (the turn unfreezes).
