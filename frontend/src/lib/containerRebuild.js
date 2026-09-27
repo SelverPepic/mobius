@@ -61,10 +61,10 @@ export function rebuildStartedAgo(status, now = Date.now()) {
   const started = Date.parse(status?.updated_at || '')
   if (!Number.isFinite(started)) return ''
   const minutes = Math.max(0, Math.floor((now - started) / 60000))
-  if (minutes < 1) return 'started just now'
-  if (minutes < 60) return `started ${minutes} min ago`
+  if (minutes < 1) return 'just entered this stage'
+  if (minutes < 60) return `in this stage for ${minutes} min`
   const hours = Math.floor(minutes / 60)
-  return `started about ${hours} ${hours === 1 ? 'hour' : 'hours'} ago`
+  return `in this stage for about ${hours} ${hours === 1 ? 'hour' : 'hours'}`
 }
 
 // Collapse a controller message to one short, safe status line.
