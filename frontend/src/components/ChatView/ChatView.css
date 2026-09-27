@@ -424,13 +424,14 @@
   align-items: center;
   align-self: flex-end;
   gap: 4px;
-  margin-top: 4px;
   /* The row uses the existing inter-message gap without centering a real
      button inside a zero-height box (which pulled the copy glyph upward into
-     the message bubble). Its negative bottom margin cancels only its own
-     layout height, so later rows keep the established transcript rhythm. */
-  height: 24px;
-  margin-bottom: -24px;
+     the message bubble). Its negative bottom margin cancels its whole box,
+     including the 4px gap above it, so mounting the row when a turn settles
+     never changes the transcript's flow. */
+  padding-top: 4px;
+  height: 28px;
+  margin-bottom: -28px;
   overflow: visible;
   opacity: 0;
   visibility: hidden;

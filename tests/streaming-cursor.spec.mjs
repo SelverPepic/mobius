@@ -156,26 +156,14 @@ test('terminal cursor removal keeps followed geometry unchanged', async ({ page 
     const rows = painted?.querySelectorAll('.chat__msg--assistant') || []
     const paragraphs = rows[rows.length - 1]?.querySelectorAll('.md-paragraph') || []
     const paragraph = paragraphs[paragraphs.length - 1]
-    const row = rows[rows.length - 1]
-    const blocks = row?.querySelector('.md-blocks')
-    const rowRect = row?.getBoundingClientRect()
+    const scrollRect = scroll?.getBoundingClientRect()
     const paragraphRect = paragraph?.getBoundingClientRect()
-    const meta = row?.querySelector('.chat__msg-meta')
-    const metaStyle = meta ? getComputedStyle(meta) : null
     return {
-      blocksHeight: blocks?.getBoundingClientRect().height ?? -1,
-      rowHeight: rowRect?.height ?? -1,
-      // The metadata row's net contribution to the answer row's flow.
-      metaFlow: metaStyle
-        ? parseFloat(metaStyle.marginTop) + meta.getBoundingClientRect().height
-          + parseFloat(metaStyle.marginBottom)
-        : 0,
-      paragraphOffset: paragraphRect && rowRect
-        ? paragraphRect.top - rowRect.top
+      scrollHeight: scroll?.scrollHeight ?? -1,
+      scrollTop: scroll?.scrollTop ?? -1,
+      paragraphTop: paragraphRect && scrollRect
+        ? paragraphRect.top - scrollRect.top
         : null,
-      bottomGap: scroll
-        ? scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight
-        : -1,
     }
   })
   const live = await measure()
@@ -187,15 +175,10 @@ test('terminal cursor removal keeps followed geometry unchanged', async ({ page 
   )))
   const settled = await measure()
 
-  // Removing the cursor leaves the answer's own flow alone: the rendered blocks
-  // keep their height and the followed paragraph keeps its place in the row.
-  expect(Math.abs(settled.blocksHeight - live.blocksHeight)).toBeLessThanOrEqual(1)
-  expect(Math.abs(settled.paragraphOffset - live.paragraphOffset)).toBeLessThanOrEqual(1)
-  // The settled turn also mounts its metadata row, whose top margin is not
-  // cancelled by its reserved height. That is the ONLY growth accepted: the row
-  // grows by exactly the metadata row's flow, and the followed view stays
-  // pinned to the tail (bottomGap derives from fractional scrollTop).
-  expect(Math.abs((settled.rowHeight - live.rowHeight) - (settled.metaFlow - live.metaFlow)))
-    .toBeLessThanOrEqual(1)
-  expect(Math.abs(settled.bottomGap - live.bottomGap)).toBeLessThanOrEqual(1.5)
+  // Settling removes the cursor and mounts the turn's metadata row; neither
+  // may move the followed transcript. scrollTop derives from fractional
+  // layout, hence its sub-pixel allowance.
+  expect(Math.abs(settled.scrollHeight - live.scrollHeight)).toBeLessThanOrEqual(1)
+  expect(Math.abs(settled.scrollTop - live.scrollTop)).toBeLessThanOrEqual(1.5)
+  expect(Math.abs(settled.paragraphTop - live.paragraphTop)).toBeLessThanOrEqual(1)
 })
