@@ -6,7 +6,7 @@ from sqlalchemy import create_engine, select
 from app import models
 from app.goals import admit_goal, resume_context, update_goal_record
 from app.goal_plans import (
-  GoalPlanConflict, GoalPlanError, goal_terminal_handoff,
+  GoalPlanConflict, GoalPlanError,
   presented_goal, replace_plan, serialize_plan,
 )
 from app.run_state import goal_identity_for_run_start
@@ -48,11 +48,10 @@ def test_resume_after_unrelated_question_and_no_provider_history(db, chat):
 
 def test_completed_tasks_are_not_implicit_goal_completion(db, chat):
   goal, run = work(db, chat, task_status="completed")
-  assert goal_terminal_handoff(db, chat.id, run.id) is not None
+  assert goal.status == "open"
   assert presented_goal(db, chat.id)["status"] == "active"
   update_goal_record(db, run, goal, 1, result="Verified deployment and collaboration")
   assert goal.status == "completed"
-  assert goal_terminal_handoff(db, chat.id, run.id) is None
   assert presented_goal(db, chat.id)["status"] == "completed"
 
 
@@ -67,12 +66,11 @@ def test_completion_cannot_race_scope_change(db, chat):
   assert goal.status == "open"
 
 
-def test_checkpoint_is_durable_and_zero_legacy_allowance_does_not_block(db, chat):
+def test_checkpoint_is_durable(db, chat):
   goal, run = work(db, chat)
   update_goal_record(db, run, goal, 1, checkpoint="Implemented half", next_action="Verify peers")
   db.expire_all()
   assert goal.checkpoint == "Implemented half"
-  assert goal_terminal_handoff(db, chat.id, run.id).goal_id == goal.id
   assert "Verify peers" in resume_context(db, run.id)
 
 
@@ -80,9 +78,9 @@ def test_turn_admission_has_no_allowance_or_progress_counter(db, chat):
   goal, run = work(db, chat)
   for _ in range(20):
     admit_goal(db, chat.id, goal.id, goal.objective,
-               {"kind":"continuation", "continuation_reason":"goal_handoff"})
+               {"kind":"continuation", "continuation_reason":"restart"})
     db.commit()
-    assert goal_terminal_handoff(db, chat.id, run.id) is not None
+  assert goal.status == "open"
   assert "automatic_turns_remaining" not in resume_context(db, run.id)
 
 
@@ -91,7 +89,7 @@ def test_stale_wakes_cannot_revive_closed_goal(db, chat, status):
   goal, run = work(db, chat)
   goal.status=status; db.commit()
   assert goal_identity_for_run_start(db, chat.id, {
-    "kind":"continuation", "continuation_reason":"goal_handoff", "goal_id":goal.id,
+    "kind":"continuation", "continuation_reason":"restart",
   }) == (None,None)
 
 
@@ -248,16 +246,6 @@ def test_dismissing_completed_goal_keeps_verified_outcome(db, chat):
   assert presented_goal(db, chat.id) is None
 
 
-@pytest.mark.parametrize("status", ["stopped", "completed", "dismissed"])
-def test_removing_allowance_does_not_admit_closed_work(db, chat, status):
-  goal, run = work(db, chat)
-  goal.status = status
-  db.commit()
-  with pytest.raises(RuntimeError, match="Goal is closed"):
-    admit_goal(db, chat.id, goal.id, goal.objective,
-               {"kind":"continuation", "continuation_reason":"goal_handoff"})
-
-
 def test_corrupt_plan_cannot_complete_and_full_replace_repairs_it(db, chat):
   goal, run = work(db, chat, task_status="completed")
   goal.plan_json = "not-a-plan"
@@ -279,30 +267,14 @@ def test_corrupt_plan_cannot_complete_and_full_replace_repairs_it(db, chat):
   assert goal.status == "completed"
 
 
-def test_corrupt_plan_never_authorizes_automatic_handoff(db, chat):
-  goal, run = work(db, chat, task_status="completed")
-  goal.plan_json = {"version": 1, "tasks": [{"id": "broken"}]}
-  goal.revision = 2
-  run.goal_plan_revision_at_admission = 1
-  db.commit()
-
-  handoff = goal_terminal_handoff(db, chat.id, run.id)
-  assert handoff is not None
-  assert handoff.automatic_allowed is False
-
-
 @pytest.mark.parametrize("status", [[], {}], ids=["list", "object"])
-def test_malformed_task_status_remains_repairable_without_auto_handoff(db, chat, status):
+def test_malformed_task_status_remains_repairable(db, chat, status):
   goal, run = work(db, chat, task_status=status)
   goal.revision = 2
-  run.goal_plan_revision_at_admission = 1
   db.commit()
 
   assert serialize_plan(db, run, goal) is None
   assert presented_goal(db, chat.id)["status"] == "active"
-  handoff = goal_terminal_handoff(db, chat.id, run.id)
-  assert handoff is not None
-  assert handoff.automatic_allowed is False
   with pytest.raises(GoalPlanError, match="unreadable"):
     update_goal_record(db, run, goal, 2, result="Cannot complete malformed work")
   assert goal.status == "open"

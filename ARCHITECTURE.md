@@ -1173,7 +1173,7 @@ recovery prompt reconstructed from that exact control. A stable client control
 id makes manual retries idempotent without inventing owner speech. Existing
 transcript-backed recoveries remain readable for safe replay across upgrades;
 generic coordinator continuations retain their exact supplied content and
-replay contract. Goal rollover remains owned by its existing plan/FIFO path.
+replay contract.
 
 The sweep is cheap: one indexed due-row query immediately at boot, on
 `chat_run_finished`, and on a 60-second fallback. Startup captures the boot
@@ -1191,7 +1191,7 @@ column remains only as an internal latch: it defaults on and is cleared solely
 by `delegations.mark_cancelled`, so a cancelled delegated child cannot
 resurrect itself when the boot sweep claims restart parks.
 
-### Goal handoff ownership is exact and singular
+### A Goal is a note, a checklist, and Done
 
 `ChatGoal` owns the stable objective, revision-checked plan, checkpoint, next
 step, and explicit outcome. `ChatRun.goal_id` attaches each execution attempt
@@ -1201,35 +1201,26 @@ can reopen stopped work but stale deliveries cannot. Migration 0063 copies
 historical plans without deleting run snapshots and leaves uncertain work open.
 
 The writer admits Goal identity and the attempt in the same transaction.
-Execution turns are not a budget, but unfinished intent alone cannot authorize
-another provider invocation. Every Goal-bound run checkpoints the `ChatGoal`
-revision at provider admission. At clean settlement, a new exact durable owner
-gets the next move; otherwise automatic rollover requires that revision to have
-advanced beyond the checkpoint. A legacy or unknown checkpoint proves nothing.
-Stop, completion, provider failures and usage-limit handling keep their existing
-boundaries. The legacy `automatic_remaining` column is inert historical schema,
-never read or updated by admission.
+Execution turns are not a budget, and an unfinished Goal never schedules its
+own next turn. Goal work moves only through what already wakes a chat: owner
+input, a Wait result, a helper result, peer or activation delivery, and
+restart or usage-limit recovery. A turn that ends cleanly needs no Goal
+handoff: nothing checks it, and an idle unfinished Goal is simply the owner's
+turn. The Goal record reports only its own lifecycle (`active` while a turn
+runs, `paused` while idle or stopped, `completed`); who moves next is derived
+from chat state the client already holds — an open card, armed Waits, running
+helpers — never from a per-Goal ownership query. Retired automatic-continuation
+bookkeeping (`goal_plan_revision_at_admission`, the `automatic_remaining`
+column) is inert historical schema.
 
 Persisted plans use the same task validation as plan writes. An unreadable
-plan keeps its Goal open, cannot authorize automatic handoff or completion,
-and can be repaired through a fully validated, revision-checked replacement.
+plan keeps its Goal open, cannot authorize completion, and can be repaired
+through a fully validated, revision-checked replacement. Identical normalized
+plan writes are revision no-ops.
 
-`goal_plans.goal_handoff_owner_kind` is the shared exact-identity query for
-both Goal presentation and turn settlement. It recognizes an owner question,
-Wait (including a settled result awaiting delivery), or wake-enabled helper only when that actor belongs to the same
-`goal_id`; an unrelated question or background operation in the chat cannot
-hide an orphaned Goal. The writer's terminal promotion checks ownership after
-question persistence. Identical normalized plan writes are revision no-ops, so
-rewriting unchanged state cannot manufacture permission to continue. Without
-durable plan progress, the terminal path saves an owner reconciliation question
-instead of starting another turn. Automatic Goal controls keep their causal
-place in the existing pending FIFO, but the writer translates them into an
-ephemeral provider prompt and never appends them as owner transcript rows.
-
-A result retains ownership until delivery. Provider-native Goal execution is
-disabled: one Möbius attempt starts one ordinary provider turn. Legacy native
-controllers are retired before resuming their conversation, not recreated in
-parallel.
+Provider-native Goal execution is disabled: one Möbius attempt starts one
+ordinary provider turn. Legacy native controllers are retired before resuming
+their conversation, not recreated in parallel.
 
 Every Goal attempt receives a deterministic hierarchical view even with no
 provider history: original objective, checkpoint, current task, ancestor
@@ -1242,7 +1233,9 @@ No model summarizer, delta cache, extra focus record,
 or duplicate copy of the incoming message is involved. Agents continue working
 in their current run rather than ending turns to refresh context. Task additions and updates operate on the existing record. Completion
 is an explicit revision-checked operation with verification evidence and no
-unfinished tasks or outstanding handoff. A green plan alone is not completion.
+unfinished tasks or running helpers. It takes delivery of the Goal's fired
+Waits so they do not wake a finished Goal; an open card or armed Wait does not
+block it. A green plan alone is not completion.
 
 Workspace `AgentWorkClaim` rows are narrower: they serialize one shared action
 across otherwise independent chats. They do not replace a chat's Goal, a
@@ -1497,9 +1490,9 @@ exact retries acknowledge it without clearing a newer card. Existing queued
 follow-ups use ordinary idle admission or the publisher's terminal drain.
 Stop remains authoritative and quiet closure cannot revive stopped work.
 
-Quiet closure cannot remove the sole next owner of an unfinished Goal: it
-requires completed work or an exact-Goal wait, helper, or queued continuation.
-An unrelated follow-up does not count; conflicts preserve the card and choice.
+Quiet closure cannot strand an approval's exact work claim: a card whose
+`action_key` still names an active claim needs a reply so its agent can
+complete or release the claim; conflicts preserve the card and choice.
 Legacy save-only answers cannot bypass typed-card semantics: the writer checks
 its actual matched card, including unkeyed requests racing a newly saved card.
 The frontend settles quiet replies without replacing the stream, touching the
@@ -1584,11 +1577,7 @@ message. Repeated steps are bounded by activity variety rather than raw call
 count. Only an explicit disclosure resolves that exact range through
 `GET /api/chats/{id}/activity-detail`; the live assistant stays self-contained.
 Mounted runtime reconciliation uses `GET /api/chats/{id}/runtime`, whose ORM
-projection raiseloads every unrequested field. Goal handoff classification
-reads only the pending-question identity in the ordinary no-question case;
-an open continuation card explicitly resolves its author from the transcript
-so an unrelated question cannot own that Goal. It must not reload the full
-Chat for each Goal status check. Both projections carry `updated_at` as the
+projection raiseloads every unrequested field. Both projections carry `updated_at` as the
 detail-snapshot version. On activation, a retained ChatView reads the runtime
 projection first and reuses its painted transcript only when those explicit
 versions match; a missing or changed version fails closed to the compact detail

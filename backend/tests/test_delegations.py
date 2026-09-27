@@ -18,7 +18,6 @@ from app.codex_sdk_runner import _codex_config_overrides
 from app.delegations import (
   RunPolicy,
   background_helper_chat_ids,
-  background_helper_goal_ids,
   delegation_execution_token,
   derived_status,
   ensure_delegation_started,
@@ -780,7 +779,6 @@ import app.chat as chat_mod
 import app.chat_start as chat_start_mod
 import app.delegations as delegations_mod
 from app.delegations import (
-  background_helper_goal_ids,
   serialize_background_helpers,
 )
 from app.chat_writer import PromotePending
@@ -867,7 +865,6 @@ def test_background_helper_projection_owns_waiting_until_parent_wake(
   )
 
   assert background_helper_chat_ids(db, [parent_id]) == {parent_id}
-  assert background_helper_goal_ids(db, parent_id) == {"root-waiting-owner"}
   summary = serialize_background_helpers(db, parent_id)
   assert summary == {
     "count": 1,
@@ -901,7 +898,6 @@ def test_background_helper_projection_owns_waiting_until_parent_wake(
   delegation.delivered_run_id = "child-run-waiting-owner"
   db.commit()
   assert background_helper_chat_ids(db, [parent_id]) == set()
-  assert background_helper_goal_ids(db, parent_id) == set()
   assert serialize_background_helpers(db, parent_id) == {"count": 0, "items": []}
 
 
@@ -2362,16 +2358,16 @@ def test_migration_adds_wake_columns_idempotently(db):
   assert "parent_woken_at" in cols
 
 
-def test_helper_result_admitted_to_a_live_parent_run_no_longer_owns_the_goal(db):
-  """The turn incorporating a helper's result owns the Goal's next move.
+def test_helper_result_admitted_to_a_live_parent_run_no_longer_shows_waiting(db):
+  """The turn incorporating a helper's result owns what happens next.
 
-  Finalize marks the result delivered only when that turn ends, so without this
-  the incorporating turn itself could never complete the Goal.
+  Finalize marks the result delivered only when that turn ends; until then the
+  chat must not still read as waiting on the helper it is already handling.
   """
   parent_id, _child_id, delegation_id = _seed_delegation(
     db, suffix="being-delivered", child_status="completed",
   )
-  assert background_helper_goal_ids(db, parent_id) == {"root-being-delivered"}
+  assert background_helper_chat_ids(db, [parent_id]) == {parent_id}
 
   db.add(make_goal_run(db,
     id="parent-wake-run", root_run_id="root-being-delivered",
@@ -2383,12 +2379,12 @@ def test_helper_result_admitted_to_a_live_parent_run_no_longer_owns_the_goal(db)
     },
   ))
   db.commit()
-  assert background_helper_goal_ids(db, parent_id) == set()
+  assert background_helper_chat_ids(db, [parent_id]) == set()
 
   # A delivery that stopped before Finalize hands ownership back to the helper.
   db.get(models.ChatRun, "parent-wake-run").status = "stopped"
   db.commit()
-  assert background_helper_goal_ids(db, parent_id) == {"root-being-delivered"}
+  assert background_helper_chat_ids(db, [parent_id]) == {parent_id}
 
 
 def test_a_reopened_helper_result_wakes_the_idle_parent_again(

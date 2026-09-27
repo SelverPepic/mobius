@@ -538,107 +538,35 @@ def test_completed_plan_clear_dismisses_without_interrupting_final_response(
   assert persisted_run.ended_at is None
 
 
-def test_goal_wait_ownership_excludes_a_later_ordinary_turn(db, chat):
+def test_idle_goal_presentation_reports_only_its_own_lifecycle(db, chat):
+  """Who moves next is chat state the client already has, not Goal state.
+
+  An open card, an armed Wait, or a running helper must not change how the
+  Goal itself presents: idle unfinished work is simply paused.
+  """
   from app.chat_waits import declare_wait
   from app.goal_plans import presented_goal
 
-  started_at = datetime.now(UTC)
   goal_run = make_goal_run(db,
-    id="waiting-goal-run", root_run_id="waiting-goal-run", chat_id=chat.id,
-    status="parked", provider="codex", goal_objective="Wait precisely",
-    goal_id="waiting-goal-id", started_at=started_at,
-  )
-  ordinary_run = make_goal_run(db,
-    id="later-ordinary-run", root_run_id="later-ordinary-run",
-    chat_id=chat.id, status="running", provider="codex",
-    started_at=started_at + timedelta(seconds=1),
-  )
-  db.add_all([goal_run, ordinary_run])
-  chat.pending_question_id = "ordinary-question"
-  db.commit()
-  ordinary_wait = declare_wait(
-    db,
-    chat_id=chat.id,
-    description="ordinary wait",
-    kind="timer",
-    delay_secs=60,
-    created_by_run_id=ordinary_run.id,
-  )
-
-  assert "wait_kind" not in presented_goal(db, chat.id)
-
-  ordinary_run.status = "completed"
-  ordinary_wait.status = "cancelled"
-  chat.pending_question_id = "goal-question"
-  db.commit()
-  assert presented_goal(db, chat.id)["wait_kind"] == "owner_question"
-
-  chat.pending_question_id = None
-  declare_wait(
-    db,
-    chat_id=chat.id,
-    description="goal wait",
-    kind="timer",
-    delay_secs=60,
-    created_by_run_id=goal_run.id,
-  )
-  assert presented_goal(db, chat.id)["wait_kind"] == "monitor"
-
-
-def test_settled_continuation_card_keeps_goal_waiting_for_owner(db, chat):
-  from app.goal_plans import presented_goal
-
-  run = make_goal_run(db,
-    id="settled-card-run", root_run_id="settled-card-run", chat_id=chat.id,
-    status="completed", provider="codex", goal_objective="Await approval",
-    goal_id="settled-card-goal", started_at=datetime.now(UTC),
-  )
-  db.add(run)
-  chat.pending_question_id = "settled-card"
-  chat.messages = [{
-    "id": run.id, "role": "assistant", "content": "", "blocks": [{
-      "type": "question", "question_id": "settled-card",
-      "response_mode": "continuation", "questions": [],
-    }], "ts": 1,
-  }]
-  db.commit()
-
-  goal = presented_goal(db, chat.id)
-  assert goal["status"] == "paused"
-  assert goal["wait_kind"] == "owner_question"
-
-
-def test_goal_wait_ownership_includes_only_its_waking_helpers(
-  db, chat, monkeypatch,
-):
-  from app.goal_plans import presented_goal
-
-  goal_run = make_goal_run(db,
-    id="helper-goal-run", root_run_id="helper-goal-run", chat_id=chat.id,
-    status="completed", provider="codex", goal_objective="Wait on helper",
-    goal_id="helper-goal-id", started_at=datetime.now(UTC),
+    id="idle-goal-run", root_run_id="idle-goal-run", chat_id=chat.id,
+    status="completed", provider="codex", goal_objective="Ship it",
+    goal_id="idle-goal-id", started_at=datetime.now(UTC),
   )
   db.add(goal_run)
   db.commit()
+  expected = {
+    "id": "idle-goal-id", "objective": "Ship it", "status": "paused",
+    "resumable": True,
+  }
+  assert presented_goal(db, chat.id) == expected
 
-  monkeypatch.setattr(
-    "app.delegations.background_helper_goal_ids",
-    lambda _db, _chat_id: {"different-goal"},
+  chat.pending_question_id = "any-card"
+  declare_wait(
+    db, chat_id=chat.id, description="goal wait", kind="timer",
+    delay_secs=60, created_by_run_id=goal_run.id,
   )
-  unrelated = presented_goal(db, chat.id)
-  assert unrelated["status"] == "paused"
-  assert "wait_kind" not in unrelated
-  assert unrelated["resumable"] is True
-  assert "wait_kind" not in unrelated
-
-  monkeypatch.setattr(
-    "app.delegations.background_helper_goal_ids",
-    lambda _db, _chat_id: {"helper-goal-id"},
-  )
-  owned = presented_goal(db, chat.id)
-  assert owned["status"] == "paused"
-  assert owned["resumable"] is True
-  assert owned["wait_kind"] == "monitor"
+  db.commit()
+  assert presented_goal(db, chat.id) == expected
 
 
 def test_legacy_queued_goal_clear_is_retired_without_opening_a_turn(db, chat):

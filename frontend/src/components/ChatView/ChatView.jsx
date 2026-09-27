@@ -17,7 +17,7 @@ import { flushSync } from 'react-dom'
 import { useQueryClient } from '@tanstack/react-query'
 import Check from 'lucide-react/dist/esm/icons/check.mjs'
 import ArrowDown from 'lucide-react/dist/esm/icons/arrow-down.mjs'
-import { Chat, Flag, Play } from '@openai/apps-sdk-ui/components/Icon'
+import { Chat, Flag } from '@openai/apps-sdk-ui/components/Icon'
 import { api, apiFetch, getAuthHeaders, getToken, jsonOrThrow, BASE } from '../../api/client.js'
 import {
   chatMessagesQueryKey,
@@ -4194,10 +4194,6 @@ export default function ChatView({
     onRefresh: refreshResume,
     blocked: resumeBlocked,
   })
-  const handleResumeGoal = useCallback(() => {
-    if (goalPresentation?.status !== 'paused') return
-    void handleResume()
-  }, [handleResume, goalPresentation?.status])
 
   // Cancel one queued message via DELETE. Keep reconciliation scoped to that
   // CID: full queue snapshots can arrive out of order when two rows are
@@ -5603,10 +5599,8 @@ export default function ChatView({
   const handleGoalRailAction = useCallback((item) => {
     if (item?.actionKind === 'owner-question') {
       revealPendingQuestion(pendingQuestionEl)
-      return
     }
-    handleResumeGoal()
-  }, [handleResumeGoal, pendingQuestionEl, revealPendingQuestion])
+  }, [pendingQuestionEl, revealPendingQuestion])
 
   // The resume card publishes the same way, from the TAIL resumable note only
   // — the same block tailResumableBlock arms the cue on. MsgContent applies
@@ -5724,18 +5718,26 @@ export default function ChatView({
   const actionableGoalPresentation = ['active', 'paused'].includes(goalPresentation?.status)
     ? goalPresentation
     : null
+  // Who moves next is chat state, not Goal state: an open card, or a Wait or
+  // helper that will resume this chat. An idle Goal otherwise is your turn.
+  const showWaitingHandoff = chatHasSelfResumingHandoff({
+    turnActive,
+    waits: armedWaits,
+    backgroundHelpers,
+    resourcePause,
+  })
   const goalWaitState = {
-    ownerActionRequired: goalPresentation?.wait_kind === 'owner_question',
-    monitoring: goalPresentation?.wait_kind === 'monitor',
+    ownerActionRequired: hasPendingQuestion,
+    monitoring: showWaitingHandoff,
   }
   const goalAriaStatus = actionableGoalPresentation
     ? goalWaitState.ownerActionRequired
-      ? `Goal waiting for you: ${activeGoalObjective}. Question available.`
+      ? `Goal needs your answer: ${activeGoalObjective}. Question available.`
       : goalWaitState.monitoring
-        ? `Monitoring for goal: ${activeGoalObjective}. This chat will resume automatically.`
+        ? `Goal waiting: ${activeGoalObjective}. This chat will resume automatically.`
         : {
             active: `Following goal: ${activeGoalObjective}.`,
-            paused: `Goal paused: ${activeGoalObjective}. Resume available.`,
+            paused: `Goal: ${activeGoalObjective}. Your turn.`,
           }[actionableGoalPresentation.status]
     : null
   const ariaStatus = goalWaitState.ownerActionRequired && goalAriaStatus
@@ -5781,28 +5783,12 @@ export default function ChatView({
             actionAriaLabel: `Answer question for goal: ${visibleGoalObjective}`,
             actionIcon: <Chat width={13} height={13} aria-hidden="true" />,
           }
-        : actionableGoalPresentation?.status === 'paused'
-            && !goalWaitState.monitoring
-        ? {
-            actionKind: 'resume',
-            actionLabel: resumeState.pending ? 'Resuming…' : resumeState.unavailable ? 'Reconnecting…' : 'Resume',
-            actionDisabled: resumeState.pending || resumeState.unavailable || providerSwitching,
-            actionError: resumeState.error,
-            actionAriaLabel: `${resumeState.pending ? 'Resuming' : resumeState.unavailable ? 'Reconnecting' : 'Resume'} goal: ${visibleGoalObjective}`,
-            actionIcon: <Play width={13} height={13} aria-hidden="true" />,
-          }
         : {}),
       icon: <Flag width={14} height={14} aria-hidden="true" />,
       ...(activeGoalPlan
         ? { details: <GoalPlanDetails plan={activeGoalPlan} /> }
         : {}),
     }
-  })
-  const showWaitingHandoff = chatHasSelfResumingHandoff({
-    turnActive,
-    waits: armedWaits,
-    backgroundHelpers,
-    resourcePause,
   })
   // A `/goal ` composer draft keeps the goal visual open while the objective is
   // still being typed (null once the draft is no longer a goal command).

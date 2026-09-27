@@ -3184,7 +3184,6 @@ async def _drain_and_release(
   run_token: str,
   ending_run_token: str = "",
   ending_status: str = "completed",
-  allow_goal_continuation: bool = False,
 ) -> tuple[dict | None, list, str | None, chat_queue.TerminalDisposition]:
   """Local helper around chat_queue.drain_and_release that binds the
   chat.py-owned discard_starting + forget_chat + strict-clear callbacks.
@@ -3205,9 +3204,7 @@ async def _drain_and_release(
   Returns the 4-tuple `(next_user, next_messages, next_session_id,
   disposition)`; the disposition tells `_complete_turn` whether a
   continuation was promoted (marker stays set), the queue was empty +
-  cleared (marker cleared inside the lock), or the run was stale. A real
-  provider terminal opts into the writer-owned unfinished-Goal continuation;
-  provider-free guidance does not, so a missing provider cannot form a loop.
+  cleared (marker cleared inside the lock), or the run was stale.
   """
   return await chat_queue.drain_and_release(
     db, chat_id, run_gen, run_token,
@@ -3217,7 +3214,6 @@ async def _drain_and_release(
     current_generation=current_run_generation,
     ending_run_token=ending_run_token,
     ending_status=ending_status,
-    allow_goal_continuation=allow_goal_continuation,
   )
 
 
@@ -4089,62 +4085,10 @@ async def _complete_turn(
     else "completed"
   )
 
-  # An ending provider turn cannot authorize its own successor merely because
-  # the Goal remains unfinished. The writer captured the plan revision at
-  # provider admission. A plan advance that leaves runnable work, or a
-  # committed owner steer, permits one rollover; the successor must earn
-  # another before continuing again.
-  # Otherwise the saved-question owner keeps the Goal exact and durable while
-  # the partner decides whether to continue or stop it.
-  terminal_handoff = None
-  if (
-    ending_status == "completed"
-    and not provider_free
-    and not sink.has_open_continuation_card()
-  ):
-    from app.goal_plans import goal_terminal_handoff
-
-    terminal_handoff = goal_terminal_handoff(
-      db, chat_id, sink.run_token or "",
-    )
   incorporate_activity_delivery = (
     ending_status == "completed" and bool(activity_results)
   )
   try:
-    if (
-      terminal_handoff is not None
-      and not terminal_handoff.automatic_allowed
-      and not sink.owner_steer_committed
-    ):
-      question_id = f"goal-handoff-{sink.run_token}"
-      await sink.publish_question({
-        "type": "question",
-        "question_id": question_id,
-        "response_mode": "continuation",
-        "questions": [{
-          "id": "goal_next_step",
-          "header": "Goal needs reconciliation",
-          "question": (
-            "The turn ended without handing off this Goal, so automatic "
-            "continuation is paused. What should happen next?"
-          ),
-          "options": [
-            {
-              "label": "Review and continue (Recommended)",
-              "description": (
-                "Start a new turn to reconcile verified current state with "
-                "the saved plan."
-              ),
-            },
-            {
-              "label": "Stop this Goal",
-              "description": "Stop the Goal and summarize the unfinished work.",
-            },
-          ],
-        }],
-      })
-      from app.owner_input import publish_owner_input_changed
-      publish_owner_input_changed(chat_id, "question", question_id=question_id)
     await sink.finalize(
       incorporate_activity_delivery=incorporate_activity_delivery,
     )
@@ -4294,7 +4238,6 @@ async def _complete_turn(
         db, chat_id, run_gen, next_run_token,
         ending_run_token=sink.run_token or "",
         ending_status=ending_status,
-        allow_goal_continuation=not provider_free,
       )
     )
   except (Exception, asyncio.TimeoutError) as exc:

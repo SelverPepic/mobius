@@ -115,7 +115,7 @@ UPDATE_GOAL_DESCRIPTION = (
   "Advance this chat's Goal in one call. tasks edits the plan as one "
   "revision: a known id changes only the fields given (for example status "
   "completed with a result, and the next task running), a new id adds a task. "
-  "next_action leaves the exact next step before a real handoff. complete "
+  "next_action records the exact next step. complete "
   "records the verified outcome and closes the Goal; it is refused while "
   "tasks or helpers are unfinished. With no arguments it returns the current "
   "plan. goal_id attaches to a named retained Goal instead of the presented one."
@@ -1218,7 +1218,7 @@ _TOOL_DEFINITIONS = {
               "label": {"type": "string", "minLength": 1, "maxLength": 100},
               "description": {"type": "string", "minLength": 1, "maxLength": 500},
               "on_answer": {"type": "string", "enum": ["resume", "close"],
-                "description": "Default resume. Explicit close saves this choice without an agent reply; arrange a durable next owner first if the Goal is unfinished."},
+                "description": "Default resume. Explicit close saves this choice without an agent reply."},
             },
             "required": ["label", "description"], "additionalProperties": False,
           },
@@ -1285,7 +1285,7 @@ _TOOL_DEFINITIONS = {
                 "label": {"type": "string", "minLength": 1, "maxLength": 100},
                 "description": {"type": "string", "minLength": 1, "maxLength": 500},
                 "on_answer": {"type": "string", "enum": ["resume", "close"],
-                "description": "Default resume. Explicit close saves this choice without an agent reply; arrange a durable next owner first if the Goal is unfinished."},},
+                "description": "Default resume. Explicit close saves this choice without an agent reply."},},
             }},
           },
         },
