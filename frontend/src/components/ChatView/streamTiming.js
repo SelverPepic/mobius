@@ -7,8 +7,8 @@
 
 // A hidden tab that comes back inside this window is usually a glance at
 // the notification shade or an app switch. If the SSE socket has also read
-// recently, keep it: tearing down a healthy stream is what makes quiet tool
-// turns flash "Reconnecting…" on every foreground.
+// recently, keep it: tearing down a healthy stream would replace and replay
+// quiet tool turns on every foreground.
 export const QUICK_WAKE_HIDDEN_MS = 5000
 
 // Window during which a 204 from /stream after a send is a race

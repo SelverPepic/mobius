@@ -409,7 +409,7 @@ test.describe('Stream reconnection', () => {
     await page.waitForTimeout(1800)
 
     expect(await page.evaluate(() => window.__streamFetchCount)).toBe(1)
-    await expect(page.locator('[data-chat-surface="painted"] .connection-status--reattach')).toHaveCount(0)
+    await expect(page.locator('[data-chat-surface="painted"] .connection-status')).toHaveCount(0)
   })
 
   test('14. Kept quick-wake socket self-heals when reads stop', async ({ page }) => {
@@ -484,7 +484,7 @@ test.describe('Stream reconnection', () => {
     await expect(page.locator('[data-chat-surface="painted"] .chat__scroll')).toContainText(
       'deadman replay', { timeout: 5000 },
     )
-    await expect(page.locator('[data-chat-surface="painted"] .connection-status--reattach')).toHaveCount(0)
+    await expect(page.locator('[data-chat-surface="painted"] .connection-status')).toHaveCount(0)
 
     await setVisibility(page, 'hidden')
     await page.waitForTimeout(50)
@@ -494,7 +494,7 @@ test.describe('Stream reconnection', () => {
     await page.waitForTimeout(400)
 
     expect(await page.evaluate(() => window.__streamFetchCount)).toBe(2)
-    await expect(page.locator('[data-chat-surface="painted"] .connection-status--reattach')).toHaveCount(0)
+    await expect(page.locator('[data-chat-surface="painted"] .connection-status')).toHaveCount(0)
   })
 
   test('12. Long-hidden wake with stale reads still reattaches and replays', async ({ page }) => {
@@ -570,7 +570,7 @@ test.describe('Stream reconnection', () => {
     await expect(page.locator('[data-chat-surface="painted"] button[aria-label="Stop"]')).toHaveCount(0)
   })
 
-  test('13. Slow long-hidden reattach shows the reconnecting note', async ({ page }) => {
+  test('13. Slow long-hidden reattach stays quiet in the chat and completes', async ({ page }) => {
     await page.addInitScript(() => {
       const realFetch = window.fetch.bind(window)
       let streamCount = 0
@@ -630,11 +630,9 @@ test.describe('Stream reconnection', () => {
     await setVisibility(page, 'visible')
 
     await page.waitForFunction(() => window.__streamFetchCount === 2)
-    // Readiness recovery on the same wake must not clear the note the
-    // visibility reattach armed (#1241).
-    await expect(page.locator('[data-chat-surface="painted"] .connection-status--reattach')).toBeVisible({
-      timeout: 3000,
-    })
+    // Past the old notice delay: a healthy reattach adds no chat-level note.
+    await page.waitForTimeout(3000)
+    await expect(page.locator('[data-chat-surface="painted"] .connection-status')).toHaveCount(0)
 
     await page.evaluate(() => window.__releaseSlowReattach())
     await expect(page.locator('[data-chat-surface="painted"] button[aria-label="Stop"]')).toHaveCount(0)

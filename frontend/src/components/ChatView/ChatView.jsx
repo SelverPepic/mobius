@@ -31,7 +31,7 @@ import usePaginationLifecycle from './usePaginationLifecycle.js'
 import {
   FOLLOW_STICK_BAND_PX,
   isNearPhysicalBottom,
-  olderHistoryRetryShown,
+  olderHistoryRetryDelayMs,
   olderHistoryShouldLoad,
 } from './scroll/policy.js'
 import { activationRetryDelay, chatEntryFrame } from './chatRuntimeState.js'
@@ -545,10 +545,12 @@ export default function ChatView({
     setActivationState({ chatId: activationIdentity, phase })
   }, [activationIdentity])
   // A cold activation has authoritative chat detail but is still preparing its
-  // transcript. Expose the one real composer now, with Send disabled and a
-  // truthful status; transcript visibility and row-backed controls remain
-  // gated by their existing readiness contracts.
-  const coldActivation = activationPhase === 'cold'
+  // transcript. Expose the one real composer now, quietly, with Send disabled;
+  // transcript visibility and row-backed controls remain gated by their
+  // existing readiness contracts.
+  // A failed activation keeps Send usable as its in-place recovery: the tap
+  // retries activation and the draft stays. Nothing sends before it settles.
+  const activationFailed = activationPhase === 'error'
   const acceptCachedReadingCoordinate = useCallback(() => {
     // The scroll owner has proved the exact nested part against committed DOM.
     setInitialEntryPhase(current => (
@@ -1152,6 +1154,7 @@ export default function ChatView({
   // useScrollMode, including while this network request is in flight.
   const loadingOlder = useRef(false)
   const paginationFollowupRafRef = useRef(0)
+  const olderHistoryRetryRef = useRef({ timer: 0, attempts: 0 })
   const paginationLifecycleRef = usePaginationLifecycle({
     chatId,
     hidden,
@@ -1161,8 +1164,8 @@ export default function ChatView({
     searchRevealId: searchReveal?.id,
     loadingOlderRef: loadingOlder,
     followupRafRef: paginationFollowupRafRef,
+    retryRef: olderHistoryRetryRef,
   })
-  const [olderHistoryError, setOlderHistoryError] = useState(false)
 
   // ── Scroll subsystem ─────────────────────────────────────────────
   //
@@ -1828,7 +1831,6 @@ export default function ChatView({
     isStreaming,
     isStreamingRef,
     connectionError,
-    reconnecting,
     catchUpCommitSeq,
     sendMessage: streamSend,
     connectToStream,
@@ -3003,9 +3005,11 @@ export default function ChatView({
   // request start would be stale whenever touch momentum continues in flight.
   function loadOlderMessages(before = offset, { readerDriven = false } = {}) {
     const el = scrollRef.current
+    // A pending quiet retry owns the next attempt, so a failing page cannot
+    // turn scroll or resize events into a request storm.
+    if (olderHistoryRetryRef.current.timer) return
     if (!el || loadingOlder.current || loading || before <= 0) return
     loadingOlder.current = true
-    setOlderHistoryError(false)
     const paginationLifecycle = paginationLifecycleRef.current
     const requestIsCurrent = () => (
       paginationLifecycleRef.current === paginationLifecycle
@@ -3026,6 +3030,7 @@ export default function ChatView({
       .then(r => jsonOrThrow(r, 'Earlier messages failed to load'))
       .then(data => {
         if (!requestIsCurrent()) return
+        olderHistoryRetryRef.current.attempts = 0
         const older = data.messages || []
         for (const msg of older) {
           if (msg.blocks) {
@@ -3068,7 +3073,21 @@ export default function ChatView({
       .catch(() => {
         if (!requestIsCurrent()) return
         loadingOlder.current = false
-        setOlderHistoryError(true)
+        // No retry control: ask again quietly, with backoff, while the reader
+        // still waits at the top for this page.
+        const retry = olderHistoryRetryRef.current
+        retry.timer = setTimeout(() => {
+          retry.timer = 0
+          const scrollEl = scrollRef.current
+          if (
+            requestIsCurrent()
+            && scrollEl
+            && olderHistoryShouldLoad(scrollEl, { userDriven: true })
+          ) {
+            loadOlderMessages(before, { readerDriven })
+          }
+        }, olderHistoryRetryDelayMs(retry.attempts))
+        retry.attempts += 1
       })
   }
 
@@ -4116,8 +4135,12 @@ export default function ChatView({
     if (isProviderSwitchBlocking(chatId)) return
     // During an early reveal (a no-cache open presented before the runtime
     // settles) the brain is interactive but the chat is not ready to receive a
-    // turn yet; ignore a send until activation settles a moment later.
-    if (!activationSettled) return
+    // turn yet; ignore a send until activation settles a moment later. After a
+    // failed activation, Send retries it now instead (see activationFailed).
+    if (!activationSettled) {
+      if (activationFailed) retryActivation()
+      return
+    }
     if (needsModelSelection({ showPicker, chatInfo })) {
       setModelSelectionRequest(request => request + 1)
       return
@@ -5302,13 +5325,6 @@ export default function ChatView({
     activationSettled,
     transcriptPaintable,
   })
-  // Stay quiet while an automatic retry is scheduled; the timer is set in the
-  // same batch as the error phase, so this render already sees it.
-  const showActivationRetry = (
-    activationPhase === 'error'
-    && !loadError
-    && activationRecoveryRef.current.timer == null
-  )
 
   // Transcript geometry reads force a synchronous layout of the whole
   // transcript, so they follow its size (content, spacer, and viewport) rather
@@ -5648,8 +5664,7 @@ export default function ChatView({
     questionNudgeShown,
     resumeNudgeShown,
   })
-  const offscreenControlsVisible = olderHistoryError
-    || questionNudgeShown
+  const offscreenControlsVisible = questionNudgeShown
     || resumeNudgeShown
     || jumpToLatestVisible
 
@@ -6239,7 +6254,11 @@ export default function ChatView({
             floating actions overlay the transcript without joining the measured
             footer; build-progress rail → connection/retry → queued messages →
             composer remain in normal footer flow. The shell owns the one persistent
-            offline explanation; the composer retains contextual send-failure copy. */}
+            offline explanation; the composer retains contextual send-failure copy.
+            Transient trouble (a stream reattaching, an older page or activation
+            that failed) recovers quietly with no note here. Only a state the
+            owner must act on, such as "Connection lost — Retry", earns a place
+            in this footer. */}
         <div className="chat__floating-actions">
           {/* Only short-lived navigation nudges may float over the transcript.
               Contribution state lives in Changes so it can never cover the
@@ -6251,18 +6270,6 @@ export default function ChatView({
                 <div className="chat__offscreen-nudges">
                   {/* Touches use the keyboard-safe path; mouse and keyboard retain
                       the native click path. */}
-                  {olderHistoryRetryShown(olderHistoryError, offset) && (
-                    <button
-                      type="button"
-                      className="chat__history-retry"
-                      {...composerAdjacentActionProps(
-                        () => loadOlderMessages(offset, { readerDriven: true }),
-                        { activateOnTouchEnd: true },
-                      )}
-                    >
-                      Earlier messages didn’t load — retry
-                    </button>
-                  )}
                   {questionNudgeShown && (
                     <button
                       type="button"
@@ -6335,27 +6342,8 @@ export default function ChatView({
             onCancel={handleCancelWait}
           />
         )}
-        {showActivationRetry && (
-          <div
-            className="chat__offline-note chat__offline-note--error chat__activation-retry"
-            role="alert"
-            aria-live="assertive"
-            aria-atomic="true"
-          >
-            <span>Chat activation still needs a retry before sending.</span>
-            <button
-              type="button"
-              className="chat__empty-action"
-              onPointerDown={event => event.preventDefault()}
-              onClick={retryActivation}
-            >
-              Retry
-            </button>
-          </div>
-        )}
         <ConnectionStatus
           error={connectionError}
-          reconnecting={reconnecting}
           onRetry={retry}
         />
         <QueuedMessages
@@ -6394,15 +6382,9 @@ export default function ChatView({
           canRequestSteer={canRequestSteer}
           canSubmitSteer={canSubmitSteer}
           sendFailure={sendFailure}
-          notice={
-            compactingChat
-              ? 'Compacting this chat’s context…'
-              : coldActivation
-                ? 'Preparing this chat…'
-                : null
-          }
+          notice={compactingChat ? 'Compacting this chat’s context…' : null}
           submissionBlocked={
-            !activationSettled
+            (!activationSettled && !activationFailed)
             || providerSwitching
             || !!newChatSession?.submitted
           }

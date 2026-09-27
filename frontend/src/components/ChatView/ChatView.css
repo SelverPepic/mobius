@@ -2347,7 +2347,6 @@
 .chat__foot .queued,
 .chat__foot .connection-status,
 .chat__foot .chat__attach-tray,
-.chat__foot .chat__history-retry,
 .chat__foot .chat__question-nudge,
 .chat__foot .chat__resume-nudge,
 .chat__foot .chat__jump-latest,
@@ -2421,19 +2420,6 @@
   color: var(--danger, #b42318);
   background: color-mix(in srgb, var(--danger, #b42318) 7%, var(--surface));
   text-align: center;
-}
-
-.chat__activation-retry {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  border-radius: 12px;
-}
-
-.chat__activation-retry .chat__empty-action {
-  flex: 0 0 auto;
-  margin-top: 0;
-  padding-block: 5px;
 }
 
 /* The pill: TRANSLUCENT surface with backdrop-blur — chat content
@@ -2732,26 +2718,12 @@
   transition: background 0.15s, color 0.15s, transform 0.08s;
 }
 .chat__question-nudge:hover,
-.chat__resume-nudge:hover,
-.chat__history-retry:hover {
+.chat__resume-nudge:hover {
   background: var(--accent); /* CONTRACT: vivid opaque accent fill */
   color: #fff;
 }
 .chat__question-nudge:active,
-.chat__resume-nudge:active,
-.chat__history-retry:active { transform: scale(0.96); }
-
-.chat__history-retry {
-  min-height: 36px;
-  margin: 0 auto;
-  padding: 8px 12px;
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  background: var(--surface);
-  color: var(--text);
-  font: 600 12px/1.2 var(--font);
-  cursor: pointer;
-}
+.chat__resume-nudge:active { transform: scale(0.96); }
 
 .chat__offscreen-nudges > button + button { margin-top: 8px; }
 

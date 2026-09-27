@@ -6741,6 +6741,17 @@ def test_cleanup_terminal_staging_checkout_only_removes_disposable_clone():
     }
     assert _cleanup_terminal_staging_checkout(record) is True
     assert not candidate.exists()
+    # The emptied per-record folder goes with its checkout.
+    assert not candidate.parent.exists()
+
+  # Anything else in the record folder is left for a person to judge.
+  kept = data_dir / "contrib" / "terminal-cleanup-kept" / "repo"
+  (kept / ".git").mkdir(parents=True)
+  (kept.parent / "notes.md").write_text("owner notes")
+  record = {"status": "merged", "plan": {"repo_path": str(kept)}}
+  assert _cleanup_terminal_staging_checkout(record) is True
+  assert not kept.exists()
+  assert (kept.parent / "notes.md").read_text() == "owner notes"
 
   live_repo = data_dir / "apps" / "terminal-cleanup-live"
   (live_repo / ".git").mkdir(parents=True)
