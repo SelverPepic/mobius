@@ -1588,13 +1588,14 @@ export default function ChatView({
   // until some unrelated local event (like focusing the composer) causes a
   // refresh. While a turn or visible queue exists, poll the small chat state
   // payload and hydrate only runtime fields — do not replace the transcript.
-  const refreshRuntimeState = useCallback(async () => {
+  const refreshRuntimeState = useCallback(async ({ shared = false } = {}) => {
     const gen = fetchGenRef.current
     try {
-      const data = await sharedRuntimeRead(chatId, () => (
+      const read = () => (
         apiFetch(`/chats/${chatId}/runtime`, { timeoutMs: CHAT_FETCH_TIMEOUT_MS })
           .then(res => jsonOrThrow(res, 'Runtime refresh failed'))
-      ))
+      )
+      const data = await (shared ? sharedRuntimeRead(chatId, read) : read())
       if (chatIdStaleRef.current) return null
       // A running status alone must not attach a stream over a transcript that
       // never loaded; a resumed reply would then look like the whole chat.
@@ -1755,16 +1756,22 @@ export default function ChatView({
 
   // Every runtime reader in this view shares one read-and-apply per
   // generation; an old view's completion must not release a successor read.
-  // The network read beneath it is also shared across views of the same chat
-  // (runtimeReads.js).
-  const reconcileRuntimeState = useCallback(() => {
+  // Background refreshes (`shared`) also share the network read across views
+  // of the same chat (runtimeReads.js). A caller that just wrote (a steer, a
+  // run signal) reads fresh and never joins a shared read that may predate
+  // its write.
+  const reconcileRuntimeState = useCallback(({ shared = false } = {}) => {
     const generation = fetchGenRef.current
     const current = runtimeReconcileRef.current
-    if (current?.chatId === chatId && current.generation === generation) {
+    if (
+      current?.chatId === chatId
+      && current.generation === generation
+      && (shared || !current.shared)
+    ) {
       return current.promise
     }
-    const owner = { chatId, generation }
-    owner.promise = refreshRuntimeState().finally(() => {
+    const owner = { chatId, generation, shared }
+    owner.promise = refreshRuntimeState({ shared }).finally(() => {
       if (runtimeReconcileRef.current === owner) runtimeReconcileRef.current = null
     })
     runtimeReconcileRef.current = owner
@@ -5094,7 +5101,7 @@ export default function ChatView({
     let cancelled = false
     const run = () => {
       if (cancelled) return
-      reconcileRuntimeState()
+      reconcileRuntimeState({ shared: true })
         .then(runtime => {
           if (!cancelled && runtime) ensureRuntimeStreamConnected(runtime)
         })
@@ -5138,7 +5145,7 @@ export default function ChatView({
         return
       }
       void reconcileFailedSendOutbox({ authoritative: false })
-      reconcileRuntimeState().then(runtime => {
+      reconcileRuntimeState({ shared: true }).then(runtime => {
         if (!cancelled && runtime) ensureRuntimeStreamConnected(runtime)
       })
     }

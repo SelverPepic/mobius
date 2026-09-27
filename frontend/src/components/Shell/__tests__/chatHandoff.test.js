@@ -505,7 +505,7 @@ test('only a loaded transcript lets runtime evidence attach a stream or reread h
     /if \(sendingRef\.current && !force\) return[\s\S]{0,300}if \(!activationSettledRef\.current\) return\n/,
     'history refreshes wait for activation without reporting the ambiguous failure callers attach on')
   assert.match(chatView,
-    /await jsonOrThrow\(res, 'Runtime refresh failed'\)[\s\S]{0,300}if \(!activationSettledRef\.current\) return null/,
+    /jsonOrThrow\(res, 'Runtime refresh failed'\)[\s\S]{0,400}if \(!activationSettledRef\.current\) return null/,
     'runtime refreshes never attach before activation')
   assert.match(chatView,
     /const signalPending = \(\) => \([\s\S]{0,80}&& activationSettledRef\.current[\s\S]{0,120}\)\s*if \(externalReconcileInFlightRef\.current\) return[\s\S]*while \(signalPending\(\)\) \{\s*const previous = processedExternalSignalRef\.current[\s\S]*if \(signalPending\(\)\) queueMicrotask\(reconcileExternalActivity\)/,

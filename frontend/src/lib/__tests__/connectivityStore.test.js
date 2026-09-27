@@ -330,7 +330,7 @@ test('both durable streams feed recovery and an exhausted chat observes it', () 
   assert.match(chat, /const res = await fetch\([\s\S]*?reportNetworkReachable\(\)/)
   assert.match(
     chatView,
-    /const run = \(\{ recovery = false \} = \{\}\) => \{[\s\S]*?reconcileRuntimeState\(\)[\s\S]*?subscribeRecovery\([\s\S]*?getRecoverySnapshot\(\)[\s\S]*?run\(\{ recovery: true \}\)/,
+    /const run = \(\{ recovery = false \} = \{\}\) => \{[\s\S]*?reconcileRuntimeState\([^)]*\)[\s\S]*?subscribeRecovery\([\s\S]*?getRecoverySnapshot\(\)[\s\S]*?run\(\{ recovery: true \}\)/,
     'every mounted pane rechecks durable runtime after shared reachability recovers',
   )
   assert.match(chat, /catch \(err\) \{[\s\S]*?void verifyConnectivity\(\)/)
