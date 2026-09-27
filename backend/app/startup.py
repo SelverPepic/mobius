@@ -199,6 +199,12 @@ def _sweep_codex_provider_sessions(context: StartupContext) -> None:
       "provider session retention reclaimed %d bytes from %d Codex files",
       codex["reclaimed_bytes"], codex["removed_files"],
     )
+  stores = codex.get("stores") or {}
+  if codex.get("store_reclaimed_bytes") or not stores.get("complete", True):
+    context.logger.info(
+      "Codex store compaction reclaimed %d bytes (complete=%s)",
+      codex.get("store_reclaimed_bytes", 0), stores.get("complete"),
+    )
   if codex["errors"]:
     context.logger.warning(
       "provider session retention skipped %d Codex file(s)", codex["errors"],

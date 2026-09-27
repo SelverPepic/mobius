@@ -4,7 +4,8 @@ Möbius keeps provider homes on ``/data`` so chats can resume across container
 replacement. Codex does not currently age its rollout JSONL files there, so the
 archive grows forever even though Möbius already treats a missing old provider
 thread as a normal cold-resume case. This owner applies Möbius's 14-day provider
-default to Codex rollout files only.
+default to Codex rollout files, then bounds Codex's own SQLite stores and
+scratch space under the same lock (codex_store_compaction).
 
 Concurrency has two layers: web callers close runner admission while idle, and
 this filesystem owner takes the exclusive side of the cross-process Codex lock.
@@ -30,6 +31,9 @@ DEFAULT_RETENTION_DAYS = {
   "codex": 14,
 }
 MAX_FILES_PER_SWEEP = 10_000
+# Codex launches wait on the sweep lock and the periodic sweep holds runner
+# admission, so one pass does bounded store work; a backlog resumes next pass.
+STORE_COMPACTION_BUDGET_SECONDS = 10.0
 
 
 def sweep_stale_provider_sessions(
@@ -38,6 +42,7 @@ def sweep_stale_provider_sessions(
   now: float | None = None,
   max_age_days: int = DEFAULT_RETENTION_DAYS["codex"],
   max_files: int = MAX_FILES_PER_SWEEP,
+  store_budget_seconds: float | None = STORE_COMPACTION_BUDGET_SECONDS,
 ) -> dict:
   """Delete stale Codex rollout JSONL files and return a bounded summary.
 
@@ -61,9 +66,12 @@ def sweep_stale_provider_sessions(
       "reclaimed_bytes": 0,
       "errors": 0,
       "truncated": False,
+      "store_reclaimed_bytes": 0,
     }
     return result
-  cutoff = (time.time() if now is None else now) - max(0, max_age_days) * 86400
+  now = time.time() if now is None else now
+  cutoff = now - max(0, max_age_days) * 86400
+  stores: dict = {}
   scanned = removed = reclaimed = errors = 0
   truncated = False
 
@@ -105,6 +113,16 @@ def sweep_stale_provider_sessions(
           base.rmdir()
         except OSError:
           pass
+
+    try:
+      from app.codex_store_compaction import compact_codex_stores
+      stores = compact_codex_stores(
+        root.parent, now=now, rollout_cutoff=cutoff,
+        budget_seconds=store_budget_seconds,
+      )
+    except Exception as exc:
+      # Store upkeep is optional; rollout retention above already succeeded.
+      stores = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"[:200]}
   finally:
     ownership.release()
 
@@ -116,6 +134,8 @@ def sweep_stale_provider_sessions(
     "reclaimed_bytes": reclaimed,
     "errors": errors,
     "truncated": truncated,
+    "stores": stores,
+    "store_reclaimed_bytes": stores.get("reclaimed_bytes", 0),
   }
   return result
 

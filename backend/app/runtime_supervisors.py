@@ -551,6 +551,12 @@ class RuntimeSupervisors:
               "provider session retention reclaimed %d bytes from %d files",
               result["reclaimed_bytes"], result["removed_files"],
             )
+          if result.get("store_reclaimed_bytes"):
+            self.log.info(
+              "Codex store compaction reclaimed %d bytes (complete=%s)",
+              result["store_reclaimed_bytes"],
+              result.get("stores", {}).get("complete"),
+            )
           if result["errors"]:
             self.log.warning(
               "provider session retention skipped %d file(s)", result["errors"],
