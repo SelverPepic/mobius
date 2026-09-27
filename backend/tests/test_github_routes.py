@@ -90,6 +90,31 @@ def _prepared_review_publication_unavailable(monkeypatch):
   )
 
 
+@pytest.fixture(autouse=True)
+def _synthetic_repos_answer_the_canonical_diff(monkeypatch):
+  """Send hashes the byte-exact diff; fake repos still answer through ``_git``.
+
+  Real repositories keep the production path. Synthetic ones have no Git head
+  and script Git through a patched ``_git``, so route the one canonical diff
+  command there instead of spawning Git against an empty directory.
+  """
+  from app import github_contribution_git as git_ops
+  real = app_git._canonical_diff
+
+  def canonical(repo, base_sha, head_sha, *, read_only=False):
+    marker = Path(repo) / ".git"
+    if marker.is_file() or (marker / "HEAD").exists():
+      return real(repo, base_sha, head_sha, read_only=read_only)
+    proc = git_ops._git(
+      Path(repo), "-c", "core.quotePath=false", "diff", "--no-ext-diff",
+      "--no-color", "--binary", "--full-index", "--src-prefix=a/",
+      "--dst-prefix=b/", f"{base_sha}..{head_sha}", check=False,
+    )
+    return proc.stdout.encode("utf-8") if proc.returncode == 0 else None
+
+  monkeypatch.setattr(app_git, "_canonical_diff", canonical)
+
+
 def _set_client_id(monkeypatch, value):
   """Sets GITHUB_OAUTH_CLIENT_ID and drops the lru_cache so the next
   get_settings() reflects it. None means "device flow disabled", which is

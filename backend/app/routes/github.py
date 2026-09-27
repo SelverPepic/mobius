@@ -124,7 +124,6 @@ from app.github_contribution_git import (
   _assert_merges_with_upstream,
   fetch_upstream_head,
   _resolve_reviewed_commit,
-  _reviewed_branch_diff,
   _assert_fresh,
 )
 from app.storage_io import atomic_write

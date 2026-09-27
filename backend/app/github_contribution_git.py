@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import quote
 
-from app import github_auth
+from app import app_git, github_auth
 from app.contribution_errors import ContributionSubmitError
 from app.github_contribution_contract import (
   BRANCH_NAME as _BRANCH_NAME,
@@ -829,19 +829,17 @@ def _resolve_reviewed_commit(repo: Path, value: object, label: str) -> str:
 
 
 def _reviewed_branch_diff(repo: Path, base_sha: str, head_sha: str) -> bytes:
-  proc = _git(
-    repo,
-    "-c", "core.quotePath=false",
-    "diff",
-    "--no-ext-diff",
-    "--no-color",
-    "--binary",
-    "--full-index",
-    "--src-prefix=a/",
-    "--dst-prefix=b/",
-    f"{base_sha}..{head_sha}",
-  )
-  return proc.stdout.encode("utf-8")
+  """The byte-exact canonical diff that staging, review status and Send hash.
+
+  One definition only: decoding it as text would rewrite CR line endings and
+  fail on non-UTF-8 source, so Send would refuse a correctly staged record.
+  """
+  diff = app_git._canonical_diff(repo, base_sha, head_sha)
+  if diff is None:
+    raise ContributionSubmitError(
+      "Git could not compute the reviewed branch diff."
+    )
+  return diff
 
 
 def _assert_fresh(

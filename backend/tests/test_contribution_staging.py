@@ -323,3 +323,18 @@ def test_helper_stages_on_behalf_of_its_source_chat(staging):
   record = response.json()["record"]
   assert record["chat_id"] == "source-chat-1"
   assert record["chat_ids"] == ["source-chat-1"]
+
+
+def test_send_freshness_accepts_what_staging_hashed_for_crlf_source(staging):
+  """Staging, review status and Send share one byte-exact diff definition."""
+  from app.contribution_records import read_record, record_paths
+  from app.github_contribution_git import _assert_fresh
+
+  worktree = staging["worktree"]
+  (worktree / "win.txt").write_bytes(b"line one\r\nline two\r\n")
+  _git(worktree, "add", "win.txt")
+  _git(worktree, "commit", "-q", "-m", "Windows file", "-m", TRAILER)
+  record = staging["new_record"]().json()["record"]
+  assert staging["review"](record).status_code == 200
+  record_path, diff_path = record_paths(staging["app_id"], "greet")
+  _assert_fresh(read_record(record_path), diff_path, worktree, "fix/greet")
