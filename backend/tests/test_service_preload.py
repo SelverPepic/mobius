@@ -266,7 +266,7 @@ async def test_invoke_service_switches_to_the_preloaded_host_once_it_is_ready(tm
   app = SimpleNamespace(id=907, slug="demo", runtime_revision="rev-a")
   monkeypatch.setattr(app_services, "service_contract", lambda *a, **k: {"entry": "service.py"})
   monkeypatch.setattr(app_services, "service_entry", lambda *_a: entry)
-  monkeypatch.setattr(app_services, "service_environment", lambda *_a: _environment(
+  monkeypatch.setattr(app_services, "service_environment", lambda *_a, **_k: _environment(
     tmp_path, APP_TOKEN="fresh",
   ))
   envelope = {"schema": 1, "method": "GET", "path": "/", "query": {}, "headers": {}, "body": None}
