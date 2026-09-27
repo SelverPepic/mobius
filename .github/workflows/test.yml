@@ -279,6 +279,13 @@ jobs:
       - name: Verify timed Docker probe cleanup
         run: scripts/test-docker-probe.sh
 
+      - name: Verify the production boot transaction
+        # The e2e container below runs the disposable test runtime, which
+        # skips the image's boot transaction. Boot the production path on real
+        # restarts once per run so a broken transaction cannot reach main.
+        if: matrix.shard == 1
+        run: scripts/test-boot-transaction.sh mobius-test:ci
+
       - name: Start test container
         run: |
           # Image is already built and loaded above — compose uses it.
