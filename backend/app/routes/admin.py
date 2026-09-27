@@ -15,6 +15,7 @@ principal" — keeping one auth model reduces surface area.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timezone
 from typing import Any
@@ -25,7 +26,7 @@ from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app import activity, deployment_control, models
+from app import activity, deployment_control, models, platform_update
 from app.database import get_db
 from app.deps import (
   get_current_owner, get_current_owner_for_lifecycle_control,
@@ -290,9 +291,14 @@ async def prepare_external_container_cutover(
 async def rebuild_status(
   _: models.Owner = Depends(get_current_owner),
 ):
-  """Read the externally durable container-replacement operation."""
+  """Read the externally durable container-replacement operation, and apply
+  its outcome to the update bound to exactly that operation."""
   try:
-    return await deployment_control.read_rebuild_status()
+    status = await deployment_control.read_rebuild_status()
+    await asyncio.to_thread(
+      platform_update.reconcile_bound_operation, dict(status),
+    )
+    return status
   except deployment_control.DeploymentControlError as exc:
     raise HTTPException(
       status_code=exc.status_code,

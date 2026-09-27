@@ -195,3 +195,10 @@ test('replacement rollback copy distinguishes the image from source and data', (
   assert.match(modal, /newly installed source stay in place/)
   assert.doesNotMatch(modal, /previous working version/)
 })
+
+test('a settling update offers a check and the owner keep decision, never a new update', () => {
+  assert.match(updates, /stage === 'settling'/)
+  assert.match(updates, /settling\s*\n?\s*\? \{ label: phase === 'checking' \? 'Checking…' : 'Check again', act: check \}/)
+  assert.match(updates, /onClick=\{update\.keepSettling\}>Keep this version</)
+  assert.match(requests, /api\.platform\.keepSettlingUpdate\(\)/)
+})

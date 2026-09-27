@@ -28,6 +28,9 @@ export default function PlatformUpdates({ active, refreshToken, onOpenChat, iner
   // A prepared or installed update must finish (restart, or container
   // replacement) before another is offered.
   const unfinished = platform?.unfinished_update?.stage === 'finish' ? platform.unfinished_update : null
+  // A new container is running the update and its replacement is not yet
+  // confirmed; nothing else may start until it is.
+  const settling = platform?.unfinished_update?.stage === 'settling'
   const available = platform?.available || platform?.newer_updates_available
   const unavailable = !platform || platform.status_unavailable
   const activeRebuild = rebuildIsActive(rebuild)
@@ -80,6 +83,8 @@ export default function PlatformUpdates({ active, refreshToken, onOpenChat, iner
 
   const primary = conflict
     ? { label: platform?.conflict_chat_id ? 'Finish in chat' : 'Finish update', act: update.resolve }
+    : settling
+      ? { label: phase === 'checking' ? 'Checking…' : 'Check again', act: check }
     : unfinished?.action === 'restart'
       ? { label: confirmRestart === 'primary' ? 'Confirm restart' : 'Restart to finish', act: () => pressRestart('primary') }
     : unfinished
@@ -92,6 +97,7 @@ export default function PlatformUpdates({ active, refreshToken, onOpenChat, iner
           ? { label: confirmRestart === 'primary' ? 'Confirm restart' : 'Restart to finish', act: () => pressRestart('primary') }
           : { label: phase === 'checking' ? 'Checking…' : 'Check for updates', act: check }
   const status = activeRebuild ? rebuildStatusLine(rebuild)
+    : settling ? 'Confirming the new container…'
     : update.reconnecting ? (update.observingKind === 'apply' ? 'Checking the update…' : 'Restarting Möbius…')
       : !platform ? 'Checking update status…' : platformUpdateStatusLabel(platform)
 
@@ -130,6 +136,14 @@ export default function PlatformUpdates({ active, refreshToken, onOpenChat, iner
         </button>
       </div>
       {confirmRestart && <p className="platform-updates__description" role="status">Restarting briefly pauses active chats. This page will reconnect automatically. Confirm within 4 seconds, or let this prompt expire.</p>}
+      {settling && !busy && !activeRebuild && (
+        <div className="platform-updates__description">
+          <p>The new container is running this update. Möbius keeps the previous version ready until the replacement is confirmed; other updates wait until then.</p>
+          {rebuild && rebuild.state !== 'succeeded' && (
+            <button type="button" className="settings__btn settings__btn--sm settings__btn--outline" onClick={update.keepSettling}>Keep this version</button>
+          )}
+        </div>
+      )}
       {!busy && !unavailable && !conflict && restartNeeded && (
         <p className="platform-updates__description">Your changes are ready. You can add more updates before restarting once.</p>
       )}

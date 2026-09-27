@@ -137,24 +137,48 @@ target, and keeps the previous local tip reachable for recovery. A conflict
 stays in an isolated worktree while the old checkout remains served. Working
 edits are carried through as a transient commit and returned uncommitted.
 
-**Prepared updates swap at shutdown.** An update an agent resolves on the
-isolated copy (a committed conflict, or blockers handed over with **Fix with an
-agent**) and every combined source-and-container update are *prepared*, not
-applied: the answer is committed on the reviewed release, checked with the same
-startup check boot runs, and recorded in `.platform-prepared-update.json`. The
-live checkout keeps serving its snapshot, and nothing edited afterwards enters
-the update. The shutdown drain (a restart, or the container cutover when the
-update needs a new image) pauses every chat, saves the live state as one commit
-under `refs/mobius/update-late`, and points the checkout at the prepared commit,
-crash-safe through the reconcile marker. At boot the late edits merge back as
-local work onto the booted update, in-progress edits returning uncommitted; a
-conflict parks on a frozen copy for one resolver chat, and automatic chat
-resumes wait until it is merged. If the swapped-in version fails the boot
-script's startup check, the script returns to the saved commit and the server
-reports the update failed. While an update is parked or prepared, Settings
-offers only Finish update for it and plans for other releases are refused. A
-conflict with the owner's own uncommitted edits during an ordinary Apply still
-finishes on the live checkout under the reconcile lock.
+**Prepared updates swap at shutdown, or on their own image's boot.** An update
+an agent resolves on the isolated copy (a committed conflict, or blockers
+handed over with **Fix with an agent**) and every combined source-and-container
+update are *prepared*, not applied: the answer is committed on the reviewed
+release and recorded in `.platform-prepared-update.json`. The live checkout
+keeps serving its snapshot, and nothing edited afterwards enters the update.
+A restart-only update is checked with the same startup check boot runs and is
+swapped in by the shutdown drain: it pauses every chat, saves the live state as
+one commit under `refs/mobius/update-late`, and points the checkout at the
+prepared commit, crash-safe through the reconcile marker.
+
+An update that needs a new image (for example new Python packages or agent
+CLIs) is never swapped in by the outgoing container. The image owns its
+packages, so only a boot of exactly that image activates the source it
+requires: the entrypoint runs the image's own boot transaction
+(`app/platform_boot.py`) from the baked checkout, not from `/data/platform`,
+before the boot guard and the decisive import probe. On the target image it
+swaps the update in; on any other image (a replacement the controller rolled
+back) it returns a swapped-in update to its own saved `late` state, sets aside
+anything made on the update since it booted under
+`refs/mobius/platform-set-aside/`, and restores the bookkeeping the swap
+replaced. The same transaction merges late edits back (in-progress edits
+return uncommitted; a conflict parks on a frozen copy for one resolver chat,
+and automatic chat resumes wait until it is merged) and finishes a swap
+interrupted at any point. If the resulting tree fails its import probe, the
+transaction returns it to the saved state and the server reports the update
+failed. It publishes its `BOOT_PROTOCOL` for the running server, which lifts
+the refusal of package-changing updates only when its own image, the rollback
+target, understands the record it prepares.
+
+The record of an image-requiring update is bound to its exact replacement (the
+Railway operation, or an app nonce the self-hosted helper echoes) and settles
+only when that operation reports success while the target image serves the
+merged platform tree; until then Settings shows it as settling and refuses
+other updates, and the owner may keep it explicitly if the controller is
+unavailable. When the target image is already running, finishing takes a
+restart, not another replacement. Starting an older image under source from a
+newer release's packages (historical image-only rollback) is unsupported: the
+boot refuses it. While an update is parked or prepared, Settings offers only
+Finish update for it and plans for other releases are refused. A conflict with
+the owner's own uncommitted edits during an ordinary Apply still finishes on
+the live checkout under the reconcile lock.
 
 **"Update available" is an ancestry question, not a version-string compare:** an update is available iff `upstream`'s tip is **not yet an ancestor of `main`** (a new release has not been incorporated). This is the content question — "does my working tree already contain this release" — that a `image_sha != recorded_sha` proxy can't answer on a customized instance, and it's what eliminates phantom "update available" rows after a deploy that changed nothing the owner hadn't already.
 

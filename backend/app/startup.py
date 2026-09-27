@@ -380,10 +380,16 @@ async def _complete_platform_swap(context: StartupContext) -> None:
 
 
 def _confirm_platform_swap_loaded(context: StartupContext) -> None:
-  from app import platform_update
+  """Confirm an update this started server settles by itself, or start the
+  bounded check that waits for its container replacement's confirmation."""
+  from app import deployment_control, platform_update
 
   if platform_update.confirm_platform_swap_loaded():
     context.logger.info("platform update swap: confirmed loaded")
+    return
+  record = platform_update.read_prepared_update()
+  if record and record["operation"]:
+    deployment_control.schedule_settle_image_update_after_boot()
 
 
 def _reconcile_startup_chats(context: StartupContext) -> None:
@@ -641,7 +647,13 @@ DATABASE_STARTUP_TASKS = (
   StartupTask("backfill session links", _backfill_session_links),
   StartupTask("backfill prompt snapshots", _backfill_prompt_snapshots),
   StartupTask("fix forward chat media", _fix_forward_chat_media),
-  StartupTask("complete platform update swap", _complete_platform_swap),
+  # A checkout that cannot be placed relative to its update must not resume
+  # work (images without the boot transaction reach this path).
+  StartupTask(
+    "complete platform update swap",
+    _complete_platform_swap,
+    database_failure_reason="platform_update_swap_unplaced",
+  ),
   StartupTask("read restart authorization", _read_restart_authorization),
   StartupTask("freeze legacy app runtimes", _freeze_legacy_app_runtimes),
   StartupTask(

@@ -1399,6 +1399,7 @@ export const api = {
       body: JSON.stringify(plan),
     }),
     cancelUnfinishedUpdate: () => apiFetch('/platform/unfinished-update', { method: 'DELETE' }),
+    keepSettlingUpdate: () => apiFetch('/platform/unfinished-update/keep', { method: 'POST' }),
     parkForAgent: (plan) => apiFetch('/platform/park-for-agent', {
       method: 'POST',
       body: JSON.stringify(plan),

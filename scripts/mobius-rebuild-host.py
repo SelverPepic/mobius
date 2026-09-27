@@ -31,6 +31,9 @@ IMAGE_SOURCE = "https://github.com/mobius-os/mobius"
 ROLLBACK_TAG = f"{IMAGE}:mobius-rebuild-last-good"
 ACTIVE_STATES = {"queued", "preparing", "replacing", "verifying"}
 HANDOFF_VERSION = "external-cutover-v1"
+# Version 2 requests carry the app's nonce, echoed as ``request_nonce`` so the
+# app can tell its exact replacement's outcome from any earlier one.
+REQUEST_VERSIONS = [1, 2]
 
 
 def now() -> str:
@@ -147,6 +150,7 @@ def write_status(config_value: dict, **fields) -> dict:
         pass
     current.update(fields)
     current["handoff"] = HANDOFF_VERSION
+    current["request_versions"] = REQUEST_VERSIONS
     current.pop("runtime_overlay", None)
     current["updated_at"] = now()
     _atomic_json(STATUS, current)
@@ -389,6 +393,21 @@ def rollback(config_value: dict, operation: str, expected: str,
     return 1
 
 
+def parse_request(payload: dict) -> tuple[str, str | None]:
+    """The requested target and, for a version 2 request, the app's nonce."""
+    version = payload.get("version")
+    keys = {"version", "expected_sha"} | ({"nonce"} if version == 2 else set())
+    if version not in REQUEST_VERSIONS or set(payload) != keys:
+        raise ValueError("invalid replacement request")
+    expected = str(payload["expected_sha"])
+    if not SHA_RE.fullmatch(expected):
+        raise ValueError("invalid replacement target")
+    nonce = str(payload["nonce"]) if version == 2 else None
+    if nonce is not None and not OPERATION_RE.fullmatch(nonce):
+        raise ValueError("invalid replacement nonce")
+    return expected, nonce
+
+
 def run() -> int:
     config_value = config()
     request = config_value["control_dir"] / "inbox" / "request.json"
@@ -415,13 +434,9 @@ def run() -> int:
             os.replace(request, claimed)
             request_claimed = True
             payload = read_json(claimed)
-            if set(payload) != {"version", "expected_sha"} or payload["version"] != 1:
-                raise ValueError("invalid replacement request")
-            expected = str(payload["expected_sha"])
-            if not SHA_RE.fullmatch(expected):
-                raise ValueError("invalid replacement target")
+            expected, nonce = parse_request(payload)
             write_status(config_value, operation_id=operation, state="queued",
-                         expected_sha=expected, code=None,
+                         expected_sha=expected, request_nonce=nonce, code=None,
                          message="Container rebuild queued.")
             cid, previous = app_container(config_value)
             image_ref = f"{IMAGE}:sha-{expected}"

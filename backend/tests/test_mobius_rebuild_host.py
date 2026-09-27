@@ -538,3 +538,29 @@ def test_drain_requires_root_open_prepare_accept_order(tmp_path, monkeypatch):
 
   assert result is None
   assert order == ["open-cutover", "prepare", "accept-cutover"]
+
+
+def test_the_helper_accepts_both_request_versions_and_echoes_only_the_nonce():
+  assert host.parse_request({"version": 1, "expected_sha": "a" * 40}) == ("a" * 40, None)
+  assert host.parse_request({
+    "version": 2, "expected_sha": "a" * 40, "nonce": "b" * 32,
+  }) == ("a" * 40, "b" * 32)
+  for invalid in (
+    {"version": 1, "expected_sha": "a" * 40, "nonce": "b" * 32},
+    {"version": 2, "expected_sha": "a" * 40},
+    {"version": 2, "expected_sha": "a" * 40, "nonce": "not-a-nonce"},
+    {"version": 3, "expected_sha": "a" * 40},
+  ):
+    with pytest.raises(ValueError):
+      host.parse_request(invalid)
+
+
+def test_the_helper_advertises_the_request_versions_it_accepts(tmp_path, monkeypatch):
+  monkeypatch.setattr(host, "STATE_DIR", tmp_path / "state")
+  monkeypatch.setattr(host, "STATUS", tmp_path / "state" / "status.json")
+  control = tmp_path / "control"
+  control.mkdir()
+
+  status = host.write_status({"control_dir": control}, state="idle")
+
+  assert status["request_versions"] == [1, 2]
