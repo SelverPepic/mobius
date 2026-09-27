@@ -820,6 +820,9 @@ class ContributionStageBody(BaseModel):
   """
 
   chat_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9-]{1,64}$")
+  # An Autopilot round restages its open PR in place: the record stays public
+  # and the round's own ``/autopilot/update`` pushes the derived head.
+  autopilot_run_id: str | None = None
   repo_path: str | None = None
   repo: str | None = None
   source_repo_path: str | None = None
@@ -904,8 +907,8 @@ class AutopilotRespondBody(BaseModel):
 
 class AutopilotUpdateBody(BaseModel):
   run_id: str
-  # The head + reviewed-diff hash the agent recomputed and wrote to the record
-  # (CAS) before calling; the endpoint re-verifies both against the branch.
+  # The head + diff hash the round's in-place stage call derived onto the
+  # record; the endpoint re-verifies both against the branch.
   head_sha: str
   diff_sha256: str
   summary: str = ""
@@ -1698,7 +1701,15 @@ def _stage_inputs(
       or plan.get("action") == "pr_update"
       else "pr"
     )
-  if action == "pr_update" and (
+  in_place = bool(body.autopilot_run_id)
+  if in_place:
+    if previous is None or previous.get("status") not in ("open", "draft"):
+      raise ContributionSubmitError(
+        "An Autopilot round restages only its open pull request.",
+        code="not_stageable",
+      )
+    action = str(plan.get("action") or "pr")
+  if (action == "pr_update" or in_place) and (
     body.title is not None or body.body_draft is not None
   ):
     raise ContributionSubmitError(
@@ -1720,7 +1731,7 @@ def _stage_inputs(
     )
   _validate_branch(branch)
   live = None
-  if action == "pr_update":
+  if action == "pr_update" and not in_place:
     live = _autopilot_live_target(*_prepared_existing_pr_target(previous))
     if live.get("error"):
       raise ContributionSubmitError(
@@ -1741,7 +1752,7 @@ def _stage_inputs(
   return {
     "repo_path": repo_path, "repo": repo_slug, "branch": branch,
     "action": action, "live": live, "base_ref": base_ref,
-    "source_repo": source_repo,
+    "source_repo": source_repo, "in_place": in_place,
   }
 
 
@@ -1804,7 +1815,7 @@ def _stage_record(
     "source_sha": app_git.head_sha(source_repo, "HEAD"),
   })
   record.update({
-    "status": "prepared",
+    "status": previous["status"] if inputs["in_place"] else "prepared",
     "title": plan["title"],
     "branch": inputs["branch"],
     "updated_at": now,
@@ -1922,6 +1933,13 @@ async def stage_contribution(
   _validate_submit_app(app_id, principal, db)
   if not _CONTRIBUTION_ID.fullmatch(record_id):
     raise HTTPException(status_code=422, detail="Invalid contribution id.")
+  if body.autopilot_run_id is not None:
+    from app import contribution_autopilot as autopilot
+    _require_autopilot_agent(principal)
+    if not autopilot.verify_claim(
+      autopilot.get_row(db, app_id, record_id), body.autopilot_run_id,
+    ):
+      raise HTTPException(status_code=409, detail="No live round with this run_id.")
   db.close()
   record_path, diff_path = _record_paths(app_id, record_id)
 
@@ -6483,9 +6501,10 @@ async def autopilot_update(
 ):
   """Push a validated follow-up commit to this PR's branch (agent-called).
 
-  The single write path the follow-up agent has. The agent commits its fix on
-  the topic branch in the staging worktree and writes the new head + reviewed
-  diff hash onto the record (CAS) before calling. This endpoint binds the call
+  The single push path the follow-up agent has. The agent commits its fix on
+  the topic branch in the staging worktree and restages the open record in
+  place (``/stage`` with its ``autopilot_run_id``) before calling, so Git, not
+  the agent, derived the new head + diff hash. This endpoint binds the call
   to that reviewed state (``head_sha``/``diff_sha256`` must match the record's
   plan), enforces the source-only allowlist (contributing.md Hard stop #2), then
   reuses the full submit push path — same freshness, co-author trailer, and

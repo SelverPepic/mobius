@@ -407,3 +407,35 @@ def test_closing_an_unmerged_contribution_releases_its_draft_pin(staging):
 
   _settle_equivalence({**response["record"], "status": "closed"})
   assert _git(source, "for-each-ref", ref) == ""
+
+
+def test_autopilot_round_restages_its_open_pr_in_place(staging, monkeypatch):
+  from app import contribution_autopilot
+
+  record = staging["new_record"]().json()["record"]
+  path = (
+    Path(get_settings().data_dir) / "apps" / str(staging["app_id"])
+    / "contributions" / "greet.json"
+  )
+  path.write_text(json.dumps({
+    **record, "status": "open", "number": 7,
+    "url": "https://github.com/octo/project/pull/7",
+    "head_repository": "octo/project",
+  }))
+  monkeypatch.setattr(contribution_autopilot, "get_row", lambda *_: object())
+  monkeypatch.setattr(
+    contribution_autopilot, "verify_claim",
+    lambda _row, run_id: run_id == "round-1",
+  )
+  _commit(staging["worktree"], {"greet.py": REVISED}, "Answer review")
+
+  assert staging["stage"](autopilot_run_id="stale-round").status_code == 409
+  response = staging["stage"](autopilot_run_id="round-1")
+  assert response.status_code == 200, response.text
+  updated = response.json()["record"]
+  assert updated["status"] == "open"
+  assert updated["plan"]["action"] == "pr"
+  assert updated["plan"]["head_sha"] == _git(staging["worktree"], "rev-parse", "HEAD")
+  # The published revision reaches the live copy, as for any restage.
+  assert response.json()["source_sync"]["state"] == "adopted"
+  assert (staging["source"] / "greet.py").read_text() == REVISED
