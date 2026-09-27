@@ -487,6 +487,7 @@ def _host_options(
     _CLAUDE_NATIVE_SCHEDULING_TOOLS,
     _CLAUDE_UNUSED_BUILTINS,
     _claude_cli_path,
+    _system_prompt_with_register,
   )
   from app.connectors import claude_mcp_config_handle
   from app.platform_tools import claude_control_servers
@@ -503,7 +504,7 @@ def _host_options(
   def definition(effort: str | None) -> AgentDefinition:
     return AgentDefinition(
       description="A Möbius helper working on one delegated task.",
-      prompt=skill_text,
+      prompt=_system_prompt_with_register(skill_text),
       disallowedTools=blocked,
       effort=effort,
       model=model,

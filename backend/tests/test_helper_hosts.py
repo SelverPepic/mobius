@@ -335,3 +335,22 @@ def test_connector_capabilities_do_not_change_the_host_key(monkeypatch):
   first = chat_mod._helper_host_key(db, policy, provider_id="codex", connector_plan=plan("tok-1"))
   second = chat_mod._helper_host_key(db, policy, provider_id="codex", connector_plan=plan("tok-2"))
   assert first == second
+
+
+def test_every_hosted_helper_gets_the_claude_register(tmp_path):
+  """Hosted helpers get the same Claude register as a top-level turn."""
+  from contextlib import ExitStack
+  from types import SimpleNamespace
+
+  factory = claude_host._host_options(
+    key=SimpleNamespace(cwd=str(tmp_path)), host_env={},
+    skill_text="CONSTITUTION", connector_plan=None, skills_enabled=False,
+    model=None,
+  )
+  host = SimpleNamespace(stderr_tail=[], pre_tool_use=None, post_tool_use=None)
+  for resume in (None, "host-session"):
+    with ExitStack() as stack:
+      options = factory(host, resume, stack)
+    for agent in options.agents.values():
+      assert agent.prompt.startswith("CONSTITUTION")
+      assert "# Interruptions in Möbius" in agent.prompt
