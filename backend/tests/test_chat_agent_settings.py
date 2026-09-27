@@ -54,45 +54,6 @@ def _start_provider_turn(chat, provider_id: str = "claude") -> str:
   return run_token
 
 
-def _capture_claude_turn(chat, content: str = "hi") -> dict:
-  """Run one Claude turn through `_run_chat_impl`; return the runner kwargs.
-
-  The SDK runner is mocked, so no LLM call happens. Driven with asyncio.run
-  (the repo doesn't depend on pytest-asyncio).
-  """
-  from app import chat as chat_mod, schemas
-  from app.broadcast import create_broadcast
-
-  captured = {}
-
-  async def fake_runner(**kwargs):
-    captured.update(kwargs)
-    return {"session_id": "fake-session-id", "cost_usd": 0.0, "error": None}
-
-  async def _scenario():
-    create_broadcast(chat.id)
-    run_token = _start_provider_turn(chat)
-    await chat_mod._run_chat_impl(
-      messages=[schemas.ChatMessage(role="user", content=content)],
-      chat_id=chat.id,
-      session_id=None,
-      provider_id="claude",
-      run_gen=chat_mod.current_run_generation(chat.id),
-      run_token=run_token,
-    )
-
-  with patch(
-         "app.claude_sdk_runner.run_claude_sdk_turn",
-         side_effect=fake_runner,
-       ), \
-       patch(
-         "app.providers.ClaudeProvider.check_auth",
-         return_value=None,
-       ):
-    asyncio.run(_scenario())
-  return captured
-
-
 def test_effective_settings_falls_back_to_global(tmp_path):
   """No chat override → returns the global default unchanged."""
   shared = tmp_path / "shared"
@@ -669,12 +630,50 @@ def test_run_chat_passes_merged_settings_into_claude_sdk(
   """The smoke contract — when a chat has agent_settings_json,
   `_run_chat_impl` passes the merged dict into run_claude_sdk_turn
   via the `agent_settings` kwarg.
+
+  Mocks the SDK runner so no real LLM call happens; asserts the
+  kwarg shape only. Driven via asyncio.run to match the pattern in
+  test_codex_sdk_runner.py (the repo doesn't depend on pytest-asyncio).
   """
+  from app import chat as chat_mod, schemas
+
   _write_global_settings({"model": "global-default", "effort": "medium"})
   chat.agent_settings_json = {"model": "claude-opus-4-5"}
   db.commit()
 
-  captured = _capture_claude_turn(chat)
+  captured = {}
+
+  async def fake_runner(**kwargs):
+    captured.update(kwargs)
+    return {
+      "session_id": "fake-session-id",
+      "cost_usd": 0.0,
+      "error": None,
+    }
+
+  async def _scenario():
+    from app.broadcast import create_broadcast
+
+    create_broadcast(chat.id)
+    run_token = _start_provider_turn(chat)
+    await chat_mod._run_chat_impl(
+      messages=[schemas.ChatMessage(role="user", content="hi")],
+      chat_id=chat.id,
+      session_id=None,
+      provider_id="claude",
+      run_gen=chat_mod.current_run_generation(chat.id),
+      run_token=run_token,
+    )
+
+  with patch(
+         "app.claude_sdk_runner.run_claude_sdk_turn",
+         side_effect=fake_runner,
+       ), \
+       patch(
+         "app.providers.ClaudeProvider.check_auth",
+         return_value=None,
+       ):
+    asyncio.run(_scenario())
 
   assert "agent_settings" in captured, (
     "run_claude_sdk_turn must receive agent_settings"
@@ -693,26 +692,42 @@ def test_claude_receives_an_owner_goal_command_as_a_plain_request(
   """Claude's CLI has its own /goal. Möbius owns the command, so the agent's
   copy must never start with it: the CLI would echo the hidden context Möbius
   appends as a visible "Goal set:" reply and arm a second goal loop."""
-  prompt = _capture_claude_turn(chat, "/goal ship the fix")["user_message"]
+  from app import chat as chat_mod, schemas
+
+  captured = {}
+
+  async def fake_runner(**kwargs):
+    captured.update(kwargs)
+    return {"session_id": "fake-session-id", "cost_usd": 0.0, "error": None}
+
+  async def _scenario():
+    from app.broadcast import create_broadcast
+
+    create_broadcast(chat.id)
+    run_token = _start_provider_turn(chat)
+    await chat_mod._run_chat_impl(
+      messages=[schemas.ChatMessage(role="user", content="/goal ship the fix")],
+      chat_id=chat.id,
+      session_id=None,
+      provider_id="claude",
+      run_gen=chat_mod.current_run_generation(chat.id),
+      run_token=run_token,
+    )
+
+  with patch(
+         "app.claude_sdk_runner.run_claude_sdk_turn",
+         side_effect=fake_runner,
+       ), \
+       patch(
+         "app.providers.ClaudeProvider.check_auth",
+         return_value=None,
+       ):
+    asyncio.run(_scenario())
+
+  prompt = captured["user_message"]
   assert prompt.startswith("[Context — current time:")
   assert "Goal: ship the fix" in prompt
   assert not any(line.startswith("/goal") for line in prompt.splitlines())
-
-
-def test_turn_after_an_owner_stop_carries_the_stop_note(client, auth, chat, db):
-  """The turn after a Stop is told the Stop refused nothing it cut."""
-  from datetime import datetime
-
-  from app.chat_context import STOPPED_TURN_NOTE
-
-  db.add(models.ChatRun(
-    id=f"{chat.id}-stopped", chat_id=chat.id, status="stopped",
-    started_at=datetime(2026, 1, 1),
-  ))
-  db.commit()
-  prompt = _capture_claude_turn(chat, "carry on")["user_message"]
-  assert prompt.startswith("[Context — current time:")
-  assert prompt.index(STOPPED_TURN_NOTE) < prompt.index("carry on")
 
 
 def test_patch_model_only_with_cross_provider_model_switches_provider(
@@ -891,7 +906,7 @@ def test_run_chat_passes_deployed_skill_and_picker_settings(
   """A turn passes the deployed skill text plus the picker-chosen
   settings into the Claude runner. This is the only path now that the
   named-agent override has been removed."""
-  from app import chat as chat_mod
+  from app import chat as chat_mod, schemas
 
   _write_global_settings({"model": "global-default", "effort": "medium"})
   chat.agent_settings_json = {"model": "claude-opus-4-5"}
@@ -899,7 +914,34 @@ def test_run_chat_passes_deployed_skill_and_picker_settings(
 
   monkeypatch.setattr(chat_mod, "_read_skill_text", lambda: "DEPLOYED-SKILL")
 
-  captured = _capture_claude_turn(chat)
+  captured = {}
+
+  async def fake_runner(**kwargs):
+    captured.update(kwargs)
+    return {"session_id": "s", "cost_usd": 0.0, "error": None}
+
+  async def _scenario():
+    from app.broadcast import create_broadcast
+    create_broadcast(chat.id)
+    run_token = _start_provider_turn(chat)
+    await chat_mod._run_chat_impl(
+      messages=[schemas.ChatMessage(role="user", content="hi")],
+      chat_id=chat.id,
+      session_id=None,
+      provider_id="claude",
+      run_gen=chat_mod.current_run_generation(chat.id),
+      run_token=run_token,
+    )
+
+  with patch(
+         "app.claude_sdk_runner.run_claude_sdk_turn",
+         side_effect=fake_runner,
+       ), \
+       patch(
+         "app.providers.ClaudeProvider.check_auth",
+         return_value=None,
+       ):
+    asyncio.run(_scenario())
 
   assert captured["skill_text"].startswith("DEPLOYED-SKILL\n\n")
   assert "<agent_experience>" in captured["skill_text"]

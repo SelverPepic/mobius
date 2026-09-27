@@ -7,15 +7,12 @@ agent only ever saw an IANA timezone NAME, and only on turn 1).
 import re
 import time
 import uuid
-from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
 from app import models, schemas
 from app.chat_context import (
   MOBIUS_SLASH_COMMANDS,
-  STOPPED_TURN_NOTE,
-  _build_stopped_turn_context,
   _build_time_context,
   _chat_has_goal_intent,
   _goal_clear_requested,
@@ -116,30 +113,6 @@ def test_elapsed_ignores_automatic_continuation_marker(monkeypatch):
     db.commit()
 
     assert _last_user_message_elapsed(db, cid) == "3 days ago"
-  finally:
-    db.close()
-
-
-def test_stop_note_covers_only_the_turn_right_after_a_stop():
-  db = SessionLocal()
-  try:
-    for earlier, noted in (
-      (["completed", "stopped"], True),
-      # A Stop raced by the next send is closed by it as interrupted.
-      (["completed", "interrupted"], True),
-      (["stopped", "completed"], False),
-      ([], False),
-    ):
-      cid = f"stopped-turn-{uuid.uuid4()}"
-      db.add(models.Chat(id=cid, title="stopped turn", messages=[]))
-      for minute, status in enumerate([*earlier, "running"]):
-        db.add(models.ChatRun(
-          id=f"{cid}-{minute}", chat_id=cid, status=status,
-          started_at=datetime(2026, 9, 27, 10, minute),
-        ))
-      db.commit()
-      note = _build_stopped_turn_context(db, cid, f"{cid}-{len(earlier)}")
-      assert (note == STOPPED_TURN_NOTE) is noted
   finally:
     db.close()
 

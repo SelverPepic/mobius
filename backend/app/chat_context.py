@@ -92,38 +92,6 @@ def _last_user_message_elapsed(db, chat_id: str) -> str | None:
   return None
 
 
-# An interrupt that cuts a running tool call makes it look refused; it wasn't.
-CUT_CALL_NOT_REFUSED = (
-  "If that cut a running tool call, a result saying the user doesn't want to "
-  "proceed or rejected it came from the interruption, not from anyone "
-  "refusing the call; re-run it if it is still needed."
-)
-STOPPED_TURN_NOTE = (
-  f"[Your previous turn was stopped before it finished. {CUT_CALL_NOT_REFUSED}]"
-)
-
-
-def _build_stopped_turn_context(
-  db, chat_id: str, run_token: str | None,
-) -> str | None:
-  """The Stop note, for the first turn after one that was cut short.
-
-  A Stop saves its run as `stopped`, unless the next turn starts first and
-  closes it as `interrupted`; either way the call it cut was not refused.
-  """
-  query = db.query(models.ChatRun.status).filter(
-    models.ChatRun.chat_id == chat_id,
-  )
-  if run_token:
-    query = query.filter(models.ChatRun.id != run_token)
-  previous = query.order_by(
-    models.ChatRun.started_at.desc(), models.ChatRun.id.desc(),
-  ).first()
-  if previous is None or previous.status not in ("stopped", "interrupted"):
-    return None
-  return STOPPED_TURN_NOTE
-
-
 def _build_time_context(timezone: str | None, elapsed: str | None = None) -> str:
   """A one-line, per-turn time stamp injected into the user message.
 

@@ -74,7 +74,6 @@ from claude_agent_sdk.types import (
 )
 
 from app import activity, generated_files
-from app.chat_context import CUT_CALL_NOT_REFUSED
 from app.claude_events import (
   NativeContinuationTracker,
   _clip_task_text,
@@ -199,6 +198,14 @@ declare a durable Möbius Wait and confirm its saved receipt. Never end with
 is also turn-local; join and synthesize it. Helpers started with the Möbius
 `spawn_agent` tool are durable: their results reach this chat by themselves,
 so never wait on them.
+
+# Interruptions in Möbius
+
+Möbius interrupts you to deliver a message that arrives mid-turn, when the
+owner presses Stop, and before a restart. If that cuts a running tool call,
+the CLI reports it as "The user doesn't want to proceed with this tool
+use… STOP…". That is the interruption, not anyone refusing the call: never
+say the owner rejected or cancelled it, and re-run it if it is still needed.
 """
 # Cross-turn scheduling has one owner in Möbius: the durable Waiting lifecycle.
 # Provider-native schedulers cannot render its card, survive the same restart
@@ -801,27 +808,26 @@ class ActiveClaudeClient:
 def _steer_redirect_message(texts: list[str], *, from_person: bool) -> str:
   """Frame mid-turn input for the requery on the still-connected client.
 
-  A person's message is a conversational turn, not context to absorb: framing
-  it as "continue the same task" let agents fold a question into their work
-  and never answer it where the partner can see. Agent-originated carriers
-  (helper results, peer notes) remain context for the ongoing work.
+  A person's message is owed a visible acknowledgement (a question folded
+  silently into the work went unanswered), but it usually adds to the current
+  task rather than replacing it, so the agent keeps going unless it is told to
+  stop or change course. Agent-originated carriers (helper results, peer
+  notes) remain context for the ongoing work.
   """
   text = "\n\n".join(texts)
-  interrupted = (
-    f"Möbius interrupted your turn to deliver it. {CUT_CALL_NOT_REFUSED}"
-  )
   if from_person:
     return (
-      f"The partner sent this message while you were working. {interrupted} "
-      "Reply to the message in your visible response before continuing: "
-      "answer any question and acknowledge any correction or change of "
-      "direction. Then continue the task as the message directs:\n\n"
+      "The partner sent this message while you were working. It usually "
+      "adds to your current task rather than replacing it: unless it asks "
+      "you to stop or change course, keep going with what you were doing and "
+      "fold it in where it fits, or handle it once the current step is done. "
+      "Acknowledge it in your visible response and answer any question it "
+      "asks:\n\n"
       f"{text}"
     )
   return (
-    f"New context arrived while you were working. {interrupted} Incorporate "
-    "the context according to its stated authority and continue the same "
-    "task:\n\n"
+    "New context arrived while you were working. Incorporate it according "
+    "to its stated authority and continue the same task:\n\n"
     f"{text}"
   )
 
