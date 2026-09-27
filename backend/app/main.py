@@ -313,6 +313,7 @@ async def lifespan(app):
         exc_info=True,
       )
     record_memory_checkpoint("startup_ready")
+    supervisors.reclaim_boot_file_cache()
   try:
     yield
   finally:

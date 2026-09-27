@@ -441,3 +441,25 @@ async def test_stalled_delegation_wake_cannot_block_other_recovery(
   assert "autopilot-lease-recovery" in supervisors._tasks
   await supervisors.stop()
   assert supervisors._tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_boot_file_cache_reclaim_runs_off_the_event_loop_and_failure_stays_optional(
+  monkeypatch,
+):
+  import app.file_cache as file_cache
+  supervisors = _supervisors()
+  loop_thread = threading.get_ident()
+  calls = []
+
+  def reclaim(data_dir):
+    calls.append((data_dir, threading.get_ident()))
+    raise OSError("advice unavailable")
+
+  monkeypatch.setattr(file_cache, "reclaim_background_work_cache", reclaim)
+  supervisors.reclaim_boot_file_cache()
+  await supervisors._tasks["boot-file-cache-reclaim"]
+
+  assert [data_dir for data_dir, _thread in calls] == ["/tmp"]
+  assert calls[0][1] != loop_thread
+  await supervisors.stop()
