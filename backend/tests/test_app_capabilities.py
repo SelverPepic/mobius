@@ -65,6 +65,7 @@ def test_legacy_closed_defaults_do_not_manufacture_capability_changes():
     "added": [],
     "removed": [],
     "changed": [],
+    "widened": [],
   }
 
 
@@ -92,6 +93,7 @@ def test_legacy_public_storage_closed_shapes_equal_current_default(legacy_public
     "added": [],
     "removed": [],
     "changed": [],
+    "widened": [],
   }
 
 
@@ -135,6 +137,7 @@ def test_future_closed_default_does_not_manufacture_a_permission_change():
     "added": [],
     "removed": [],
     "changed": [],
+    "widened": [],
   }
 
 
@@ -686,6 +689,69 @@ def test_model_catalog_changes_are_not_access_changes():
   ))
   assert renamed == {
     "unknown_previous": False, "added": [], "removed": [], "changed": [],
+    "widened": [],
   }
   moved = diff_contracts(contract(), contract(base_url="https://other.example/v1"))
   assert moved["changed"] == ["model_provider.base_url"]
+
+
+def _contract(permissions=None, **over):
+  manifest = _manifest(**over)
+  manifest["permissions"].update(permissions or {})
+  contract, _digest = contract_and_digest(manifest)
+  return contract
+
+
+def test_update_review_asks_only_when_access_widens():
+  plain = _contract()
+  github = _contract(permissions={"github_access": True})
+  reader = _contract(permissions={"cross_app_access": "read"})
+  writer = _contract(permissions={"cross_app_access": "write"})
+
+  assert diff_contracts(plain, github)["widened"] == ["data.github_access"]
+  assert diff_contracts(github, plain)["removed"] == ["data.github_access"]
+  assert diff_contracts(github, plain)["widened"] == []
+  assert diff_contracts(reader, writer)["widened"] == ["data.cross_app_access"]
+  assert diff_contracts(writer, reader)["widened"] == []
+
+
+def test_shrinking_a_list_narrows_and_growing_it_widens():
+  one = _contract(skills=["alpha"])
+  two = _contract(skills=["alpha", "beta"])
+  other = _contract(skills=["gamma"])
+
+  assert diff_contracts(two, one)["widened"] == []
+  assert diff_contracts(one, two)["widened"] == ["agent.skills"]
+  assert diff_contracts(one, other)["widened"] == ["agent.skills"]
+
+
+def _speech(**limits):
+  return {"media.speech": {"version": 1, "reason": "Read aloud.", "limits": limits}}
+
+
+def test_removing_or_raising_a_limit_widens_but_adding_or_lowering_one_does_not():
+  capped = _contract(capabilities=_speech(max_text_chars=1000))
+  lower = _contract(capabilities=_speech(max_text_chars=500))
+  uncapped = _contract(capabilities=_speech())
+  path = "runtime.media.speech.limits.max_text_chars"
+
+  assert diff_contracts(capped, uncapped)["widened"] == [path]
+  assert diff_contracts(lower, capped)["widened"] == [path]
+  assert diff_contracts(capped, lower)["widened"] == []
+  assert diff_contracts(uncapped, capped)["widened"] == []
+
+
+def test_dropping_a_whole_capability_with_its_limit_narrows():
+  capped = _contract(capabilities=_speech(max_text_chars=1000))
+
+  report = diff_contracts(capped, _contract())
+
+  assert report["removed"]
+  assert report["widened"] == []
+
+
+def test_offline_contract_changes_never_ask_for_access():
+  online = _contract()
+  offline = _contract(offline_capable=True, offline={"reads": True, "writes": "none"})
+
+  assert diff_contracts(online, offline)["widened"] == []

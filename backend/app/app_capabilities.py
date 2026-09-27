@@ -812,12 +812,16 @@ def diff_contracts(
 ) -> dict[str, list[str] | bool]:
   """Return stable changed capability paths for update review.
 
-  Values are compared at leaf paths.  The UI owns severity/copy; the backend
-  only reports precise semantic changes and whether the prior contract was
-  unavailable (legacy install).
+  Values are compared at leaf paths.  The UI owns copy; the backend reports
+  precise semantic changes, whether the prior contract was unavailable
+  (legacy install), and which changed paths widen access (``widened``) so
+  the owner is asked only when an update grants more than before.
   """
   if not isinstance(installed, dict):
-    return {"unknown_previous": True, "added": [], "removed": [], "changed": []}
+    return {
+      "unknown_previous": True,
+      "added": [], "removed": [], "changed": [], "widened": [],
+    }
 
   def leaves(value: Any, prefix: str = "") -> dict[str, Any]:
     if isinstance(value, dict):
@@ -835,9 +839,56 @@ def diff_contracts(
   added = sorted(k for k in after.keys() - before.keys())
   removed = sorted(k for k in before.keys() - after.keys())
   changed = sorted(k for k in before.keys() & after.keys() if before[k] != after[k])
+  widened = sorted(
+    path for path in [*added, *removed, *changed]
+    if _widens(path, before.get(path), after.get(path), after)
+  )
   return {
     "unknown_previous": False,
     "added": added,
     "removed": removed,
     "changed": changed,
+    "widened": widened,
   }
+
+
+# Ordered grant levels for enumerated access values; a higher rank grants more.
+_ACCESS_RANKS = (
+  ("none", "read", "write"),
+  ("none", "summary", "summary_with_deleted"),
+)
+
+
+def _widens(path: str, before: Any, after: Any, after_leaves: dict) -> bool:
+  """Whether one semantic leaf change grants the app more than it had.
+
+  Update review asks the owner only for widening changes, so anything this
+  cannot rank is treated as widening. Closed values are already pruned, so a
+  missing leaf means "no grant" — except a limit, where a missing leaf means
+  "no ceiling" while its capability is still granted.
+  """
+  parts = path.split(".")
+  if parts[0] == "offline":
+    return False  # Offline behaviour describes the app; it grants nothing.
+  if "limits" in parts:
+    if after is None:  # Removed ceiling: wider unless the grant went too.
+      grant = ".".join(parts[:parts.index("limits")]) + "."
+      return any(
+        key.startswith(grant) and not key[len(grant):].startswith("limits.")
+        for key in after_leaves
+      )
+    if before is None:
+      return False  # A new ceiling only restricts.
+    if isinstance(before, (int, float)) and isinstance(after, (int, float)):
+      return after > before
+    return True
+  if after is None:
+    return False  # Removed grant.
+  if before is None:
+    return True  # New grant.
+  if isinstance(before, list) and isinstance(after, list):
+    return any(item not in before for item in after)
+  for ranks in _ACCESS_RANKS:
+    if before in ranks and after in ranks:
+      return ranks.index(after) > ranks.index(before)
+  return True
