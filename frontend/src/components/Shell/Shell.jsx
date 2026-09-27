@@ -1,4 +1,4 @@
-import { fetchFreshShellList } from './shellListReconciliation.js'
+import { fetchFreshShellList, letSystemStreamOwnListRefresh } from './shellListReconciliation.js'
 import { requestChatChanges } from '../../lib/chatChangesNavigation.js'
 import { lazy, Suspense, useState, useEffect, useLayoutEffect, useCallback, useMemo, useReducer, useRef } from 'react'
 import { flushSync } from 'react-dom'
@@ -554,6 +554,9 @@ export default function Shell({ onInitialVisualReady }) {
 
   const { loadTheme } = useTheme()
   const queryClient = useQueryClient()
+  // Before the list queries below mount: the system stream's open barrier is
+  // their live read (see reconcileSystemStateOnOpen).
+  useState(() => letSystemStreamOwnListRefresh(queryClient, [appQueries, chatQueries]))
   const recencyMarkedAppRef = useRef(null)
   useEffect(() => {
     if (activeView !== 'canvas' || activeAppId == null) {
@@ -2758,14 +2761,12 @@ export default function Shell({ onInitialVisualReady }) {
   // Holding chatsLoadedRef past first hydration would just delay an
   // already-correct call.
   //
-  // Defensive refetch: TanStack's default refetchOnMount + staleTime
-  // (30s in queryClient.js) can leave the persisted snapshot serving
-  // beyond a reload — if the snapshot was written <30s before the
-  // reload, the on-mount refetch is skipped as "fresh". When `prev`
-  // isn't in that snapshot, we'd otherwise wait forever for a live
-  // confirmation that never comes. Force a refetch in that case so
-  // `isFetchedAfterMount` eventually flips and demotion (or
-  // confirmation) actually runs.
+  // Live confirmation: a persisted snapshot hydrates without a mount-time
+  // refetch (letSystemStreamOwnListRefresh). The system stream's open barrier
+  // reads the list live on every (re)connect and reconnects if that read
+  // fails, so `isFetchedAfterMount` flips once it lands and demotion (or
+  // confirmation) runs then. Starting a separate read here would begin before
+  // the stream's subscription and always be discarded by the barrier.
   useEffect(() => {
     if (!chatsQuery.isFetched) return
     const liveFetched = chatsQuery.isSuccess
@@ -2775,15 +2776,10 @@ export default function Shell({ onInitialVisualReady }) {
     if (prevInChats) {
       // Cached data shows `prev` is valid. Keep it mounted as-is so
       // ChatView's scroll/spacer restore proceeds without remounting.
-      // BUT: if we're still on stale-cache hydration (not liveFetched),
-      // also nudge a refetch — the persisted snapshot can be a stale
-      // FALSE POSITIVE too (a chat the user deleted in another tab
-      // before reload still appears in the cache). Without the nudge,
-      // ChatView would mount on `prev`, fetch `/api/chats/{prev}`,
-      // 404, and show an error state for the full 30s staleTime
-      // window. The nudge resolves the situation in one round-trip.
+      // The persisted snapshot can be a stale FALSE POSITIVE (a chat
+      // deleted in another tab before reload); the stream's live read
+      // corrects it within one round-trip of connecting.
       knownExistingOffListChatIdsRef.current.delete(prev)
-      if (!liveFetched && !chatsQuery.isFetching) refreshChats()
       chatsLoadedRef.current = true
       return
     }
@@ -2810,11 +2806,8 @@ export default function Shell({ onInitialVisualReady }) {
       // from the server yet. Hold `prev` as a tentative restore —
       // ChatView mounts on it, and if it's gone server-side, the
       // 404 from ChatView's own fetch surfaces a retryable error
-      // instead of a silent chat-switch. Nudge the chats query in
-      // case TanStack's staleTime (30s in queryClient.js) skipped
-      // the on-mount refetch — without that nudge a fresh persisted
-      // snapshot pins us here indefinitely.
-      if (!chatsQuery.isFetching) refreshChats()
+      // instead of a silent chat-switch. The stream's live read
+      // re-runs this effect once it lands.
       chatsLoadedRef.current = true
       return
     }
@@ -2875,8 +2868,7 @@ export default function Shell({ onInitialVisualReady }) {
     })()
     return () => { cancelled = true }
   }, [chats, chatsQuery.isFetched, chatsQuery.isSuccess,
-      chatsQuery.isFetchedAfterMount, chatsQuery.isFetching,
-      refreshChats, dispatchWorkspace, applyModeDestination,
+      chatsQuery.isFetchedAfterMount, dispatchWorkspace, applyModeDestination,
       requestEmptySingleNewChat, workspaceStateRef, activeChatIdRef])
 
   // Handle non-content SSE events: theme changes, app updates, shell rebuilds.
