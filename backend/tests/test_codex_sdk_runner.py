@@ -428,6 +428,18 @@ def test_tool_completed_events_emit_output_before_end():
     {"type": "tool_end"},
   ]
 
+  assert codex_sdk_runner._tool_completed_events(
+    CommandExecutionThreadItem(""),
+    sdk,
+    streamed_command_output="first chunk\nsecond chunk\n",
+  ) == [
+    {
+      "type": "tool_output", "content": "first chunk\nsecond chunk",
+      "output_complete": True, "output_exit_code": 0,
+    },
+    {"type": "tool_end"},
+  ]
+
 
 def test_dynamic_tool_completion_marks_its_authoritative_result():
   class DynamicToolCallThreadItem:
@@ -1908,7 +1920,7 @@ def test_codex_lifecycle_maps_to_shared_task_chip_contract():
     "type": "task_start",
     "task_id": "thread-started:child",
     "description": "researcher",
-    "task_type": "researcher",
+    "task_type": "codex_agent",
     "tool_use_id": "host-1",
   }
   assert codex_events._public_task_event(

@@ -628,6 +628,86 @@ def test_delegation_listing_exposes_run_usage_without_loading_result(
   }
 
 
+@pytest.mark.parametrize("scope", ["read", "write"])
+def test_a_helper_starting_fresh_after_earlier_turns_keeps_its_task(
+  client, owner_token, db, monkeypatch, scope,
+):
+  """A helper whose first turn ended before any session was recorded (a
+  restart, a failed start) resumes in a fresh provider session. That session
+  must receive the helper's history, task first, not only the continuation;
+  a write helper is never replayed automatically."""
+  from app import chat as chat_mod, schemas
+  from app.broadcast import create_broadcast
+
+  task = "TASK_SENTINEL: audit the three Reflection runs"
+  continuation = "Resume the interrupted owner work after the planned server restart."
+  app = models.App(
+    slug=f"test-fresh-helper-{scope}",
+    source_dir=f"/tmp/mobius-tests/test-fresh-helper-{scope}",
+    name="Subagents", description="", jsx_source="",
+  )
+  db.add(app)
+  db.flush()
+  parent = models.Chat(id=f"parent-{scope}", title="Parent", messages=[])
+  child = models.Chat(
+    id=f"child-{scope}", title="Child", provider="claude",
+    created_by_app_id=app.id, session_id=None,
+    messages=[
+      {"role": "user", "content": task},
+      {"role": "assistant", "content": "PARTIAL_WORK_SENTINEL"},
+    ],
+  )
+  db.add_all((parent, child))
+  db.flush()
+  db.add(models.Delegation(
+    id=f"delegation-{scope}", app_id=app.id, parent_chat_id=parent.id,
+    parent_root_run_id="parent-root", task_key=f"fresh-{scope}",
+    child_chat_id=child.id, provider="claude", model=None, effort=None,
+    scope=scope, cwd="/data",
+    prompt_sha256=hashlib.sha256(task.encode()).hexdigest(),
+  ))
+  run_token = f"fresh-helper-{scope}"
+  db.add(make_goal_run(db,
+    id=run_token, root_run_id=run_token, chat_id=child.id,
+    status="running", provider="claude", provider_execution_admitted=False,
+  ))
+  db.commit()
+  monkeypatch.setattr("app.providers.ClaudeProvider.check_auth", lambda *a: None)
+  monkeypatch.setattr(
+    "app.providers.ClaudeProvider.ensure_auth", lambda *a: asyncio.sleep(0),
+  )
+  prompts = []
+
+  async def runner(**kwargs):
+    prompts.append(kwargs["user_message"])
+    return {"session_id": "helper-session", "cost_usd": 0.0, "error": None}
+
+  monkeypatch.setattr("app.claude_helper_host.run_claude_host_turn", runner)
+  monkeypatch.setattr("app.claude_sdk_runner.run_claude_sdk_turn", runner)
+  create_broadcast(child.id)
+
+  asyncio.run(chat_mod._run_chat_impl(
+    messages=[
+      schemas.ChatMessage(role="user", content=task),
+      schemas.ChatMessage(role="assistant", content="PARTIAL_WORK_SENTINEL"),
+      schemas.ChatMessage(role="user", content=continuation),
+    ],
+    chat_id=child.id, session_id=None, provider_id="claude",
+    run_token=run_token, run_gen=chat_mod.current_run_generation(child.id),
+  ))
+
+  db.expire_all()
+  if scope == "write":
+    assert prompts == []
+    final = db.get(models.Chat, child.id).messages[-1]
+    assert "DELEGATION_WRITE_REVIEW_REQUIRED" in str(final)
+    return
+  (prompt,) = prompts
+  assert prompt.index("TASK_SENTINEL") < prompt.index(
+    "PARTIAL_WORK_SENTINEL"
+  ) < prompt.index(continuation)
+
+
 def test_child_policy_is_integrity_checked_and_write_loss_needs_review(db):
   app = models.App(
     slug="test-delegations-116",
