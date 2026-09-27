@@ -883,13 +883,23 @@ def test_scan_keeps_interactive_cadence_when_change_events_are_unavailable(
   (fw_dirs["frontend"] / "src").mkdir()
 
   class NoEvents:
+    reaped = False
+
     def schedule(self, *_args, **_kwargs):
+      return None
+
+    def start(self):
+      # inotify_init runs when the observer starts, so the limit surfaces here.
       raise OSError("inotify instance limit reached")
+
+    def unschedule_all(self):
+      type(self).reaped = True
 
   monkeypatch.setattr(fw, "Observer", NoEvents)
   observers = fw._start_source_observers(_RecordingHandler())
   try:
     assert [type(o).__name__ for o in observers] == ["PollingObserverVFS"]
     assert observers[0].timeout == fw._POLL_INTERVAL_SECS
+    assert NoEvents.reaped, "a partially started change-event observer must be reaped"
   finally:
     fw._stop_observers(observers)

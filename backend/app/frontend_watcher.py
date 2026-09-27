@@ -179,6 +179,11 @@ def _start_source_observers(handler: FileSystemEventHandler) -> list[BaseObserve
     events.start()
     observers.append(events)
   except OSError as exc:
+    # Each source directory gets its own inotify instance, so hitting the
+    # instance or watch limit fails partway and leaves the earlier emitters
+    # running, each holding a thread and an fd that feed a queue nobody drains.
+    # Reap them so the degraded scan-only path leaves nothing behind.
+    events.unschedule_all()
     log.warning(
       "frontend change events unavailable (%s); scanning source every %ss",
       exc, _POLL_INTERVAL_SECS,
