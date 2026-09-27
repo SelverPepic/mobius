@@ -399,14 +399,15 @@ class AcknowledgeProviderSuccess(_Command):
   Provider admission is intentionally earlier: it prevents ambiguous replay
   of an execution attempt. It is not proof that the provider accepted the
   prompt. This later acknowledgement both heals an older provider-limit signal
-  and, when peer context was delivered, advances that delivery cursor in the
-  same writer-owned transaction.
+  and records what the provider received — the peer-note cursor and the Wait
+  results the turn carried — in the same writer-owned transaction.
   """
 
   chat_id: str = ""
   run_token: str = ""
   peer_message_through_created_at: datetime | None = None
   peer_message_through_id: str | None = None
+  wait_results: tuple[str, ...] = ()
 
 
 @dataclass
@@ -2643,7 +2644,7 @@ class ChatWriterActor:
   def _acknowledge_provider_success(
     self, db, cmd: AcknowledgeProviderSuccess,
   ) -> None:
-    """Heal availability and optionally advance peer delivery after success."""
+    """Heal availability and record what the provider received."""
     from app.models import ChatRun
 
     delivered_at = cmd.peer_message_through_created_at
@@ -2685,6 +2686,8 @@ class ChatWriterActor:
     clear_provider_availability_after_success(
       db, run.provider, run.started_at,
     )
+    from app.chat_waits import stage_wait_results_delivered
+    stage_wait_results_delivered(db, cmd.chat_id, cmd.wait_results)
     if not _commit_or_rollback(db):
       raise _PersistFailed("AcknowledgeProviderSuccess did not persist")
 
