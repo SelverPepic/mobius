@@ -1176,7 +1176,8 @@ test.describe('Stream reconnection', () => {
     await expect(page.locator('[data-chat-surface="painted"] .chat__scroll'))
       .toContainText('A couple of choices:')
     const goalRail = page.getByRole('group', { name: 'Goal progress' })
-    await expect(goalRail).toContainText(`Goal · ${GOAL}`)
+    // An open card makes the goal wait on the owner.
+    await expect(goalRail).toContainText(`Goal · Needs your answer · ${GOAL}`)
 
     // A preserved draft remains editable, but the question barrier owns the
     // action slot: offer Stop rather than a Send that can only receive 409.

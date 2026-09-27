@@ -405,7 +405,9 @@ test('a blocked apply stays open, focuses its result, and shows resolver failure
 
   await page.locator('.urm__overlay').click({ position: { x: 2, y: 2 } })
   await expect(blocked).toHaveCount(0)
-  await expect(page.getByRole('button', { name: 'Resolve in chat' })).toBeFocused()
+  // After the dialog, the Settings conflict action finishes the update (#1395).
+  await expect(page.locator('.platform-updates')
+    .getByRole('button', { name: 'Finish update', exact: true })).toBeFocused()
 })
 
 test('a predicted overlap goes straight to an agent without applying', async ({ page }) => {
@@ -548,7 +550,9 @@ test('a conflict result closes to truthful repair state when status reads fail',
   await result.getByRole('button', { name: 'Not now' }).click()
   await expect(result).toHaveCount(0)
   await expect(page.getByText('Update blocked', { exact: true })).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Resolve in chat' })).toBeFocused()
+  // After the dialog, the Settings conflict action finishes the update (#1395).
+  await expect(page.locator('.platform-updates')
+    .getByRole('button', { name: 'Finish update', exact: true })).toBeFocused()
 })
 
 test('a rollback result keeps an explicit repair action when status reads fail', async ({ page }) => {

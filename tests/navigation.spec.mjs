@@ -1167,12 +1167,23 @@ test.describe('Touch navigation', () => {
         }).observe(document.body, { childList: true, subtree: true, attributes: true })
       }, requestedId)
 
-      // A focus return refetches the chat list while the create is still held.
+      // A return after a long absence reconnects the system stream, which
+      // re-reads the chat list while the create is still held. Back-date the
+      // hide past the quick-wake window (SYSTEM_QUICK_WAKE_MS, 10s) rather than
+      // waiting it out.
       const listRefresh = page.waitForResponse(response => (
         response.request().method() === 'GET'
         && /\/api\/chats(?:\?.*)?$/.test(response.url())
       ))
-      await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
+      await page.evaluate(() => {
+        const realNow = Date.now
+        Date.now = () => realNow() - 11_000
+        Object.defineProperty(document, 'visibilityState', { value: 'hidden', configurable: true })
+        document.dispatchEvent(new Event('visibilitychange'))
+        Date.now = realNow
+        Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true })
+        document.dispatchEvent(new Event('visibilitychange'))
+      })
       await listRefresh
       await page.evaluate(() => new Promise(resolve => (
         requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(resolve, 250)))

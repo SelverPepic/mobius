@@ -148,7 +148,11 @@ for (const acknowledgement of ['detail', 'replay']) {
     // until the second POST. Otherwise detail is authoritative and may settle
     // the answer before a retry; making both race for a required second POST
     // tests scheduling, not preservation or exactly-once effects.
-    await page.evaluate(() => window.dispatchEvent(new Event('online')))
+    // The interactive answer went out and its acknowledgement was lost; only
+    // then does delivery retry, on a genuine offline -> online readiness edge.
+    await expect.poll(() => f.attempts.length).toBe(1)
+    const network = await disconnectDelivery(page)
+    await network.reconnect()
     if (acknowledgement === 'replay') {
       await expect.poll(() => f.attempts.length).toBe(2)
     }
