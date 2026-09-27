@@ -417,6 +417,10 @@ export default function ChatView({
 }) {
   const queryClient = useQueryClient()
   const provisionalNewChat = !!newChatSession && !newChatSession.materialized
+  // A provisional New Chat has no server row until its create commits, so it
+  // has no transcript or runtime to read.
+  const provisionalNewChatRef = useRef(provisionalNewChat)
+  provisionalNewChatRef.current = provisionalNewChat
   const hiddenRef = useRef(hidden)
   hiddenRef.current = hidden
   // A drawer search may target a ChatView that is already mounted. Subscribe
@@ -1390,6 +1394,7 @@ export default function ChatView({
     // attaches the live stream (see settleRuntime). Like a superseded read,
     // this is not the ambiguous `null` that callers may attach on.
     if (!activationSettledRef.current) return
+    if (provisionalNewChatRef.current) return
     const gen = fetchGenRef.current
     try {
       const res = await apiFetch(
@@ -1589,6 +1594,7 @@ export default function ChatView({
   // refresh. While a turn or visible queue exists, poll the small chat state
   // payload and hydrate only runtime fields — do not replace the transcript.
   const refreshRuntimeState = useCallback(async ({ shared = false } = {}) => {
+    if (provisionalNewChatRef.current) return null
     const gen = fetchGenRef.current
     try {
       const read = () => (
