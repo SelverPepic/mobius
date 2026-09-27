@@ -28,6 +28,28 @@ def test_trial_provider_requires_linked_broker(monkeypatch, tmp_path):
   assert provider.check_auth(str(tmp_path)) is None
 
 
+def test_out_of_credit_reads_spendable_balance_and_fails_open(monkeypatch):
+  provider = _provider()
+
+  def balance(spendable):
+    monkeypatch.setattr(
+      provider, "trial_status",
+      lambda: {"balance": {"spendable_units": spendable}},
+    )
+
+  balance(0)
+  assert provider.out_of_credit() is True
+  # Top-up credit counts whatever the trial's state.
+  balance(1_250_000)
+  assert provider.out_of_credit() is False
+
+  def unreachable():
+    raise OSError("broker down")
+
+  monkeypatch.setattr(provider, "trial_status", unreachable)
+  assert provider.out_of_credit() is False
+
+
 def test_trial_provider_config_uses_only_local_broker_marker(tmp_path):
   provider = _provider()
   env = provider.build_env(

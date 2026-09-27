@@ -85,7 +85,7 @@ import {
 } from './providerSwitch.js'
 import {
   PROVIDER_AVAILABILITY_PHASE,
-  mobiusTrialAttention,
+  mobiusOutOfCredit,
   resolveProviderAvailability,
   visibleProviderModels,
 } from '../../lib/providerAvailability.js'
@@ -140,7 +140,6 @@ export default function ChatSettingsPanel({
   // its retry id and error feedback.
   providerSwitchState,
   providerUsage = null,
-  onOpenMobiusYou,
 }) {
   const [saving, setSaving] = useState(false)
   const [localError, setLocalError] = useState('')
@@ -165,9 +164,6 @@ export default function ChatSettingsPanel({
   const registry = registryQuery.data
   const prefs = prefsQuery.data
   const availability = resolveProviderAvailability(providerStatusQuery)
-  // A linked Möbius trial that can't currently be used stays selectable (the
-  // row is real), but its label must be honest and offer activation.
-  const mobiusAttention = mobiusTrialAttention(providerStatusQuery.data?.mobius)
   const availabilitySettled = (
     availability.phase !== PROVIDER_AVAILABILITY_PHASE.LOADING
   )
@@ -674,11 +670,11 @@ export default function ChatSettingsPanel({
                     <span>{m.label}</span>
                   </span>
                   <span className="csp-row__sub">
-                    {providerConfigured
-                      ? (pid === 'mobius' && mobiusAttention
-                          ? `${info.label} · ${mobiusAttention.label}`
-                          : info.label)
-                      : `${info.label} · Not connected`}
+                    {!providerConfigured
+                      ? `${info.label} · Not connected`
+                      : pid === 'mobius' && mobiusOutOfCredit(providerStatusQuery.data?.mobius)
+                        ? `${info.label} · No credit`
+                        : info.label}
                   </span>
                 </span>
                 <span className="csp-row__dot" />
@@ -731,16 +727,6 @@ export default function ChatSettingsPanel({
           )
         })
       })}
-      {dataReady && mobiusAttention && availability.configuredProviders.has('mobius') && (
-        <div className="csp__availability-warning" role="status">
-          <span>{`Möbius trial: ${mobiusAttention.subtitle}`}</span>
-          {onOpenMobiusYou && (
-            <button type="button" onClick={onOpenMobiusYou}>
-              Open Möbius · You
-            </button>
-          )}
-        </div>
-      )}
       {onAutoResumeChange && (
         <div className="csp__automation">
           <div className="csp__automation-row">

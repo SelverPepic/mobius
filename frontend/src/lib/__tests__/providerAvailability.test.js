@@ -4,7 +4,7 @@ import {
   PROVIDER_AVAILABILITY_PHASE,
   configuredProviderOrder,
   configuredProviderSet,
-  mobiusTrialAttention,
+  mobiusOutOfCredit,
   providerAvailabilityNeedsAttention,
   resolveProviderAvailability,
   visibleProviderModels,
@@ -75,36 +75,10 @@ test('attention means status failure or no configured provider, not optional dis
   }), false)
 })
 
-test('mobius trial attention stays silent when usable or state is unknown', () => {
-  // No lifecycle field (app/embed caller, signed out, or unreachable account).
-  assert.equal(mobiusTrialAttention(undefined), null)
-  assert.equal(mobiusTrialAttention({}), null)
-  // A usable trial keeps the normal "Trial active" presentation.
-  assert.equal(
-    mobiusTrialAttention({ trial_state: 'active', trial_usable: true }),
-    null,
-  )
-})
-
-test('mobius trial attention labels each unusable lifecycle state', () => {
-  const ready = mobiusTrialAttention({
-    trial_state: 'ready', trial_usable: false, needs_activation: true,
-  })
-  assert.equal(ready.label, 'Needs activation')
-  assert.equal(ready.needsActivation, true)
-  assert.match(ready.subtitle, /\$2 trial/)
-
-  assert.equal(
-    mobiusTrialAttention({ trial_state: 'expired', trial_usable: false }).label,
-    'Trial expired',
-  )
-  assert.equal(
-    mobiusTrialAttention({ trial_state: 'ineligible', trial_usable: false }).label,
-    'Trial unavailable',
-  )
-  // active but out of credit is a distinct unusable case.
-  assert.equal(
-    mobiusTrialAttention({ trial_state: 'active', trial_usable: false }).label,
-    'No credit',
-  )
+test('Möbius is out of credit only when its balance says nothing is spendable', () => {
+  assert.equal(mobiusOutOfCredit({ trial: { balance: { spendable_units: 0 } } }), true)
+  assert.equal(mobiusOutOfCredit({ trial: { balance: { spendable_units: 1_250_000 } } }), false)
+  // No balance (signed out, app caller, broker unreachable) is not a verdict.
+  assert.equal(mobiusOutOfCredit({ trial: null }), false)
+  assert.equal(mobiusOutOfCredit(undefined), false)
 })

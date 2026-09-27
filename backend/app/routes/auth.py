@@ -883,24 +883,6 @@ async def providers_status(
         out[pid]["trial"] = await run_in_threadpool(provider.trial_status)
       except Exception:
         out[pid]["trial"] = None
-      # The credential preflight stays green while a trial is merely
-      # not-yet-activated / ended / ineligible so the model row remains
-      # visible and selectable. Surface the real lifecycle state so the
-      # picker and Settings can show an accurate label + activation
-      # affordance instead of a false "Trial active". Best-effort: a signed
-      # out or unreachable account leaves these fields absent.
-      try:
-        from app.routes.identity import mobius_trial_resolution
-        owner = db.query(models.Owner).first()
-        resolution = (
-          await mobius_trial_resolution(db, owner.id) if owner else None
-        )
-      except Exception:
-        resolution = None
-      if resolution is not None:
-        out[pid]["trial_state"] = resolution["state"]
-        out[pid]["trial_usable"] = resolution["usable"]
-        out[pid]["needs_activation"] = resolution["needs_activation"]
   return out
 
 
