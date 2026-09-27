@@ -269,9 +269,13 @@ jobs:
         # The SDK is pinned and installed only in the production image. Run its
         # focused, offline contract tests there so slim host CI cannot silently
         # skip the exact provider surface Mobius serves.
+        # The container is disposable, so its database is too; say so, or
+        # app.database refuses to create an engine in a test process.
         run: >-
           docker run --rm
           --entrypoint python
+          -e MOBIUS_TEST_DATABASE_ISOLATED=1
+          -e DATABASE_URL=sqlite:////tmp/codex-contract.db
           -v "$PWD/backend/tests/test_codex_sdk_contract.py:/app/test_codex_sdk_contract.py:ro"
           mobius-test:ci
           -m pytest -q /app/test_codex_sdk_contract.py
