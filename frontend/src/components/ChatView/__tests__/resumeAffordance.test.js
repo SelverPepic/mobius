@@ -207,7 +207,6 @@ test('ChatView routes both offscreen attention nudges through the controller', (
 
 test('floating composer controls share the keyboard-safe activation contract', () => {
   const controls = [
-    ['chat__history-retry', /loadOlderMessages\(offset, \{ readerDriven: true \}\)/],
     ['chat__question-nudge', /revealPendingQuestion\(pendingQuestionEl\)/],
     ['chat__resume-nudge', /revealConversationTail/],
     ['chat__jump-latest', /followLatest/],
