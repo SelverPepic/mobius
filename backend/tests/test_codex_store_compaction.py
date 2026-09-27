@@ -5,7 +5,7 @@ import time
 import pytest
 
 from app import codex_store_compaction as compaction
-from app.codex_session_lock import acquire_codex_session_activity
+from app.codex_session_lock import acquire_codex_session_activity, codex_home_in_use
 from app.provider_session_retention import sweep_stale_provider_sessions
 
 NOW = 1_790_000_000.0
@@ -266,3 +266,31 @@ def test_a_spent_budget_never_starts_a_rebuild(tmp_path, monkeypatch):
   resumed = _compact(tmp_path)
   assert "VACUUM" in statements
   assert resumed["state"]["status"] == "completed"
+
+
+def test_an_open_codex_file_marks_codex_busy_even_without_the_launcher_lock(tmp_path):
+  home = tmp_path / "cli-auth" / "codex"
+  (home / "sessions").mkdir(parents=True)
+  rollout = home / "sessions" / "rollout-cli.jsonl"
+  rollout.write_text("{}")
+
+  assert codex_home_in_use(tmp_path) is False
+  with rollout.open():
+    assert codex_home_in_use(tmp_path) is True
+  assert codex_home_in_use(tmp_path) is False
+
+
+def test_sweep_leaves_codex_alone_while_an_unlocked_codex_holds_its_files(tmp_path):
+  """A Codex CLI started from an agent shell takes no Möbius lock."""
+  home = tmp_path / "cli-auth" / "codex"
+  home.mkdir(parents=True)
+  _logs(home, [5] * 20)
+
+  with (home / "logs_2.sqlite").open("rb"):
+    busy = sweep_stale_provider_sessions(tmp_path, now=NOW)
+  assert busy["status"] == "skipped_active"
+  assert _count(home / "logs_2.sqlite", "SELECT count(*) FROM logs") == 20
+
+  idle = sweep_stale_provider_sessions(tmp_path, now=NOW)
+  assert idle["status"] == "completed"
+  assert _count(home / "logs_2.sqlite", "SELECT count(*) FROM logs") == 0

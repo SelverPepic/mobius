@@ -85,26 +85,6 @@ class RunnerRegistry:
       self._admission_leases.add(lease)
       return lease
 
-  def acquire_quiescing_admission_lease(self) -> object | None:
-    """Close admission so existing runners can drain for bounded maintenance.
-
-    Unlike ``acquire_idle_admission_lease``, this may be acquired while a
-    runner is still active.  The caller must wait for ``is_idle`` before it
-    touches provider state, and must always release the lease.  No existing
-    runner is stopped by this boundary.
-    """
-    with self._admission_lock:
-      if self._admission_closed or self._admission_leases:
-        return None
-      lease = object()
-      self._admission_leases.add(lease)
-      return lease
-
-  def is_idle(self) -> bool:
-    """Return whether no runner has reserved or holds an active slot."""
-    with self._admission_lock:
-      return not self._starting and not self._handles
-
   def release_admission_lease(self, lease: object) -> None:
     """Release exactly one maintenance owner's admission closure."""
     with self._admission_lock:

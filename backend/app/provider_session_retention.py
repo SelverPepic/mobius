@@ -54,9 +54,14 @@ def sweep_stale_provider_sessions(
   rescanning a prefix of recent files.
   """
   root = Path(data_dir) / "cli-auth" / "codex" / "sessions"
-  from app.codex_session_lock import try_acquire_codex_session_sweep
+  from app.codex_session_lock import codex_home_in_use, try_acquire_codex_session_sweep
 
   ownership = try_acquire_codex_session_sweep(data_dir)
+  if ownership is not None and codex_home_in_use(data_dir):
+    # A Codex started outside Möbius's launchers holds no lock but does hold
+    # its files open; its rollouts and stores are just as live.
+    ownership.release()
+    ownership = None
   if ownership is None:
     result = {
       "status": "skipped_active",
