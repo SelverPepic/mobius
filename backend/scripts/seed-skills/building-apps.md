@@ -757,6 +757,9 @@ useEffect(() => {
 - **Viewer variant:** to display an EXISTING chat owned by this app (including a
   same-app cron-attributed daily chat resolved from a `meta.json`), pass an explicit
   `chatId` and no `persist` — the helper just mounts it read-through.
+  `GET /api/app-chats` lists this app's chats; each entry's `running` says a
+  turn is live and `awaiting_owner` says a question card is waiting, so a list
+  can show status without reading transcripts.
 - Keep the chat as the interaction surface; it gives the user a persistent
   transcript, normal agent tooling, and follow-up questions in one place.
 
