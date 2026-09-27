@@ -399,6 +399,7 @@ def _switch_request_fingerprint(provider_id: str, settings_patch: dict) -> str:
 
 
 _visible_in_owner_drawer = visible_in_owner_drawer
+_MAX_CHAT_SUMMARY_IDS = 200
 
 
 @router.post(
@@ -683,6 +684,19 @@ def _chat_detail_response(
       projected_message["wait_summaries"] = summaries
       next_page[relative_index] = projected_message
     page = next_page
+  from app.continuations import recovery_reasons_by_run_id
+  recovery_reasons = recovery_reasons_by_run_id(db, chat.id, [
+    message["id"] for message in page
+    if message.get("role") == "assistant" and isinstance(message.get("id"), str)
+  ])
+  if recovery_reasons:
+    next_page = list(page)
+    for relative_index, message in enumerate(page):
+      reason = recovery_reasons.get(message.get("id"))
+      if message.get("role") != "assistant" or reason is None:
+        continue
+      next_page[relative_index] = {**message, "continuation_reason": reason}
+    page = next_page
 
   settings_obj = _coerce_agent_settings(chat.agent_settings_json) or None
   # The picker's current model must match what a message would actually use. A
@@ -766,11 +780,24 @@ def _chat_detail_response(
 @router.get("")
 def list_chats(
   include_app_chats: bool = False,
+  ids: list[str] | None = Query(default=None),
   _: models.Owner = Depends(get_current_owner),
   db: Session = Depends(get_db),
 ):
-  """Returns all active chats ordered by most recently updated."""
-  record_memory_checkpoint_once("shell_chat_list_first_request")
+  """Returns all active chats ordered by most recently updated.
+
+  ``ids`` narrows the same projection to those chats so a run or wait event
+  can refresh its rows without re-reading the whole list. An id missing from
+  the answer is deleted or no longer visible; the caller drops that row.
+  """
+  if ids is not None and len(ids) > _MAX_CHAT_SUMMARY_IDS:
+    raise HTTPException(
+      status_code=422,
+      detail=f"At most {_MAX_CHAT_SUMMARY_IDS} chat ids per request.",
+    )
+  if ids is None:
+    # Startup memory evidence describes the complete drawer read, not a row refresh.
+    record_memory_checkpoint_once("shell_chat_list_first_request")
 
   # Pinned chats sort first (newest pin at top of the pinned group),
   # then unpinned by owner-send recency. `activity_at` is the drawer
@@ -823,6 +850,8 @@ def list_chats(
   ).filter(
     models.Chat.deleted_at.is_(None),
   )
+  if ids is not None:
+    q = q.filter(models.Chat.id.in_(ids))
   chats = (
     q.order_by(
       models.Chat.pinned_at.is_(None),
@@ -846,10 +875,11 @@ def list_chats(
     db, (chat.id for chat in chats),
   )
   secure_input_chats = secure_inputs.pending_chat_ids()
-  record_memory_checkpoint_once(
-    "shell_chat_list_first_response",
-    chat_count=len(chats),
-  )
+  if ids is None:
+    record_memory_checkpoint_once(
+      "shell_chat_list_first_response",
+      chat_count=len(chats),
+    )
   return [
     _owner_chat_summary(
       chat,
@@ -3259,6 +3289,9 @@ def create_app_chat(
   chat = models.Chat(
     id=str(uuid.uuid4()),
     title=body.title or "New chat",
+    # An app that names its chat chose that name deliberately, like an owner
+    # rename: neither the first message nor a generated name replaces it.
+    title_locked=bool(body.title),
     messages=[],
     provider=provider,
     agent_settings_json=agent_settings,
@@ -3415,7 +3448,7 @@ async def patch_app_chat(
   """Updates runtime metadata for a chat owned by the calling app.
 
   An embedded app may configure its custom base prompt while the chat is still
-  empty. Once the first turn starts, the complete platform + system-app prompt
+  empty. Once the first turn starts, the complete platform + installed-app prompt
   is immutable for that chat; changing it requires a new chat.
   """
   if principal.app_id is None:

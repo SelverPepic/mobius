@@ -71,6 +71,7 @@ from app import activity, models
 # wrapped imports in lifespan() below.
 from app.routes import (
   admin_router, agent_coordination_router, apps_router, app_services_router,
+  app_tools_router,
   auth_router,
   app_chat_router,
   chat_continuity_router, chat_embed_router, chat_logs_router, chat_router,
@@ -141,9 +142,11 @@ def _probe_runtime_database_schema() -> dict | None:
 
   The boot verdict is intentionally sticky, but it cannot describe a database
   changed by another process after startup. The deployment healthcheck calls
-  this bounded catalog probe every 30 seconds. A failure is sticky until a
+  this bounded catalog probe every 30 seconds. Lost tables are sticky until a
   clean restart because database-owning background services may already be in
   an incoherent state even if an operator repairs the file underneath them.
+  An unreachable database only fails this probe: a momentary failure recovers
+  on the next one, and a lasting one keeps failing the deployment healthcheck.
   """
   if _DATABASE_RUNTIME_FAILURE:
     return dict(_DATABASE_RUNTIME_FAILURE)
@@ -153,9 +156,7 @@ def _probe_runtime_database_schema() -> dict | None:
     logging.getLogger(__name__).error(
       "runtime database readiness probe failed: %s", exc,
     )
-    failure = {"reason": "database_runtime_unavailable"}
-    _set_database_runtime_failure(failure)
-    return failure
+    return {"reason": "database_runtime_unavailable"}
   missing = sorted(set(Base.metadata.tables) - present)
   if not missing:
     return None
@@ -265,6 +266,13 @@ def _assert_provider_defaults(provider_names) -> None:
 async def lifespan(app):
   _log = logging.getLogger(__name__)
   record_memory_checkpoint("lifespan_start")
+  # Before anything is spawned: no agent or tool may inherit server secrets.
+  from app.config import withhold_server_secrets_from_children
+  withhold_server_secrets_from_children()
+  # Helper hosts belong to one server process. Any a crashed predecessor left
+  # behind are ended; their helpers' durable turns recover like any other.
+  from app import helper_hosts
+  helper_hosts.end_orphaned_hosts()
   from app.startup import (
     StartupContext,
     run_startup_plan,
@@ -319,6 +327,10 @@ async def lifespan(app):
     activity.flush_request_errors()
     from app.saved_secure_inputs import shutdown as stop_sealed_consumers
     await stop_sealed_consumers()
+    try:
+      await helper_hosts.MANAGER.close_all()
+    except Exception as exc:
+      _log.error("helper host shutdown failed: %s", exc, exc_info=True)
     # Supervisors stop before the persistence actor they monitor.
     await supervisors.stop()
     # Do not leave a stopped owner published after lifespan exits. Re-entering
@@ -816,6 +828,11 @@ app.add_middleware(
   allow_headers=[
     "Authorization",
     "Content-Type",
+    # Community mutations (rating, review, install receipt, publishing) use
+    # this header for replay safety. App Store runs in an opaque-origin frame,
+    # so browsers preflight it; without an explicit allowance the request is
+    # blocked client-side and the UI can only report "Failed to fetch".
+    "Idempotency-Key",
     "X-Mobius-Embed-Instance",
     "X-Mobius-Stream-Snapshot",
     "X-Mobius-Version",
@@ -911,6 +928,7 @@ app.include_router(chats_router)
 app.include_router(chats_stream_router)
 app.include_router(secure_inputs_router)
 app.include_router(agent_coordination_router)
+app.include_router(app_tools_router)
 app.include_router(delegations_router)
 app.include_router(chat_waits_router)
 app.include_router(goal_plans_router)

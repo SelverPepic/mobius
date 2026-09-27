@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Reconcile platform-owned skills at boot without a hand-maintained digest list.
+"""Reconcile platform-owned skills when the server starts.
 
-The sidecar records the last platform version applied to each flat skill. Local
-edits or deletions remain in place and are marked for review. An installation
-predating the sidecar is adopted only when its bytes match a seed blob in the
-image revision's Git ancestry; uncertain copies are never overwritten. A
-retired seed is archived outside discovery before its active path is removed.
+Seeds come from the platform checkout that contains this script, so installed
+skills follow the source the server is running rather than the container
+image. The sidecar records the last platform version applied to each flat
+skill. Local edits or deletions remain in place and are marked for review. An
+installation predating the sidecar is adopted only when its bytes match a seed
+blob in that checkout's Git ancestry; uncertain copies are never overwritten. A
+retired seed is archived outside discovery before its active path is removed,
+and is installed again if a later source brings it back.
 """
 
 from __future__ import annotations
@@ -24,19 +27,18 @@ _APP_IMPORT_ROOT = str(Path(__file__).resolve().parent.parent)
 if _APP_IMPORT_ROOT not in sys.path:
   sys.path.insert(0, _APP_IMPORT_ROOT)
 
+from app.manifest_contract import folder_skill_id, is_folder_skill_member  # noqa: E402
 from app.storage_io import atomic_write  # noqa: E402
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 SKILLS = DATA_DIR / "shared" / "skills"
 RETIRED_SKILLS = DATA_DIR / "shared" / "retired-skills"
-PLATFORM_REPO = DATA_DIR / "platform"
-BUILD_SHA = os.environ.get("BUILD_SHA", "")
+# The checkout this script belongs to: the served platform, or the baked
+# fallback platform when that is what the server is running.
+PLATFORM_REPO = Path(__file__).resolve().parents[2]
 SIDECAR = ".seed-skills.json"
 SEED_PATH = "backend/scripts/seed-skills"
-_SEED_CANDIDATES = (
-  Path("/app/scripts/seed-skills"),
-  Path(__file__).resolve().parent / "seed-skills",
-)
+_SEED_CANDIDATES = (Path(__file__).resolve().parent / "seed-skills",)
 
 # Two exact owner-curated legacy copies were deliberately migrated by the old
 # registry because their instructions crossed a safety boundary. They are not
@@ -86,6 +88,14 @@ def _writable(path: Path) -> None:
     pass
 
 
+def _app_folder_skill_id(name: str) -> str | None:
+  """Folder id of an app-owned `<id>/<member>.md` record, else None."""
+  folder, sep, member = name.partition("/")
+  if not sep or not is_folder_skill_member(member):
+    return None
+  return folder if folder_skill_id(f"{folder}/") else None
+
+
 def _read_records(path: Path, *, platform: bool = False) -> dict | None:
   if path.is_symlink():
     return None
@@ -100,11 +110,13 @@ def _read_records(path: Path, *, platform: bool = False) -> dict | None:
   if not isinstance(records, dict):
     return None
   for name, record in records.items():
-    if (
-      not isinstance(name, str) or Path(name).name != name
-      or not name.endswith(".md") or not isinstance(record, dict)
-    ):
+    if not isinstance(name, str) or not isinstance(record, dict):
       return None
+    # Platform seeds are flat. App records may also name a member of a
+    # `<id>/` folder skill, exactly as the manifest contract installs them.
+    if name != Path(name).name or not name.endswith(".md"):
+      if platform or _app_folder_skill_id(name) is None:
+        return None
     if platform:
       baseline = record.get("baseline_sha256")
       upstream = record.get("upstream_sha256")
@@ -120,14 +132,12 @@ def _read_records(path: Path, *, platform: bool = False) -> dict | None:
 
 
 def _git_history() -> dict[str, set[str]] | None:
-  """Historical seed bytes reachable from this image's exact source revision.
+  """Historical seed bytes reachable from this checkout's ``HEAD``.
 
-  The image's baked checkout may be shallow. The persistent platform checkout
-  carries history, but may also have advanced past the image. Pin to BUILD_SHA
-  so a future-only or locally-authored seed cannot authorize a boot rewrite.
+  Pin to the same checkout the seeds come from, so a seed only another
+  revision carries cannot authorize a rewrite. A shallow baked checkout simply
+  proves less, which keeps uncertain copies untouched.
   """
-  if len(BUILD_SHA) != 40 or any(c not in "0123456789abcdef" for c in BUILD_SHA):
-    return None
   if not (PLATFORM_REPO / ".git").exists():
     return None
   env = {k: v for k, v in os.environ.items() if k not in {
@@ -137,7 +147,7 @@ def _git_history() -> dict[str, set[str]] | None:
   base = ["git", "-c", f"safe.directory={PLATFORM_REPO}", "-C", str(PLATFORM_REPO)]
   try:
     listed = subprocess.run(
-      [*base, "log", "--raw", "--no-abbrev", "--no-renames", "--format=", BUILD_SHA, "--", SEED_PATH],
+      [*base, "log", "--raw", "--no-abbrev", "--no-renames", "--format=", "HEAD", "--", SEED_PATH],
       capture_output=True, check=True, timeout=30, env=env,
     ).stdout
     objects: list[tuple[str, str]] = []
@@ -234,7 +244,11 @@ def init() -> None:
     print("init_skills: seed tree contains an unexpected file type; no seed changes made")
     return
   seed_files = {path.name: path for path in candidates}
-  app_owned = {name for name, rec in app_records.items() if isinstance(rec, dict)}
+  # A folder skill owns its whole `<id>` name, even while deactivated.
+  app_owned = {
+    f"{folder}.md" if (folder := _app_folder_skill_id(name)) else name
+    for name in app_records
+  }
   installed_owned = {name for name, rec in installed.items() if isinstance(rec, dict)}
 
   # A removed platform seed leaves discovery, but its exact bytes are always
@@ -270,6 +284,11 @@ def init() -> None:
     upstream = source.read_bytes()
     upstream_sha = _sha(upstream)
     record = records.get(name)
+    if record is not None and record.get("status") == "retired":
+      # An older source (a previous image or the baked fallback) retired this
+      # seed; the source now running ships it again, so treat it as new.
+      records.pop(name)
+      record = None
     if target.is_symlink() or (target.exists() and not _plain_file(target)):
       print(f"init_skills: {name} has unexpected file type; left untouched")
       continue

@@ -432,18 +432,17 @@ def test_local_apply_converges_schedule_creation_and_removal(client, auth):
   assert updated.json()["warnings"] == []
 
 
-def test_local_apply_rejects_a_nonexecutable_scheduled_job(client, auth):
+def test_local_apply_accepts_a_scheduled_job_without_execute_permission(
+  client, auth,
+):
+  """The runner launches the shebang's interpreter, so file mode is irrelevant."""
   source = _source()
   _declare_schedule(source)
   (source / "job.sh").chmod(0o644)
 
-  rejected = _apply(client, auth, source)
+  applied = _apply(client, auth, source)
 
-  assert rejected.status_code == 422, rejected.text
-  assert rejected.json()["detail"] == {
-    "code": "invalid_schedule_job",
-    "message": "Schedule job is not executable.",
-  }
+  assert applied.status_code == 200, applied.text
 
 
 def test_unchanged_local_reapply_retries_failed_schedule_sync(client, auth):
@@ -1464,3 +1463,35 @@ def test_runtime_bootstrap_uses_recorded_commit_not_dirty_worktree(client, auth,
   (source / "job.sh").write_text("dirty job")
   rebuilt = runtime_root(row)
   assert (rebuilt / "job.sh").read_text() == "accepted job"
+
+
+@pytest.mark.asyncio
+async def test_accepted_update_syncs_every_member_of_a_folder_skill(tmp_path, monkeypatch):
+  # A resolved Store update can add folder-skill files the remote manifest's
+  # file list does not name; the accepted source owns which files exist.
+  from types import SimpleNamespace
+
+  from app import app_apply, install
+
+  folder = tmp_path / "contributing"
+  folder.mkdir()
+  for name in ("SKILL.md", "cycle.md", "adapter-mobius.md"):
+    (folder / name).write_text(f"# {name}\n")
+  captured = {}
+
+  async def capture(_db, _app, manifest, _warnings):
+    captured.update(manifest)
+
+  monkeypatch.setattr(install, "_sync_app_skills", capture)
+  app = SimpleNamespace(source_dir=str(tmp_path), capability_contract={})
+  remote = {
+    "version": "1.2.3", "skills": ["contributing/"],
+    "source_files": ["contributing/SKILL.md", "contributing/review-merge.md"],
+  }
+
+  assert await app_apply._sync_accepted_app_skills(None, app, remote) == ()
+
+  assert captured["version"] == "1.2.3"
+  assert captured["source_files"] == [
+    "contributing/SKILL.md", "contributing/adapter-mobius.md", "contributing/cycle.md",
+  ]

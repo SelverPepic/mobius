@@ -35,7 +35,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app import app_git, platform_activation
+from app import app_git, platform_activation, platform_boot
 from app import platform_update as pu
 
 
@@ -191,7 +191,20 @@ def clone_env(tmp_path, monkeypatch):
     "UPDATE_PROGRESS_PATH",
     tmp_path / ".update-progress.json",
   )
+  monkeypatch.setattr(
+    pu, "PREPARED_UPDATE_PATH", tmp_path / ".prepared-update.json",
+  )
+  # The real startup check imports the full platform; these fixture clones
+  # carry only a minimal backend, so the check is exercised separately.
+  monkeypatch.setattr(
+    "app.restart_util.validate_restart_source", lambda platform_root=None: None,
+  )
   monkeypatch.setenv("BUILD_SHA", "test-sha")
+  # This boot's image runs the boot transaction; tests of images before it
+  # remove the marker. ``_boot_image`` chooses the running image's revision.
+  monkeypatch.setattr(pu, "BOOT_TRANSACTION_MARKER", tmp_path / ".boot-transaction")
+  pu.BOOT_TRANSACTION_MARKER.write_text("1\n")
+  monkeypatch.setenv("MOBIUS_BUILD_INFO_PATH", str(tmp_path / "build-info.json"))
   origin = _make_origin(tmp_path)
   platform = _clone_platform(tmp_path, origin)
   _write_frontend_build(platform)
@@ -529,7 +542,8 @@ def test_partial_provenance_parks_only_the_genuine_conflict(clone_env):
 
   (worktree / "backend/app/foo.py").write_text("VALUE = 'RESOLVED'\n")
   _git(worktree, "add", "backend/app/foo.py")
-  assert pu.continue_platform_overlay_update(platform) == "updated"
+  assert pu.continue_platform_overlay_update(platform) == "prepared"
+  assert _finish_prepared(platform) == "replayed"
 
   assert _overlay_subjects(platform, target) == [
     "Reconcile local platform source with reviewed upstream",
@@ -595,6 +609,135 @@ def test_long_local_history_merges_once_and_never_replays_commits(
   assert original != result.pre_sha
 
 
+def _boot_started_server(platform: Path, source: str = "platform") -> None:
+  """What the boot script records once it has chosen what uvicorn serves."""
+  pu.SERVING_SOURCE_FILE.write_text(source + "\n")
+  pu.SERVING_SHA_FILE.write_text(_served_sha(platform) + "\n")
+
+
+def _boot_image(sha: str) -> None:
+  """Boot a container whose image was built from ``sha``."""
+  Path(os.environ["MOBIUS_BUILD_INFO_PATH"]).write_text(json.dumps({"sha": sha}))
+
+
+def _finish_prepared(platform: Path) -> str | None:
+  """Finish a prepared update across its cutover: the outgoing server swaps
+  in only a restart-only update, and the update's own image swaps in one that
+  needs it. That boot merges late edits back before import; then the server
+  starts, finishes before resumes, and confirms."""
+  record = pu.read_prepared_update()
+  swapped = pu.swap_in_prepared_update(cutover=True, repo=platform)
+  assert swapped == (not record["requires_image"])
+  _boot_image(record["target"])
+  before_import = pu.settle_prepared_update_for_this_image(platform)
+  _boot_started_server(platform)
+  outcome = pu.complete_platform_swap(platform)
+  assert before_import == outcome
+  pu.confirm_platform_swap_loaded(platform)
+  return outcome
+
+
+def test_a_swapped_version_that_fails_to_start_returns_to_the_previous_state(
+  clone_env,
+):
+  origin, platform = clone_env
+  served, target, _worktree = _park_resolved_line_a_conflict(platform, origin)
+  assert pu.continue_platform_overlay_update(platform) == "prepared"
+  dirty = platform / "backend/app/foo.py"
+  dirty.write_text("VALUE = 'KEEP ME'\n")
+  assert pu.swap_in_prepared_update(cutover=True, repo=platform)
+  record = pu.read_prepared_update()
+
+  # What the boot script does when the swapped-in version fails its check.
+  _git(platform, "reset", "-q", "--hard", record["late"])
+  pu._write_prepared_update({**record, "state": "reverted"})
+
+  assert pu.complete_platform_swap(platform) == "reverted"
+  assert _served_sha(platform) == served
+  assert dirty.read_text() == "VALUE = 'KEEP ME'\n"
+  assert _git(platform, "status", "--porcelain").stdout.splitlines() == [
+    " M backend/app/foo.py",
+  ]
+  assert pu._read_rolled_back_flag()["target"] == target
+  # The update stays prepared: Finish can be retried or the update cancelled.
+  assert pu.read_prepared_update()["state"] == "prepared"
+  assert pu.unfinished_update(platform)["cancellable"] is True
+  assert not pu.late_edits_pending()
+
+
+def test_boot_revert_returns_to_the_saved_state_only_after_a_swap(clone_env):
+  origin, platform = clone_env
+  served, _target, _worktree = _park_resolved_line_a_conflict(platform, origin)
+  assert pu.continue_platform_overlay_update(platform) == "prepared"
+
+  # Nothing swapped yet: the boot revert leaves the checkout alone.
+  assert not pu.revert_failed_update(platform)
+  assert _served_sha(platform) == served
+
+  assert pu.swap_in_prepared_update(cutover=True, repo=platform)
+  assert _served_sha(platform) != served
+  assert pu.revert_failed_update(platform)
+  assert _served_sha(platform) == served
+  # The update stays prepared, and the owner is told why it is not running.
+  assert pu.read_prepared_update()["state"] == "prepared"
+  assert pu._read_rolled_back_flag()["target"] == _target
+  assert pu.complete_platform_swap(platform) is None
+
+
+def test_a_prepared_update_can_be_cancelled_until_it_is_swapped_in(clone_env):
+  origin, platform = clone_env
+  served, target, _worktree = _park_resolved_line_a_conflict(platform, origin)
+  assert pu.continue_platform_overlay_update(platform) == "prepared"
+  assert pu.unfinished_update(platform)["cancellable"] is True
+
+  pu.cancel_unfinished_update(platform)
+  assert pu.unfinished_update(platform) is None
+  assert _served_sha(platform) == served
+  assert pu.swap_in_prepared_update(cutover=True, repo=platform) is False
+
+
+def test_a_cancel_racing_the_shutdown_swap_keeps_the_live_source(
+  clone_env, monkeypatch,
+):
+  """The swap re-reads the update under the lock, so a Cancel that lands
+  between the drain's first look and the lock is honored."""
+  origin, platform = clone_env
+  served, _target, _worktree = _park_resolved_line_a_conflict(platform, origin)
+  assert pu.continue_platform_overlay_update(platform) == "prepared"
+  real_lock = pu._reconcile_flock
+  cancelled = []
+
+  @contextmanager
+  def cancel_before_locking(*args, **kwargs):
+    if not cancelled:
+      cancelled.append(True)
+      pu.cancel_unfinished_update(platform)
+    with real_lock(*args, **kwargs):
+      yield
+
+  monkeypatch.setattr(pu, "_reconcile_flock", cancel_before_locking)
+
+  assert pu.swap_in_prepared_update(cutover=True, repo=platform) is False
+  assert cancelled and pu.unfinished_update(platform) is None
+  assert _served_sha(platform) == served
+
+
+def test_a_parked_resolution_can_be_cancelled_before_its_swap(clone_env):
+  """The owner's exit from a resolver that cannot finish: nothing is live yet."""
+  origin, platform = clone_env
+  served, _target, worktree = _park_resolved_line_a_conflict(platform, origin)
+  assert pu.unfinished_update(platform)["stage"] == "resolve"
+  assert pu.unfinished_update(platform)["cancellable"] is True
+
+  pu.cancel_unfinished_update(platform)
+
+  assert pu.unfinished_update(platform) is None
+  assert not pu.CONFLICT_FLAG.exists()
+  assert not worktree.exists()
+  assert _served_sha(platform) == served
+  assert pu.platform_status(platform)["available"] is True
+
+
 def _park_resolved_line_a_conflict(platform: Path, origin: Path) -> tuple[str, str, Path]:
   """Park a committed LINE_A conflict and stage the resolver's answer.
 
@@ -633,7 +776,8 @@ def test_resolver_merge_commit_is_an_accepted_resolution(clone_env):
   _served, _target, worktree = _park_resolved_line_a_conflict(platform, origin)
   _git(worktree, "commit", "-q", "-m", "resolve both sides")
 
-  assert pu.continue_platform_overlay_update(platform) == "updated"
+  assert pu.continue_platform_overlay_update(platform) == "prepared"
+  assert _finish_prepared(platform) == "replayed"
   assert "LINE_A = 'RESOLVED'" in (platform / "backend/app/main.py").read_text()
 
 
@@ -673,7 +817,10 @@ def test_resolver_refuses_unstaged_final_bytes_without_losing_them(clone_env):
   assert "LINE_A = 'LOCAL'" in (platform / "backend/app/main.py").read_text()
 
   _git(worktree, "add", "backend/app/main.py", "notes.txt")
-  assert pu.continue_platform_overlay_update(platform) == "updated"
+  assert pu.continue_platform_overlay_update(platform) == "prepared"
+  # Preparing never touches the live checkout.
+  assert "LINE_A = 'LOCAL'" in (platform / "backend/app/main.py").read_text()
+  assert _finish_prepared(platform) == "replayed"
   assert "LINE_A = 'FINAL'" in (platform / "backend/app/main.py").read_text()
   assert (platform / "notes.txt").read_text() == "resolved with context\n"
   assert _overlay_subjects(platform, target) == [
@@ -681,7 +828,7 @@ def test_resolver_refuses_unstaged_final_bytes_without_losing_them(clone_env):
   ]
 
 
-def test_late_clean_commit_merges_with_the_resolution(clone_env):
+def test_late_commits_stay_out_of_the_update_return_after_boot_and_stay_reachable(clone_env):
   origin, platform = clone_env
   served, target, worktree = _park_resolved_line_a_conflict(platform, origin)
   _local_commit(platform, edits={"backend/app/late.py": "LATE = 1\n"}, msg="late 1")
@@ -689,66 +836,364 @@ def test_late_clean_commit_merges_with_the_resolution(clone_env):
     platform, edits={"backend/app/late.py": "LATE = 2\n"}, msg="late 2",
   )
 
-  assert pu.continue_platform_overlay_update(platform) == "updated"
-
-  # The answer and the later work land together as one commit on the target.
-  assert _overlay_subjects(platform, target) == [
-    "Reconcile local platform source with reviewed upstream",
-  ]
-  assert "LINE_A = 'RESOLVED'" in (platform / "backend/app/main.py").read_text()
-  assert (platform / "backend/app/late.py").read_text() == "LATE = 2\n"
-  assert f"Previous local source: {late}" in _git(
-    platform, "show", "-s", "--format=%B", "HEAD",
-  ).stdout
-  assert _git(platform, "status", "--porcelain").stdout == ""
+  assert pu.continue_platform_overlay_update(platform) == "prepared"
+  # The live checkout keeps serving until the swap; the update is exactly the
+  # answer on the reviewed release, without the late commits.
+  assert _served_sha(platform) == late
+  prepared = pu.read_prepared_update()["prepared"]
+  assert _git(platform, "cat-file", "-e", f"{prepared}:backend/app/late.py",
+              check=False).returncode != 0
   assert not pu.CONFLICT_FLAG.exists()
   assert not worktree.exists()
+
+  assert _finish_prepared(platform) == "replayed"
+  assert "LINE_A = 'RESOLVED'" in (platform / "backend/app/main.py").read_text()
+  assert (platform / "backend/app/late.py").read_text() == "LATE = 2\n"
+  assert _git(platform, "status", "--porcelain").stdout == ""
+  assert pu.read_prepared_update() is None
+  assert not pu.late_edits_pending()
   assert served != late
+  # The replaced local chain, late commits and their messages included, stays
+  # reachable for undo after the update squashes it into one commit.
+  assert _git(platform, "rev-parse", pu._PRE_UPDATE_REF).stdout.strip() == late
+  assert "late 2" in _git(platform, "log", "-1", "--format=%s", pu._PRE_UPDATE_REF).stdout
 
 
-def test_late_conflicting_commit_parks_again_for_the_same_resolver(clone_env):
+def test_a_late_commit_that_conflicts_is_parked_after_boot_and_holds_resumes(
+  clone_env,
+):
   origin, platform = clone_env
   _served, target, worktree = _park_resolved_line_a_conflict(platform, origin)
-  pu._write_conflict_flag(
-    target, ["backend/app/main.py"], "resolver-chat",
-    overlay=pu._read_conflict_flag()["overlay"],
-  )
-  late = _local_commit(platform, edits={
+  _local_commit(platform, edits={
     "backend/app/main.py": _MAIN_PY.replace("LINE_A = 1", "LINE_A = 'LATE'"),
   }, msg="late conflicting edit")
 
-  assert pu.continue_platform_overlay_update(platform) == "conflict"
+  assert pu.continue_platform_overlay_update(platform) == "prepared"
+  assert _finish_prepared(platform) == "conflict"
 
-  # Nothing moved; the resolver sees its answer against the later edit.
-  assert _served_sha(platform) == late
+  # The checked update is what booted; the late edit waits on a frozen copy
+  # and automatic chat resumes wait for it.
+  booted = pu.read_prepared_update()["prepared"]
+  assert _served_sha(platform) == booted
+  assert "LINE_A = 'RESOLVED'" in (platform / "backend/app/main.py").read_text()
+  assert pu.late_edits_pending()
   flag = pu._read_conflict_flag()
-  assert flag["chat_id"] == "resolver-chat"
-  assert flag["overlay"]["served"] == late
-  assert flag["overlay"]["stage"] == "committed"
-  assert flag["overlay"]["target"] == target
-  marked = (worktree / "backend/app/main.py").read_text()
+  assert flag["overlay"]["replay"] is True
+  assert pu.unfinished_update(platform)["stage"] == "resolve"
+  # The update already booted: cancelling would strand the late edit.
+  assert pu.unfinished_update(platform)["cancellable"] is False
+  with pytest.raises(pu.PlatformUpdateError, match="prepared_update_swapped"):
+    pu.cancel_unfinished_update(platform)
+  assert pu._read_conflict_flag() == flag
+  replay = Path(flag["overlay"]["worktree"])
+  marked = (replay / "backend/app/main.py").read_text()
   assert "LINE_A = 'LATE'" in marked and "LINE_A = 'RESOLVED'" in marked
 
+  (replay / "backend/app/main.py").write_text(
+    _MAIN_PY.replace("LINE_A = 1", "LINE_A = 'RESOLVED AND LATE'"),
+  )
+  _git(replay, "add", "backend/app/main.py")
+  assert pu.continue_platform_overlay_update(platform) == "updated"
+  assert "LINE_A = 'RESOLVED AND LATE'" in (
+    platform / "backend/app/main.py"
+  ).read_text()
+  assert not pu.late_edits_pending()
+  assert pu._is_ancestor(platform, target, _served_sha(platform))
+
+
+def test_uncommitted_late_edits_survive_a_conflicting_late_commit(clone_env):
+  """A late commit's conflict parks first; the uncommitted edits made on top
+  of it must still come back afterwards, never be dropped with the park."""
+  origin, platform = clone_env
+  _served, target, _worktree = _park_resolved_line_a_conflict(platform, origin)
+  _local_commit(platform, edits={
+    "backend/app/main.py": _MAIN_PY.replace("LINE_A = 1", "LINE_A = 'LATE'"),
+  }, msg="late conflicting commit")
+  (platform / "backend/app/main.py").write_text(
+    _MAIN_PY.replace("LINE_A = 1", "LINE_A = 'LATE DIRTY'"),
+  )
+  (platform / "backend/app/foo.py").write_text("VALUE = 'DIRTY'\n")
+
+  assert pu.continue_platform_overlay_update(platform) == "prepared"
+  assert _finish_prepared(platform) == "conflict"
+  replay = Path(pu._read_conflict_flag()["overlay"]["worktree"])
+  (replay / "backend/app/main.py").write_text(
+    _MAIN_PY.replace("LINE_A = 1", "LINE_A = 'RESOLVED AND LATE'"),
+  )
+  _git(replay, "add", "backend/app/main.py")
+
+  # The committed answer is in; the uncommitted edit to the same line now
+  # overlaps it, so it parks for the resolver instead of vanishing.
+  assert pu.continue_platform_overlay_update(platform) == "conflict"
+  assert pu.late_edits_pending()
+  flag = pu._read_conflict_flag()
+  assert flag["overlay"]["stage"] == "working" and flag["overlay"]["replay"] is True
+  replay = Path(flag["overlay"]["worktree"])
+  marked = (replay / "backend/app/main.py").read_text()
+  assert "LINE_A = 'LATE DIRTY'" in marked and "LINE_A = 'RESOLVED AND LATE'" in marked
+  (replay / "backend/app/main.py").write_text(
+    _MAIN_PY.replace("LINE_A = 1", "LINE_A = 'RESOLVED, LATE AND DIRTY'"),
+  )
+  _git(replay, "add", "backend/app/main.py")
+
+  assert pu.continue_platform_overlay_update(platform) == "updated"
+  assert not pu.late_edits_pending()
+  assert "LINE_A = 'RESOLVED, LATE AND DIRTY'" in (
+    platform / "backend/app/main.py"
+  ).read_text()
+  assert (platform / "backend/app/foo.py").read_text() == "VALUE = 'DIRTY'\n"
+  # In-progress edits come back uncommitted, as after a clean replay.
+  assert sorted(_git(platform, "status", "--porcelain").stdout.splitlines()) == [
+    " M backend/app/foo.py", " M backend/app/main.py",
+  ]
+  assert pu._is_ancestor(platform, target, _served_sha(platform))
+  # The replay is not an update: the chain the swap replaced stays recorded.
+  assert "late conflicting commit" in _git(
+    platform, "log", "-1", "--format=%s", pu._PRE_UPDATE_REF,
+  ).stdout
+
+
+def _swapped_with_late_commit(platform: Path, origin: Path) -> tuple[str, str]:
+  _served, target, _worktree = _park_resolved_line_a_conflict(platform, origin)
+  assert pu.continue_platform_overlay_update(platform) == "prepared"
+  _local_commit(platform, edits={"backend/app/late.py": "LATE = 1\n"})
+  assert pu.swap_in_prepared_update(cutover=True, repo=platform)
+  return target, pu.read_prepared_update()["late"]
+
+
+def test_late_edits_merge_back_before_the_server_imports_the_update(
+  clone_env,
+):
+  """The image's boot transaction merges late edits back, so the server that
+  starts next loads the update and the edits together."""
+  origin, platform = clone_env
+  target, _late = _swapped_with_late_commit(platform, origin)
+
+  assert pu.settle_prepared_update_for_this_image(platform) == "replayed"
+
+  assert (platform / "backend/app/late.py").read_text() == "LATE = 1\n"
+  assert pu._is_ancestor(platform, target, _served_sha(platform))
+  # Only a started server confirms: repeating boot or startup keeps the
+  # rollback record, and so does a server started from the baked fallback,
+  # which never loaded the edits, so resumes stay held there.
+  assert pu.settle_prepared_update_for_this_image(platform) == "replayed"
+  _boot_started_server(platform, source="baked")
+  assert pu.complete_platform_swap(platform) == "replayed"
+  assert pu.late_edits_pending()
+  assert not pu.confirm_platform_swap_loaded(platform)
+  assert pu.read_prepared_update()["replayed"] == _served_sha(platform)
+
+  _boot_started_server(platform)
+  assert not pu.late_edits_pending()
+  assert pu.confirm_platform_swap_loaded(platform)
+  assert pu.read_prepared_update() is None
+
+
+def test_a_merged_back_tree_that_cannot_start_returns_to_the_previous_state(
+  clone_env, tmp_path,
+):
+  origin, platform = clone_env
+  target, late = _swapped_with_late_commit(platform, origin)
+  assert pu.settle_prepared_update_for_this_image(platform) == "replayed"
+
+  # The server could not import it; the boot's probe fails and the boot
+  # transaction returns to the saved previous state.
+  assert pu.revert_failed_update(platform)
+
+  assert _served_sha(platform) == late
+  assert pu.settle_prepared_update_for_this_image(platform) == "waiting"
+  assert pu.complete_platform_swap(platform) is None
+  assert (platform / "backend/app/late.py").read_text() == "LATE = 1\n"
+  assert pu.read_prepared_update()["state"] == "prepared"
+  assert pu._read_rolled_back_flag()["target"] == target
+
+
+@pytest.mark.parametrize("killed_in", ["_clear_reconcile_pre", "_restore_working_edits"])
+def test_a_merge_back_killed_midway_finishes_on_the_next_boot(
+  clone_env, monkeypatch, killed_in,
+):
+  origin, platform = clone_env
+  target, _late = _swapped_with_late_commit(platform, origin)
+  (platform / "notes.txt").write_text("in progress\n")
+  real = getattr(pu, killed_in)
+  calls = []
+
+  def killed(*args, **kwargs):
+    if not calls:
+      calls.append(killed_in)
+      raise KeyboardInterrupt("killed")
+    return real(*args, **kwargs)
+
+  monkeypatch.setattr(pu, killed_in, killed)
+  with pytest.raises(KeyboardInterrupt):
+    pu.settle_prepared_update_for_this_image(platform)
+
+  # Next boot: the transaction's guard recovers the checkout, then the
+  # merge-back runs or is recognised as done; never "not swapped".
+  assert pu.settle_prepared_update_for_this_image(platform) == "replayed"
+  assert (platform / "backend/app/late.py").read_text() == "LATE = 1\n"
+  assert pu._is_ancestor(platform, target, _served_sha(platform))
+  assert pu.read_prepared_update()["replayed"] == _served_sha(platform)
+  _boot_started_server(platform)
+  assert pu.complete_platform_swap(platform) == "replayed"
+  assert pu.confirm_platform_swap_loaded(platform)
+  assert pu.unfinished_update(platform) is None
+
+
+def test_startup_merges_late_edits_boot_missed_and_records_the_restart(
+  clone_env, tmp_path,
+):
+  """An older image or a failed boot step leaves the merge-back to the
+  started server, which already imported the update: say a restart is owed,
+  hold resumes until it, and keep the rollback for a tree that cannot start."""
+  origin, platform = clone_env
+  _target, late = _swapped_with_late_commit(platform, origin)
+  _boot_started_server(platform)  # started on the update without the edits
+  booted = _served_sha(platform)
+
+  assert pu.complete_platform_swap(platform) == "replayed"
+
+  assert (platform / "backend/app/late.py").read_text() == "LATE = 1\n"
+  marker = pu._read_activation_marker()
+  assert marker["target_sha"] == _served_sha(platform) != booted
+  assert "backend/app/late.py" in marker["paths"]
+  assert pu.late_edits_pending()
+  assert not pu.confirm_platform_swap_loaded(platform)
+  # The restart's import check fails: the boot can still go back.
+  assert pu.revert_failed_update(platform)
+  assert _served_sha(platform) == late
+
+
+def test_a_failed_restart_record_during_startup_keeps_resumes_held(
+  clone_env, monkeypatch,
+):
+  origin, platform = clone_env
+  _swapped_with_late_commit(platform, origin)
+  _boot_started_server(platform)
+
+  def unavailable(*args, **kwargs):
+    raise OSError("disk full")
+
+  monkeypatch.setattr(pu, "_record_update_activation", unavailable)
+  with pytest.raises(OSError):
+    pu.complete_platform_swap(platform)
+
+  assert pu.read_prepared_update()["replayed"] == _served_sha(platform)
+  assert pu.late_edits_pending()  # this server still runs the update alone
+
+
+def test_a_different_descendant_of_a_recorded_merge_back_is_not_trusted(
+  clone_env,
+):
+  origin, platform = clone_env
+  _swapped_with_late_commit(platform, origin)
+  assert pu.settle_prepared_update_for_this_image(platform) == "replayed"
+  record = pu.read_prepared_update()
+  _git(platform, "reset", "-q", "--hard", record["prepared"])
+  _local_commit(platform, edits={"other.txt": "not the late edits\n"})
+
+  # The boot cannot say what this tree is, so it refuses to serve it.
+  with pytest.raises(pu.BootTransactionError):
+    pu.settle_prepared_update_for_this_image(platform)
+  with pytest.raises(pu.BootTransactionError):
+    pu.complete_platform_swap(platform)
+  assert pu.read_prepared_update()["replayed"] == record["replayed"]
+
+
+def test_boot_writes_the_merged_back_tree_without_group_write(
+  clone_env, monkeypatch,
+):
+  """A group-writable served tree fails the served-runtime check and boots
+  the baked platform instead; boot's umask must not leak into the files."""
+  origin, platform = clone_env
+  _swapped_with_late_commit(platform, origin)
+  monkeypatch.setattr(pu, "PLATFORM_REPO", platform)
+  previous = os.umask(0o002)
+  try:
+    assert platform_boot.main(["platform_boot", "activate"]) == 0
+  finally:
+    os.umask(previous)
+
+  mode = (platform / "backend/app/late.py").stat().st_mode
+  assert not mode & 0o022
+
+
+def test_a_parked_late_edit_conflict_is_not_merged_again_on_the_next_boot(
+  clone_env,
+):
+  origin, platform = clone_env
+  _park_resolved_line_a_conflict(platform, origin)
+  (platform / "backend/app/main.py").write_text(
+    _MAIN_PY.replace("LINE_A = 1", "LINE_A = 'DIRTY LATE'"),
+  )
+  assert pu.continue_platform_overlay_update(platform) == "prepared"
+  assert _finish_prepared(platform) == "conflict"
+  worktree = Path(pu._read_conflict_flag()["overlay"]["worktree"])
+  answer = _MAIN_PY.replace("LINE_A = 1", "LINE_A = 'HALF RESOLVED'")
+  (worktree / "backend/app/main.py").write_text(answer)
+
+  # A restart while the resolver works keeps its parked merge and progress.
+  assert pu.settle_prepared_update_for_this_image(platform) == "conflict"
+  assert pu.complete_platform_swap(platform) == "conflict"
+  assert (worktree / "backend/app/main.py").read_text() == answer
+  assert pu.late_edits_pending()
+
+
+def _resolvable_late_conflict(platform: Path, origin: Path) -> tuple[str, Path]:
+  _park_resolved_line_a_conflict(platform, origin)
+  _local_commit(platform, edits={
+    "backend/app/main.py": _MAIN_PY.replace("LINE_A = 1", "LINE_A = 'LATE'"),
+  }, msg="late conflicting commit")
+  assert pu.continue_platform_overlay_update(platform) == "prepared"
+  assert _finish_prepared(platform) == "conflict"
+  booted = _served_sha(platform)  # the server started without the edits
+  worktree = Path(pu._read_conflict_flag()["overlay"]["worktree"])
   (worktree / "backend/app/main.py").write_text(
     _MAIN_PY.replace("LINE_A = 1", "LINE_A = 'RESOLVED AND LATE'"),
   )
   _git(worktree, "add", "backend/app/main.py")
+  return booted, worktree
+
+
+def test_finishing_a_late_edit_conflict_records_the_restart_that_loads_it(
+  clone_env,
+):
+  origin, platform = clone_env
+  booted, _worktree = _resolvable_late_conflict(platform, origin)
+
   assert pu.continue_platform_overlay_update(platform) == "updated"
-  assert _overlay_subjects(platform, target) == [
-    "Reconcile local platform source with reviewed upstream",
-  ]
-  assert "LINE_A = 'RESOLVED AND LATE'" in (
-    platform / "backend/app/main.py"
-  ).read_text()
+
+  marker = pu._read_activation_marker()
+  assert marker["target_sha"] == _served_sha(platform) != booted
+  assert "backend/app/main.py" in marker["paths"]
 
 
-def test_late_uncommitted_edits_stay_uncommitted_after_continue(clone_env):
+def test_a_late_edit_resolution_that_cannot_record_its_restart_stays_pending(
+  clone_env, monkeypatch,
+):
+  origin, platform = clone_env
+  _booted, _worktree = _resolvable_late_conflict(platform, origin)
+
+  def unavailable(*args, **kwargs):
+    raise OSError("disk full")
+
+  monkeypatch.setattr(pu, "_record_update_activation", unavailable)
+  with pytest.raises(OSError):
+    pu.continue_platform_overlay_update(platform)
+
+  # Nothing claims the edits are loaded: resumes stay held for the next boot.
+  assert pu.read_prepared_update()["state"] == "swapped"
+  assert pu.late_edits_pending()
+
+
+def test_late_uncommitted_edits_stay_uncommitted_after_the_swap(clone_env):
   origin, platform = clone_env
   _served, target, _worktree = _park_resolved_line_a_conflict(platform, origin)
   (platform / "backend/app/foo.py").write_text("VALUE = 'DIRTY'\n")
   (platform / "notes.txt").write_text("untracked dirty\n")
 
-  assert pu.continue_platform_overlay_update(platform) == "updated"
+  assert pu.continue_platform_overlay_update(platform) == "prepared"
+  assert _finish_prepared(platform) == "replayed"
 
   assert _parents(platform) == [target]
   assert "LINE_A = 'RESOLVED'" in (platform / "backend/app/main.py").read_text()
@@ -758,19 +1203,18 @@ def test_late_uncommitted_edits_stay_uncommitted_after_continue(clone_env):
   ]
 
 
-def test_late_conflicting_uncommitted_edit_parks_as_a_working_conflict(clone_env):
+def test_a_late_uncommitted_edit_that_conflicts_parks_after_boot(clone_env):
   origin, platform = clone_env
-  served, target, _worktree = _park_resolved_line_a_conflict(platform, origin)
+  _served, target, _worktree = _park_resolved_line_a_conflict(platform, origin)
   (platform / "backend/app/main.py").write_text(
     _MAIN_PY.replace("LINE_A = 1", "LINE_A = 'DIRTY LATE'"),
   )
 
-  assert pu.continue_platform_overlay_update(platform) == "conflict"
+  assert pu.continue_platform_overlay_update(platform) == "prepared"
+  assert _finish_prepared(platform) == "conflict"
 
-  assert _served_sha(platform) == served
-  assert "LINE_A = 'DIRTY LATE'" in (platform / "backend/app/main.py").read_text()
   parked = pu._read_conflict_flag()["overlay"]
-  assert parked["stage"] == "working"
+  assert parked["stage"] == "working" and parked["replay"] is True
   worktree = Path(parked["worktree"])
   (worktree / "backend/app/main.py").write_text(
     _MAIN_PY.replace("LINE_A = 1", "LINE_A = 'RESOLVED WITH DIRTY'"),
@@ -778,11 +1222,8 @@ def test_late_conflicting_uncommitted_edit_parks_as_a_working_conflict(clone_env
   _git(worktree, "add", "backend/app/main.py")
 
   assert pu.continue_platform_overlay_update(platform) == "updated"
-  # The committed release keeps the first answer; the owner's edit on top of
-  # it comes back uncommitted.
-  assert _overlay_subjects(platform, target) == [
-    "Reconcile local platform source with reviewed upstream",
-  ]
+  # The booted update keeps the first answer; the owner's in-progress edit on
+  # top of it comes back uncommitted.
   assert "LINE_A = 'RESOLVED'" in _git(
     platform, "show", "HEAD:backend/app/main.py",
   ).stdout
@@ -792,28 +1233,37 @@ def test_late_conflicting_uncommitted_edit_parks_as_a_working_conflict(clone_env
   assert _git(platform, "status", "--porcelain").stdout.splitlines() == [
     " M backend/app/main.py",
   ]
+  assert not pu.late_edits_pending()
 
 
-def test_rejected_resolution_restores_uncommitted_edits(clone_env, monkeypatch):
-  origin, platform = clone_env
-  served, _target, _worktree = _park_resolved_line_a_conflict(platform, origin)
-  (platform / "backend/app/foo.py").write_text("VALUE = 'DIRTY'\n")
-  monkeypatch.setattr(pu, "_import_probe", lambda _repo: (False, "probe failed"))
-
-  assert pu.continue_platform_overlay_update(platform) == "rolled_back"
-
-  assert _served_sha(platform) == served
-  assert (platform / "backend/app/foo.py").read_text() == "VALUE = 'DIRTY'\n"
-  assert _git(platform, "status", "--porcelain").stdout.splitlines() == [
-    " M backend/app/foo.py",
-  ]
-
-
-def test_failed_activation_keeps_uncommitted_edits_and_the_parked_answer(
+def test_an_answer_that_fails_the_startup_check_is_never_prepared(
   clone_env, monkeypatch,
 ):
   origin, platform = clone_env
   served, _target, worktree = _park_resolved_line_a_conflict(platform, origin)
+  (platform / "backend/app/foo.py").write_text("VALUE = 'DIRTY'\n")
+  from app import restart_util
+
+  def fails(platform_root=None):
+    raise restart_util.RestartSourceInvalid("startup check failed")
+
+  monkeypatch.setattr("app.restart_util.validate_restart_source", fails)
+
+  with pytest.raises(pu.PlatformUpdateError, match="startup check failed"):
+    pu.continue_platform_overlay_update(platform)
+
+  assert pu.read_prepared_update() is None
+  assert _served_sha(platform) == served
+  assert (platform / "backend/app/foo.py").read_text() == "VALUE = 'DIRTY'\n"
+  assert worktree.exists() and pu.CONFLICT_FLAG.exists()
+
+
+def test_a_failed_swap_keeps_the_live_checkout_and_the_prepared_update(
+  clone_env, monkeypatch,
+):
+  origin, platform = clone_env
+  served, _target, _worktree = _park_resolved_line_a_conflict(platform, origin)
+  assert pu.continue_platform_overlay_update(platform) == "prepared"
   dirty = platform / "backend/app/foo.py"
   dirty.write_text("VALUE = 'KEEP ME'\n")
   (platform / "backend/app/new_mod.py").write_text("NEW = True\n")
@@ -828,27 +1278,28 @@ def test_failed_activation_keeps_uncommitted_edits_and_the_parked_answer(
     return original_git(*args, **kwargs)
 
   monkeypatch.setattr(pu, "_git", fail_first_candidate_reset)
-  with pytest.raises(RuntimeError, match="candidate reset failed"):
-    pu.continue_platform_overlay_update(platform)
+  assert pu.swap_in_prepared_update(cutover=True, repo=platform) is False
   monkeypatch.setattr(pu, "_git", original_git)
 
   assert _served_sha(platform) == served
   assert dirty.read_text() == "VALUE = 'KEEP ME'\n"
   assert (platform / "backend/app/new_mod.py").read_text() == "NEW = True\n"
+  assert pu.read_prepared_update()["state"] == "prepared"
   # A fresh owner edit after the failure is not reset by the next boot.
   dirty.write_text("VALUE = 'FRESH AFTER FAILURE'\n")
   pu.boot_guard_clean_served_tree(platform)
   assert dirty.read_text() == "VALUE = 'FRESH AFTER FAILURE'\n"
-  assert worktree.exists()
-  assert pu.continue_platform_overlay_update(platform) == "updated"
+  assert _finish_prepared(platform) == "replayed"
   assert dirty.read_text() == "VALUE = 'FRESH AFTER FAILURE'\n"
+  assert "LINE_A = 'RESOLVED'" in (platform / "backend/app/main.py").read_text()
 
 
-def test_boot_recovers_carried_edits_after_a_killed_activation(
+def test_boot_recovers_the_live_state_after_a_swap_killed_midway(
   clone_env, monkeypatch,
 ):
   origin, platform = clone_env
-  served, _target, worktree = _park_resolved_line_a_conflict(platform, origin)
+  served, _target, _worktree = _park_resolved_line_a_conflict(platform, origin)
+  assert pu.continue_platform_overlay_update(platform) == "prepared"
   dirty = platform / "backend/app/foo.py"
   dirty.write_text("VALUE = 'KEEP ME'\n")
   original_git = pu._git
@@ -862,13 +1313,10 @@ def test_boot_recovers_carried_edits_after_a_killed_activation(
     return original_git(*args, **kwargs)
 
   # A SIGKILL runs no cleanup: the branch has moved, the checkout has not.
-  restore_working_edits = pu._restore_working_edits
   monkeypatch.setattr(pu, "_git", kill_after_branch_move)
-  monkeypatch.setattr(pu, "_restore_working_edits", lambda *_args: False)
   with pytest.raises(Killed):
-    pu.continue_platform_overlay_update(platform)
+    pu.swap_in_prepared_update(cutover=True, repo=platform)
   monkeypatch.setattr(pu, "_git", original_git)
-  monkeypatch.setattr(pu, "_restore_working_edits", restore_working_edits)
   assert _served_sha(platform) != served
 
   pu.boot_guard_clean_served_tree(platform)
@@ -878,12 +1326,21 @@ def test_boot_recovers_carried_edits_after_a_killed_activation(
   assert _git(platform, "status", "--porcelain").stdout.splitlines() == [
     " M backend/app/foo.py",
   ]
-  assert worktree.exists() and pu.CONFLICT_FLAG.exists()
+  # The swap was recorded before the checkout moved; boot sees it never took
+  # and returns the update to prepared rather than holding chats or losing
+  # the live edits.
+  assert pu.complete_platform_swap(platform) == "not_swapped"
+  assert pu.read_prepared_update()["state"] == "prepared"
+  assert not pu.late_edits_pending()
+  assert dirty.read_text() == "VALUE = 'KEEP ME'\n"
 
 
-def test_incomplete_rollback_leaves_carried_edits_for_boot(clone_env, monkeypatch):
+def test_an_incomplete_swap_rollback_leaves_the_live_state_for_boot(
+  clone_env, monkeypatch,
+):
   origin, platform = clone_env
   served, _target, _worktree = _park_resolved_line_a_conflict(platform, origin)
+  assert pu.continue_platform_overlay_update(platform) == "prepared"
   dirty = platform / "backend/app/foo.py"
   dirty.write_text("VALUE = 'KEEP ME'\n")
   original_git = pu._git
@@ -900,8 +1357,7 @@ def test_incomplete_rollback_leaves_carried_edits_for_boot(clone_env, monkeypatc
     return original_git(*args, **kwargs)
 
   monkeypatch.setattr(pu, "_git", fail_activation_and_rollback)
-  with pytest.raises(RuntimeError, match="activation reset failed"):
-    pu.continue_platform_overlay_update(platform)
+  assert pu.swap_in_prepared_update(cutover=True, repo=platform) is False
   monkeypatch.setattr(pu, "_git", original_git)
 
   assert pu.RECONCILE_PRE_FLAG.exists()
@@ -910,9 +1366,12 @@ def test_incomplete_rollback_leaves_carried_edits_for_boot(clone_env, monkeypatc
   assert dirty.read_text() == "VALUE = 'KEEP ME'\n"
 
 
-def test_concurrent_branch_move_keeps_the_resolution_parked(clone_env, monkeypatch):
+def test_a_concurrent_writer_keeps_the_branch_and_the_update_stays_prepared(
+  clone_env, monkeypatch,
+):
   origin, platform = clone_env
-  _served, target, worktree = _park_resolved_line_a_conflict(platform, origin)
+  _served, target, _worktree = _park_resolved_line_a_conflict(platform, origin)
+  assert pu.continue_platform_overlay_update(platform) == "prepared"
   original = pu._activate_candidate
   raced: dict[str, str] = {}
 
@@ -924,20 +1383,17 @@ def test_concurrent_branch_move_keeps_the_resolution_parked(clone_env, monkeypat
     original(repo, local, pre_sha, tip)
 
   monkeypatch.setattr(pu, "_activate_candidate", concurrent_then_activate)
-  with pytest.raises(subprocess.CalledProcessError):
-    pu.continue_platform_overlay_update(platform)
+  assert pu.swap_in_prepared_update(cutover=True, repo=platform) is False
   monkeypatch.setattr(pu, "_activate_candidate", original)
 
-  # The newer writer keeps the branch; the answer stays parked.
+  # The newer writer keeps the branch; the update stays prepared.
   assert _served_sha(platform) == raced["sha"]
-  assert worktree.exists() and pu.CONFLICT_FLAG.exists()
+  assert pu.read_prepared_update()["state"] == "prepared"
 
-  assert pu.continue_platform_overlay_update(platform) == "updated"
-  assert _overlay_subjects(platform, target) == [
-    "Reconcile local platform source with reviewed upstream",
-  ]
+  assert _finish_prepared(platform) == "replayed"
   assert (platform / "backend/app/raced.py").read_text() == "RACED = True\n"
   assert "LINE_A = 'RESOLVED'" in (platform / "backend/app/main.py").read_text()
+  assert pu._is_ancestor(platform, target, _served_sha(platform))
 
 
 @pytest.mark.asyncio
@@ -1170,7 +1626,8 @@ def test_original_dirty_edit_survives_a_committed_conflict_resolution(clone_env)
   )
   _git(worktree, "add", "backend/app/main.py")
 
-  assert pu.continue_platform_overlay_update(platform) == "updated"
+  assert pu.continue_platform_overlay_update(platform) == "prepared"
+  assert _finish_prepared(platform) == "replayed"
   assert "LINE_A = 'BOTH'" in (platform / "backend/app/main.py").read_text()
   assert (platform / "backend/app/foo.py").read_text() == "VALUE = 'BEFORE APPLY'\n"
   assert _git(platform, "status", "--porcelain").stdout.splitlines() == [
@@ -1196,14 +1653,17 @@ def test_original_dirty_edit_conflicting_with_resolution_parks_again(clone_env):
   )
   _git(worktree, "add", "backend/app/main.py")
 
-  assert pu.continue_platform_overlay_update(platform) == "conflict"
+  assert pu.continue_platform_overlay_update(platform) == "prepared"
   assert _served_sha(platform) == pre
   assert (platform / "backend/app/foo.py").read_text() == "VALUE = 'BEFORE APPLY'\n"
+  # The in-progress edit is a late edit: it overlaps the update after boot.
+  assert _finish_prepared(platform) == "conflict"
   again = pu._read_conflict_flag()["overlay"]
   assert again["stage"] == "working" and again["paths"] == ["backend/app/foo.py"]
+  replay = Path(again["worktree"])
 
-  (worktree / "backend/app/foo.py").write_text("VALUE = 'UPSTREAM AND LOCAL'\n")
-  _git(worktree, "add", "backend/app/foo.py")
+  (replay / "backend/app/foo.py").write_text("VALUE = 'UPSTREAM AND LOCAL'\n")
+  _git(replay, "add", "backend/app/foo.py")
   assert pu.continue_platform_overlay_update(platform) == "updated"
   assert _overlay_subjects(platform, target) == [
     "Reconcile local platform source with reviewed upstream",
@@ -1274,7 +1734,8 @@ def test_uncommitted_edits_stay_uncommitted_across_a_parked_conflict(clone_env):
   )
   _git(worktree, "add", "backend/app/main.py")
 
-  assert pu.continue_platform_overlay_update(platform) == "updated"
+  assert pu.continue_platform_overlay_update(platform) == "prepared"
+  assert _finish_prepared(platform) == "replayed"
 
   target = _git(platform, "rev-parse", "origin/main").stdout.strip()
   assert _overlay_subjects(platform, target) == [
@@ -1360,48 +1821,26 @@ def test_dirty_resolution_merges_with_a_late_commit(clone_env):
   ]
 
 
-def test_continue_runs_the_same_post_replay_gates_as_apply(
+def test_boot_leaves_frontend_dependencies_alone_when_the_lock_did_not_change(
   clone_env, monkeypatch,
 ):
   origin, platform = clone_env
-  _local_commit(platform, edits={"backend/app/main.py":
-    _MAIN_PY.replace("LINE_A = 1", "LINE_A = 'LOCAL'")})
-  _advance_origin(origin, edits={
-    "backend/app/main.py": _MAIN_PY.replace("LINE_A = 1", "LINE_A = 'UPSTREAM'"),
-    "frontend/package-lock.json": "new-locked-frontend-deps\n",
-    "frontend/src/App.jsx": "export default 'upstream'\n",
-  })
-  gates, rebuilt = [], []
+  _served, _target, _worktree = _park_resolved_line_a_conflict(platform, origin)
   monkeypatch.setattr(
     pu, "_sync_frontend_dependencies",
-    lambda repo: gates.append("frontend") or (True, ""),
+    lambda repo: pytest.fail("the dependency lock did not change"),
   )
-  monkeypatch.setattr(
-    pu, "_rebuild_frontend",
-    lambda repo, res: gates.append("build") or rebuilt.append(res.new_sha),
-  )
-
-  res = pu.reconcile_clone(platform)
-  assert res.status == "conflict"
-  worktree = Path(res.overlay["worktree"])
-  (worktree / "backend/app/main.py").write_text(
-    _MAIN_PY.replace("LINE_A = 1", "LINE_A = 'BOTH'"),
-  )
-  _git(worktree, "add", "backend/app/main.py")
-
-  assert pu.continue_platform_overlay_update(platform) == "updated"
-
-  # The same gates, in the same order, as an owner Apply: the frontend deps
-  # land before the build so it never compiles against stale node_modules.
-  assert gates == ["frontend", "build"]
-  assert rebuilt == [_served_sha(platform)]
-  assert not (platform / "frontend" / ".source-build-signature").exists()
+  assert pu.continue_platform_overlay_update(platform) == "prepared"
+  assert _finish_prepared(platform) == "replayed"
 
 
 def test_continue_refuses_new_python_dependencies_before_source_moves(
   clone_env,
 ):
+  """An image without the boot transaction cannot hand new packages' source
+  to the image that has them, so it prepares nothing."""
   origin, platform = clone_env
+  pu.BOOT_TRANSACTION_MARKER.unlink()
   served = _local_commit(platform, edits={
     "backend/app/main.py": _MAIN_PY.replace(
       "LINE_A = 1", "LINE_A = 'LOCAL'",
@@ -1429,17 +1868,21 @@ def test_continue_refuses_new_python_dependencies_before_source_moves(
   assert worktree.exists()
 
 
-def test_continue_rolls_back_a_candidate_that_fails_a_gate(clone_env, monkeypatch):
+def test_boot_installs_changed_frontend_dependencies_before_the_shell_rebuilds(
+  clone_env, monkeypatch,
+):
   origin, platform = clone_env
-  pre = _local_commit(platform, edits={"backend/app/main.py":
+  _local_commit(platform, edits={"backend/app/main.py":
     _MAIN_PY.replace("LINE_A = 1", "LINE_A = 'LOCAL'")})
   _advance_origin(origin, edits={
     "backend/app/main.py": _MAIN_PY.replace("LINE_A = 1", "LINE_A = 'UPSTREAM'"),
     "frontend/package-lock.json": "new-locked-frontend-deps\n",
     "frontend/src/App.jsx": "export default 'upstream'\n",
   })
+  installs = []
   monkeypatch.setattr(
-    pu, "_sync_frontend_dependencies", lambda repo: (False, "npm exploded"),
+    pu, "_sync_frontend_dependencies",
+    lambda repo: installs.append(repo) or (True, ""),
   )
   res = pu.reconcile_clone(platform)
   worktree = Path(res.overlay["worktree"])
@@ -1447,12 +1890,18 @@ def test_continue_rolls_back_a_candidate_that_fails_a_gate(clone_env, monkeypatc
     _MAIN_PY.replace("LINE_A = 1", "LINE_A = 'BOTH'"),
   )
   _git(worktree, "add", "backend/app/main.py")
+  stamp = platform / "frontend" / ".source-build-signature"
+  stamp.parent.mkdir(parents=True, exist_ok=True)
+  stamp.write_text("old build\n")
 
-  assert pu.continue_platform_overlay_update(platform) == "rolled_back"
+  assert pu.continue_platform_overlay_update(platform) == "prepared"
+  assert installs == []  # nothing installs until the update has booted
+  assert _finish_prepared(platform) == "replayed"
 
-  assert _served_sha(platform) == pre
-  assert "npm exploded" in pu._read_rolled_back_flag()["error"]
-  assert not pu.CONFLICT_FLAG.exists()
+  # The lock installs first; dropping the stamp makes the watcher's startup
+  # check rebuild the shell against it.
+  assert installs == [platform]
+  assert not stamp.exists()
 
 
 def test_merge_shaped_history_update_restores_uncommitted_edits(clone_env):
@@ -2269,7 +2718,12 @@ def test_platform_conflict_resolver_message_points_at_the_parked_worktree():
   assert "all marked files together" in content
   assert "merge --no-ff" not in content
   assert "running platform is untouched" in content
-  assert "separate image/restart actions" in content
+  assert "finish this same update yourself" in content
+  assert "update-preview?intent=finish" in content
+  assert "/api/platform/rebuild" in content
+  assert "without touching the live checkout" in content
+  assert "merged back after it boots" in content
+  assert "A plain restart never swaps in an update that needs a new image" in content
 
 
 def test_status_restart_needed_when_disk_head_changed_after_boot(clone_env):
@@ -2531,6 +2985,40 @@ def test_reviewed_image_target_does_not_treat_incoming_dockerfile_as_local(
   _local_commit(platform, edits={"Dockerfile": "FROM local-divergence\n"})
   assert pu.container_replacement_blockers(
     target, platform, local_change_base=current,
+  ) == ["Dockerfile"]
+
+
+def test_local_image_change_already_in_a_further_changed_target_is_not_a_blocker(
+  clone_env,
+):
+  """A local fix the release already contains, plus more release edits to the
+  same file, loses nothing on replacement; only the merged file decides."""
+  origin, platform = clone_env
+  base = _advance_origin(
+    origin, edits={"Dockerfile": "FROM base\nRUN one\n\n\n\nRUN two\n"},
+    msg="multi-line base",
+  )
+  _git(platform, "fetch", "origin")
+  _git(platform, "merge", "--ff-only", base)
+  _local_commit(
+    platform, edits={"Dockerfile": "FROM base\nRUN one-fixed\n\n\n\nRUN two\n"},
+  )
+  target = _advance_origin(
+    origin,
+    edits={"Dockerfile": "FROM base\nRUN one-fixed\n\n\n\nRUN two-newer\n"},
+    msg="release carries the fix and more",
+  )
+  _git(platform, "fetch", "origin")
+
+  assert pu.container_replacement_blockers(
+    target, platform, local_change_base=base,
+  ) == []
+
+  _local_commit(
+    platform, edits={"Dockerfile": "FROM base\nRUN one-local-only\n\n\n\nRUN two\n"},
+  )
+  assert pu.container_replacement_blockers(
+    target, platform, local_change_base=base,
   ) == ["Dockerfile"]
 
 
@@ -2900,17 +3388,16 @@ def test_status_no_restart_when_only_tests_changed(clone_env):
   assert status["state"] == pu.PlatformUpdateState.UP_TO_DATE.value
 
 
-def test_status_ignores_seed_repair_already_matching_running_image(
+def test_status_ignores_boot_script_repair_already_matching_running_image(
   clone_env, monkeypatch,
 ):
-  """A served-checkout SHA cannot make an already-baked seed stale.
+  """A served-checkout SHA cannot make an already-baked boot script stale.
 
-  Seed templates run from the image, unlike the Python checkout. Restoring one
-  to the image's exact bytes must clear a false image-rebuild prompt without
-  modifying the separately owner-curated shared skill.
+  Boot scripts run from the image, unlike the Python checkout. Restoring one
+  to the image's exact bytes must clear a false image-rebuild prompt.
   """
   _, platform = clone_env
-  path = "backend/scripts/seed-skills/goal-planning.md"
+  path = "backend/scripts/init_chat_summaries.py"
   seed = platform / path
   seed.parent.mkdir(parents=True)
   seed.write_text("old seed\n")
@@ -2920,7 +3407,7 @@ def test_status_ignores_seed_repair_already_matching_running_image(
   pu.SERVING_SOURCE_FILE.write_text("platform\n")
   pu.SERVING_SHA_FILE.write_text(served + "\n")
 
-  baked = "running image seed\n"
+  baked = "running image script\n"
   _local_commit(platform, edits={path: baked})
   monkeypatch.setattr(pu, "_build_info", lambda: {
     "image_inputs": {path: hashlib.sha256(baked.encode()).hexdigest()},
@@ -3686,7 +4173,7 @@ def test_update_preview_excludes_local_edits(clone_env):
   assert preview["conflict_paths"] == []
 
 
-def test_update_preview_does_not_replay_local_overlay(
+def test_update_preview_predicts_the_apply_conflict_without_touching_the_checkout(
   clone_env, monkeypatch,
 ):
   origin, platform = clone_env
@@ -3701,8 +4188,9 @@ def test_update_preview_does_not_replay_local_overlay(
 
   preview = pu.platform_update_preview(platform)
 
-  # Review is read-only: it neither replays history nor parks a resolver.
-  assert preview["conflict_paths"] == []
+  # Review names the conflict Apply would park, so the update can go straight
+  # to an agent, yet stays read-only: no replay, no parked resolver.
+  assert preview["conflict_paths"] == ["backend/app/main.py"]
   assert _served_sha(platform) == served
   assert _git(platform, "status", "--porcelain").stdout == ""
   assert _git(platform, "worktree", "list", "--porcelain").stdout == worktrees_before
@@ -4369,6 +4857,154 @@ def test_finish_stays_on_applied_release_when_newer_source_is_available(clone_en
   assert applied != newer
 
 
+def test_finish_targets_the_installed_release_when_the_tracking_ref_lags(clone_env):
+  origin, platform = clone_env
+  older = _served_sha(platform)
+  installed = _advance_origin(origin, edits={"release.txt": "installed release\n"})
+  assert pu.reconcile_clone(platform).status == "updated"
+  # A reviewed Apply can install an exact target fetched outside the tracking
+  # ref, so origin/main may still name the older release afterwards.
+  _git(platform, "update-ref", "refs/remotes/origin/main", older)
+
+  assert pu.applied_release_sha(platform) == installed
+  status = pu.platform_status(platform)
+  assert status["available"] is False
+  assert status["contained_upstream_sha"] == installed
+  preview = pu.platform_update_preview(platform)
+  assert preview["target_sha"] == installed
+  pu.check_for_updates(platform)
+  assert pu.recorded_upstream_sha(platform) == installed
+
+
+def test_finish_refuses_a_branch_reset_below_the_installed_release(clone_env):
+  origin, platform = clone_env
+  older = _served_sha(platform)
+  _advance_origin(origin, edits={"release.txt": "installed release\n"})
+  assert pu.reconcile_clone(platform).status == "updated"
+  _git(platform, "update-ref", "refs/remotes/origin/main", older)
+  _git(platform, "reset", "-q", "--hard", older)
+
+  # Finish must never target a release the served source does not contain,
+  # even though the lagging tracking ref names one it does.
+  with pytest.raises(pu.PlatformUpdateError, match="applied_release_unavailable"):
+    pu.applied_release_sha(platform)
+
+
+def test_a_parked_update_is_the_only_one_until_it_finishes(clone_env):
+  origin, platform = clone_env
+  _local_commit(platform, edits={"backend/scripts/init_chat_summaries.py": "local\n"})
+  current = _served_sha(platform)
+  pinned = _advance_origin(origin, edits={"release.txt": "pinned\n"})
+  pu._fetch(platform)
+  plan = _apply_plan(current, pinned, platform)
+  plan.pop("repo")
+
+  assert pu.park_update_for_agent(**plan, repo=platform) == {
+    "target_sha": pinned, "stage": "resolve", "action": "replace",
+    "cancellable": True,
+  }
+  assert pu.platform_status(platform)["unfinished_update"]["target_sha"] == pinned
+
+  newer = _advance_origin(origin, edits={"release.txt": "newer\n"})
+  pu._fetch(platform)
+  with pytest.raises(pu.PlatformUpdateError, match="finish_update_first"):
+    pu._validate_update_plan(
+      platform, plan_id=pu._update_plan_id(current, newer, None),
+      current_sha=current, target_sha=newer,
+    )
+  assert pu.abandon_platform_overlay_update(platform) == "abandoned"
+  assert pu.unfinished_update(platform) is None
+
+
+def test_only_an_owed_container_replacement_blocks_newer_updates(clone_env):
+  origin, platform = clone_env
+  script = "backend/scripts/init_chat_summaries.py"
+  target = _advance_origin(origin, edits={
+    script: "release boot\n",
+    "backend/app/main.py": _MAIN_PY.replace("LINE_A = 1", "LINE_A = 300"),
+  })
+  assert pu.reconcile_clone(platform).status == "updated"
+
+  # A pending restart alone never blocks: several updates may share one.
+  pu.mark_activation_needed(
+    _served_sha(platform), ["backend/app/main.py"], upstream_sha=target,
+    repo=platform,
+  )
+  assert pu.unfinished_update(platform) is None
+
+  pu.mark_activation_needed(
+    _served_sha(platform), [script], upstream_sha=target, repo=platform,
+  )
+  assert pu.unfinished_update(platform) == {
+    "target_sha": target, "stage": "finish", "action": "replace",
+    "cancellable": False,
+  }
+
+
+def test_blockers_are_fixed_on_a_frozen_copy_and_late_edits_return_after_boot(
+  clone_env,
+):
+  origin, platform = clone_env
+  script = "backend/scripts/init_chat_summaries.py"
+  _local_commit(platform, edits={script: "local boot tweak\n"})
+  current = _served_sha(platform)
+  target = _advance_origin(origin, edits={"release.txt": "reviewed\n"})
+  pu._fetch(platform)
+  plan = _apply_plan(current, target, platform)
+  plan.pop("repo")
+
+  pending = pu.park_update_for_agent(**plan, repo=platform)
+
+  assert pending["stage"] == "resolve"
+  parked = pu._read_conflict_flag()["overlay"]
+  assert parked["blockers"] == [script]
+  worktree = Path(parked["worktree"])
+  content = pu._platform_conflict_resolver_message(target, [], parked)
+  assert script in content and f"git checkout {target} -- <path>" in content
+
+  _git(worktree, "rm", "-q", script)  # the release does not ship this file
+  # Another chat keeps working on the live checkout meanwhile.
+  _local_commit(platform, edits={"notes.txt": "late live edit\n"})
+
+  assert pu.continue_platform_overlay_update(platform) == "prepared"
+  # Nothing reached the live checkout: it still serves the local boot tweak.
+  assert (platform / script).read_text() == "local boot tweak\n"
+  assert not (platform / "release.txt").exists()
+  assert pu.unfinished_update(platform)["stage"] == "finish"
+
+  # A restart does not swap in an update that needs a new container.
+  assert pu.read_prepared_update()["requires_image"] is True
+  assert pu.swap_in_prepared_update(cutover=False, repo=platform) is False
+
+  assert _finish_prepared(platform) == "replayed"
+  assert (platform / "release.txt").read_text() == "reviewed\n"
+  assert (platform / "notes.txt").read_text() == "late live edit\n"
+  assert not (platform / script).exists()
+  assert pu._is_ancestor(platform, target, _served_sha(platform))
+
+
+def test_finish_of_already_applied_source_still_requires_the_owed_image(
+  clone_env,
+):
+  """Source that already contains the release has no incoming changes, but
+  the running image still owes that release's image work; Finish must keep
+  requiring the replacement instead of refusing it."""
+  origin, platform = clone_env
+  target = _advance_origin(origin, edits={"Dockerfile": "FROM official-new\n"})
+  pu._fetch(platform)
+  _git(platform, "merge", "--ff-only", target)
+  pu._write_activation_marker(
+    target, ["Dockerfile"], upstream_sha=target, image_paths=["Dockerfile"],
+  )
+  current = _served_sha(platform)
+  plan = _apply_plan(current, target, platform)
+  plan.pop("repo")
+
+  prepared = pu.prepare_reviewed_update(**plan, repo=platform)
+
+  assert prepared["requires_image"] is True
+
+
 def test_finish_can_prove_applied_source_without_a_recorded_marker(clone_env):
   _origin, platform = clone_env
   applied = _served_sha(platform)
@@ -4460,12 +5096,12 @@ def test_host_installer_replays_exact_bundled_release_and_preserves_local_edits(
 
 
 @pytest.mark.parametrize("deployment", ["self_hosted", "railway"])
-def test_review_exposes_seed_customization_before_replacement_without_mutation(
+def test_review_exposes_boot_script_customization_before_replacement_without_mutation(
   clone_env, monkeypatch, deployment,
 ):
   origin, platform = clone_env
   monkeypatch.setattr(platform_activation, "deployment_kind", lambda: deployment)
-  paths = ["backend/scripts/seed-skills/cron.md", "backend/scripts/seed-skills/waiting.md"]
+  paths = ["backend/scripts/init_agent_context.py", "backend/scripts/init_chat_summaries.py"]
   _local_commit(platform, edits={path: "local instructions\n" for path in paths})
   target = _advance_origin(origin, edits={"Dockerfile": "FROM official-new\n"})
   pu._fetch(platform)
@@ -4483,7 +5119,7 @@ def test_review_exposes_seed_customization_before_replacement_without_mutation(
   assert preview["blocking_paths"] == paths
   assert reviewed["blockers"] == preview["blocking_paths"]
   assert preview["blocking_diff"] is not None
-  assert "backend/scripts/seed-skills/cron.md" in preview["blocking_diff"]
+  assert "backend/scripts/init_agent_context.py" in preview["blocking_diff"]
   assert "local instructions" in preview["blocking_diff"]
   assert preview["blocking_diff_truncated"] is False
   assert preview["activation"]["deployment"] == deployment
@@ -4493,9 +5129,9 @@ def test_review_exposes_seed_customization_before_replacement_without_mutation(
   assert all((platform / path).read_text() == "local instructions\n" for path in paths)
 
 
-def test_review_does_not_block_seed_changes_already_in_the_official_release(clone_env):
+def test_review_does_not_block_image_changes_already_in_the_official_release(clone_env):
   origin, platform = clone_env
-  path = "backend/scripts/seed-skills/cron.md"
+  path = "backend/scripts/init_chat_summaries.py"
   _local_commit(platform, edits={path: "same useful instructions\n"})
   target = _advance_origin(origin, edits={path: "same useful instructions\n"})
   pu._fetch(platform)
@@ -4615,7 +5251,7 @@ def test_review_does_not_follow_image_input_ancestor_symlink(clone_env):
 def test_finish_review_exposes_local_image_blockers_too(clone_env):
   _, platform = clone_env
   official = _served_sha(platform)
-  path = "backend/scripts/seed-skills/cron.md"
+  path = "backend/scripts/init_chat_summaries.py"
   _local_commit(platform, edits={path: "preserve me\n"})
   pu.mark_activation_needed(_served_sha(platform), [path], upstream_sha=official, repo=platform)
 
@@ -4624,3 +5260,677 @@ def test_finish_review_exposes_local_image_blockers_too(clone_env):
   assert preview["operation"] == "finish"
   assert preview["blocking_paths"] == [path]
   assert "preserve me" in preview["blocking_diff"]
+
+
+# --- An update that needs a new image is activated by that image's boot -----
+
+
+def _prepare_package_update(platform: Path, origin: Path) -> dict:
+  """Prepare a reviewed release that changes Python packages, with a late
+  commit and an in-progress edit made on the old source afterwards."""
+  base = _served_sha(platform)
+  _local_commit(platform, edits={"backend/app/local.py": "LOCAL = 1\n"})
+  target = _advance_origin(origin, edits={
+    "backend/requirements.lock": "new-package==1\n",
+    "backend/app/uses_new_package.py": "import new_package\n",
+  })
+  pu._fetch(platform)
+  current = _served_sha(platform)
+  plan = _apply_plan(current, target, platform)
+  plan.pop("repo")
+  record = pu.prepare_reviewed_update(**plan, repo=platform)
+  assert record["state"] == "prepared" and record["requires_image"] is True
+  assert _served_sha(platform) == current != base
+  _local_commit(platform, edits={"backend/app/late.py": "LATE = 1\n"})
+  (platform / "backend/app/local.py").write_text("LOCAL = 'in progress'\n")
+  return record
+
+
+def _assert_update_active_with_late_work(platform: Path, target: str) -> None:
+  assert pu._is_ancestor(platform, target, _served_sha(platform))
+  assert (platform / "backend/requirements.lock").read_text() == "new-package==1\n"
+  assert (platform / "backend/app/late.py").read_text() == "LATE = 1\n"
+  # The in-progress edit returns uncommitted, exactly as it was left.
+  assert (platform / "backend/app/local.py").read_text() == "LOCAL = 'in progress'\n"
+  assert "backend/app/local.py" in _git(platform, "status", "--porcelain").stdout
+
+
+def test_the_outgoing_server_never_swaps_in_an_update_that_needs_a_new_image(
+  clone_env,
+):
+  origin, platform = clone_env
+  _prepare_package_update(platform, origin)
+  before = _served_sha(platform)
+
+  assert pu.swap_in_prepared_update(cutover=True, repo=platform) is False
+
+  assert _served_sha(platform) == before
+  assert pu.read_prepared_update()["state"] == "prepared"
+
+
+def test_an_image_without_the_boot_transaction_still_swaps_at_its_cutover(
+  clone_env,
+):
+  """Images from before the boot transaction keep their own contract: they
+  swap an image update in at the cutover, and could not prepare this one."""
+  origin, platform = clone_env
+  target = _advance_origin(origin, edits={"Dockerfile": "FROM official-new\n"})
+  pu._fetch(platform)
+  plan = _apply_plan(_served_sha(platform), target, platform)
+  plan.pop("repo")
+  pu.BOOT_TRANSACTION_MARKER.unlink()
+  assert pu.prepare_reviewed_update(**plan, repo=platform)["requires_image"]
+
+  assert pu.swap_in_prepared_update(cutover=True, repo=platform) is True
+
+
+def test_only_the_update_s_own_image_swaps_it_in_at_boot(clone_env):
+  origin, platform = clone_env
+  record = _prepare_package_update(platform, origin)
+  before = _served_sha(platform)
+
+  _boot_image("0" * 40)  # the old image restarting
+  assert pu.settle_prepared_update_for_this_image(platform) == "waiting"
+  assert _served_sha(platform) == before
+
+  _boot_image(record["target"])
+  assert pu.settle_prepared_update_for_this_image(platform) == "replayed"
+  _assert_update_active_with_late_work(platform, record["target"])
+  # Repeating the boot changes nothing.
+  replayed = pu.read_prepared_update()["replayed"]
+  assert pu.settle_prepared_update_for_this_image(platform) == "replayed"
+  assert pu.read_prepared_update()["replayed"] == replayed == _served_sha(platform)
+
+
+class _Killed(BaseException):
+  pass
+
+
+def _kill_once(monkeypatch, name: str, *, after: bool) -> None:
+  """Kill the boot the first time ``name`` runs, before or after its effect."""
+  real = getattr(pu, name)
+  calls = []
+
+  def killed(*args, **kwargs):
+    if calls:
+      return real(*args, **kwargs)
+    calls.append(name)
+    if after:
+      real(*args, **kwargs)
+    raise _Killed(name)
+
+  monkeypatch.setattr(pu, name, killed)
+
+
+@pytest.mark.parametrize(("name", "after"), [
+  ("_carry_working_edits", True),  # edits carried, record still prepared
+  ("_write_prepared_update", True),  # record swapped, branch not moved
+  ("_activate_candidate", True),  # branch moved, reconcile marker still set
+  ("_finish_swap", False),  # branch moved, bookkeeping not done
+  ("_set_upstream", False),  # bookkeeping half done
+  ("_merged_candidate", False),  # merge-back not started
+  ("_clear_reconcile_pre", False),  # merge-back moved, marker still set
+])
+def test_a_boot_killed_at_any_point_of_the_swap_finishes_on_the_next_boot(
+  clone_env, monkeypatch, name, after,
+):
+  origin, platform = clone_env
+  record = _prepare_package_update(platform, origin)
+  _boot_image(record["target"])
+  _kill_once(monkeypatch, name, after=after)
+
+  with pytest.raises(_Killed):
+    pu.settle_prepared_update_for_this_image(platform)
+
+  assert pu.settle_prepared_update_for_this_image(platform) == "replayed"
+  _assert_update_active_with_late_work(platform, record["target"])
+  assert pu.recorded_upstream_sha(platform) == record["target"]
+  assert not pu.RECONCILE_PRE_FLAG.exists()
+
+
+def test_an_image_that_is_not_kept_returns_to_the_saved_state_and_keeps_new_work(
+  clone_env,
+):
+  """The controller rolled the image back after the update booted on it: the
+  old image restores its own source and bookkeeping, and nothing made on the
+  update since is lost."""
+  origin, platform = clone_env
+  record = _prepare_package_update(platform, origin)
+  upstream_before = pu.recorded_upstream_sha(platform)
+  # Image work the previous version still owes survives every boot.
+  pu._write_activation_marker(
+    "a" * 40, ["Dockerfile"], upstream_sha="a" * 40, image_paths=["Dockerfile"],
+  )
+  activation_before = pu.RESTART_NEEDED_FLAG.read_text()
+  late_tree = (platform / "backend/app/late.py").read_text()
+  _boot_image(record["target"])
+  assert pu.settle_prepared_update_for_this_image(platform) == "replayed"
+  # An agent resumes on the new version and keeps working.
+  _local_commit(platform, edits={"backend/app/new_work.py": "NEW = 1\n"})
+  (platform / "backend/app/draft.py").write_text("DRAFT = 1\n")
+
+  _boot_image(record["snapshot"])  # the image it replaced
+  assert pu.settle_prepared_update_for_this_image(platform) == "reverted"
+
+  assert (platform / "backend/app/late.py").read_text() == late_tree
+  assert not (platform / "backend/app/uses_new_package.py").exists()
+  assert (platform / "backend/app/local.py").read_text() == "LOCAL = 'in progress'\n"
+  assert pu.recorded_upstream_sha(platform) == upstream_before
+  assert pu.RESTART_NEEDED_FLAG.read_text() == activation_before
+  reverted = pu.read_prepared_update()
+  assert reverted["state"] == "prepared" and reverted["operation"] is None
+  refs = _git(
+    platform, "for-each-ref", "--format=%(refname)", pu._SET_ASIDE_PREFIX,
+  ).stdout.split()
+  assert len(refs) == 1
+  kept = _git(platform, "show", f"{refs[0]}:backend/app/draft.py").stdout
+  assert kept == "DRAFT = 1\n"
+  assert _git(platform, "show", f"{refs[0]}:backend/app/new_work.py").stdout == "NEW = 1\n"
+  assert refs[0] in pu._read_rolled_back_flag()["error"]
+
+
+def test_a_reverted_image_update_with_nothing_new_sets_nothing_aside(clone_env):
+  origin, platform = clone_env
+  record = _prepare_package_update(platform, origin)
+  _boot_image(record["target"])
+  pu.settle_prepared_update_for_this_image(platform)
+
+  assert pu.revert_failed_update(platform)
+
+  assert not _git(
+    platform, "for-each-ref", pu._SET_ASIDE_PREFIX,
+  ).stdout.strip()
+
+
+def test_a_boot_refuses_a_checkout_it_cannot_place_for_any_update(clone_env):
+  """Restart-only or not, an unexplained checkout under a live swap is never
+  served: the boot cannot tell which source it would be running."""
+  origin, platform = clone_env
+  record = _prepare_package_update(platform, origin)
+  _boot_image(record["target"])
+  pu.settle_prepared_update_for_this_image(platform)
+  _git(platform, "reset", "-q", "--hard", record["snapshot"])
+  _local_commit(platform, edits={"elsewhere.txt": "unrelated\n"})
+
+  with pytest.raises(pu.BootTransactionError):
+    pu.settle_prepared_update_for_this_image(platform)
+
+
+def test_a_record_from_a_newer_boot_protocol_is_refused(clone_env):
+  origin, platform = clone_env
+  record = _prepare_package_update(platform, origin)
+  pu._write_prepared_update({**record, "protocol": pu.BOOT_PROTOCOL + 1})
+  _boot_image(record["target"])
+
+  with pytest.raises(pu.BootTransactionError, match="protocol"):
+    pu.settle_prepared_update_for_this_image(platform)
+
+
+def test_only_this_boot_s_transaction_certifies_image_updates(clone_env):
+  pu.BOOT_TRANSACTION_MARKER.write_text("0\n")
+  assert not pu.image_activates_updates()
+  pu.BOOT_TRANSACTION_MARKER.unlink()
+  assert not pu.image_activates_updates()
+  pu.BOOT_TRANSACTION_MARKER.write_text(f"{pu.BOOT_PROTOCOL}\n")
+  assert pu.image_activates_updates()
+
+
+def _activate_bound(platform: Path, origin: Path, operation: dict) -> dict:
+  record = _prepare_package_update(platform, origin)
+  pu.bind_update_operation(record["target"], operation, repo=platform)
+  _boot_image(record["target"])
+  assert pu.settle_prepared_update_for_this_image(platform) == "replayed"
+  _boot_started_server(platform)
+  return pu.read_prepared_update()
+
+
+def _succeeded(record: dict, **overrides) -> dict:
+  status = {
+    "state": "succeeded", "expected_sha": record["target"],
+    "operation_id": record["operation"]["id"], "image_digest": None,
+    "request_nonce": None,
+  }
+  return {**status, **overrides}
+
+
+def test_only_the_bound_replacement_s_success_retires_an_image_update(clone_env):
+  origin, platform = clone_env
+  record = _activate_bound(
+    platform, origin, {"controller": "railway", "id": "replace_1"},
+  )
+
+  # The started server does not confirm it: the controller can still roll back.
+  assert not pu.confirm_platform_swap_loaded(platform)
+  pending = pu.unfinished_update(platform)
+  assert pending["stage"] == "settling" and not pending["cancellable"]
+  assert not pu.late_edits_pending()  # resumes are not held meanwhile
+
+  for stale in (
+    _succeeded(record, operation_id="replace_0"),  # an earlier attempt
+    _succeeded(record, expected_sha="b" * 40),
+    _succeeded(record, state="verifying"),
+  ):
+    assert pu.reconcile_bound_operation(stale, platform) is None
+  _boot_started_server(platform, source="baked")
+  assert pu.reconcile_bound_operation(_succeeded(record), platform) is None
+  _boot_image("c" * 40)
+  _boot_started_server(platform)
+  assert pu.reconcile_bound_operation(_succeeded(record), platform) is None
+  assert pu.read_prepared_update() == record
+
+  _boot_image(record["target"])
+  assert pu.reconcile_bound_operation(_succeeded(record), platform) == "retired"
+  assert pu.read_prepared_update() is None
+  assert pu.unfinished_update(platform) is None
+
+
+def test_a_host_replacement_is_identified_by_the_app_s_nonce(clone_env):
+  origin, platform = clone_env
+  nonce = "f" * 32
+  record = _activate_bound(platform, origin, {"controller": "host", "id": nonce})
+
+  assert pu.reconcile_bound_operation(
+    _succeeded(record, operation_id="x", request_nonce="e" * 32), platform,
+  ) is None
+  assert pu.reconcile_bound_operation(
+    _succeeded(record, operation_id="x", request_nonce=nonce), platform,
+  ) == "retired"
+
+
+def test_a_railway_success_for_another_image_digest_does_not_retire(clone_env):
+  origin, platform = clone_env
+  record = _prepare_package_update(platform, origin)
+  pu._write_prepared_update({**record, "image_digest": "sha256:" + "1" * 64})
+  pu.bind_update_operation(
+    record["target"], {"controller": "railway", "id": "replace_1"}, repo=platform,
+  )
+  _boot_image(record["target"])
+  pu.settle_prepared_update_for_this_image(platform)
+  _boot_started_server(platform)
+  record = pu.read_prepared_update()
+
+  assert pu.reconcile_bound_operation(
+    _succeeded(record, image_digest="sha256:" + "2" * 64), platform,
+  ) is None
+  assert pu.reconcile_bound_operation(
+    _succeeded(record, image_digest="sha256:" + "1" * 64), platform,
+  ) == "retired"
+
+
+@pytest.mark.parametrize("state", ["failed", "no_change", "rolled_back"])
+def test_a_replacement_that_never_booted_the_target_releases_its_binding(
+  clone_env, state,
+):
+  origin, platform = clone_env
+  record = _prepare_package_update(platform, origin)
+  operation = {"controller": "railway", "id": "replace_1"}
+  pu.bind_update_operation(record["target"], operation, repo=platform)
+  status = {
+    "state": state, "expected_sha": record["target"],
+    "operation_id": "replace_1", "image_digest": None,
+  }
+
+  assert pu.reconcile_bound_operation(status, platform) == "unbound"
+  assert pu.read_prepared_update()["operation"] is None
+  assert pu.unfinished_update(platform)["stage"] == "finish"
+
+
+def test_only_the_exact_binding_is_released_after_a_definitive_failure(clone_env):
+  origin, platform = clone_env
+  record = _prepare_package_update(platform, origin)
+  bound = {"controller": "railway", "id": "replace_2"}
+  pu.bind_update_operation(record["target"], bound, repo=platform)
+
+  pu.unbind_update_operation(
+    record["target"], {"controller": "railway", "id": "replace_1"}, repo=platform,
+  )
+  assert pu.read_prepared_update()["operation"] == bound
+  pu.unbind_update_operation(record["target"], bound, repo=platform)
+  assert pu.read_prepared_update()["operation"] is None
+
+
+def test_the_owner_may_keep_a_settling_update_only_on_its_own_image(clone_env):
+  origin, platform = clone_env
+  record = _activate_bound(
+    platform, origin, {"controller": "railway", "id": "replace_1"},
+  )
+  _boot_started_server(platform, source="baked")
+  with pytest.raises(pu.PlatformUpdateError, match="update_not_settling"):
+    pu.keep_settling_update(platform)
+
+  _boot_started_server(platform)
+  pu.keep_settling_update(platform)
+  assert pu.read_prepared_update() is None
+  assert record["target"]
+
+
+def test_a_settling_update_blocks_preparing_another(clone_env):
+  origin, platform = clone_env
+  record = _activate_bound(
+    platform, origin, {"controller": "host", "id": "d" * 32},
+  )
+  newer = _advance_origin(origin, edits={"release.txt": "newer\n"})
+  pu._fetch(platform)
+  current = _served_sha(platform)
+
+  for target in (newer, record["target"]):
+    plan = _apply_plan(current, target, platform)
+    plan.pop("repo")
+    with pytest.raises(pu.PlatformUpdateError, match="finish_update_first"):
+      pu.prepare_reviewed_update(**plan, repo=platform)
+  with pytest.raises(pu.PlatformUpdateError, match="prepared_update_swapped"):
+    pu.cancel_unfinished_update(platform)
+
+
+def test_finishing_needs_only_a_restart_once_the_target_image_runs(clone_env):
+  """The target image booted but the update did not stay in (its probe
+  failed): another replacement would change nothing, so Finish restarts."""
+  origin, platform = clone_env
+  record = _prepare_package_update(platform, origin)
+  _boot_image("0" * 40)
+  assert pu.unfinished_update(platform)["action"] == "replace"
+
+  _boot_image(record["target"])
+  pu.settle_prepared_update_for_this_image(platform)
+  assert pu.revert_failed_update(platform)
+
+  pending = pu.unfinished_update(platform)
+  assert (pending["stage"], pending["action"]) == ("finish", "restart")
+  # That restart's boot swaps it in again.
+  assert pu.settle_prepared_update_for_this_image(platform) == "replayed"
+
+
+def test_a_late_edit_conflict_resolution_keeps_the_replacement_binding(clone_env):
+  origin, platform = clone_env
+  record = _prepare_package_update(platform, origin)
+  _local_commit(platform, edits={
+    "backend/requirements.lock": "late-local-package==1\n",
+  }, msg="late conflicting commit")
+  pu.bind_update_operation(
+    record["target"], {"controller": "host", "id": "d" * 32}, repo=platform,
+  )
+  _boot_image(record["target"])
+  assert pu.settle_prepared_update_for_this_image(platform) == "conflict"
+  worktree = Path(pu._read_conflict_flag()["overlay"]["worktree"])
+  (worktree / "backend/requirements.lock").write_text("new-package==1\n")
+  _git(worktree, "add", "backend/requirements.lock")
+
+  assert pu.continue_platform_overlay_update(platform) == "updated"
+
+  kept = pu.read_prepared_update()
+  assert kept["state"] == "swapped" and kept["operation"]["id"] == "d" * 32
+  assert kept["replayed"] == _served_sha(platform)
+
+
+def _record_image_inputs(platform: Path, lock: bytes) -> None:
+  info = Path(os.environ["MOBIUS_BUILD_INFO_PATH"])
+  data = json.loads(info.read_text()) if info.exists() else {}
+  data["image_inputs"] = {
+    path: hashlib.sha256(
+      lock if path.endswith(".lock") else (platform / path).read_bytes(),
+    ).hexdigest()
+    for path in pu._PYTHON_DEPENDENCY_INPUTS
+  }
+  info.write_text(json.dumps(data))
+
+
+def _with_python_inputs(platform: Path, origin: Path) -> None:
+  release = _advance_origin(origin, edits={
+    "backend/requirements.txt": "fastapi\n",
+    "backend/requirements.lock": "fastapi==1\n",
+  })
+  pu._fetch(platform)
+  _git(platform, "merge", "-q", "--ff-only", release)
+  pu._set_upstream(platform, release)
+
+
+def test_an_older_image_refuses_source_with_a_newer_release_s_packages(clone_env):
+  """Booting an older image under a newer release's source (a historical
+  image-only rollback) is unsupported and fails closed."""
+  origin, platform = clone_env
+  _with_python_inputs(platform, origin)
+  old_image = _served_sha(platform)
+  old_lock = (platform / "backend/requirements.lock").read_bytes()
+  newer = _advance_origin(origin, edits={"backend/requirements.lock": "new-package==1\n"})
+  pu._fetch(platform)
+  _git(platform, "merge", "-q", "--ff-only", newer)
+  pu._set_upstream(platform, newer)
+
+  _boot_image(old_image)
+  _record_image_inputs(platform, old_lock)
+  with pytest.raises(pu.BootTransactionError, match="newer release"):
+    pu.settle_prepared_update_for_this_image(platform)
+
+  # The release's own image, or a newer one, serves it.
+  _boot_image(newer)
+  _record_image_inputs(platform, b"new-package==1\n")
+  assert pu.settle_prepared_update_for_this_image(platform) == "none"
+
+
+def test_an_image_newer_than_its_source_or_a_local_package_edit_still_boots(
+  clone_env,
+):
+  origin, platform = clone_env
+  _with_python_inputs(platform, origin)
+  old_lock = (platform / "backend/requirements.lock").read_bytes()
+  newer = _advance_origin(origin, edits={"backend/requirements.lock": "new-package==1\n"})
+  pu._fetch(platform)
+
+  _boot_image(newer)  # image-first: the source has not caught up yet
+  _record_image_inputs(platform, b"new-package==1\n")
+  assert pu.settle_prepared_update_for_this_image(platform) == "none"
+
+  _boot_image(_served_sha(platform))
+  _record_image_inputs(platform, old_lock)
+  (platform / "backend/requirements.lock").write_text("locally-added==1\n")
+  assert pu.settle_prepared_update_for_this_image(platform) == "none"
+
+
+def test_entrypoint_settles_guards_and_probes_before_any_served_code_runs():
+  script = (
+    Path(__file__).resolve().parents[1] / "scripts" / "entrypoint.sh"
+  ).read_text(encoding="utf-8")
+  body = script[script.index("rm -f /tmp/platform-boot-transaction"):]
+  body = body[:body.index('printf \'%s\\n\' "$_serve_source" > /tmp/serving-source')]
+  branch = body[body.index("if ! _platform_boot activate 2>&1; then"):]
+  order = [
+    0,
+    branch.index("if ! _platform_boot guard 2>&1; then"),
+    branch.index("if _platform_import_probe; then"),
+    branch.index("elif _platform_boot revert"),
+  ]
+  assert order == sorted(order)
+  assert "reconcile_clone_sync" not in body
+  assert "cd /app/platform-baked/backend" in script
+
+
+def test_a_second_finish_cannot_rebind_an_update_already_bound(clone_env):
+  """Two concurrent Finish requests: the first binding wins, so the request
+  that is published is the one that can confirm the update."""
+  origin, platform = clone_env
+  record = _prepare_package_update(platform, origin)
+  first = {"controller": "host", "id": "a" * 32}
+  second = {"controller": "host", "id": "b" * 32}
+  pu.bind_update_operation(record["target"], first, repo=platform)
+
+  pu.bind_update_operation(record["target"], first, repo=platform)  # idempotent
+  with pytest.raises(pu.PlatformUpdateError, match="update_operation_bound"):
+    pu.bind_update_operation(record["target"], second, repo=platform)
+  # Only a caller that saw the first binding after its replacement ended may
+  # replace it.
+  pu.bind_update_operation(record["target"], second, repo=platform, replacing=first)
+  assert pu.read_prepared_update()["operation"] == second
+
+
+def test_a_bound_update_cannot_be_cancelled_until_its_binding_is_released(clone_env):
+  origin, platform = clone_env
+  record = _prepare_package_update(platform, origin)
+  operation = {"controller": "railway", "id": "replace_1"}
+  pu.bind_update_operation(record["target"], operation, repo=platform)
+
+  with pytest.raises(pu.PlatformUpdateError, match="update_operation_bound"):
+    pu.cancel_unfinished_update(platform)
+  pu.unbind_update_operation(record["target"], operation, repo=platform)
+  pu.cancel_unfinished_update(platform)
+  assert pu.read_prepared_update() is None
+
+
+def _bound_late_conflict(platform: Path, origin: Path, *, uncommitted: bool) -> tuple[dict, Path]:
+  record = _prepare_package_update(platform, origin)
+  conflicting = "late-local-package==1\n"
+  if uncommitted:
+    (platform / "backend/requirements.lock").write_text(conflicting)
+  else:
+    _local_commit(platform, edits={"backend/requirements.lock": conflicting})
+  pu.bind_update_operation(
+    record["target"], {"controller": "host", "id": "d" * 32}, repo=platform,
+  )
+  _boot_image(record["target"])
+  assert pu.settle_prepared_update_for_this_image(platform) == "conflict"
+  worktree = Path(pu._read_conflict_flag()["overlay"]["worktree"])
+  return record, worktree
+
+
+def test_a_resolved_uncommitted_late_edit_conflict_boots_as_replayed_again(clone_env):
+  """The resolution is recorded only after its in-progress edits are unwound,
+  so the next boot recognises the checkout instead of refusing it."""
+  origin, platform = clone_env
+  _record, worktree = _bound_late_conflict(platform, origin, uncommitted=True)
+  (worktree / "backend/requirements.lock").write_text("new-package==1\nlocal==1\n")
+  _git(worktree, "add", "backend/requirements.lock")
+
+  assert pu.continue_platform_overlay_update(platform) == "updated"
+
+  kept = pu.read_prepared_update()
+  assert kept["replayed"] == _served_sha(platform)
+  assert kept["operation"]["id"] == "d" * 32
+  assert "backend/requirements.lock" in _git(platform, "status", "--porcelain").stdout
+  assert pu.settle_prepared_update_for_this_image(platform) == "replayed"
+
+
+@pytest.mark.parametrize(("module", "name", "after"), [
+  ("pu", "_set_aside_resolver_work", True),  # answer kept, merge not dropped
+  ("app_git", "remove_overlay_worktree", True),  # worktree gone, flag not
+  ("pu", "_reset_hard_to", False),  # merge dropped, checkout not reset
+  ("pu", "_settle_reverted", False),  # checkout reset, record still swapped
+])
+def test_an_image_not_kept_during_a_late_edit_conflict_keeps_the_resolver_s_work(
+  clone_env, monkeypatch, module, name, after,
+):
+  origin, platform = clone_env
+  record, worktree = _bound_late_conflict(platform, origin, uncommitted=False)
+  (worktree / "backend/requirements.lock").write_text("half resolved\n")
+
+  target = pu if module == "pu" else app_git
+  real = getattr(target, name)
+  calls = []
+
+  def killed(*args, **kwargs):
+    if calls:
+      return real(*args, **kwargs)
+    calls.append(name)
+    if after:
+      real(*args, **kwargs)
+    raise _Killed(name)
+
+  monkeypatch.setattr(target, name, killed)
+  _boot_image(record["snapshot"])
+  with pytest.raises(_Killed):
+    pu.settle_prepared_update_for_this_image(platform)
+  # Killed anywhere, the record still describes the swap, never a settled
+  # update beside a stale late-edit conflict.
+  assert pu.read_prepared_update()["state"] == "swapped"
+
+  assert pu.settle_prepared_update_for_this_image(platform) == "reverted"
+  assert pu.read_prepared_update()["state"] == "prepared"
+  assert not pu.CONFLICT_FLAG.exists()
+  assert not worktree.exists()
+  assert pu.unfinished_update(platform)["stage"] == "finish"
+  refs = _git(
+    platform, "for-each-ref", "--format=%(refname)", pu._SET_ASIDE_PREFIX,
+  ).stdout.split()
+  kept = [
+    ref for ref in refs
+    if _git(platform, "show", f"{ref}:backend/requirements.lock", check=False).stdout
+    == "half resolved\n"
+  ]
+  assert kept, "the resolver's in-progress answer was lost"
+
+
+def test_a_bound_late_edit_conflict_cannot_be_abandoned(clone_env):
+  origin, platform = clone_env
+  _bound_late_conflict(platform, origin, uncommitted=False)
+
+  with pytest.raises(pu.PlatformUpdateError, match="replay_conflict_must_finish"):
+    pu.abandon_platform_overlay_update(platform)
+  assert pu.read_prepared_update()["state"] == "swapped"
+
+
+def test_a_local_requirements_edit_does_not_hide_a_newer_release_lock(clone_env):
+  origin, platform = clone_env
+  _with_python_inputs(platform, origin)
+  old_image = _served_sha(platform)
+  old_lock = (platform / "backend/requirements.lock").read_bytes()
+  newer = _advance_origin(origin, edits={"backend/requirements.lock": "new-package==1\n"})
+  pu._fetch(platform)
+  _git(platform, "merge", "-q", "--ff-only", newer)
+  pu._set_upstream(platform, newer)
+  (platform / "backend/requirements.txt").write_text("fastapi\nlocally-added\n")
+
+  _boot_image(old_image)
+  _record_image_inputs(platform, old_lock)
+  with pytest.raises(pu.BootTransactionError, match="newer release"):
+    pu.settle_prepared_update_for_this_image(platform)
+
+
+def test_the_boot_protocol_can_only_advance_with_a_new_image():
+  path = Path(pu.__file__).resolve().parents[1] / "runtime" / "boot-protocol"
+  assert int(path.read_text().strip()) == pu.BOOT_PROTOCOL
+  impact = platform_activation.classify_activation(["backend/runtime/boot-protocol"])
+  assert impact["level"] == platform_activation.ActivationLevel.IMAGE_REBUILD.value
+
+
+def test_startup_refuses_a_checkout_it_cannot_place_on_images_without_the_transaction(
+  clone_env,
+):
+  origin, platform = clone_env
+  _swapped_with_late_commit(platform, origin)
+  pu.settle_prepared_update_for_this_image(platform)
+  record = pu.read_prepared_update()
+  _git(platform, "reset", "-q", "--hard", record["prepared"])
+  _local_commit(platform, edits={"other.txt": "unrelated\n"})
+
+  with pytest.raises(pu.BootTransactionError):
+    pu.complete_platform_swap(platform)
+
+
+def test_startup_takes_no_update_lock_when_no_update_is_pending(clone_env, monkeypatch):
+  """Most boots have no update; startup must not need a writable lock then."""
+  blocked = Path(os.environ["MOBIUS_BUILD_INFO_PATH"]).parent / "not-a-dir"
+  blocked.write_text("")
+  monkeypatch.setattr(pu, "RECONCILE_LOCK", blocked / ".reconcile.lock")
+
+  assert pu.complete_platform_swap() is None
+  assert pu.confirm_platform_swap_loaded() is False
+
+
+@pytest.mark.asyncio
+async def test_only_an_unplaced_swap_stops_startup(monkeypatch):
+  import logging
+
+  from app import startup
+
+  context = SimpleNamespace(logger=logging.getLogger("test"))
+
+  def disk_full():
+    raise OSError("disk full")
+
+  monkeypatch.setattr(pu, "complete_platform_swap", disk_full)
+  await startup._complete_platform_swap(context)  # best effort, as before
+
+  def unplaced():
+    raise pu.BootTransactionError("unplaced")
+
+  monkeypatch.setattr(pu, "complete_platform_swap", unplaced)
+  with pytest.raises(pu.BootTransactionError):
+    await startup._complete_platform_swap(context)

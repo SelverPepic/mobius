@@ -116,6 +116,12 @@ _GIT_TIMEOUT = 30
 _EQUIVALENCE_PENDING_PREFIX = "refs/mobius/equivalences/pending"
 _EQUIVALENCE_LANDED_PREFIX = "refs/mobius/equivalences/landed"
 _REVIEWED_SOURCE_PREFIX = "refs/mobius/equivalences/reviewed-source"
+# A contribution revised in review can merge in a different form than the draft
+# the live source still holds. When GitHub settles it merged, Contribute records
+# that draft here; the platform updater sets it aside before merging the release
+# that carries the merged version, so the two never meet as a conflict.
+_SUPERSEDED_DRAFT_PREFIX = "refs/mobius/equivalences/superseded"
+_CONTRIBUTION_DRAFT_PREFIX = "refs/mobius/contribution-drafts/"
 _EQUIVALENCE_VERSION = 1
 _REVIEWED_SOURCE_VERSION = 1
 _HEX_OID = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
@@ -2370,16 +2376,152 @@ def preview_reconciliation(
   )
 
 
+@dataclass(frozen=True)
+class SupersededDraft:
+  ref: str
+  anchor_sha: str  # tree = the draft; its one parent is the draft's base
+  base_sha: str
+  upstream_sha: str  # the merge commit that carries the reviewed version
+  draft_ref: str | None
+
+
+def mark_draft_superseded(
+  source_dir: str | Path,
+  *,
+  contribution_id: str,
+  base_sha: str,
+  head_sha: str,
+  upstream_sha: str,
+  draft_ref: str | None = None,
+) -> str | None:
+  """Record that a merged contribution supersedes the draft live still holds.
+
+  ``base..head`` is the draft Contribute proved the live source contained
+  before review revised it. ``upstream_sha`` is GitHub's merge commit; it need
+  not be fetched yet, because the updater only acts once its release contains
+  it. Returns the ref, or None when the draft commits are unavailable.
+  """
+  repo = Path(source_dir)
+  base = _resolve_commit(repo, base_sha)
+  head = _resolve_commit(repo, head_sha)
+  upstream = str(upstream_sha or "").strip().lower()
+  tree = _tree_oid(repo, head) if head else None
+  if (
+    base is None or tree is None or not _HEX_OID.fullmatch(upstream)
+    or ref_is_ancestor(repo, base, head) is not True
+  ):
+    return None
+  pin = draft_ref if (
+    isinstance(draft_ref, str) and draft_ref.startswith(_CONTRIBUTION_DRAFT_PREFIX)
+  ) else None
+  metadata = {
+    "version": _EQUIVALENCE_VERSION,
+    "contribution_id": str(contribution_id)[:128],
+    "upstream_sha": upstream,
+    "draft_ref": pin,
+  }
+  anchor = _run(
+    repo, "commit-tree", tree, "-p", base,
+    "-m", json.dumps(metadata, sort_keys=True, separators=(",", ":")),
+  ).stdout.strip()
+  key = hashlib.sha256(str(contribution_id).encode("utf-8")).hexdigest()
+  ref = f"{_SUPERSEDED_DRAFT_PREFIX}/{key}"
+  _run(repo, "update-ref", ref, anchor)
+  return ref
+
+
+def _superseded_drafts(repo: Path) -> list[SupersededDraft]:
+  listing = _run(
+    repo, "for-each-ref", "--format=%(refname) %(objectname)",
+    _SUPERSEDED_DRAFT_PREFIX, check=False,
+  )
+  drafts: list[SupersededDraft] = []
+  for line in listing.stdout.splitlines():
+    ref, _, anchor = line.partition(" ")
+    parents = _run(
+      repo, "rev-list", "--parents", "-n", "1", anchor, check=False,
+    ).stdout.split()
+    message = _run(repo, "log", "-1", "--format=%B", anchor, check=False).stdout
+    try:
+      metadata = json.loads(message)
+    except ValueError:
+      continue
+    upstream = str(metadata.get("upstream_sha") or "") if isinstance(metadata, dict) else ""
+    if len(parents) != 2 or not _HEX_OID.fullmatch(upstream):
+      continue
+    drafts.append(SupersededDraft(
+      ref=ref, anchor_sha=anchor, base_sha=parents[1], upstream_sha=upstream,
+      draft_ref=metadata.get("draft_ref") or None,
+    ))
+  return drafts
+
+
+def without_superseded_drafts(
+  source_dir: str | Path, local: str, upstream: str,
+) -> str:
+  """Return ``local``, or a commit on it with merged contributions' drafts set aside.
+
+  A draft is set aside only when all hold: this update newly brings the merge
+  that superseded it (``upstream`` contains it and the shared base does not;
+  once integrated, removing a draft a resolver kept would revert the merged
+  version); the local tree provably contains the exact draft; and removing it
+  merges cleanly (local work built on the draft stays with the resolver, as
+  before). Upstream's version then arrives from the release side of the merge.
+  The result's parent is ``local``, so merge bases and other witnesses hold.
+  """
+  repo = Path(source_dir)
+  tip = _resolve_commit(repo, local)
+  tree = _tree_oid(repo, tip) if tip else None
+  shared = _run(repo, "merge-base", local, upstream, check=False).stdout.strip()
+  if tip is None or tree is None or not shared:
+    return local
+  set_aside = 0
+  for draft in _superseded_drafts(repo):
+    if (
+      ref_is_ancestor(repo, draft.upstream_sha, upstream) is not True
+      or ref_is_ancestor(repo, draft.upstream_sha, shared) is True
+      or not _change_is_subsumed(repo, draft.base_sha, draft.anchor_sha, tree)
+    ):
+      continue
+    try:
+      removed = merge_refs(
+        repo, tree, draft.base_sha, merge_base=draft.anchor_sha,
+      )
+    except (OSError, subprocess.SubprocessError, RuntimeError):
+      continue
+    if removed.status != "clean" or not removed.merged_tree_oid:
+      continue
+    tree = removed.merged_tree_oid
+    set_aside += 1
+  if not set_aside:
+    return local
+  return _run(
+    repo, "commit-tree", tree, "-p", tip,
+    "-m", "Set aside local drafts of merged contributions",
+  ).stdout.strip()
+
+
 def retire_landed_equivalent_changes(
   source_dir: str | Path, integrated_upstream: str,
 ) -> int:
-  """Drop landed anchors made obsolete by a successfully integrated target."""
+  """Drop landed anchors made obsolete by a successfully integrated target.
+
+  A superseded draft retires with its pin once the integrated release carries
+  its merge: from then on the merge is in every shared base, so the draft can
+  never be set aside again (a draft a resolver kept is ordinary local work).
+  """
   repo = Path(source_dir)
   retired = 0
   for change in _landed_equivalent_changes(repo):
     if _change_landed_in_target(repo, change, integrated_upstream):
       proc = _run(repo, "update-ref", "-d", change.ref, check=False)
       retired += int(proc.returncode == 0)
+  for draft in _superseded_drafts(repo):
+    if ref_is_ancestor(repo, draft.upstream_sha, integrated_upstream) is True:
+      for ref in (draft.ref, draft.draft_ref):
+        if ref:
+          _run(repo, "update-ref", "-d", ref, check=False)
+      retired += 1
   return retired
 
 
@@ -2909,40 +3051,6 @@ def has_conflict_markers(source_dir: str | Path) -> bool:
   return markers.returncode == 0
 
 
-def has_unresolved_binary_conflicts(source_dir: str | Path) -> bool:
-  """Keep binary conflicts gated until the resolver explicitly stages them.
-
-  Text conflicts can be proven resolved by removal of Git's marker boundaries,
-  after which ``commit_local`` safely stages them. Binary conflicts have no
-  markers, so an unmerged binary path is never auto-accepted.
-  """
-  repo = Path(source_dir)
-  if not merge_in_progress(repo):
-    return False
-  listing = _run(repo, "ls-files", "-u", "-z").stdout
-  paths = {
-    row.split("\t", 1)[1]
-    for row in listing.split("\0")
-    if "\t" in row
-  }
-  for rel in paths:
-    worktree = repo / rel
-    try:
-      if b"\0" in worktree.read_bytes():
-        return True
-    except OSError:
-      pass
-    for stage in (1, 2, 3):
-      blob = subprocess.run(
-        ["git", "-C", str(repo), "show", f":{stage}:{rel}"],
-        capture_output=True, timeout=_GIT_TIMEOUT, check=False,
-        env=_git_env(repo),
-      )
-      if blob.returncode == 0 and b"\0" in blob.stdout:
-        return True
-  return False
-
-
 def commit_local(source_dir: str | Path, msg: str) -> str | None:
   """Commits the current working-tree source onto `main`.
 
@@ -3036,22 +3144,6 @@ def commit_local(source_dir: str | Path, msg: str) -> str | None:
     return None
   _run(repo, "commit", "-q", "-m", msg)
   return _run(repo, "rev-parse", LOCAL_BRANCH).stdout.strip()
-
-
-def preserve_local_tip_for_recovery(source_dir: str | Path) -> str:
-  """Pin the current app source before a deliberate upstream-only replacement.
-
-  The Store self-update must stay installable even if its own source conflicts;
-  this ref keeps the displaced local tree (including captured working edits)
-  reachable for a later owner-guided reconciliation.
-  """
-  repo = Path(source_dir)
-  tip = head_sha(repo, LOCAL_BRANCH)
-  if not tip:
-    raise RuntimeError("local app source is unavailable for recovery")
-  ref = f"refs/mobius/app-pre-update/{tip}"
-  _run(repo, "update-ref", ref, tip)
-  return ref
 
 
 def commit_replay(
@@ -3270,23 +3362,44 @@ def read_merged_tree(source_dir: str | Path, tree_oid: str) -> dict[str, bytes]:
   `MergeResult.merged_tree_oid` here and writes it back, so one and many files
   share one path. Paths are repo-relative POSIX; bytes are read binary-faithful
   (no text decode). `-z` keeps paths NUL-separated so names with spaces or
-  newlines survive.
+  newlines survive. All blobs stream through one `cat-file --batch` process
+  (update checks and installs read several trees each, and one process per
+  file dominated their cost), spooled to a temporary file so each blob is held
+  in memory once. Only blobs are files: gitlinks are skipped, and an object
+  missing from the database is omitted so callers treat the tree as incomplete.
   """
   repo = Path(source_dir)
   listing = subprocess.run(
-    ["git", "-C", str(repo), "ls-tree", "-r", "-z", "--name-only", tree_oid],
+    ["git", "-C", str(repo), "ls-tree", "-r", "-z", tree_oid],
     capture_output=True, timeout=_GIT_TIMEOUT, check=True, env=_git_env(repo),
   )
-  files: dict[str, bytes] = {}
-  for rel in listing.stdout.decode().split("\0"):
-    if not rel:
+  entries: list[tuple[str, str]] = []
+  for record in listing.stdout.split(b"\0"):
+    if not record:
       continue
-    blob = subprocess.run(
-      ["git", "-C", str(repo), "cat-file", "-p", f"{tree_oid}:{rel}"],
-      capture_output=True, timeout=_GIT_TIMEOUT, check=False, env=_git_env(repo),
+    meta, rel = record.split(b"\t", 1)
+    _mode, kind, oid = meta.split()
+    if kind == b"blob":
+      entries.append((rel.decode(), oid.decode()))
+  files: dict[str, bytes] = {}
+  if not entries:
+    return files
+  with tempfile.TemporaryFile() as out:
+    subprocess.run(
+      ["git", "-C", str(repo), "cat-file", "--batch"],
+      input="".join(f"{oid}\n" for _rel, oid in entries).encode(),
+      stdout=out, stderr=subprocess.PIPE,
+      timeout=_GIT_TIMEOUT, check=True, env=_git_env(repo),
     )
-    if blob.returncode == 0:
-      files[rel] = blob.stdout
+    out.seek(0)
+    for rel, oid in entries:
+      header = out.readline().split()
+      if header[:1] != [oid.encode()]:
+        raise RuntimeError(f"git cat-file --batch lost its place at {rel}")
+      if header[1:] == [b"missing"]:
+        continue
+      files[rel] = out.read(int(header[2]))
+      out.read(1)
   return files
 
 
@@ -3446,7 +3559,7 @@ def start_conflict_merge(
       # read-tree resolves every clean path directly and leaves only residual
       # conflicts as staged 1/2/3 entries. The follow-up checkout writes the
       # familiar markers without collapsing the unmerged index, so binary
-      # conflicts remain gated by has_unresolved_binary_conflicts.
+      # conflicts stay unresolved until someone explicitly stages a side.
       _run(
         repo, "read-tree", "-m", "-u",
         merge_base, local_branch, upstream_branch,

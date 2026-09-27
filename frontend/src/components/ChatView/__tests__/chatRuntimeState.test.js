@@ -132,6 +132,27 @@ test('a continuation supersedes the resumable pause it completed', () => {
   assert.equal(messages[0].blocks.length, 2)
 })
 
+test('a recovery answer supersedes the pause it resumed without a transcript marker', () => {
+  const pause = {
+    role: 'assistant',
+    blocks: [
+      { type: 'text', content: 'Work before the restart.' },
+      { type: 'error', resumable: true, message: 'Paused for restart.' },
+    ],
+  }
+  const recovered = {
+    role: 'assistant',
+    id: 'auto-retry-sample',
+    continuation_reason: 'restart',
+    content: 'Picking up.',
+  }
+
+  const displayed = supersedeResumedPauseBlocks([pause, recovered])
+
+  assert.deepEqual(displayed[0].blocks, [pause.blocks[0]])
+  assert.equal(displayed[1], recovered)
+})
+
 test('a pause-only row disappears once its continuation marker replaces it', () => {
   const messages = [
     {
@@ -520,6 +541,31 @@ test('collapsed activity runs are prepared as the one row they present', () => {
 
   assert.deepEqual(coldTranscriptRenderFrames(messages), [messages],
     'one collapsed ActivityStretch must not become ninety hidden prefix commits')
+})
+
+test('cold preparation frames keep every stored page of a paged app operation', () => {
+  const page = label => ({
+    type: 'tool', tool: 'Bash', status: 'done',
+    app_activity: {
+      app_slug: 'memory', status: 'succeeded', label,
+      operation_key: 'lk:read:ab12', resources: [{ label }],
+    },
+  })
+  const blocks = [
+    page('Read a Memory page'),
+    { type: 'text', content: 'Reading on.' },
+    page('Finished reading 2 notes from Memory'),
+    { type: 'text', content: 'Done.' },
+  ]
+  const messages = [{ role: 'assistant', ts: 1, blocks }]
+  const frames = coldTranscriptRenderFrames(messages, { minCost: 1, frameBudget: 1 })
+
+  const prepared = frames.slice(0, -1).map(frame => frame.at(-1).blocks)
+  assert.deepEqual(prepared.map(frameBlocks => frameBlocks.length), [1, 2, 3])
+  for (const frameBlocks of prepared) {
+    assert.ok(frameBlocks.every((block, index) => block === blocks[index]),
+      'a frame is a prefix of the stored blocks, so later positions keep their keys')
+  }
 })
 
 test('one long markdown block grows by token fractions instead of one giant frame', () => {

@@ -20,56 +20,32 @@ from dataclasses import dataclass
 
 from sqlalchemy.orm import Session
 
+from app import models
 from app.install import install_from_manifest
+from app.timeutil import now_naive_utc
 
 log = logging.getLogger("mobius.bootstrap")
 
-# The Store is part of the recovery path, so first boot must install the exact
-# revision reviewed with this platform release rather than whatever happens to
-# be at a mutable branch tip. The catalog has no release tags yet; pinning the
-# reviewed commit provides the same immutable input until it does.
-BOOTSTRAP_STORE_MANIFEST_URL = (
-  "https://raw.githubusercontent.com/mobius-os/app-store/"
-  "7140bc9afa2f60498993567ab4628a8b40345d14/mobius.json"
-)
+# Every default app installs from its catalog repository's `main`, so a new
+# deployment starts on the latest version of each app; later versions arrive
+# through the Store's ordinary update flow. Nothing here freezes a revision:
+# `tests/test_bootstrap_live.py` (its own CI step) installs this whole set on an
+# empty instance so a `main` that no longer installs on this platform fails CI
+# instead of silently leaving new deployments without the app.
+_MANIFEST_URL = "https://raw.githubusercontent.com/mobius-os/{repo}/main/mobius.json"
 
-# The Skills app (browse/install ecosystem skills + the skill-agent chat).
-# Canonical home is the app-skills catalog repo. PINNED to a reviewed commit,
-# never a mutable branch: core and app releases pair explicitly — this pin
-# names the newest app revision reviewed against THIS platform's API surface,
-# and bumping it is a deliberate platform commit that rides the same release.
-# (Now v2.0.0 — compat badges, catalog browser — which requires this platform's
-# skills API; pinned here as core #146 and app #4 merged together in this
-# release. The prior v1.1.2 pin needed no skills API and ran on any core.)
-BOOTSTRAP_SKILLS_MANIFEST_URL = (
-  "https://raw.githubusercontent.com/mobius-os/app-skills/"
-  "113210883ddab380a01da1443e61600439d23b2a/mobius.json"
+BOOTSTRAP_STORE_MANIFEST_URL = _MANIFEST_URL.format(repo="app-store")
+BOOTSTRAP_SKILLS_MANIFEST_URL = _MANIFEST_URL.format(repo="app-skills")
+BOOTSTRAP_MEMORY_MANIFEST_URL = _MANIFEST_URL.format(repo="app-memory")
+BOOTSTRAP_REFLECTION_MANIFEST_URL = _MANIFEST_URL.format(repo="app-reflection")
+BOOTSTRAP_INTEGRATIONS_MANIFEST_URL = _MANIFEST_URL.format(
+  repo="app-integrations",
 )
-
-BOOTSTRAP_MEMORY_MANIFEST_URL = (
-  "https://raw.githubusercontent.com/mobius-os/app-memory/main/mobius.json"
+BOOTSTRAP_INTEGRATIONS_PREDECESSOR_MANIFEST_URL = _MANIFEST_URL.format(
+  repo="app-connections",
 )
-BOOTSTRAP_REFLECTION_MANIFEST_URL = (
-  "https://raw.githubusercontent.com/mobius-os/app-reflection/main/mobius.json"
-)
-BOOTSTRAP_INTEGRATIONS_MANIFEST_URL = (
-  "https://raw.githubusercontent.com/mobius-os/app-integrations/main/mobius.json"
-)
-BOOTSTRAP_INTEGRATIONS_PREDECESSOR_MANIFEST_URL = (
-  "https://raw.githubusercontent.com/mobius-os/app-connections/main/mobius.json"
-)
-BOOTSTRAP_IDENTITY_MANIFEST_URL = (
-  "https://raw.githubusercontent.com/mobius-os/app-mobius-you/main/mobius.json"
-)
-# Social (federated community board + direct messages). PINNED to a reviewed
-# commit, never a mutable branch tip: first boot installs the exact audited
-# revision that ships with this release, matching Store/Skills. This is a plain
-# manifest install — the same generic mechanism as every other bootstrap app —
-# not app-specific first-boot policy in the platform.
-BOOTSTRAP_SOCIAL_MANIFEST_URL = (
-  "https://raw.githubusercontent.com/mobius-os/app-social/"
-  "5cb40d86953f689ee376fa45d39bcd07d7bd5f42/mobius.json"
-)
+BOOTSTRAP_IDENTITY_MANIFEST_URL = _MANIFEST_URL.format(repo="app-mobius-you")
+BOOTSTRAP_SOCIAL_MANIFEST_URL = _MANIFEST_URL.format(repo="app-social")
 
 
 @dataclass(frozen=True)
@@ -79,10 +55,16 @@ class _BootstrapApp:
   reinstall_after_uninstall: bool
   predecessor_manifest_id: str | None = None
   predecessor_manifest_url: str | None = None
+  # Pinned in the drawer only when this deployment has never had the app, so
+  # an owner's later unpin (or uninstall and reinstall) is never overridden.
+  pin_on_first_install: bool = False
 
 
 _CORE_BOOTSTRAP_APPS = (
-  _BootstrapApp("store", BOOTSTRAP_STORE_MANIFEST_URL, True),
+  # The Store is how a new owner finds everything else, so it starts pinned.
+  _BootstrapApp(
+    "store", BOOTSTRAP_STORE_MANIFEST_URL, True, pin_on_first_install=True,
+  ),
   # Skills is NOT the recovery surface — an owner uninstall is respected, and
   # the Store remains the way back.
   _BootstrapApp("skills", BOOTSTRAP_SKILLS_MANIFEST_URL, False),
@@ -118,6 +100,63 @@ _CORE_BOOTSTRAP_APPS = (
 # service environment block.
 _SKIP_ENV = "MOEBIUS_SKIP_BOOTSTRAP"
 
+# Fixed sentinel key for the single DefaultPinInitialization row.
+_DEFAULT_PINS_MARKER_ID = "default_pins"
+
+
+def _default_store_pin_pending(db: Session) -> bool:
+  """Return whether this deployment still owes its default Store pin.
+
+  Decided once and persisted: an owner or any app row (tombstones included)
+  before bootstrap means an existing deployment, which is never pinned. A
+  missing Store row alone proves nothing (purged tombstones, identities the
+  installer resolves late, deployments that never installed the Store).
+  """
+  marker = db.query(models.DefaultPinInitialization).filter(
+    models.DefaultPinInitialization.id == _DEFAULT_PINS_MARKER_ID,
+  ).first()
+  if marker is not None:
+    pending = marker.initialized_at is None
+    db.rollback()
+    return pending
+  existing_deployment = (
+    db.query(models.Owner.id).first() is not None
+    or db.query(models.App.id).first() is not None
+  )
+  db.add(models.DefaultPinInitialization(
+    id=_DEFAULT_PINS_MARKER_ID,
+    initialized_at=now_naive_utc() if existing_deployment else None,
+  ))
+  db.commit()
+  return not existing_deployment
+
+
+def _mark_default_store_pinned(db: Session, app_id: int) -> bool:
+  """Pin the Store and settle the marker in one transaction.
+
+  A failure rolls back and leaves the marker pending for the next boot.
+  """
+  try:
+    now = now_naive_utc()
+    db.query(models.App).filter(
+      models.App.id == app_id, models.App.pinned_at.is_(None),
+    ).update({models.App.pinned_at: now}, synchronize_session=False)
+    db.query(models.DefaultPinInitialization).filter(
+      models.DefaultPinInitialization.id == _DEFAULT_PINS_MARKER_ID,
+      models.DefaultPinInitialization.initialized_at.is_(None),
+    ).update(
+      {models.DefaultPinInitialization.initialized_at: now},
+      synchronize_session=False,
+    )
+    db.commit()
+    return True
+  except Exception:
+    db.rollback()
+    log.exception(
+      "bootstrap: default Store pin failed; leaving it pending for next boot",
+    )
+    return False
+
 
 async def ensure_bootstrap_apps_installed(db: Session) -> None:
   """Idempotently install the configured bootstrap apps when absent.
@@ -142,6 +181,14 @@ async def ensure_bootstrap_apps_installed(db: Session) -> None:
   # Bootstrap uses the same resolver as preview and install so all three paths
   # agree on persisted identities, moved refs, and proven legacy origins.
   from app.install import _canonical_identity_key, _find_install_identity_row
+
+  # Decide before installing anything, since installs create app rows.
+  try:
+    default_pin_pending = _default_store_pin_pending(db)
+  except Exception:
+    db.rollback()
+    log.exception("bootstrap: could not decide default pins; pinning nothing")
+    default_pin_pending = False
 
   for bootstrap_app in _CORE_BOOTSTRAP_APPS:
     # Use the installer's identity resolver here too: bootstrap and an explicit
@@ -191,6 +238,18 @@ async def ensure_bootstrap_apps_installed(db: Session) -> None:
         "bootstrap: %s already installed (app id=%s)",
         bootstrap_app.manifest_id, existing_id,
       )
+      # A new deployment whose earlier Store-pin transaction failed still owes
+      # the pin even though the Store is already installed this boot. The live
+      # row (deleted_at is None whenever a reinstall-policy app reads as already
+      # installed) is the one to pin.
+      if (
+        default_pin_pending
+        and bootstrap_app.pin_on_first_install
+        and existing is not None
+        and existing.deleted_at is None
+        and _mark_default_store_pinned(db, existing.id)
+      ):
+        default_pin_pending = False
       continue
     log.info(
       "bootstrap: installing %s from %s",
@@ -218,3 +277,9 @@ async def ensure_bootstrap_apps_installed(db: Session) -> None:
       "bootstrap: %s install %s (app id=%s, warnings=%s)",
       bootstrap_app.manifest_id, mode, app.id, warnings,
     )
+    if (
+      default_pin_pending
+      and bootstrap_app.pin_on_first_install
+      and _mark_default_store_pinned(db, app.id)
+    ):
+      default_pin_pending = False

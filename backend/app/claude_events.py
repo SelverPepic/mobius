@@ -47,7 +47,6 @@ except ImportError:
   DEFERRING_TASK_TYPES = frozenset({"local_agent", "local_workflow"})
 
 from app import activity
-from app.sdk_emit import emit_unknown_enabled, unknown_event
 from app.tool_edit_preview import claude_edit_preview
 from app.tool_summaries import summarize_tool_input
 from app.tool_sources import normalize_tool_sources, sources_from_websearch_text
@@ -258,44 +257,62 @@ def _is_web_search_tool_result(content: Any) -> bool:
   return content.get("type") == "web_search_tool_result"
 
 
-def _emit_unknown(bc, kind: str, raw: Any) -> None:
-  """Logs an unknown SDK event and emits it on the wire when enabled.
+def _log_unknown(kind: str, raw: Any) -> None:
+  """Record an SDK event Möbius does not handle.
 
-  The DEBUG log fires unconditionally so noisy sessions stay
-  inspectable in `chat.log` even when wire emission is turned off
-  via ``MOBIUS_EMIT_UNKNOWN=0``.
+  Unhandled events are never broadcast: no client renders them, and on a
+  busy chat the per-token progress events alone were most of the stream and
+  of every reconnect replay.
   """
-  event = unknown_event(kind, raw)
-  if emit_unknown_enabled():
-    bc.publish(event)
+  log.debug("unhandled Claude SDK event: kind=%s raw=%r", kind, raw)
 
 
-# Tools that are pure harness mechanics: they carry no owner-facing meaning, so
-# they never become visible activity. `TaskOutput` is the agent waiting on work
-# it already started. Möbius's own ultracode reminder tells the agent to wait in
-# ten-minute blocks and re-issue the wait when one elapses, so a long turn used
-# to render as a wall of "TaskOutput … retrieval_status: timeout" rows — a
-# countdown expiring, read by the owner as the product timing out and failing.
-# The work itself is reported as prose; the waiting is not something to show.
-#
-# Suppression is symmetric by `tool_use_id`: dropping the start while still
-# publishing the end would leave the frontend reducer holding a `tool_end` for a
-# block it never opened.
-_MECHANICS_TOOLS = frozenset({"TaskOutput"})
+def _claude_block_starts(bc) -> dict:
+  """Per-broadcast FIFO of streamed block indices, keyed by (message, kind).
 
-
-def _suppressed_tool_ids(bc) -> set[str]:
-  """Per-broadcast ids whose tool events are mechanics, not activity."""
-  ids = getattr(bc, "_mechanics_tool_ids", None)
-  if ids is None:
-    ids = set()
+  Claude Code re-sends each completed content block as its OWN single-block
+  AssistantMessage, so the final's position inside that message is always 0
+  while its stream events carry the real content-block index. Recording the
+  index at each ``content_block_start`` lets a completed block reclaim the
+  identity of the stream it completes: the Nth final text (or thinking) block
+  of a message is the Nth streamed block of that kind.
+  """
+  starts = getattr(bc, "_claude_block_starts", None)
+  if starts is None:
+    starts = {}
     try:
-      bc._mechanics_tool_ids = ids
+      bc._claude_block_starts = starts
     except AttributeError:
-      # A test double that forbids attributes still suppresses the start; the
-      # matching end simply falls through as it did before.
-      return set()
-  return ids
+      return {}
+  return starts
+
+
+def _claude_final_index(bc, message_id: str | None, kind: str) -> int | None:
+  """The streamed content-block index a completed block of ``kind`` finishes."""
+  starts = _claude_block_starts(bc)
+  queue = starts.get((message_id, kind))
+  if not queue:
+    return None
+  index = queue.pop(0)
+  if not queue:
+    del starts[(message_id, kind)]
+  return index
+
+
+def _claude_thinking_segment_id(
+  message_id: str | None, index: object,
+) -> str | None:
+  """Turn-unique identity of one Claude thinking content block.
+
+  The content-block index resets on every model call, so the index alone
+  merged separate calls' thinking into one paragraph and could not name the
+  block a completed ThinkingBlock repairs.
+  """
+  if index is None:
+    return None
+  if message_id is None:
+    return f"claude:content:{index}"
+  return f"claude:{message_id}:{index}"
 
 
 def _claude_text_item_id(message_id: str | None, index: object) -> str | None:
@@ -455,7 +472,7 @@ def dispatch_sdk_message(
     if sdk_msg.subtype == "init":
       # Setup metadata only — no Möbius-side render.
       return current_session_id, None
-    _emit_unknown(bc, f"system:{sdk_msg.subtype}", sdk_msg)
+    _log_unknown(f"system:{sdk_msg.subtype}", sdk_msg)
     return current_session_id, None
 
   if isinstance(sdk_msg, StreamEvent):
@@ -488,14 +505,12 @@ def dispatch_sdk_message(
       if delta_type == "thinking_delta":
         thinking = delta.get("thinking") or delta.get("text") or ""
         if thinking:
-          block_index = event.get("index")
-          segment_id = (
-            f"claude:content:{block_index}"
-            if block_index is not None else None
+          segment_id = _claude_thinking_segment_id(
+            getattr(bc, "current_message_id", None), event.get("index"),
           )
           bc.publish(_thinking_event(thinking, segment_id))
         return current_session_id, None
-      _emit_unknown(bc, f"stream:content_block_delta:{delta_type}", delta)
+      _log_unknown(f"stream:content_block_delta:{delta_type}", delta)
       return current_session_id, None
     if event_type == "content_block_start":
       # A new assistant content block is starting. When it is a TEXT
@@ -508,10 +523,33 @@ def dispatch_sdk_message(
       # text resuming after an AskUserQuestion answer, which otherwise
       # glued together as "answer1.answer2" with no separator.
       cb = event.get("content_block") or {}
-      if isinstance(cb, dict) and cb.get("type") == "text":
+      block_type = cb.get("type") if isinstance(cb, dict) else None
+      message_id = getattr(bc, "current_message_id", None)
+      index = event.get("index")
+      if block_type in ("text", "thinking") and index is not None:
+        _claude_block_starts(bc).setdefault(
+          (message_id, block_type), [],
+        ).append(index)
+      if block_type == "text":
         bc.publish({"type": "text_boundary"})
+        # A block may open with content already present; the deltas carry
+        # only what follows it.
+        initial = cb.get("text")
+        if initial:
+          item_id = _claude_text_item_id(message_id, index)
+          bc.publish({
+            "type": "text", "content": initial,
+            **({"text_item_id": item_id} if item_id else {}),
+          })
         return current_session_id, None
-    _emit_unknown(bc, f"stream:{event_type}", event)
+      if block_type == "thinking":
+        initial = cb.get("thinking")
+        if initial:
+          bc.publish(_thinking_event(
+            initial, _claude_thinking_segment_id(message_id, index),
+          ))
+        return current_session_id, None
+    _log_unknown(f"stream:{event_type}", event)
     return current_session_id, None
 
   if isinstance(sdk_msg, AssistantMessage):
@@ -522,13 +560,8 @@ def dispatch_sdk_message(
     if usage_state is not None and sdk_msg.usage:
       usage_state["latest_model_usage"] = dict(sdk_msg.usage)
     server_tools: dict[str, str] = {}
-    for content_index, block in enumerate(sdk_msg.content):
+    for block in sdk_msg.content:
       if isinstance(block, ToolUseBlock):
-        # Mechanics never reach the transcript — see _MECHANICS_TOOLS. Remember
-        # the id so the matching result is dropped with it.
-        if block.name in _MECHANICS_TOOLS:
-          _suppressed_tool_ids(bc).add(block.id)
-          continue
         # block.id is the canonical tool_use_id; the matching ToolResultBlock
         # carries it as .tool_use_id. Thread it through so a large tool output
         # can be reduced on the wire and fetched lazily by id (contract rule 6).
@@ -575,9 +608,7 @@ def dispatch_sdk_message(
             "tool_use_id": block.id,
           })
           continue
-        _emit_unknown(
-          bc, f"assistant_block:{type(block).__name__}", block,
-        )
+        _log_unknown(f"assistant_block:{type(block).__name__}", block)
         continue
       if isinstance(block, ServerToolResultBlock):
         tool_name = server_tools.get(block.tool_use_id)
@@ -597,12 +628,25 @@ def dispatch_sdk_message(
             "tool_use_id": block.tool_use_id,
           })
           continue
-        _emit_unknown(
-          bc, f"assistant_block:{type(block).__name__}", block,
-        )
+        _log_unknown(f"assistant_block:{type(block).__name__}", block)
         continue
       if isinstance(block, ThinkingBlock):
-        # Streamed via thinking_delta already — snapshot duplicate.
+        # The completed block is the record; the thinking_delta stream was
+        # its live preview. Emit it so the reducer replaces the streamed
+        # segment it completes (a no-op when nothing was lost), or
+        # materialises it when no delta for it arrived at all.
+        if block.thinking:
+          index = _claude_final_index(bc, sdk_msg.message_id, "thinking")
+          segment_id = _claude_thinking_segment_id(sdk_msg.message_id, index)
+          if index is None:
+            # Never streamed (no block start seen): it is new content.
+            bc.publish(_thinking_event(block.thinking, segment_id))
+          else:
+            bc.publish({
+              "type": "thinking_final",
+              "content": block.thinking,
+              "segment_id": segment_id,
+            })
         continue
       if isinstance(block, TextBlock):
         # The text already streamed live via text_delta events; this is the
@@ -615,20 +659,21 @@ def dispatch_sdk_message(
         # same message object and so were always durable — this closes the gap
         # for text. Replace, never append: the reducer concatenates plain
         # "text" events, so re-emitting as "text" would double the prose.
-        # The item id (message id + content-block index) matches the streamed
+        # The item id (message id + the STREAMED content-block index, not the
+        # block's position in this single-block message) matches the streamed
         # deltas' id, so events.py replaces THIS block by identity instead of
-        # guessing the trailing text block — the fix for an earlier text block
-        # keeping a dropped leading chunk when a message has several.
+        # guessing the trailing text block.
         if block.text:
-          item_id = _claude_text_item_id(sdk_msg.message_id, content_index)
+          item_id = _claude_text_item_id(
+            sdk_msg.message_id,
+            _claude_final_index(bc, sdk_msg.message_id, "text"),
+          )
           bc.publish({
             "type": "text_final", "content": block.text,
             **({"text_item_id": item_id} if item_id else {}),
           })
         continue
-      _emit_unknown(
-        bc, f"assistant_block:{type(block).__name__}", block,
-      )
+      _log_unknown(f"assistant_block:{type(block).__name__}", block)
     if sdk_msg.usage:
       bc.publish(context_usage_event(
         "claude", claude_call_input_tokens(sdk_msg.usage),
@@ -644,10 +689,6 @@ def dispatch_sdk_message(
     content = sdk_msg.content if isinstance(sdk_msg.content, list) else []
     for block in content:
       if isinstance(block, ToolResultBlock):
-        # The paired half of the mechanics suppression above.
-        if block.tool_use_id in _suppressed_tool_ids(bc):
-          _suppressed_tool_ids(bc).discard(block.tool_use_id)
-          continue
         output = _format_tool_output(block.content)
         # Carry the tool_use_id (matches the ToolUseBlock's .id) so the sink can
         # key a stash of the full output and the block can fetch it by id.
@@ -673,7 +714,7 @@ def dispatch_sdk_message(
             })
         bc.publish({"type": "tool_end", "tool_use_id": block.tool_use_id})
         continue
-      _emit_unknown(bc, f"user_block:{type(block).__name__}", block)
+      _log_unknown(f"user_block:{type(block).__name__}", block)
     return current_session_id, None
 
   if isinstance(sdk_msg, RateLimitEvent):
@@ -715,6 +756,6 @@ def dispatch_sdk_message(
       ),
     }
 
-  # Any SDK message class we didn't enumerate — never silently dropped.
-  _emit_unknown(bc, f"sdk_message:{type(sdk_msg).__name__}", sdk_msg)
+  # Any SDK message class we didn't enumerate is logged, never broadcast.
+  _log_unknown(f"sdk_message:{type(sdk_msg).__name__}", sdk_msg)
   return current_session_id, None

@@ -48,6 +48,12 @@ router = APIRouter(prefix="/api/platform", tags=["platform"])
 
 
 _PLAN_ERROR_MESSAGES = {
+  "prepared_update_swapped": (
+    "This update is already in place. Finish it instead of cancelling it."
+  ),
+  "finish_update_first": (
+    "Another update is not finished yet. Finish it in Settings before starting a new one."
+  ),
   "update_plan_stale": (
     "Möbius changed since this preview. Refresh and review the update again."
   ),
@@ -67,6 +73,17 @@ _PLAN_ERROR_MESSAGES = {
   "image_rebuild_required": (
     "This update needs a system replacement. Return to the review and use "
     "its update action so Möbius can keep the source and running system together."
+  ),
+  "update_operation_bound": (
+    "A container replacement for this update is still under way. Wait for it "
+    "to finish before cancelling."
+  ),
+  "replay_conflict_must_finish": (
+    "Finish merging your recent edits into this update; dropping them now "
+    "would lose the way back to the previous version."
+  ),
+  "update_not_settling": (
+    "This update is no longer waiting for confirmation. Refresh Settings."
   ),
   "platform_update_in_progress": (
     "Möbius is finishing another update task. Wait a moment, then review again."
@@ -177,6 +194,9 @@ async def get_platform_update_preview(
   there is nothing to update."""
   try:
     if intent == "finish":
+      prepared = await asyncio.to_thread(platform_update.prepared_update_preview)
+      if prepared is not None:
+        return prepared
       target_sha = await asyncio.to_thread(deployment_control.applied_release_sha)
       image_digest = None
       if platform_activation.deployment_kind() == "railway":
@@ -294,6 +314,63 @@ async def rebuild_reviewed_platform_update(
     raise HTTPException(
       status_code=exc.status_code,
       detail={"code": exc.code, "message": exc.message},
+    ) from exc
+
+
+@router.post("/park-for-agent", dependencies=[Depends(reject_cross_site)])
+async def park_platform_update_for_agent(
+  request: PlatformApplyIn,
+  _: models.Owner = Depends(get_current_owner_for_lifecycle_control),
+) -> platform_update.UnfinishedUpdate:
+  """Park a reviewed, blocked update on a frozen copy for its resolver chat."""
+  try:
+    return await asyncio.to_thread(
+      platform_update.park_update_for_agent,
+      plan_id=request.plan_id,
+      current_sha=request.current_sha,
+      target_sha=request.target_sha,
+      image_digest=request.image_digest,
+    )
+  except PlatformUpdateError as exc:
+    raise HTTPException(status_code=409, detail=_plan_error_detail(exc)) from exc
+
+
+@router.delete(
+  "/unfinished-update",
+  dependencies=[Depends(reject_cross_site)],
+  status_code=204,
+)
+async def cancel_unfinished_platform_update(
+  _: models.Owner = Depends(get_current_owner_for_lifecycle_control),
+) -> None:
+  """Drop an update that has not been swapped in; the live checkout never changed."""
+  try:
+    # A replacement that already ended must not keep the update bound.
+    await deployment_control.release_ended_binding()
+    await asyncio.to_thread(platform_update.cancel_unfinished_update)
+  except deployment_control.DeploymentControlError as exc:
+    raise HTTPException(
+      status_code=exc.status_code, detail={"code": exc.code, "message": exc.message},
+    ) from exc
+  except PlatformUpdateError as exc:
+    raise HTTPException(status_code=409, detail=_plan_error_detail(exc)) from exc
+
+
+@router.post(
+  "/unfinished-update/keep",
+  dependencies=[Depends(reject_cross_site)],
+  status_code=204,
+)
+async def keep_settling_platform_update(
+  _: models.Owner = Depends(get_current_owner_for_lifecycle_control),
+) -> None:
+  """Keep a settling update whose container replacement can no longer be
+  confirmed: the owner's explicit decision when the controller is unavailable."""
+  try:
+    await deployment_control.keep_settling_update()
+  except deployment_control.DeploymentControlError as exc:
+    raise HTTPException(
+      status_code=exc.status_code, detail={"code": exc.code, "message": exc.message},
     ) from exc
 
 

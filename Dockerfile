@@ -47,11 +47,11 @@ RUN useradd -m -s /bin/bash mobius
 # agent-browser looks by default).
 # Discard npm's download cache in each layer: installed packages are the
 # runtime artifact; registry tarballs only make the production image larger.
-ARG CODEX_VERSION=0.156.1
-ARG CODEX_SDK_VERSION=0.156.1
+ARG CODEX_VERSION=0.157.1
+ARG CODEX_SDK_VERSION=0.157.1
 ARG AGENT_BROWSER_VERSION=0.38.1
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    age ca-certificates cron curl git jq procps ripgrep sqlite3 sudo tini unzip util-linux \
+    age ca-certificates cron curl git jq procps ripgrep sqlite3 sudo tini unzip util-linux xxd \
     libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
     libdrm2 libxkbcommon0 libatspi2.0-0 libxcomposite1 libxdamage1 \
     libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2t64 \
@@ -96,8 +96,9 @@ RUN set -eux; \
 # against the release's own checksums file, fetched at build time; a mismatch
 # fails the build. Built for the image arch (amd64|arm64); only the single
 # `gh` binary is installed, docs/man pages are dropped. Placed after the apt
-# layer so a gh bump doesn't bust the apt cache.
-ARG GH_CLI_VERSION=2.97.0
+# layer so a gh bump doesn't bust the apt cache. 2.99+ is needed for
+# `--attach`, which uploads screenshots into PR/issue bodies and comments.
+ARG GH_CLI_VERSION=2.101.0
 RUN set -eux; \
     arch="$(dpkg --print-architecture)"; \
     case "$arch" in amd64|arm64) ;; *) echo "unsupported arch: $arch" >&2; exit 1 ;; esac; \

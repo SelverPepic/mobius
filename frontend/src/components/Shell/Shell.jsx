@@ -114,6 +114,7 @@ import {
   currentReusableEmptyChat,
   failedNewChatPresentation,
   mergeChatListWithCreatedGuards,
+  newChatIsAllocating,
   newChatPresentationIsCurrent,
   readNewChatIntent,
   reconcileCreatedChatGuard,
@@ -138,7 +139,9 @@ import {
   withChatOwnerInput,
   withChatRename,
   withChatRunState,
+  withRefreshedChatRows,
 } from './chatListProjection.js'
+import { createChatRowRefresh } from './chatRowRefresh.js'
 import {
   clearComposerDraft,
   consumeComposerHandoff,
@@ -193,6 +196,7 @@ import useDesktopSidebar, {
 import useWorkspaceSession from './useWorkspaceSession.js'
 import useDeferredNewChatMaterialization from './useDeferredNewChatMaterialization.js'
 import useShellUpdateController from './useShellUpdateController.js'
+import useVisibleAppPresence from './useVisibleAppPresence.js'
 import useAppFrameCache from './useAppFrameCache.js'
 import useShellVisualViewport from './useShellVisualViewport.js'
 import useShellShortcuts from '../../hooks/useShellShortcuts.js'
@@ -211,6 +215,8 @@ const EMPTY_LIST = Object.freeze([])
 // Reconnect list reads order durable state ahead of buffered system events, so
 // they need a short deadline rather than holding notifications behind a stalled request.
 const SYSTEM_RECONNECT_LIST_TIMEOUT_MS = 5_000
+// Run/wait events arriving this close together share one scoped rows read.
+const CHAT_ROW_REFRESH_BATCH_MS = 250
 // Mode timing lives with the pure snapshot geometry in workspaceView.js; browser
 // transition completion owns its lifetime, so Shell has no animation timers.
 const SettingsView = lazy(() => import('../SettingsView/SettingsView.jsx'))
@@ -2371,6 +2377,35 @@ export default function Shell({ onInitialVisualReady }) {
       return next
     })
   }, [queryClient])
+  // Run and wait events each change a few rows. Re-reading the complete list
+  // per event sent ~1 MB to every open window while agents worked, so events
+  // refresh just their rows (see chatRowRefresh.js for the ordering rules).
+  const chatRowRefreshRef = useRef(null)
+  useEffect(() => {
+    const refresh = createChatRowRefresh({
+      readRows: async ids => jsonOrThrow(
+        await api.chats.rows(ids, { cache: 'no-store' }), 'chat rows fetch failed:',
+      ),
+      applyRows: (ids, fresh) => {
+        projectChatList(rows => reconcileCreatedChats(
+          withRefreshedChatRows(rows, ids, fresh),
+        ))
+        // Scoped reads never refill the offline list copy; drop the stale one so
+        // a cold offline start keeps the fresher persisted list.
+        void invalidateShellListCache('chats')
+      },
+      refreshAll: refreshChats,
+      fullReadInFlight: () => queryClient.isFetching({ queryKey: chatQueries.keys.all }) > 0,
+      fullReadMark: chatQueries.list.readMark,
+      fullReadLandedSince: chatQueries.list.readLandedSince,
+      batchMs: CHAT_ROW_REFRESH_BATCH_MS,
+    })
+    chatRowRefreshRef.current = refresh
+    return () => refresh.cancel()
+  }, [projectChatList, queryClient, reconcileCreatedChats, refreshChats])
+  const refreshChatRows = useCallback(
+    chatId => chatRowRefreshRef.current?.request(chatId), [],
+  )
   const markChatOwnerActivity = useCallback((chatId) => {
     const at = new Date().toISOString()
     projectChatList(rows => withChatOwnerActivity(rows, chatId, at))
@@ -2787,6 +2822,13 @@ export default function Shell({ onInitialVisualReady }) {
       chatsLoadedRef.current = true
       return
     }
+    if (newChatIsAllocating(newChatPresentationRef.current, prev)) {
+      // New Chat mounted this id before its row exists. Probing now would read
+      // "not created yet" as deletion, close the owner's composer mid-typing,
+      // and let the empty-slot repair create a second chat.
+      chatsLoadedRef.current = true
+      return
+    }
 
     // Drawer-list absence is not deletion evidence: /api/chats is a filtered view
     // that hides app-attributed chats and can lag a new chat, and (like every list
@@ -2801,6 +2843,7 @@ export default function Shell({ onInitialVisualReady }) {
       // Stale-guard: the active chat can change while the probe is in flight, so a
       // verdict for an old restore target must never navigate.
       if (cancelled || activeChatIdRef.current !== probedChatId) return
+      if (newChatIsAllocating(newChatPresentationRef.current, probedChatId)) return
       if (verdict === 'deleted') {
         knownExistingOffListChatIdsRef.current.delete(probedChatId)
         // The restored chat is genuinely gone: close its tab in its pane. Builder
@@ -3073,7 +3116,7 @@ export default function Shell({ onInitialVisualReady }) {
         // Reconcile ChatView immediately and refresh the compact list so its
         // Waiting card and Recents marker agree across tabs and reconnects.
         markChatRunReconcile(ev.chatId)
-        void invalidateShellListCache('chats').then(refreshChats)
+        refreshChatRows(ev.chatId)
       }
     } else if (ev.type === 'chat_run_started') {
       if (ev.chatId) {
@@ -3087,7 +3130,7 @@ export default function Shell({ onInitialVisualReady }) {
         // must not masquerade as a fresh owner interaction. Reconcile every
         // start so durable owner activity, rather than the transient run
         // signal, owns the Recents position.
-        void invalidateShellListCache('chats').then(refreshChats)
+        refreshChatRows(ev.chatId)
       }
     } else if (ev.type === 'chat_run_finished') {
       const chatId = ev.chatId
@@ -3107,7 +3150,7 @@ export default function Shell({ onInitialVisualReady }) {
         // Failure attention is durable and versioned on the run transition.
         // Refresh the compact list rather than guessing from transcript text;
         // planned restart parks therefore remain neutral automatically.
-        void invalidateShellListCache('chats').then(refreshChats)
+        refreshChatRows(chatId)
         // Project agents write directly into the project directory. Refresh
         // every mounted folder query for that project so generated artifacts
         // appear as soon as the run finishes, without polling the filesystem.
@@ -3193,7 +3236,7 @@ export default function Shell({ onInitialVisualReady }) {
     markChatOwnerInput, markChatRunState, markShellUpdateAvailable,
     markStreamingAcknowledged, markStreamingEnd,
     onNotificationCreated, placeInWorkspace, projectChatLookup, queryClient,
-    refreshApps, refreshChats, tombstoneRoute, warmAppCode,
+    refreshApps, refreshChatRows, refreshChats, tombstoneRoute, warmAppCode,
   ])
 
   // Shell-level SSE subscription for system events. Stays open for
@@ -3252,7 +3295,12 @@ export default function Shell({ onInitialVisualReady }) {
     queryClient,
     refreshApps,
   ])
-  useSystemEventStream(handleSystemEvent, { onOpen: reconcileSystemStateOnOpen })
+  const [systemSubscriptionId, setSystemSubscriptionId] = useState(null)
+  useSystemEventStream(handleSystemEvent, {
+    onOpen: reconcileSystemStateOnOpen,
+    onSubscription: setSystemSubscriptionId,
+  })
+  useVisibleAppPresence(systemSubscriptionId, visibleAppIds)
 
   // Service-worker messages arrive on navigator.serviceWorker, not the window
   // message bus used by AppCanvas. Keep this listener limited to notification

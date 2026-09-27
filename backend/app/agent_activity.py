@@ -6,7 +6,7 @@ import json
 import re
 import shlex
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 
 RESULT_PREFIX = "MOBIUS_APP_ACTIVITY_V1:"
@@ -25,6 +25,10 @@ _BACKGROUND_RE = re.compile(
   r" Output is being written to: (?P<path>/[^\s]+?\.output)\."
 )
 _EXIT_TRAILER_RE = re.compile(r"\[exited with code (?P<code>-?\d+)\]\s*\Z")
+# One app operation can span several calls when its output is paged to fit a
+# provider's tool-output limit. Receipts from the same app that share this key
+# are one operation: the chat shows them as a single row (activityGrouping.js).
+_OPERATION_KEY_RE = re.compile(r"[A-Za-z0-9._:-]{1,160}")
 
 
 def _text(value: object, limit: int) -> str:
@@ -46,6 +50,9 @@ class ActivityCommand:
 class AgentActivityBinding:
   by_path: Mapping[str, ActivityCommand]
   tool_names: tuple[str, ...]
+  # Activities triggered by an installed app's agent tool, keyed by the
+  # agent-facing tool name (`<app>_<tool>`, see app_tools).
+  by_app_tool: Mapping[str, ActivityCommand] = field(default_factory=dict)
 
   @property
   def is_empty(self) -> bool:
@@ -53,7 +60,9 @@ class AgentActivityBinding:
 
   @classmethod
   def of(
-    cls, pairs: Iterable[tuple[str, ActivityCommand]],
+    cls,
+    pairs: Iterable[tuple[str, ActivityCommand]],
+    app_tools: Iterable[tuple[str, ActivityCommand]] = (),
   ) -> "AgentActivityBinding":
     by_path: dict[str, ActivityCommand] = {}
     names: list[str] = []
@@ -64,7 +73,10 @@ class AgentActivityBinding:
       name = PurePosixPath(path).name
       if name and name not in names:
         names.append(name)
-    return cls(by_path=by_path, tool_names=tuple(names))
+    by_app_tool: dict[str, ActivityCommand] = {}
+    for tool_name, command in app_tools:
+      by_app_tool.setdefault(tool_name, command)
+    return cls(by_path=by_path, tool_names=tuple(names), by_app_tool=by_app_tool)
 
 
 EMPTY_AGENT_ACTIVITY_BINDING = AgentActivityBinding(by_path={}, tool_names=())
@@ -140,13 +152,55 @@ def activity_from_command(
   declared = _declared_command(tokens, binding) if tokens else None
   if declared is None:
     return None
+  return _running(declared)
+
+
+# How each provider names a tool served by the Möbius control server.
+_CONTROL_TOOL_PREFIXES = ("mcp__mobius_control__", "mobius_control:")
+
+
+def _running(command: ActivityCommand) -> dict:
   return {
     "status": "running",
-    "app_slug": declared.app_slug,
-    "app_name": declared.app_name,
-    "activity_id": declared.activity_id,
-    "label": declared.running_label,
+    "app_slug": command.app_slug,
+    "app_name": command.app_name,
+    "activity_id": command.activity_id,
+    "label": command.running_label,
   }
+
+
+def activity_from_app_tool(
+  tool: object, binding: AgentActivityBinding,
+) -> dict | None:
+  """Return the running card for a call to an installed app's agent tool."""
+  if not isinstance(tool, str):
+    return None
+  for prefix in _CONTROL_TOOL_PREFIXES:
+    if tool.startswith(prefix):
+      declared = binding.by_app_tool.get(tool[len(prefix):])
+      return _running(declared) if declared is not None else None
+  return None
+
+
+def app_tool_result_text(content: object) -> object:
+  """The text an app tool returned, whichever way the provider reported it.
+
+  Claude reports an MCP result as its text; Codex as the JSON of the MCP
+  result object. The app's receipt is a line inside that text.
+  """
+  if not isinstance(content, str):
+    return content
+  try:
+    result = json.loads(content)
+  except ValueError:
+    return content
+  blocks = result.get("content") if isinstance(result, dict) else None
+  if not isinstance(blocks, list):
+    return content
+  return "\n".join(
+    block["text"] for block in blocks
+    if isinstance(block, dict) and isinstance(block.get("text"), str)
+  )
 
 
 def _identity(pending: object, settled: dict) -> dict:
@@ -240,6 +294,9 @@ def activity_from_result(
   resources = _resources(payload.get("resources"))
   if resources:
     settled["resources"] = resources
+  operation_key = payload.get("operation_key")
+  if isinstance(operation_key, str) and _OPERATION_KEY_RE.fullmatch(operation_key):
+    settled["operation_key"] = operation_key
   return _identity(pending, settled)
 
 
