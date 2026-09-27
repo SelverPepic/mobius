@@ -408,9 +408,10 @@ def parse_request(payload: dict) -> tuple[str, str | None]:
     return expected, nonce
 
 
-def read_request(request: Path) -> tuple[dict | None, tuple[int, int] | None]:
-    """The queued request's payload (None when unreadable) and file identity,
-    or ``(None, None)`` when nothing is queued."""
+def read_request(request: Path) -> tuple[dict | None, tuple[int, int, bytes] | None]:
+    """The queued request's payload (None when unreadable) and the identity of
+    the exact file read (device, inode, bytes), or ``(None, None)`` when
+    nothing is queued."""
     try:
         fd = os.open(request, os.O_RDONLY)
     except FileNotFoundError:
@@ -422,31 +423,46 @@ def read_request(request: Path) -> tuple[dict | None, tuple[int, int] | None]:
         value = json.loads(raw)
     except (ValueError, UnicodeError):
         value = None
-    return (value if isinstance(value, dict) else None), (info.st_dev, info.st_ino)
+    payload = value if isinstance(value, dict) else None
+    return payload, (info.st_dev, info.st_ino, raw)
 
 
-def claim_request(request: Path, claimed: Path, identity: tuple[int, int]) -> bool:
-    """Take exactly the request file this worker read out of the inbox.
+def claim_request(
+    request: Path, claimed: Path, identity: tuple[int, int, bytes],
+) -> bool:
+    """Take exactly the request this worker read out of the inbox.
 
     The app reuses the inbox path and may withdraw a request and queue a newer
-    one at any moment, so a rename alone can take the wrong file. Returns
-    False when the request read was withdrawn; a newer request that took its
-    path is put back untouched."""
+    one at any moment, so a rename alone can take the wrong file. The claimed
+    file counts as this request only when both its inode and its bytes match
+    what was read. Returns False when the request read was withdrawn; any
+    other file taken is put back, or kept beside it, never deleted."""
     try:
         os.replace(request, claimed)
     except FileNotFoundError:
         return False
-    info = os.stat(claimed)
-    if (info.st_dev, info.st_ino) == identity:
+    try:
+        info = os.stat(claimed)
+        verified = (info.st_dev, info.st_ino) == identity[:2] and (
+            claimed.read_bytes() == identity[2]
+        )
+    except OSError:
+        verified = False
+    if verified:
         return True
+    return_unverified_request(request, claimed)
+    return False
+
+
+def return_unverified_request(request: Path, claimed: Path) -> None:
+    """Put a file this worker did not read back in the inbox without
+    overwriting a newer one; failing that, keep it under a durable name."""
     try:
         os.link(claimed, request)
-        claimed.unlink()
-    except FileExistsError:
-        # Another request arrived meanwhile; keep this one beside it rather
-        # than overwrite or drop either.
+    except OSError:
         os.replace(claimed, claimed.with_name(f".unreturned-{claimed.name}"))
-    return False
+    else:
+        claimed.unlink()
 
 
 def run() -> int:
@@ -460,6 +476,7 @@ def run() -> int:
     # atomic rename also works when operators place Docker data on a separate
     # mount. Moving out of the app-writable inbox prevents later replacement.
     claimed = config_value["control_dir"] / f".request-{operation}.json"
+    claim_verified = False
     expected = None
     previous = None
     image_ref = None
@@ -487,12 +504,14 @@ def run() -> int:
             # claims. Claim only after ownership is established so a boot-time
             # reconcile can never mistake a live worker's request for debris.
             if not claim_request(request, claimed, identity):
+                # Whatever the rename took is back in the inbox or kept aside.
                 if expected:
                     write_status(config_value, operation_id=operation, state="failed",
                                  expected_sha=expected, request_nonce=nonce,
                                  code="withdrawn",
                                  message="The request was withdrawn before it started.")
                 return 1
+            claim_verified = True
             if not expected:
                 raise ValueError("invalid replacement request")
             cid, previous = app_container(config_value)
@@ -597,9 +616,10 @@ def run() -> int:
                      expected_sha=expected, code="replacement_failed", message=detail)
         return 1
     finally:
-        # Only a claimed file is ever removed; whatever is still in the inbox
-        # may be a newer request and stays for the next run or withdrawal.
-        claimed.unlink(missing_ok=True)
+        # Only the verified claim is ever removed; whatever is still in the
+        # inbox may be a newer request and stays for the next run or withdrawal.
+        if claim_verified:
+            claimed.unlink(missing_ok=True)
 
 
 def reconcile() -> int:

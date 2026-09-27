@@ -660,3 +660,52 @@ def test_a_request_queued_after_a_withdrawal_survives_the_failed_claim(
 
   assert host.run() == 1
   assert request.read_text(encoding="utf-8") == newer
+
+
+def test_a_request_rewritten_in_place_is_returned_not_run(tmp_path, monkeypatch):
+  """Same inode, different bytes: the file claimed is not the request read."""
+  _config, inbox = _worker_paths(tmp_path, monkeypatch)
+  request = inbox / "request.json"
+  request.write_text(json.dumps({
+    "version": 2, "expected_sha": "4" * 40, "nonce": "b" * 32,
+  }), encoding="utf-8")
+  rewritten = json.dumps({"version": 2, "expected_sha": "5" * 40, "nonce": "c" * 32})
+
+  def status(_config, **fields):
+    if fields.get("state") == "queued":
+      with open(request, "w", encoding="utf-8") as handle:  # same inode
+        handle.write(rewritten)
+    return fields
+
+  monkeypatch.setattr(host, "write_status", status)
+  monkeypatch.setattr(
+    host, "app_container",
+    lambda _config: (_ for _ in ()).throw(AssertionError("must not run")),
+  )
+
+  assert host.run() == 1
+  assert request.read_text(encoding="utf-8") == rewritten
+
+
+def test_an_unverified_claim_that_cannot_be_returned_is_kept(tmp_path, monkeypatch):
+  config, inbox = _worker_paths(tmp_path, monkeypatch)
+  request = inbox / "request.json"
+  request.write_text(json.dumps({
+    "version": 2, "expected_sha": "4" * 40, "nonce": "b" * 32,
+  }), encoding="utf-8")
+  newer = json.dumps({"version": 2, "expected_sha": "5" * 40, "nonce": "c" * 32})
+
+  def status(_config, **fields):
+    if fields.get("state") == "queued":
+      _requeue(request, newer)
+    return fields
+
+  def no_link(*_args):
+    raise PermissionError("link refused")
+
+  monkeypatch.setattr(host, "write_status", status)
+  monkeypatch.setattr(host.os, "link", no_link)
+
+  assert host.run() == 1
+  kept = list(config["control_dir"].glob(".unreturned-*"))
+  assert [path.read_text(encoding="utf-8") for path in kept] == [newer]
