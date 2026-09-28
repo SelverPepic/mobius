@@ -17,7 +17,7 @@ runs:
       uses: actions/cache@v6
       with:
         path: ~/backend-venv
-        key: backend-venv-${{ runner.os }}-${{ steps.python.outputs.python-version }}-${{ hashFiles('backend/requirements.lock', 'backend/requirements-static.txt', 'Dockerfile') }}
+        key: backend-venv-${{ runner.os }}-${{ steps.python.outputs.python-version }}-${{ hashFiles('backend/requirements.lock', 'backend/requirements-static.txt', 'Dockerfile', '.github/actions/backend-env/action.yml') }}
     - name: Install backend deps
       if: steps.python-deps.outputs.cache-hit != 'true'
       shell: bash
@@ -40,7 +40,7 @@ runs:
       uses: actions/cache@v6
       with:
         path: frontend/node_modules
-        key: frontend-deps-${{ runner.os }}-${{ hashFiles('frontend/package-lock.json') }}
+        key: frontend-deps-${{ runner.os }}-${{ hashFiles('frontend/package-lock.json', '.github/actions/backend-env/action.yml') }}
     - name: Install frontend runtime deps
       # frontend_watcher's publish validation executes the locked Acorn /
       # eslint-scope checker. compile_jsx also uses the lockfile's Rolldown,

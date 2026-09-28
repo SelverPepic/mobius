@@ -288,7 +288,7 @@ jobs:
       # reason to take down the others' results.
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+        shard: [1, 2, 3, 4]
 
     steps:
       - uses: actions/checkout@v7
