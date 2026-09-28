@@ -3087,12 +3087,8 @@ export default function Shell({ onInitialVisualReady }) {
     } else if (ev.type === 'app_build_failed') {
       // Explicit apply reports compile failures synchronously to its caller and
       // keeps the previous app version live. A legacy/external diagnostic must
-      // not cover the composer; actionable update drift uses app_update_stale.
+      // not cover the composer.
       return
-    } else if (ev.type === 'app_update_stale') {
-      // A reviewed candidate changed while a conflict was being resolved. The
-      // previous version keeps running, so this is never worth interrupting
-      // the owner for; the store's own update check is the discovery surface.
     } else if (ev.type === 'chat_owner_input_changed') {
       if (ev.chatId) {
         markChatOwnerInput(ev.chatId, ownerInputChangeFromEvent(ev))

@@ -2076,7 +2076,6 @@ async def resolve_app_update(
         _require_pending_resolution, Path(source_dir),
         receipt["upstream_commit"],
       )
-      replay_app_name = app.name
       replay_upstream_commit = app.upstream_commit
 
     # The installer owns promotion of source, bundle, metadata, static assets,
@@ -2101,11 +2100,16 @@ async def resolve_app_update(
         and isinstance(detail, dict)
         and detail.get("code") == "pending_update_changed"
       ):
-        get_system_broadcast().publish({
-          "type": "app_update_stale",
-          "appId": str(app_id),
-          "appName": replay_app_name,
-        })
+        # The reviewed release can never be replayed again. The live version
+        # is untouched, so drop its receipt and let the next update check
+        # offer the new candidate instead of a pending update that never ends.
+        async with (
+          fs_locks.app_storage_lock(app_id),
+          fs_locks.source_dir_lock(source_dir),
+        ):
+          await asyncio.to_thread(
+            install.clear_pending_conflict_update, source_dir,
+          )
       raise
 
   reapplied = result.app

@@ -3109,10 +3109,15 @@ def test_version_only_conflict_auto_resolves_to_upstream(
   assert 'APP_VERSION = "2.0.0"' in jsx_file.read_text()  # upstream version won
 
 
-def test_resolved_conflict_changed_candidate_fails_closed_and_stays_retryable(
+def test_resolved_conflict_changed_candidate_fails_closed_and_clears_receipt(
   client, auth, bypass_url_validation,
 ):
-  """A moving URL cannot mix release-C artifacts into a release-B resolve."""
+  """A moving URL cannot mix release-C artifacts into a release-B resolve.
+
+  Release B can never be replayed again, so its receipt is cleared: the live
+  version stays, and the next update check offers the new candidate instead
+  of reporting a pending update that can never finish.
+  """
   from app.models import App
   from app.database import SessionLocal
 
@@ -3174,13 +3179,16 @@ def test_resolved_conflict_changed_candidate_fails_closed_and_stays_retryable(
   finally:
     db.close()
   assert bundle.read_bytes() == old_bundle
-  assert pending.is_file(), "journal must survive for restart/user retry"
   assert not (app_dir / ".git" / "MERGE_HEAD").exists()
   assert jsx_file.read_text() == JSX_MULTI.replace("ORIGINAL TITLE", "LOCAL TITLE")
-  # The committed resolution stays in its checkout for the retry.
-  assert (checkout / "index.jsx").read_text() == resolved
-  retry = client.get(f"/api/apps/{app_id}/update-check", headers=auth)
-  assert retry.json()["pending_update_state"] == "replay_pending"
+  assert not pending.exists()
+  assert not checkout.exists()
+  recheck = _update_check(
+    client, auth, base, app_id, {**manifest_v1, "version": "3.0.0"}, jsx_v2,
+  )
+  assert recheck.status_code == 200, recheck.text
+  assert recheck.json()["pending_update_state"] == "none"
+  assert recheck.json()["upstream_version"] == "3.0.0"
 
 
 def test_resolved_conflict_converges_static_metadata_and_bundle_once(

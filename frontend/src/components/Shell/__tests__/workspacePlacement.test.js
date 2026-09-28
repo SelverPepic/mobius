@@ -819,10 +819,3 @@ test('shell reconciles both durable drawer lists whenever the system stream reco
     'open chats and durable running chats reconcile even when run events were missed')
   assert.match(shellSource, /useSystemEventStream\(handleSystemEvent, \{\s*onOpen: reconcileSystemStateOnOpen[,\s]/)
 })
-
-test('stale pending updates never interrupt the owner', () => {
-  const shellSource = readFileSync(new URL('../Shell.jsx', import.meta.url), 'utf8')
-  assert.match(shellSource, /ev\.type === 'app_update_stale'/)
-  assert.doesNotMatch(shellSource, /appUpdateStaleMessage\(ev\)/)
-  assert.doesNotMatch(shellSource, /findAppStoreApp\(appsRef\.current\)/)
-})
