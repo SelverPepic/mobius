@@ -1176,7 +1176,7 @@ def test_run_codex_sdk_turn_resume_skips_skill_lookup(monkeypatch):
   assert registry.get_handle("chat-1", RunnerKind.CODEX_SDK) is None
 
 
-def test_explicit_data_dir_keeps_out_of_band_runner_off_server_settings(
+def test_explicit_data_dir_sets_sdk_home_without_server_settings(
   monkeypatch, tmp_path,
 ):
   from app import config
@@ -4551,7 +4551,7 @@ def test_extract_rate_limit_reset_handles_empty_and_none():
   assert codex_sdk_runner._extract_rate_limit_reset(empty) == (None, False)
 
 
-def test_explicit_data_dir_keeps_out_of_band_runner_off_server_settings(
+def test_explicit_data_dir_reaches_session_lock_and_runner_without_server_settings(
   monkeypatch, tmp_path,
 ):
   """Scheduled callers need the SDK runner without the server secret config."""
