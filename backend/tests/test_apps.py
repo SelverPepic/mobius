@@ -574,7 +574,7 @@ def test_schedule_update_with_timezone_materializes_and_declares(
   assert r.status_code == 400
   r = client.post(
     f"/api/apps/{app_id}/schedule",
-    json={"cron": "0 5 * * 1", "timezone": "Europe/Belgrade"},
+    json={"cron": "0 5 1 * *", "timezone": "Europe/Belgrade"},
     headers=auth,
   )
   assert r.status_code == 400
@@ -746,7 +746,7 @@ def test_invalid_zone_cadence_does_not_suppress_healthy_app_cron(
   assert count == 1
   assert infrastructure_ready is True
   assert len(warnings) == 1
-  assert "Invalid zone-local daily cron" in warnings[0]
+  assert "Invalid zone-local wall-time cron" in warnings[0]
   assert register.call_args.args[0] == "healthy"
 
 

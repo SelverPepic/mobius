@@ -28,6 +28,11 @@ For an installable app, use the manifest contract:
 }
 ```
 
+A fixed-time default (`30 5 * * *`, or on weekdays `0 9 * * 1-5`) runs at that
+wall time in the owner's timezone once the Shell has reported it, and moves when
+that timezone changes. Other cadences run in server time. A time the owner picks
+through the schedule route keeps its own timezone.
+
 The job reads its numeric app id from `$1` and uses `$APP_TOKEN` for its own
 reviewed API routes. Its first line must be a valid shebang naming an absolute
 interpreter, such as `#!/bin/bash` or `#!/usr/bin/env python3`; the platform

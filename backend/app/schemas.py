@@ -437,8 +437,8 @@ class AppInstallOut(AppOut):
 class AppScheduleUpdate(BaseModel):
   """Body for updating one installed app's cron schedule.
 
-  When ``timezone`` (an IANA identifier) is set, ``cron`` is a plain daily
-  expression owned in that zone; the platform stores that identity durably
+  When ``timezone`` (an IANA identifier) is set, ``cron`` is a fixed wall
+  time (daily or on listed weekdays) owned in that zone; the platform stores that identity durably
   and materializes an every-minute gate that resolves the real wall-clock
   occurrence. Ambiguous times run once at their first occurrence; nonexistent
   times run at the first valid minute after the gap. Without ``timezone``,
