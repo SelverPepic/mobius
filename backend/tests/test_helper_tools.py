@@ -360,24 +360,88 @@ def test_a_steered_result_is_delivered_at_the_steer_cut_once(db, monkeypatch):
 
 
 def test_claude_stop_does_not_wake_an_unread_helper_result(
-  db, monkeypatch,
+  db,
 ):
-  """A real Stop stays stopped; the unread result remains for the owner."""
+  """Stop, not the helper, cuts Claude and leaves the result for the owner."""
+  from app.claude_sdk_runner import ActiveClaudeClient
+  from app.runner_registry import registry
+
   parent_id, child_id, delegation_id = _running_parent(db, "steer-stopped")
-  monkeypatch.setattr(chat_mod, "is_chat_running", lambda _chat_id: True)
-  asyncio.run(delegations_mod.wake_parent_after_child_settled(child_id))
+  interrupts = []
+
+  class _Client:
+    async def interrupt(self):
+      interrupts.append("interrupt")
+
+  async def settle_then_stop():
+    handle = ActiveClaudeClient(_Client(), chat_id=parent_id)
+    registry.register(handle)
+    try:
+      await delegations_mod.wake_parent_after_child_settled(child_id)
+      assert interrupts == []
+      handle.mark_finished()  # Simulate the runner's completed SDK drain.
+      stopped, cleared = await chat_mod.stop_chat_for(parent_id)
+      assert stopped is True and cleared == []
+      assert handle.interrupt_requested is True
+    finally:
+      registry.unregister(parent_id, handle.kind)
+
+  asyncio.run(settle_then_stop())
+  assert interrupts == ["interrupt"]
   db.expire_all()
   assert db.get(models.Chat, parent_id).pending_messages == []
   assert db.get(models.Delegation, delegation_id).delivered_run_id is None
+  # The synthetic runner's final status follows the real Stop above.
   db.get(models.ChatRun, "root-steer-stopped").status = "stopped"
   db.commit()
-  monkeypatch.setattr(chat_mod, "is_chat_running", lambda _chat_id: False)
+  before = {row.id for row in db.query(models.ChatRun.id).filter(
+    models.ChatRun.chat_id == parent_id,
+  )}
+  asyncio.run(delegations_mod.deliver_results_after_parent_settled(parent_id))
+  db.expire_all()
+  assert {row.id for row in db.query(models.ChatRun.id).filter(
+    models.ChatRun.chat_id == parent_id,
+  )} == before
   assert delegations_mod.parent_wake_blocker(
     db, parent_id, "root-steer-stopped", "root-steer-stopped",
   )[0] == "parent_not_waiting"
   assert delegations_mod.build_delegation_result_context(
     db, parent_id,
   ).delegation_ids == (delegation_id,)
+
+
+def test_claude_helper_result_does_not_block_immediate_owner_steer(db):
+  """The helper cannot cut a command; a deliberate owner steer still can."""
+  from app.claude_sdk_runner import ActiveClaudeClient
+  from app.chat_steering import steer_into_active_turn
+  from app.runner_registry import registry
+
+  parent_id, child_id, delegation_id = _running_parent(db, "owner-steer")
+  interrupts = []
+
+  class _Client:
+    async def interrupt(self):
+      interrupts.append("interrupt")
+
+  async def settle_then_steer():
+    handle = ActiveClaudeClient(_Client(), chat_id=parent_id)
+    handle.mark_generating()
+    registry.register(handle)
+    try:
+      await delegations_mod.wake_parent_after_child_settled(child_id)
+      assert interrupts == []
+      assert await steer_into_active_turn(
+        "claude", parent_id, "The owner changed course.",
+      ) is True
+      assert interrupts == ["interrupt"]
+      assert handle.pending_steer == ["The owner changed course."]
+    finally:
+      registry.unregister(parent_id, handle.kind)
+
+  asyncio.run(settle_then_steer())
+  db.expire_all()
+  assert db.get(models.Chat, parent_id).pending_messages == []
+  assert db.get(models.Delegation, delegation_id).delivered_run_id is None
 
 
 def test_a_result_the_live_turn_already_admitted_is_not_steered_again(
