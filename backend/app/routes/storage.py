@@ -70,7 +70,7 @@ from app.deps import (
   get_principal,
   reject_cross_site,
 )
-from app.path_utils import validate_path_within_base
+from app.path_utils import has_overlong_segment, validate_path_within_base
 
 router = APIRouter(prefix="/api/storage", tags=["storage"])
 
@@ -314,6 +314,8 @@ def _resolve(base: Path, rel: str) -> Path:
     raise HTTPException(status_code=400, detail="Invalid path.")
   if ".." in Path(rel).parts:
     raise HTTPException(status_code=400, detail="Path traversal not allowed.")
+  if has_overlong_segment(rel):
+    raise HTTPException(status_code=400, detail="A path name is too long.")
   resolved = validate_path_within_base(rel, base)
   # Reject a symlink ANYWHERE in the path. validate_path_within_base resolves
   # symlinks before its containment check, so an in-tree symlink (target also
