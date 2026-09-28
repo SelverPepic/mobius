@@ -455,3 +455,43 @@ def test_a_healthy_rollback_to_the_wrong_image_is_not_settled(tmp_path, monkeypa
   host.rollback({}, TXN["operation_id"], TXN["expected_sha"], "x", "y",
                 TXN["previous_image"])
   assert writes[-1]["state"] == "rolled_back" and host.read_transaction() is None
+
+
+def test_an_idle_trial_never_brings_back_a_superseded_candidate(state, monkeypatch):
+  _with_candidate(state)
+  reinstall = lambda: host.seed_worker(worker(4))  # noqa: E731
+  _run_launcher(monkeypatch, {2: (0, None, reinstall)})
+  index = _index(state)
+  assert index["active"]["revision"] == 4 and index["candidate"] is None
+
+
+def test_a_candidate_taken_by_someone_else_is_not_run(state, monkeypatch):
+  _with_candidate(state)
+  loaded = launcher.load_index()
+  host.offer_worker(worker(3), IMAGE_ID)  # the record changes before the trial
+  calls = []
+  monkeypatch.setattr(launcher, "execute", lambda entry, cmd: calls.append(entry) or 0)
+  assert launcher.try_candidate(loaded["candidate"], loaded["active"]["sha256"]) == 1
+  assert not calls and _index(state)["candidate"]["revision"] == 3
+
+
+def test_a_revision_one_worker_can_still_recover_this_journal(tmp_path, monkeypatch):
+  """The launcher's fallback may be an older worker: the journal written
+  here must stay readable by revision 1 (mobius-os/mobius 238360c3e7)."""
+  old = subprocess.run(
+    ["git", "-C", str(ROOT), "show", "238360c3e7:scripts/mobius-rebuild-host.py"],
+    capture_output=True, text=True,
+  )
+  if old.returncode != 0:
+    pytest.skip("revision 1 is not in this checkout's history")
+  path = tmp_path / "revision1.py"
+  path.write_text(old.stdout)
+  revision1 = _load("mobius_rebuild_host_revision1", path)
+  assert revision1.WORKER_REVISION == 1
+  monkeypatch.setattr(host, "TRANSACTION", tmp_path / "transaction.json")
+  monkeypatch.setattr(revision1, "TRANSACTION", tmp_path / "transaction.json")
+  host.write_transaction(host.transaction_record(
+    "1" * 32, "a" * 40, "2" * 32, "sha256:" + "c" * 64, IMAGE_ID,
+  ))
+  assert revision1.read_transaction() is not None
+  assert host.read_transaction() is not None

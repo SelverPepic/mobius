@@ -826,10 +826,8 @@ def run() -> int:
                 return 0
             subprocess.run(["docker", "tag", previous, ROLLBACK_TAG], check=True,
                            text=True, capture_output=True)
-            transaction = {
-                "version": 1, "operation_id": operation, "expected_sha": expected,
-                "request_nonce": nonce, "previous_image": previous,
-            }
+            transaction = transaction_record(operation, expected, nonce,
+                                             previous, digest)
             # From here an interruption can leave chats drained or the app
             # removed; reconcile() settles it from this record.
             write_transaction(transaction)
@@ -904,6 +902,17 @@ def run() -> int:
             # inbox may be a newer request and stays for the next run or withdrawal.
             if claim_verified:
                 _discard_claim(claimed)
+
+
+def transaction_record(operation: str, expected: str, nonce: str | None,
+                       previous: str, target: str) -> dict:
+    return {
+        "version": 1, "operation_id": operation, "expected_sha": expected,
+        "request_nonce": nonce, "previous_image": previous,
+        # Unused here, but revision 1 workers (a launcher's fallback)
+        # recognise a journal only with it.
+        "target_image": target,
+    }
 
 
 def write_transaction(value: dict) -> None:

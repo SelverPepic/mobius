@@ -135,12 +135,17 @@ def execute(worker: dict, command: str) -> int:
 def try_candidate(candidate: dict, replaced: str) -> int:
     """Run one replacement with the candidate, taken out of the record first."""
     digest = candidate["sha256"]
+    taken = []
+
 
     def take(stored):
         if (stored.get("candidate") or {}).get("sha256") == digest:
             stored["candidate"] = None
+            taken.append(True)
 
     _update(take)
+    if not taken:
+        return 1  # the record changed first; the next run reads it afresh
     before = _status()
     result = execute(candidate, "run")
     after = _status()
@@ -150,13 +155,14 @@ def try_candidate(candidate: dict, replaced: str) -> int:
         state = None
 
     def settle(stored):
+        if (stored.get("active") or {}).get("sha256") != replaced:
+            return  # a newer worker was installed while it ran
         if after == before and result == 0:
-            # Nothing was queued: the candidate has not been tried yet.
-            if stored.get("candidate") is None:
+            # Nothing was queued: the candidate has not been tried, and it
+            # goes back unless a newer worker was offered meanwhile.
+            if stored.get("high_water") == candidate["revision"]:
                 stored["candidate"] = _record(candidate)
-        elif (state in {"succeeded", "no_change"}
-              and (stored.get("active") or {}).get("sha256") == replaced):
-            # Proven, and no newer worker was installed while it ran.
+        elif state in {"succeeded", "no_change"}:
             stored["active"] = _record(candidate)
 
     _update(settle)
