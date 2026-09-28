@@ -1121,7 +1121,7 @@ _TOOL_DEFINITIONS = {
       "and what done looks like. Its result arrives in this chat by itself, "
       "during a live Codex turn when safe or after the turn settles; Claude "
       "is not interrupted just for a helper result. Stop leaves it owed for "
-      "the next owner turn. Never poll. "
+      "the next owner turn; never poll. "
       "access=read forbids file changes."
     ),
     "inputSchema": {
