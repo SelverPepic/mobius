@@ -5490,6 +5490,68 @@ def _add_owner_timezone(eng) -> None:
     conn.execute(text("ALTER TABLE owner ADD COLUMN timezone VARCHAR(64) NULL"))
 
 
+def _record_schedule_provenance(eng) -> None:
+  """Record who chose each app schedule declared before provenance existed.
+
+  Until then every accepted update re-registered the manifest default in
+  server time. A surviving zone-owned declaration, or a server-time one that
+  differs from the accepted manifest default, was therefore set through the
+  schedule route: the owner's choice. A server-time declaration equal to the
+  default is the manifest's. Declarations that already have provenance stay.
+  """
+  import shlex
+  from sqlalchemy import inspect as sa_inspect, text
+
+  if "apps" not in sa_inspect(eng).get_table_names():
+    return
+  data_dir = Path(os.environ.get("DATA_DIR", "/data"))
+  with eng.connect() as conn:
+    apps = conn.execute(text("SELECT id, runtime_revision FROM apps")).all()
+  for app_id, revision in apps:
+    state = data_dir / "apps" / str(int(app_id)) / "schedule"
+    target = state / "choice.json"
+    try:
+      declared = (state / "init-cron.sh").read_text(encoding="utf-8")
+    except OSError:
+      continue
+    entry = re.search(
+      r"""^\s*ENTRY=(?:"([^"]+)"|'([^']+)')\s*$""", declared, re.M,
+    )
+    if target.exists() or entry is None:
+      continue
+    try:
+      tokens = shlex.split(entry.group(1) or entry.group(2))
+    except ValueError:
+      continue
+    fields = 1 if tokens and tokens[0].startswith("@") else 5
+    cron = " ".join(tokens[:fields])
+    paths = [token for token in tokens[fields:] if not token.isdigit()]
+    if not paths:
+      continue
+    default = None
+    if revision:
+      try:
+        manifest = json.loads((
+          data_dir / "app-runtime" / str(int(app_id)) / revision
+          / "mobius.json"
+        ).read_text(encoding="utf-8"))
+        default = (manifest.get("schedule") or {}).get("default")
+      except (OSError, ValueError, AttributeError):
+        default = None
+    zone = re.search(r'^SCHEDULE_TZ="([^"\n]+)"\s*$', declared, re.M)
+    source = re.search(r'^SCHEDULE_SOURCE="([^"\n]+)"\s*$', declared, re.M)
+    if zone and source:
+      choice = {"source": "owner", "cron": source.group(1).strip(),
+                "timezone": zone.group(1)}
+    else:
+      choice = {"source": "manifest" if cron == default else "owner",
+                "cron": cron, "timezone": None}
+    choice.update(job=Path(paths[-1]).name, manifest_default=default)
+    tmp = target.with_name(f".{target.name}.migration.tmp")
+    tmp.write_text(json.dumps(choice, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, target)
+
+
 _SCHEMA_MIGRATIONS = (
   # Full IDs are permanent identities, not sequence positions. Append new
   # work in execution order; never renumber a shipped ID to reconcile sources.
@@ -5572,6 +5634,7 @@ _SCHEMA_MIGRATIONS = (
   ("0070_delegation_goal_task", _add_delegation_goal_task),
   ("0071_delegation_result_identity", _add_delegation_result_identity),
   ("0072_owner_timezone", _add_owner_timezone),
+  ("0073_schedule_provenance", _record_schedule_provenance),
 )
 
 

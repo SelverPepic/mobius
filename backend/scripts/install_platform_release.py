@@ -38,8 +38,9 @@ def main() -> int:
     print(json.dumps({
       "state": "blocked",
       "error": (
-        "This image changes Python packages. Its source must be activated by "
-        "a replacement flow that validates the new image and source together."
+        "This release changes Python packages that the running image lacks. "
+        "Upgrade only the container first (scripts/CONTAINER-REBUILD.md, "
+        "\"Container-only upgrade\"), then install the release."
       ),
     }, ensure_ascii=False))
     return 2

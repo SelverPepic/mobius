@@ -5,19 +5,20 @@ is not a durable way to express "5:00 AM in Europe/Belgrade": the server's
 offset to that zone changes at daylight-saving transitions, in either zone.
 
 The durable schedule identity is therefore an IANA timezone name plus a
-zone-local daily cron expression, declared in the app's ``init-cron.sh``
+zone-local wall-time cron expression, declared in the app's ``init-cron.sh``
 (``SCHEDULE_TZ`` / ``SCHEDULE_SOURCE``). Its live crontab materialization runs
 the supervised job gate every minute; the gate compares real instants with the
 declared zone clock and claims at most one run per local date.
 
-Only simple daily expressions (numeric minute + hour, ``* * *`` date fields)
-may carry a timezone. DST edge behavior is explicit:
+Only fixed wall times may carry a timezone: numeric minute and hour, ``*``
+day-of-month and month, and every weekday or a weekday list (``0 9 * * 1-5``).
+DST edge behavior is explicit:
 
 * an ambiguous wall time runs once, at its first occurrence (``fold=0``);
 * a nonexistent wall time runs at the first valid minute after the gap;
 * a civil date with no valid minute at or after the requested time is skipped.
 
-That policy gives a daily schedule one deterministic launch on ordinary and
+That policy gives each scheduled day one deterministic launch on ordinary and
 DST-transition dates without pretending a static server-local cron expression
 can preserve an IANA wall clock.
 """
@@ -30,9 +31,9 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-_DAILY_CRON_RE = re.compile(
-  r"[ \t]*([0-9]{1,2})[ \t]+([0-9]{1,2})"
-  r"[ \t]+\*[ \t]+\*[ \t]+\*[ \t]*",
+_WALL_CLOCK_CRON_RE = re.compile(
+  r"[ \t]*([0-9]{1,2})[ \t]+([0-9]{1,2})[ \t]+\*[ \t]+\*"
+  r"[ \t]+(\*|[0-7](?:-[0-7])?(?:,[0-7](?:-[0-7])?)*)[ \t]*",
   re.ASCII,
 )
 # Written by init-cron-scaffold.sh; parsed (never executed) from init-cron.sh.
@@ -54,31 +55,42 @@ def valid_timezone(name: str) -> bool:
   return True
 
 
-def parse_daily_cron(expr: str) -> tuple[int, int] | None:
-  """Returns (minute, hour) for a plain daily cron, else None."""
-  m = _DAILY_CRON_RE.fullmatch(expr or "")
+def parse_wall_clock_cron(
+  expr: str,
+) -> tuple[int, int, frozenset[int]] | None:
+  """(minute, hour, weekdays) for a fixed wall time, else None.
+
+  ``weekdays`` uses cron numbering with Sunday as 0; ``*`` is all seven.
+  """
+  m = _WALL_CLOCK_CRON_RE.fullmatch(expr or "")
   if not m:
     return None
   minute, hour = int(m.group(1)), int(m.group(2))
   if minute > 59 or hour > 23:
     return None
-  return minute, hour
+  days: set[int] = set()
+  for part in m.group(3).replace("*", "0-6").split(","):
+    low, _, high = part.partition("-")
+    if int(high or low) < int(low):
+      return None
+    days.update(day % 7 for day in range(int(low), int(high or low) + 1))
+  return minute, hour, frozenset(days)
 
 
 def materialize_zone_cron(
   zone_cron: str,
   tz_name: str,
 ) -> str:
-  """Return the honest live cadence for a zone-local daily schedule.
+  """Return the honest live cadence for a zone-local wall-time schedule.
 
   The actual wall-clock decision belongs to the supervised job gate. A static
   offset expression is intentionally never returned: it would drift or misfire
   at the next target-zone or server-zone transition.
   """
-  if parse_daily_cron(zone_cron) is None:
+  if parse_wall_clock_cron(zone_cron) is None:
     raise ValueError(
-      "A timezone-owned schedule must be a plain daily cron "
-      f"('m h * * *'), got: {zone_cron!r}"
+      "A timezone-owned schedule must be a fixed wall time "
+      f"('m h * * *' or 'm h * * 1-5'), got: {zone_cron!r}"
     )
   if not valid_timezone(tz_name):
     raise ValueError(f"Unknown IANA timezone: {tz_name!r}")
@@ -108,18 +120,21 @@ def wall_clock_occurrence(
   """The UTC instant selected for one local civil date.
 
   Ambiguous times choose the first occurrence. Nonexistent times advance to
-  the first valid minute on the same civil date. ``None`` means the remainder
-  of that civil date does not exist in the zone.
+  the first valid minute on the same civil date. ``None`` means the schedule
+  skips that weekday, or the remainder of that civil date does not exist in
+  the zone.
   """
-  parsed = parse_daily_cron(zone_cron)
+  parsed = parse_wall_clock_cron(zone_cron)
   if parsed is None:
     raise ValueError(
-      "A timezone-owned schedule must be a plain daily cron "
-      f"('m h * * *'), got: {zone_cron!r}"
+      "A timezone-owned schedule must be a fixed wall time "
+      f"('m h * * *' or 'm h * * 1-5'), got: {zone_cron!r}"
     )
   if not valid_timezone(tz_name):
     raise ValueError(f"Unknown IANA timezone: {tz_name!r}")
-  minute, hour = parsed
+  minute, hour, weekdays = parsed
+  if local_date.isoweekday() % 7 not in weekdays:
+    return None
   tz = ZoneInfo(tz_name)
   requested = datetime(
     local_date.year, local_date.month, local_date.day, hour, minute,
@@ -169,8 +184,8 @@ def parse_zone_declaration(init_cron_text: str) -> tuple[str, str] | None:
   zone_cron = source_match.group(1).strip()
   if not valid_timezone(tz_name):
     raise ValueError(f"Unknown IANA timezone: {tz_name!r}")
-  if parse_daily_cron(zone_cron) is None:
-    raise ValueError(f"Invalid zone-local daily cron: {zone_cron!r}")
+  if parse_wall_clock_cron(zone_cron) is None:
+    raise ValueError(f"Invalid zone-local wall-time cron: {zone_cron!r}")
   return tz_name, zone_cron
 
 

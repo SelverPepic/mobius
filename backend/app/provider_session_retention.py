@@ -7,13 +7,14 @@ thread as a normal cold-resume case. This owner applies Möbius's 14-day provide
 default to Codex rollout files, then bounds Codex's own SQLite stores and
 scratch space under the same lock (codex_store_compaction).
 
-Concurrency waits only for Codex. This filesystem owner takes the exclusive
-side of the cross-process Codex lock, whose shared side every launcher,
-including standalone Reflection, holds for its full process lifetime, and it
-also skips while any process holds a file under CODEX_HOME open, which covers a
-Codex started outside those launchers. Other agents are never paused. Startup
-can therefore reclaim before SQLite opens while still skipping safely if an
-external Codex process is already active.
+Concurrency waits only for Codex, and is decided by two checks. This owner
+takes the exclusive side of the cross-process Codex lock, whose shared side
+Möbius holds around each Codex turn, usage probe, and session fork, so none
+starts or runs during a sweep. A Codex process that outlives its turn (a warm helper host
+between turns) or was started from an agent's shell holds no lock, so the
+sweep also skips while any process holds a file under CODEX_HOME open. Other
+agents are never paused. Startup can therefore reclaim before SQLite opens
+while still skipping safely if an external Codex process is already active.
 """
 
 from __future__ import annotations
@@ -33,9 +34,9 @@ DEFAULT_RETENTION_DAYS = {
   "codex": 14,
 }
 MAX_FILES_PER_SWEEP = 10_000
-# Codex launches wait on the sweep lock, so one pass does bounded store work;
-# a backlog resumes on the next pass.
-STORE_COMPACTION_BUDGET_SECONDS = 10.0
+# Codex turns wait on the sweep lock, so store work stops at this wall-clock
+# bound; a backlog resumes on the next pass.
+STORE_COMPACTION_BUDGET_SECONDS = 5.0
 
 
 def sweep_stale_provider_sessions(

@@ -130,7 +130,10 @@ each request. It sends one JSON object on stdin and accepts one JSON response
 on stdout: `{ "status": 200, "body": ..., "headers": {...} }`. The platform
 owns authentication, immutable source selection, the short-lived app token,
 8 MiB request/response ceilings, timeout, concurrency, and response-header
-safety. Private and public requests use separate serialized lanes so a private
+safety: only `Cache-Control`, `Content-Disposition`, `Content-Language`,
+`ETag`, `Last-Modified`, and `Vary` pass, other headers are dropped, and an
+authenticated response may not opt into shared caching (`public`, `s-maxage`).
+Private and public requests use separate serialized lanes so a private
 request can synchronously receive a public callback without deadlocking. An
 agent-tool call (below) runs on a third lane that is not serialized per app, so
 several can run at once alongside the two request lanes. When lanes that run at
@@ -156,6 +159,57 @@ setup's hash seed and any module-level random generator other than the global
 `random`, which is reseeded per request. A request that no preloaded process
 can take is spawned as usual.
 
+By default a service, its preload host, and a Python job run on the platform's
+interpreter and can import its libraries, which change with platform updates.
+An app can instead declare its own dependencies:
+
+```json
+{
+  "python": { "lock": "requirements.lock" },
+  "source_files": ["index.jsx", "service.py", "requirements.lock"]
+}
+```
+
+The lock is a complete `pip-compile --generate-hashes` output inside the app
+source, listed in `source_files`. It must include everything the app imports,
+since nothing is borrowed from the platform, and every package must have a
+wheel. Apply, Store install, and Store update build a virtual environment
+without system site-packages, published at `/data/app-envs/<app id>/<key>`,
+where the key combines the interpreter/ABI with the lock's SHA-256. The build
+installs hash-checked wheels only, so no package build code runs. pip reads no
+configuration file and inherits only index, certificate, and proxy settings,
+and URL credentials are removed from any diagnostics returned. The build then
+runs `pip check` and a smoke run. The smoke run executes the service entry's
+module-level setup (everything but its `__main__` block), or else a Python
+job's top-level imports. It is the app's own code running as the backend user
+with no sandbox, like the service itself, given inert `APP_*` values and
+throwaway storage. Each build step runs in its own process group, killed when
+the step ends or after its time limit (60 s for the smoke run). That cleanup
+is best effort, since a process that calls `setsid` leaves the group, but a
+build never waits past its limits. A matching environment is reused. A build
+failure fails the Apply or install with pip's diagnostics, which name the
+package, and the previous revision stays live. A Store install or update
+builds from the fetched package before its database transaction, so it
+smoke-tests the fetched service. If the owner's local edits merge into that
+update, the merged service is not what was tested. A merge that changes the
+lock is refused rather than built inside the transaction.
+
+The declaring revision's service, preload host, and every job run with the
+environment's `bin` first on `PATH`, so a spawned `python3` is the app's too.
+The service and preload host start with the environment's interpreter, and so
+does a job whose shebang is `#!/usr/bin/env [-S] pythonX[.Y]` or an absolute
+Python path. A shebang that names Python in any other form is rejected when
+the app is applied or installed. Other jobs keep their own interpreter.
+
+Nothing falls back to the platform interpreter. After an image replacement
+that changes the interpreter, the key no longer matches, and an accepted
+revision whose manifest cannot be read is treated the same way. A revision
+with no `mobius.json` at all is deliberately undeclared, because accepted
+revisions may legitimately lack one. Service calls
+answer 503 and the app's jobs log a failure until Apply rebuilds the
+environment, which needs network. Environments that no retained runtime
+revision references are removed with those revisions.
+
 Same-app calls use `/api/apps/{app_id}/service/{path}`. An app can expose a
 reviewed service to other installed apps at `/api/services/{service_id}/{path}`
 by setting `access` to `apps`, or additionally expose anonymous calls at
@@ -166,12 +220,20 @@ install-time grants and do not widen the service app token's accepted
 permissions. The generic routes are the whole contract: the platform does not
 carry app-specific path aliases. Services receive the same `APP_ID`, `APP_SLUG`,
 `APP_STORAGE_DIR`, `API_BASE_URL`, and short-lived `APP_TOKEN` environment as
-other reviewed app-owned processes. A service reached only through an
-authenticated caller (`self` or `apps` access) additionally receives the
+other reviewed app-owned processes. The token's authority follows the caller.
+An authenticated invocation's token carries the app's own authority. A public
+invocation acts for an anonymous visitor, so its token has a narrow scope: it
+may read the owner's identity (with the app's `identity_manage` grant) and app
+list and send the owner a notification, and every other route refuses it. In
+particular it cannot start or drive the owner's agents, so an anonymous visitor
+cannot spend on the owner's provider accounts. A service reached only through
+an authenticated caller (`self` or `apps` access) additionally receives the
 provider-credential locations `DATA_DIR`, `CLAUDE_CONFIG_DIR`, and `CODEX_HOME`,
 so it may run a provider CLI as its scheduled job can; a publicly reachable
-(`public`) service never receives them, so an anonymous visitor cannot spend on
-the owner's provider accounts.
+(`public`) service never receives them. None of this is a filesystem sandbox:
+a service is owner-installed reviewed code with the platform's file access.
+Paths under `tools/` are reserved for agent tool calls; HTTP callers get 404
+there.
 
 Project output formats are app-owned too. A `project_templates[].artifact_types`
 declaration names the source extensions, preview kind, output path, and reviewed

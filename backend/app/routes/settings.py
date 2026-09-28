@@ -552,17 +552,17 @@ def get_owner_timezone(
 
 
 @owner_router.put("/timezone", dependencies=[Depends(reject_cross_site)])
-def set_owner_timezone(
+async def set_owner_timezone(
   body: OwnerTimezoneUpdate,
   owner: models.Owner = Depends(get_current_owner),
   db: Session = Depends(get_db),
 ) -> dict:
   """Records the owner's IANA timezone as reported by the shell's browser.
 
-  Plain daily app schedules registered on install or update are owned in this
-  zone. Changing it does not rewrite schedules already registered.
+  Fixed wall-time schedules that are still the app's manifest default move to
+  this zone now; schedules the owner chose keep their own zone.
   """
-  from app import cron_tz
+  from app import cron_tz, install
 
   zone = body.timezone.strip()
   if not cron_tz.valid_timezone(zone):
@@ -570,6 +570,7 @@ def set_owner_timezone(
   if owner.timezone != zone:
     owner.timezone = zone
     db.commit()
+  await install.converge_manifest_schedule_zones(db, zone)
   return {"timezone": zone}
 
 

@@ -293,3 +293,16 @@ def test_reserved_root_slug_cannot_be_published(client, auth):
     db.close()
   response = _publish(client, auth, app["id"])
   assert response.status_code == 400
+
+
+def test_public_app_host_is_platform_code_and_its_module_is_inert(client, auth):
+  from app.main import _INERT_CONTENT_CSP, _SHELL_CSP
+
+  app = _create(client, auth, name="Public lane")
+  assert _publish(client, auth, app["id"]).status_code == 200
+  page = client.get(f"/{app['slug']}")
+  assert page.status_code == 200
+  assert page.headers["content-security-policy"] == _SHELL_CSP
+  module = _public_module(client, app["id"], _public_token_from_html(page.text))
+  assert module.status_code == 200
+  assert module.headers["content-security-policy"] == _INERT_CONTENT_CSP

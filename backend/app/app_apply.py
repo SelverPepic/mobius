@@ -23,7 +23,8 @@ from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app import (
-  app_git, chat_app_artifacts, icon_assets, managed_paths, models, service_preload, timeutil,
+  app_git, app_python_env, chat_app_artifacts, icon_assets, managed_paths, models,
+  service_preload, timeutil,
 )
 from app.app_capabilities import (
   contract_from_app_state,
@@ -37,16 +38,17 @@ from app.compiler import (
   publish_staged_bundle,
   unlink_app_bundle,
 )
+from app.config import get_settings
 from app.manifest_contract import (
   ICON_MAX_BYTES,
   MANIFEST_MAX_BYTES,
   STATIC_ASSET_MAX_BYTES,
   STATIC_ASSETS_TOTAL_MAX,
   ManifestContractError,
-  job_interpreter,
   static_asset_entries,
   validate_manifest_contract,
   validate_repo_relative_path,
+  validate_schedule_job,
 )
 
 
@@ -71,10 +73,10 @@ _LOCAL_PACKAGE_WARNING = (
 )
 
 _STORE_LOCAL_PACKAGE_DIVERGED = (
-  "This app is Store-managed, so its live tools, service, schedule, and "
-  "skills come from the reviewed package. Your local mobius.json changes to "
-  "those were NOT applied by this ordinary apply. Re-apply with "
-  "--accept-local-package to make the local manifest authoritative."
+  "This app is Store-managed, so its live package comes from the accepted "
+  "manifest. Your local mobius.json changes were NOT applied by this "
+  "ordinary apply. Re-apply with --accept-local-package to make the local "
+  "manifest authoritative."
 )
 
 
@@ -384,68 +386,24 @@ def _read_manifest(snapshot_dir: Path) -> dict:
   return dict(manifest)
 
 
-def _reviewed_package_surface(contract) -> dict:
-  """Author-declared package fields that ordinary Store apply cannot change.
-
-  Kept deliberately narrow to the surface an agent edits in mobius.json and
-  that the reviewed contract owns for a Store app — tools, service, schedule,
-  skills, embedded agent, and system prompt. Host-normalized parts (schema,
-  runtime, public, offline) are excluded so a contract-schema bump since
-  install can never masquerade as a local edit.
-  """
-  contract = contract if isinstance(contract, dict) else {}
-  agent = contract.get("agent")
-  agent = agent if isinstance(agent, dict) else {}
-  return {
-    "tools": agent.get("tools") or [],
-    "skills": agent.get("skills") or [],
-    "system_prompt": agent.get("system_prompt"),
-    "embeds_agent": bool(agent.get("embeds_agent", False)),
-    "service": contract.get("service"),
-    "background": contract.get("background"),
-  }
-
-
 def _store_local_package_divergence(app: models.App, snapshot_dir: Path) -> str | None:
-  """Warn when a Store app's local package declarations differ from live.
+  """Warn when ordinary Store apply drops local mobius.json edits.
 
-  Ordinary apply of a Store-managed app publishes the compiled entry but keeps
-  the reviewed package metadata, so local mobius.json edits to tools, service,
-  schedule, or skills are silently dropped. This compares the contract those
-  local declarations *would* produce under --accept-local-package against the
-  live one and returns a warning only when they genuinely differ. It is
-  best-effort: any read or parse problem returns None so a valid apply is never
-  blocked by the check.
+  Ordinary apply of a Store-managed app publishes code but keeps the accepted
+  package manifest, the runtime root's mobius.json. Any local manifest that
+  differs from it was not applied. Best-effort: a read or parse problem
+  returns None so a valid apply is never blocked by the check.
   """
+  from app import applied_app_runtime
+
   try:
-    raw = (snapshot_dir / "mobius.json").read_bytes()
-    if len(raw) > MANIFEST_MAX_BYTES:
-      return None
-    manifest = json.loads(raw)
-    validate_manifest_contract(manifest)
-  except (OSError, UnicodeDecodeError, json.JSONDecodeError, ManifestContractError):
+    local = json.loads((snapshot_dir / "mobius.json").read_bytes())
+    accepted = json.loads(
+      (applied_app_runtime.runtime_root(app) / "mobius.json").read_bytes()
+    )
+  except (OSError, ValueError, applied_app_runtime.AppliedRuntimeUnavailable):
     return None
-  if not isinstance(manifest, dict):
-    return None
-  # Mirror the effective normalization the accept-local path applies before
-  # building the contract, so the comparison reflects exactly what accepting
-  # this manifest would install.
-  effective = dict(manifest)
-  effective.setdefault("offline_capable", app.offline_capable)
-  effective.setdefault("embeds_agent", app.embeds_agent)
-  service = effective.get("service")
-  if isinstance(service, dict):
-    service = dict(service)
-    service.setdefault("id", app.service_id)
-    effective["service"] = service
-  try:
-    accepted = contract_from_manifest(effective)
-  except Exception:
-    return None
-  live = app.capability_contract if isinstance(app.capability_contract, dict) else {}
-  if _reviewed_package_surface(accepted) != _reviewed_package_surface(live):
-    return _STORE_LOCAL_PACKAGE_DIVERGED
-  return None
+  return _STORE_LOCAL_PACKAGE_DIVERGED if local != accepted else None
 
 
 def _entry_source(snapshot_dir: Path, relative: str) -> str:
@@ -760,6 +718,8 @@ async def apply_source_revision(
   published = None
   staged = None
   runtime_staged = None
+  python_env = None
+  published_env = None
   static_created: list[Path] = []
   static_rollback: list = []
   static_commit: list = []
@@ -804,7 +764,7 @@ async def apply_source_revision(
         job_name = schedule.get("job") if isinstance(schedule, dict) else None
         if job_name:
           try:
-            job_interpreter((snapshot_dir / job_name).read_bytes())
+            validate_schedule_job(manifest, (snapshot_dir / job_name).read_bytes())
           except (OSError, ManifestContractError) as exc:
             raise AppApplyError(
               "invalid_schedule_job", str(exc), status_code=422,
@@ -959,6 +919,20 @@ async def apply_source_revision(
         static_assets=runtime_assets,
         **runtime_options,
       )
+      # Build the declared Python environment from the accepted tree before
+      # its pointer is published: a failure leaves the previous revision live.
+      try:
+        python_env = await asyncio.to_thread(
+          app_python_env.prepare_env,
+          get_settings().data_dir, None if created else app.id,
+          runtime_staged.root,
+        )
+      except app_python_env.PythonEnvBuildError as exc:
+        raise AppApplyError(
+          "python_env_failed",
+          f"Could not build the app's Python environment. {exc}",
+          status_code=422,
+        ) from exc
       if created:
         # A new App has no numeric id until SQLite inserts it. Compiling after
         # that insert used to hold the database write lock for the entire
@@ -968,6 +942,11 @@ async def apply_source_revision(
         # only when the accepted Git tree and compiled bytes are ready.
         db.add(app)
         db.flush()
+      if python_env is not None:
+        published_env = app_python_env.publish_env(
+          get_settings().data_dir, app.id, python_env,
+        )
+        python_env = None
       applied_app_runtime.publish_runtime(app, runtime_staged)
       runtime_staged = None
       app_staged = _compiled_dir() / f"app-{app.id}.js.staging"
@@ -1043,6 +1022,10 @@ async def apply_source_revision(
     db.rollback()
     if runtime_staged is not None:
       shutil.rmtree(runtime_staged.root)
+    app_python_env.discard_env(python_env)
+    if not durable_commit:
+      # No row may reference it; a rolled-back new app has none to drive GC.
+      app_python_env.unpublish_env(published_env)
     if not durable_commit and static_materialized:
       _rollback_static_assets(static_created, static_rollback)
     if staged is not None:

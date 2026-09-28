@@ -128,7 +128,9 @@ async def test_wait_delivery_starts_only_its_exact_goal_run(db, chat, monkeypatc
   assert len(scheduled) == 1
   successor = db.get(models.ChatRun, f"wait-resume-{wait.id}")
   assert successor.goal_id == "goal-run"
-  assert db.get(models.ChatWait, wait.id).resume_delivered_at is not None
+  # Scheduling is not delivery: the Wait stays owed until a turn carrying it
+  # succeeds.
+  assert db.get(models.ChatWait, wait.id).resume_delivered_at is None
 
 
 def _complete(db, result="Verified: checks green"):

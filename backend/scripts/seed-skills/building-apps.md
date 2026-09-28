@@ -268,13 +268,27 @@ manifest, layered by how always-on they are:
   `description`, and `input_schema` (a JSON Schema `object`). Requires a
   `service`: agents see `<app slug>_<name>`, and each call reaches the service
   as `POST /tools/<name>` with body `{"arguments": ..., "call": ...}` and the
-  app's own authority (`backend/app/app_tools.py`). Helpers get the tools too:
+  app's own authority (`backend/app/app_tools.py`). Only the platform reaches
+  `tools/`: HTTP calls to the service there get 404, so `call` is trustworthy. Helpers get the tools too:
   the request's `actor` has `delegated: true` for a helper and
   `access: "read"` for a read-only one, so refuse any change for a read-only
   caller. Tool calls run on their own concurrency lane that is NOT serialized
   per app (unlike a service's private/public requests), so several — from this
   chat, other chats, or helpers — can reach the service at once; a tool that
   writes must do its own file or database locking. Keep tools few.
+- **Python dependencies for a service or Python job.** Without a declaration,
+  these run on the platform's interpreter and borrow its libraries, which can
+  change on any platform update, and anything installed live disappears when
+  the container is replaced. To own them, commit a complete
+  `pip-compile --generate-hashes` lock (list it in `source_files`) and declare
+  `"python": {"lock": "requirements.lock"}`. Apply or install then builds the
+  app's own environment on `/data` from wheels only. It checks the environment
+  by running the service's setup code, which is your code, unsandboxed. The
+  service and every job then run with the environment first on `PATH`, and a
+  `#!/usr/bin/env python3` job uses its interpreter. If a package fails to
+  build, the Apply fails and names it. After a platform update that changes
+  Python, the service returns 503 and jobs fail until you Apply again. Details
+  are in `CAPABILITIES.md`.
 
 Anything that depends on your app being installed belongs in its fragment (the
 always-on default) and/or its skill (the how-to). A not-installed app then
@@ -469,14 +483,13 @@ const res = await fetch(`/api/storage/apps/${appId}/${path}`, {
 
 The extension picks the form (same `.json`-no-envelope rule as above).
 
+Shared storage is owner-written. An app token cannot write or delete there, and it can read and list only `skills/`, `self-reminders.jsonl`, and `memory/` (the last only with a declared `shared_memory` read contract). Every other shared path returns 403 to an app.
+
 ### Cross-app feedback
 
-When an app asks the partner for feedback that another agent should notice, write it twice:
+When an app asks the partner for feedback that another agent should notice, store it in the app's own storage as `feedback/<id>.json` via `window.mobius.storage`, so the app owns its audit trail and offline/read-your-writes behavior. Apps cannot write shared storage.
 
-- Local app storage: `feedback/<id>.json` via `window.mobius.storage`, so the app owns its audit trail and offline/read-your-writes behavior.
-- Shared storage: `app-feedback/<app-slug>/<id>.json` via `PUT /api/storage/shared/...`, best-effort and honestly surfaced if it fails, so Reflection and future cross-app agents can enumerate it without knowing the app's numeric id.
-
-Use a small structured object: `app`, `kind`, `created_at`, `signal`, `text`, and domain context such as `report_date`, `article_headlines`, `source_id`, or `screen`. Keep one record per file. Consumers must enumerate `shared-list/app-feedback/` and app subfolders; do not probe guessed ids.
+Use a small structured object: `app`, `kind`, `created_at`, `signal`, `text`, and domain context such as `report_date`, `article_headlines`, `source_id`, or `screen`. Keep one record per file. Consumers enumerate `apps-list/{appId}/feedback/`; do not probe guessed ids.
 
 ---
 

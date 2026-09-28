@@ -113,7 +113,7 @@ def test_app_service_token_can_read_its_own_secret(client, auth, db):
 
   service_token = create_app_token(
     app.id, owner.username, owner.token_epoch, app.token_nonce,
-    is_service=True,
+    service="private",
   )
   service_auth = {"Authorization": f"Bearer {service_token}"}
   read = client.get(f"/api/apps/{app.id}/secrets/key", headers=service_auth)

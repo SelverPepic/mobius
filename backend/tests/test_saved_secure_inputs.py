@@ -401,11 +401,20 @@ def test_timeout_kills_consumer_descendants_not_only_parent(tmp_path, monkeypatc
   }, values, "chat"))
   assert code == 124 and values == {}
   child_pid = int(pid_file.read_text())
-  try:
-    from pathlib import Path
-    state = Path(f"/proc/{child_pid}/stat").read_text().split()[2]
-  except FileNotFoundError:
-    state = "gone"
+  from pathlib import Path
+  import time
+
+  def child_state():
+    try:
+      return Path(f"/proc/{child_pid}/stat").read_text().split()[2]
+    except FileNotFoundError:
+      return "gone"
+
+  # The group is killed on timeout; a loaded host may take a moment to act on
+  # the signal. A descendant the kill missed would still be sleeping at the end.
+  deadline = time.monotonic() + 5
+  while (state := child_state()) not in {"Z", "gone"} and time.monotonic() < deadline:
+    time.sleep(0.05)
   assert state in {"Z", "gone"}, "consumer descendant survived timeout"
 
 
