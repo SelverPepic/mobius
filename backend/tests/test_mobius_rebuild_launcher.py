@@ -15,7 +15,6 @@ import pytest
 
 ROOT = Path(__file__).parents[2]
 WORKER_SCRIPT = ROOT / "scripts" / "mobius-rebuild-host.py"
-REGISTRY = ROOT / "scripts" / "rebuild-worker-revisions.json"
 
 
 def _load(name: str, path: Path):
@@ -69,19 +68,9 @@ def _index(state) -> dict:
 
 # --- The shipped worker's revision is tied to its bytes ----------------------
 
-def test_every_worker_change_bumps_its_revision():
-  """The launcher adopts only strictly higher revisions, so changed worker
-  bytes under an old revision would never reach installed hosts. (CI also
-  refuses any change to a released revision's recorded digest.)"""
-  source = WORKER_SCRIPT.read_bytes()
-  revision = host.worker_revision(source)
-  registry = json.loads(REGISTRY.read_text())
-  assert revision == host.WORKER_REVISION >= 1
-  assert registry.get(str(revision)) == hashlib.sha256(source).hexdigest(), (
-    "scripts/mobius-rebuild-host.py changed: increase WORKER_REVISION and "
-    "record the new revision's sha256 in scripts/rebuild-worker-revisions.json"
-  )
-  assert sorted(map(int, registry)) == list(range(1, revision + 1))
+def test_the_shipped_worker_declares_its_revision():
+  """CI requires a higher revision whenever the worker's bytes change."""
+  assert host.worker_revision(WORKER_SCRIPT.read_bytes()) == host.WORKER_REVISION >= 1
 
 
 def test_revision_is_read_as_text():
@@ -106,21 +95,18 @@ def test_seed_installs_the_checkout_worker_and_never_downgrades(state):
 
 def test_offers_only_strictly_newer_compiling_workers(state):
   host.seed_worker(worker(1))
-  assert host.offer_worker(worker(1), IMAGE_ID) == "current: revision 1"
+  assert host.offer_worker(worker(1), IMAGE_ID).startswith("not adopted")
   assert host.offer_worker(worker(3), IMAGE_ID).startswith("offered")
-  assert host.offer_worker(worker(3), IMAGE_ID) == "current: revision 3"
-  # An older official image (possibly one a compromised app asked for)
-  # never displaces the newest worker.
-  assert host.offer_worker(worker(2), IMAGE_ID).startswith("not adopted: revision 2 is older")
-  assert host.offer_worker(worker(None), IMAGE_ID).startswith("not adopted")
-  assert host.offer_worker(worker(3, "print(1)"), IMAGE_ID).startswith(
-    "rejected: a different worker already claims revision 3",
-  )
+  # Neither the same revision (other bytes included) nor an older official
+  # image (possibly one a compromised app asked for) displaces it.
+  for other in (worker(3), worker(3, "print(1)"), worker(2), worker(None)):
+    assert host.offer_worker(other, IMAGE_ID).startswith("not adopted")
   assert host.offer_worker(worker(4, "def broken(:"), IMAGE_ID).startswith(
     "rejected: worker does not compile",
   )
   index = launcher.load_index()
   assert (index["active"]["revision"], index["candidate"]["revision"]) == (1, 3)
+  assert index["candidate"]["path"].read_bytes() == worker(3)
   assert oct(index["candidate"]["path"].stat().st_mode & 0o777) == "0o700"
 
 
@@ -177,8 +163,7 @@ def test_a_candidate_that_succeeds_becomes_active(state, monkeypatch):
   result, calls = _run_launcher(monkeypatch, {2: (0, {"state": "succeeded"}, None)})
   assert (result, calls) == (0, [(2, "run")])
   index = _index(state)
-  assert (index["active"]["revision"], index["previous"]["revision"]) == (2, 1)
-  assert index["candidate"] is None
+  assert index["active"]["revision"] == 2 and index["candidate"] is None
 
 
 @pytest.mark.parametrize("status", [
@@ -189,22 +174,30 @@ def test_a_candidate_that_succeeds_becomes_active(state, monkeypatch):
 ])
 def test_any_other_candidate_outcome_drops_it_for_good(state, monkeypatch, status):
   _with_candidate(state)
-  result, _calls = _run_launcher(monkeypatch, {2: (1, status, None)})
-  assert result == 1
+  assert _run_launcher(monkeypatch, {2: (1, status, None)})[0] == 1
   index = _index(state)
   assert index["active"]["revision"] == 1 and index["candidate"] is None
-  assert index["high_water"] == 2
-  # The retry runs the proven worker, and those bytes are never offered again.
+  # The retry runs the proven worker, and revision 2 is never offered again.
   assert _run_launcher(monkeypatch, {1: (0, {"state": "succeeded"}, None)})[1] == [(1, "run")]
-  assert host.offer_worker(worker(2), IMAGE_ID).startswith("not adopted: revision 2 failed before")
+  assert host.offer_worker(worker(2), IMAGE_ID).startswith("not adopted")
   assert host.offer_worker(worker(3), IMAGE_ID).startswith("offered")
 
 
-def test_a_candidate_is_kept_when_nothing_was_queued_or_withdrawn(state, monkeypatch):
+def test_a_trial_the_host_interrupts_is_never_repeated(state, monkeypatch):
+  _with_candidate(state)
+
+  def killed():
+    raise KeyboardInterrupt  # systemd stopped the service mid-trial
+
+  with pytest.raises(KeyboardInterrupt):
+    _run_launcher(monkeypatch, {2: (1, None, killed)})
+  index = _index(state)
+  assert index["active"]["revision"] == 1 and index["candidate"] is None
+
+
+def test_a_candidate_is_kept_when_nothing_was_queued(state, monkeypatch):
   _with_candidate(state)
   assert _run_launcher(monkeypatch, {2: (0, None, None)})[1] == [(2, "run")]
-  assert _index(state)["candidate"]["revision"] == 2
-  _run_launcher(monkeypatch, {2: (1, {"state": "failed", "code": "withdrawn"}, None)})
   assert _index(state)["candidate"]["revision"] == 2
 
 
@@ -214,7 +207,6 @@ def test_a_newer_offer_made_by_a_succeeding_candidate_survives(state, monkeypatc
   _run_launcher(monkeypatch, {2: (0, {"state": "succeeded"}, offer)})
   index = _index(state)
   assert (index["active"]["revision"], index["candidate"]["revision"]) == (2, 3)
-  # The promoted worker's file survived the newer offer: it still runs.
   loaded = launcher.load_index()
   assert loaded and loaded["active"]["path"].read_bytes() == worker(2)
 
@@ -225,18 +217,6 @@ def test_a_worker_installed_while_a_candidate_ran_is_not_superseded(state, monke
   _run_launcher(monkeypatch, {2: (0, {"state": "succeeded"}, reinstall)})
   index = _index(state)
   assert index["active"]["revision"] == 4 and index["candidate"] is None
-  assert launcher.load_index()["active"]["revision"] == 4
-
-
-def test_a_failing_candidate_never_reactivates_itself(state, monkeypatch):
-  """Astra's sequence: the failing worker must not come back as active."""
-  _with_candidate(state)
-  _run_launcher(monkeypatch, {2: (1, {"state": "failed", "code": "x"}, None)})
-  offer = lambda: host.offer_worker(worker(3), IMAGE_ID)  # noqa: E731
-  _run_launcher(monkeypatch, {1: (0, {"state": "succeeded"}, offer)})
-  index = _index(state)
-  assert (index["active"]["revision"], index["candidate"]["revision"]) == (1, 3)
-  assert hashlib.sha256(worker(2)).hexdigest() in index["rejected"]
 
 
 def test_reconcile_always_runs_the_proven_worker(state, monkeypatch):
@@ -384,21 +364,12 @@ def journal(tmp_path, monkeypatch):
   return writes, rollbacks
 
 
-def test_recovery_completes_a_verified_target(journal, monkeypatch):
-  writes, rollbacks = journal
-  monkeypatch.setattr(host, "wait_healthy", lambda *a: True)
-  monkeypatch.setattr(host, "app_container", lambda _c: ("cid", IMAGE_ID))
-  host.recover({}, host.read_transaction())
-  assert writes[-1]["state"] == "succeeded"
-  assert writes[-1]["request_nonce"] == TXN["request_nonce"]
-  assert not rollbacks and host.read_transaction() is None
-
-
 @pytest.mark.parametrize("healthy,running", [
   (True, TXN["previous_image"]),  # stopped before the new container started
+  (True, IMAGE_ID),  # the new container was running when the worker stopped
   (False, IMAGE_ID),  # the new container never became healthy
 ])
-def test_recovery_restores_the_previous_container_otherwise(journal, monkeypatch, healthy, running):
+def test_recovery_restores_the_previous_container(journal, monkeypatch, healthy, running):
   _writes, rollbacks = journal
   monkeypatch.setattr(host.subprocess, "run", lambda args, **_k: None)  # docker tag
   monkeypatch.setattr(host, "wait_healthy", lambda *a: healthy)

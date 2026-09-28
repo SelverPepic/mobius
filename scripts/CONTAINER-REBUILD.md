@@ -186,49 +186,40 @@ takes `/app/platform-baked/scripts/mobius-rebuild-host.py` out of that exact
 image ID. It creates a container without starting it, accepts exactly one
 regular file within a size and time bound, and removes the container and its
 volumes. It offers the file to the launcher as a **candidate** only when the
-file:
+file compiles and declares a `WORKER_REVISION` (read as text, never by running
+it) above every revision offered or installed so far. That high-water mark
+never drops, so neither a dropped candidate nor an older official image's
+worker is ever offered again.
 
-- declares a strictly higher `WORKER_REVISION`, read as text and never by
-  running it;
-- compiles;
-- has never failed before.
-
-A different payload claiming an offered revision is refused. The file is
-durable before the record that names it.
-
-The candidate runs the next replacement. If that replacement succeeds, the
-candidate becomes the active worker. Any other outcome (a reported failure,
-rollback, or crash) drops it for good, and the proven active worker handles
-the retry. Withdrawn or already-running requests say nothing about the worker
-and leave it as candidate. A worker installed while the candidate ran is never
-superseded by that candidate. `reconcile` always runs the proven worker. A
-faulty worker change therefore costs one update attempt, never the ability to
-update. Worker files are small and never deleted, so any recorded worker can
-still run.
+The launcher removes the candidate from its record before trying it on the
+next replacement, so a trial that the host interrupts is never repeated. The
+candidate becomes active only when that replacement succeeds, and only if no
+newer worker was installed while it ran. Otherwise the proven worker handles
+the retry, and `reconcile` always runs the proven worker. A faulty worker change
+therefore costs one update attempt, never the ability to update. Worker files
+are small and never deleted.
 
 Worker changes reach installed hosts through ordinary updates, taking effect
 from the replacement after the release that ships them, so keep each change
-compatible with its predecessor for one release. Reinstalling never lowers
-the adopted revision. `scripts/rebuild-worker-revisions.json` ties every
-revision to its bytes: tests fail when the worker changes without a new
-revision, and CI refuses any change to a released revision's recorded digest.
+compatible with its predecessor for one release. CI requires a higher
+`WORKER_REVISION` whenever the worker changes, and a post-publish job proves
+that each published worker reaches a host installed from the previous release
+and performs a real replacement there.
 
 Before it drains the running app, a worker records the replacement in
-`/var/lib/mobius-rebuild/transaction.json`: operation, nonce, target and
-previous image IDs. Compose starts the verified image through a helper-owned
-tag pointed at its ID (`mobius-rebuild-target`), and recovery restores the
-journaled previous ID. The record is removed only once the outcome is settled.
-Failure handling, rollback and settlement all run under the replacement lock
-that the installer and `reconcile` also take.
-If a worker is interrupted, `reconcile` (after the run and at boot) finishes
-the replacement when the target image is running, healthy and serving the
-requested revision. Otherwise it restores the previous container with the
-usual re-armed chat handoff. A new request waits until that settles. The
-record's schema is shared by every worker revision.
+`/var/lib/mobius-rebuild/transaction.json`: operation, nonce, and previous
+image ID. Compose starts the verified image through a helper-owned tag pointed
+at its ID (`mobius-rebuild-target`). If a worker is interrupted, `reconcile`
+(after the run and at boot) restores exactly the recorded previous image with
+the usual re-armed chat handoff, so the app can request the update again. The
+record is removed only when the healthy container is that image; otherwise the
+status reads `needs_recovery`. A new request waits until the record is settled.
+Failure handling, rollback and settlement run under the replacement lock that
+the installer and `reconcile` also take. The record's schema is shared by every
+worker revision.
 
-Status reports `worker_revision`, `launcher_revision` (absent for a fixed
-helper from before the launcher) and the last `worker_adoption` outcome. Fixed
-helpers keep working: the app does not require the launcher, and
+The root status records `worker_revision`, `launcher_revision` and the last
+`worker_adoption` outcome for operators. Fixed helpers keep working: the app does not require the launcher, and
 `deployment/self-hosted-helper.required` advances only for a change the
 launcher itself or an older fixed helper cannot provide.
 

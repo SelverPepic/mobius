@@ -38,16 +38,6 @@ RebuildState = Literal[
 ]
 
 
-class HostWorker(TypedDict):
-  """The self-hosted replacement worker that reported this status."""
-
-  revision: int
-  # None: a fixed helper from before the launcher, updated only by reinstalling.
-  launcher_revision: int | None
-  # The last attempt to adopt the worker a replaced image carries.
-  adoption: str | None
-
-
 class RebuildStatus(TypedDict):
   supported: bool
   deployment: platform_activation.DeploymentKind
@@ -62,7 +52,6 @@ class RebuildStatus(TypedDict):
   updated_at: str | None
   # The app's nonce for the host request this status reports (self-hosted).
   request_nonce: str | None
-  host_worker: HostWorker | None
 
 
 class OfficialImageRelease(TypedDict):
@@ -130,23 +119,6 @@ def _empty_status(
     release_source="applied",
     updated_at=None,
     request_nonce=None,
-    host_worker=None,
-  )
-
-
-def _host_worker(raw: dict[str, Any]) -> HostWorker | None:
-  revision = raw.get("worker_revision")
-  if not isinstance(revision, int) or isinstance(revision, bool) or revision < 1:
-    return None
-  launcher = raw.get("launcher_revision")
-  adoption = raw.get("worker_adoption")
-  return HostWorker(
-    revision=revision,
-    launcher_revision=(
-      launcher if isinstance(launcher, int) and not isinstance(launcher, bool)
-      else None
-    ),
-    adoption=str(adoption)[:200] if isinstance(adoption, str) else None,
   )
 
 
@@ -271,7 +243,6 @@ def _normalize_status(
     release_source="applied",
     updated_at=updated_at,
     request_nonce=nonce if _OPERATION_RE.fullmatch(nonce) else None,
-    host_worker=_host_worker(raw),
   )
 
 
@@ -377,7 +348,6 @@ def _normalize_managed_status(
     release_source=release_source,
     updated_at=str(raw.get("updated_at") or "") or None,
     request_nonce=None,
-    host_worker=None,
   )
 
 
@@ -485,9 +455,6 @@ def _read_host_status() -> dict[str, Any]:
         # handoff version. Preserve their retired capability through this
         # synthesized state so a pending request cannot make them look current.
         "runtime_overlay": value.get("runtime_overlay"),
-        "worker_revision": value.get("worker_revision"),
-        "launcher_revision": value.get("launcher_revision"),
-        "worker_adoption": value.get("worker_adoption"),
       }
       unclaimed_for = (datetime.now(timezone.utc) - queued_at).total_seconds()
       if unclaimed_for >= _UNCLAIMED_REQUEST_BOUND_S:

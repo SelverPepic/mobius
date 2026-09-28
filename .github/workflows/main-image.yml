@@ -117,7 +117,7 @@ jobs:
           [ -n "$previous" ] || { echo "no earlier published release"; exit 1; }
           # The installer runs as root over this runner-owned checkout.
           sudo git config --global --add safe.directory '*'
-          sudo scripts/test-host-helper.sh "$previous" "$GITHUB_SHA" "$previous"
+          sudo scripts/test-host-helper.sh "$previous" "$GITHUB_SHA"
 
   promote-main:
     if: github.repository == 'mobius-os/mobius'

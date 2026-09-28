@@ -128,7 +128,6 @@ _RULES = (
       "scripts/install-rebuild-helper.sh",
       "scripts/mobius-rebuild-host.py",
       "scripts/mobius-rebuild-launcher.py",
-      "scripts/rebuild-worker-revisions.json",
     ),
     deployment="self_hosted",
   ),

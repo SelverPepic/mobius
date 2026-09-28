@@ -8,13 +8,15 @@ by updates. It holds no replacement logic. It runs a copy of
 - ``active``: the proven worker. It always runs ``reconcile`` and runs a
   replacement when there is no candidate.
 - ``candidate``: a newer worker the active one took from a verified official
-  image after a successful replacement. It runs the next replacement. If that
-  replacement succeeds it becomes active; any other outcome drops it for good
-  and the proven worker handles the retry. So worker changes ship in releases
-  and activate without a host command, and a faulty one costs one attempt.
+  image after a successful replacement. The launcher removes it from the
+  record before trying it on the next replacement, so a trial the host
+  interrupts is never repeated. It becomes active only when that replacement
+  succeeds; the worker's revision high-water mark keeps it from ever being
+  offered again otherwise.
 
-Only a change to this file needs a reinstall
-(``deployment/self-hosted-helper.required``).
+Worker changes therefore ship in releases and activate without a host command,
+and a faulty one costs one attempt. Only a change to this file needs a
+reinstall (``deployment/self-hosted-helper.required``).
 """
 
 from __future__ import annotations
@@ -41,9 +43,6 @@ ENV = {
     "LANG": "C.UTF-8",
     "MOBIUS_REBUILD_LAUNCHER": str(LAUNCHER_REVISION),
 }
-PROVEN = {"succeeded", "no_change"}
-# Outcomes that say nothing about the worker that reported them.
-NEUTRAL_CODES = {"withdrawn", "already_running"}
 
 
 def _root_private(path: Path, *, directory: bool) -> bool:
@@ -92,6 +91,33 @@ def load_index() -> dict | None:
     return {**index, "active": active, "candidate": candidate}
 
 
+def _record(entry: dict) -> dict:
+    return {key: value for key, value in entry.items() if key != "path"}
+
+
+def _update(change) -> None:
+    """Apply ``change`` to the stored record under the replacement lock."""
+    with LOCK.open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        stored = json.loads(INDEX.read_text(encoding="utf-8"))
+        change(stored)
+        fd, name = tempfile.mkstemp(dir=STATE_DIR, prefix=".workers.json.")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(stored, handle, separators=(",", ":"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(name, 0o600)
+            os.replace(name, INDEX)
+            directory = os.open(STATE_DIR, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            Path(name).unlink(missing_ok=True)
+
+
 def _status() -> bytes:
     try:
         return STATUS.read_bytes()
@@ -106,52 +132,35 @@ def execute(worker: dict, command: str) -> int:
     ).returncode
 
 
-def settle_candidate(ran: dict, result: int, before: bytes, replaced: str) -> None:
-    """Promote the candidate that just ran if it proved itself, else drop it.
+def try_candidate(candidate: dict, replaced: str) -> int:
+    """Run one replacement with the candidate, taken out of the record first."""
+    digest = candidate["sha256"]
 
-    ``replaced`` is the active worker's digest when the candidate started. A
-    newer worker installed meanwhile (the installer waits only for the
-    worker's lock) is never superseded by this older decision."""
-    after = _status()
-    if after == before and result == 0:
-        return  # nothing was queued: the candidate has not been tried
-    try:
-        reported = json.loads(after) if after != before else {}
-    except ValueError:
-        reported = {}
-    if reported.get("code") in NEUTRAL_CODES:
-        return
-    proven = reported.get("state") in PROVEN
-    entry = {key: value for key, value in ran.items() if key != "path"}
-    with LOCK.open("a+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        stored = json.loads(INDEX.read_text(encoding="utf-8"))
-        if (stored.get("candidate") or {}).get("sha256") == ran["sha256"]:
+    def take(stored):
+        if (stored.get("candidate") or {}).get("sha256") == digest:
             stored["candidate"] = None
-        if not proven:
-            stored["rejected"] = sorted({*stored.get("rejected", []), ran["sha256"]})
-        elif (stored.get("active") or {}).get("sha256") == replaced:
-            stored["previous"] = stored.get("active")
-            stored["active"] = entry
-        _publish(stored)
 
-
-def _publish(index: dict) -> None:
-    fd, name = tempfile.mkstemp(dir=STATE_DIR, prefix=".workers.json.")
+    _update(take)
+    before = _status()
+    result = execute(candidate, "run")
+    after = _status()
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(index, handle, separators=(",", ":"))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(name, 0o600)
-        os.replace(name, INDEX)
-        directory = os.open(STATE_DIR, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    finally:
-        Path(name).unlink(missing_ok=True)
+        state = json.loads(after).get("state") if after != before else None
+    except ValueError:
+        state = None
+
+    def settle(stored):
+        if after == before and result == 0:
+            # Nothing was queued: the candidate has not been tried yet.
+            if stored.get("candidate") is None:
+                stored["candidate"] = _record(candidate)
+        elif (state in {"succeeded", "no_change"}
+              and (stored.get("active") or {}).get("sha256") == replaced):
+            # Proven, and no newer worker was installed while it ran.
+            stored["active"] = _record(candidate)
+
+    _update(settle)
+    return result
 
 
 def main(argv: list[str]) -> int:
@@ -165,14 +174,9 @@ def main(argv: list[str]) -> int:
         print("no verified replacement worker is installed; rerun "
               "scripts/install-rebuild-helper.sh", file=sys.stderr)
         return 1
-    if argv[1] == "reconcile":
-        return execute(index["active"], "reconcile")
-    ran = index["candidate"] or index["active"]
-    before = _status()
-    result = execute(ran, "run")
-    if ran is index["candidate"]:
-        settle_candidate(ran, result, before, index["active"]["sha256"])
-    return result
+    if argv[1] == "run" and index["candidate"]:
+        return try_candidate(index["candidate"], index["active"]["sha256"])
+    return execute(index["active"], argv[1])
 
 
 if __name__ == "__main__":

@@ -60,6 +60,29 @@ jobs:
           # already-published entries remained unchanged.
           fetch-depth: 0
       - uses: ./.github/actions/backend-env
+      - name: A changed replacement worker declares a higher revision
+        env:
+          BASE_SHA: ${{ github.event.merge_group.base_sha || github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          # Installed launchers take a worker from an image only when its
+          # WORKER_REVISION is higher than any they have seen, so changed
+          # worker bytes under an unchanged revision would never ship.
+          git fetch -q origin main
+          base=${BASE_SHA:-$(git merge-base HEAD FETCH_HEAD)}
+          python3 - "$base" <<'PY'
+          import re, subprocess, sys
+          path = "scripts/mobius-rebuild-host.py"
+          def revision(text):
+              found = re.findall(r"^WORKER_REVISION = ([0-9]+)$", text, re.M)
+              return int(found[0]) if found else 0
+          old = subprocess.run(["git", "show", f"{sys.argv[1]}:{path}"],
+                               capture_output=True, text=True).stdout
+          new = open(path).read()
+          assert revision(new) >= revision(old), "WORKER_REVISION decreased"
+          assert old == new or not old or revision(new) > revision(old), (
+              f"{path} changed: increase WORKER_REVISION")
+          PY
+
       - name: Run backend static analysis
         working-directory: backend
         run: |
@@ -343,74 +366,6 @@ jobs:
           [ -n "$previous" ] || { echo "infrastructure: no published image at or before $base"; exit 1; }
           docker pull -q "ghcr.io/mobius-os/mobius:sha-$previous"
           scripts/test-upgrade-path.sh "ghcr.io/mobius-os/mobius:sha-$previous" mobius-test:ci .
-
-  host-helper:
-    runs-on: ubuntu-latest
-    # Self-hosted updates run a root launcher and the worker it adopted, not
-    # app code. Install this change's real helper on the runner, as an owner
-    # does once, and let the installed systemd units replace one published
-    # release with another from a request written inside the app. Changes
-    # that cannot affect that path finish at once.
-    timeout-minutes: 40
-    needs: privacy
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - name: Decide whether this change can affect the host helper
-        id: scope
-        env:
-          EVENT: ${{ github.event_name }}
-          PR_BASE: ${{ github.event.pull_request.base.sha }}
-        run: |
-          run=true
-          if [ "$EVENT" = pull_request ]; then
-            git diff --name-only "$PR_BASE" HEAD \
-              | grep -qE '^(scripts/(mobius-rebuild-host\.py|mobius-rebuild-launcher\.py|install-rebuild-helper\.sh|rebuild-topology\.py|rebuild-worker-revisions\.json|test-host-helper\.sh)|docker-compose\.yml|backend/runtime/restart_ledger\.py|backend/scripts/prepare-container-(cutover|replacement)\.py|\.github/workflows/test\.yml)' \
-              || run=false
-          fi
-          echo "run=$run" >> "$GITHUB_OUTPUT"
-
-      - name: Worker revisions are append-only
-        if: steps.scope.outputs.run == 'true'
-        env:
-          BASE_SHA: ${{ github.event.merge_group.base_sha || github.event.pull_request.base.sha || github.event.before }}
-        run: |
-          # Installed launchers adopt only strictly higher revisions, so a
-          # released revision's bytes may never change.
-          git fetch -q origin main
-          base=${BASE_SHA:-$(git merge-base HEAD FETCH_HEAD)}
-          git show "$base:scripts/rebuild-worker-revisions.json" > /tmp/base-revisions.json 2>/dev/null || echo '{}' > /tmp/base-revisions.json
-          python3 - <<'PY'
-          import json
-          base = json.load(open("/tmp/base-revisions.json"))
-          head = json.load(open("scripts/rebuild-worker-revisions.json"))
-          changed = [key for key, digest in base.items() if head.get(key) != digest]
-          assert not changed, f"released worker revisions changed: {changed}"
-          PY
-
-      - name: Replace a published release through the installed helper
-        if: steps.scope.outputs.run == 'true'
-        env:
-          BASE_SHA: ${{ github.event.merge_group.base_sha || github.event.pull_request.base.sha || github.event.before }}
-        run: |
-          git fetch -q origin main
-          base=${BASE_SHA:-$(git merge-base HEAD FETCH_HEAD)}
-          # The two newest published releases this change branches from.
-          image=ghcr.io/mobius-os/mobius
-          published() { docker manifest inspect "$image:sha-$1" >/dev/null 2>&1; }
-          found=()
-          for sha in $(git rev-list --first-parent --max-count=200 "$base"); do
-            if published "$sha"; then found+=("$sha"); fi
-            [ "${#found[@]}" -eq 2 ] && break
-          done
-          [ "${#found[@]}" -eq 2 ] || { echo "infrastructure: fewer than two published releases before $base"; exit 1; }
-          # The installer runs as root over this runner-owned checkout.
-          sudo git config --global --add safe.directory '*'
-          sudo scripts/test-host-helper.sh "${found[1]}" "${found[0]}"
 
   e2e:
     runs-on: ubuntu-latest

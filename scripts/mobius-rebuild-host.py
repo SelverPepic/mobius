@@ -48,7 +48,7 @@ REQUEST_VERSIONS = [1, 2]
 # each requested official image only when this number is higher than every
 # worker it has run. Increase it with every change to this file; never lower
 # it. The launcher reads it as text, so keep it a plain literal on one line.
-WORKER_REVISION = 1
+WORKER_REVISION = 2
 # The frozen launcher runs the worker selected here; see offer_worker().
 WORKERS = STATE_DIR / "workers"
 WORKER_INDEX = STATE_DIR / "workers.json"
@@ -504,11 +504,10 @@ def _checked(source: bytes) -> tuple[int | None, str | None]:
 def offer_worker(source: bytes, origin: str) -> str:
     """Offer a verified image's worker to the launcher as its candidate.
 
-    The launcher runs a candidate for the next replacement and promotes it
-    only when that replacement succeeds; otherwise it keeps the proven active
-    worker and never tries those bytes again. Only strictly higher revisions
-    are offered, and a different payload claiming an offered revision is
-    refused. Returns a short outcome for status."""
+    Only a revision above every revision offered or installed so far is
+    offered, so a worker the launcher tried and dropped is never offered
+    again, and no official image can bring back an older one. Returns a short
+    outcome for status."""
     if not os.environ.get("MOBIUS_REBUILD_LAUNCHER"):
         return "not adopted: this helper predates the launcher"
     revision, refusal = _checked(source)
@@ -518,18 +517,9 @@ def offer_worker(source: bytes, origin: str) -> str:
         index = json.loads(WORKER_INDEX.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return "not adopted: the launcher's worker record is unreadable"
-    digest = hashlib.sha256(source).hexdigest()
     high_water = int(index.get("high_water", 0))
-    known = {(index.get(key) or {}).get("sha256")
-             for key in ("active", "candidate")}
-    if digest in index.get("rejected", []):
-        return f"not adopted: revision {revision} failed before"
-    if revision < high_water:
-        return f"not adopted: revision {revision} is older than {high_water}"
-    if revision == high_water:
-        if digest in known:
-            return f"current: revision {revision}"
-        return f"rejected: a different worker already claims revision {revision}"
+    if revision <= high_water:
+        return f"not adopted: revision {revision} is not newer than {high_water}"
     entry = _worker_entry(source, revision, origin)
     _publish_index({**index, "high_water": revision, "candidate": entry})
     return f"offered: revision {revision} runs the next replacement"
@@ -545,18 +535,15 @@ def seed_worker(source: bytes) -> str:
     try:
         index = json.loads(WORKER_INDEX.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        index = {"version": 1, "high_water": 0, "active": None,
-                 "candidate": None, "previous": None, "rejected": []}
+        index = {"version": 1, "high_water": 0, "active": None, "candidate": None}
     digest = hashlib.sha256(source).hexdigest()
     if (index.get("active") or {}).get("sha256") == digest:
         return f"current: revision {revision}"
     if revision <= int(index.get("high_water", 0)) and index.get("active"):
         return f"kept: a newer worker (revision {index['high_water']}) is installed"
     entry = _worker_entry(source, revision, "checkout")
-    _publish_index({
-        **index, "high_water": revision, "active": entry,
-        "previous": index.get("active"), "candidate": None,
-    })
+    _publish_index({**index, "high_water": revision, "active": entry,
+                    "candidate": None})
     return f"installed: revision {revision}"
 
 
@@ -841,8 +828,7 @@ def run() -> int:
                            text=True, capture_output=True)
             transaction = {
                 "version": 1, "operation_id": operation, "expected_sha": expected,
-                "request_nonce": nonce, "target_image": digest,
-                "previous_image": previous,
+                "request_nonce": nonce, "previous_image": previous,
             }
             # From here an interruption can leave chats drained or the app
             # removed; reconcile() settles it from this record.
@@ -940,41 +926,20 @@ def read_transaction() -> dict | None:
         value.get("version") == 1
         and OPERATION_RE.fullmatch(str(value.get("operation_id") or ""))
         and SHA_RE.fullmatch(str(value.get("expected_sha") or ""))
-        and str(value.get("target_image") or "").startswith("sha256:")
+        and str(value.get("previous_image") or "").startswith("sha256:")
     )
     return value if ok else None
 
 
 def recover(config_value: dict, transaction: dict) -> None:
-    """Settle a replacement a worker left unfinished: keep the target when it
-    is running and verified, otherwise restore the previous container."""
+    """Restore the previous container a worker left mid-replacement, so the
+    app can request the update again."""
     operation = transaction["operation_id"]
     expected = transaction["expected_sha"]
     fields = {"request_nonce": transaction.get("request_nonce")}
     write_status(config_value, operation_id=operation, state="verifying",
                  expected_sha=expected, code=None, **fields,
                  message="Recovering an interrupted replacement.")
-    try:
-        if wait_healthy(config_value, 180):
-            cid, current = app_container(config_value)
-            if current == transaction["target_image"]:
-                verify_served_generation(cid, expected)
-                finalized = restart_ledger(
-                    config_value, cid, "finalize-cutover", operation,
-                    image=transaction["target_image"],
-                )
-                retain_images(f"{IMAGE}:sha-{expected}",
-                              transaction.get("previous_image"))
-                clear_transaction()
-                write_status(
-                    config_value, operation_id=operation, state="succeeded",
-                    expected_sha=expected, **fields,
-                    code=None if finalized else "handoff_finalize_failed",
-                    message="The interrupted replacement was completed.",
-                )
-                return
-    except Exception:
-        pass
     # Restore exactly the journaled previous image, whatever the tag says now.
     previous = str(transaction.get("previous_image") or "")
     try:
