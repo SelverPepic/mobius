@@ -1097,8 +1097,12 @@ _TOOL_DEFINITIONS = {
       "Save this chat's continuity note. Every field is optional: title "
       "renames the chat (a name the owner chose always wins), digest replaces "
       "its short current paragraph, and summary appends one entry to its "
-      "cumulative Summary. Omitted fields stay unchanged. If a save fails, "
-      "read the note before retrying so an entry is not added twice."
+      "cumulative Summary. Default to one concise changes-only save per substantive "
+      "turn; save earlier before handoffs, owner-input cards, restarts, or "
+      "risky/long work that needs a recovery checkpoint. Omit unchanged title "
+      "and digest; do not repeat saved facts or raw tool output. Omitted fields "
+      "stay unchanged. If a save fails, read the note before retrying so an entry "
+      "is not added twice."
     ),
     "inputSchema": {
       "type": "object", "additionalProperties": False,
