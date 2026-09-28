@@ -3118,15 +3118,16 @@ def _schedule_continuation(
     coro = None
     try:
       from app.chat_waits import claim_scheduled_wait_result
-      from app.delegations import claim_scheduled_parent_wake
 
+      # Only a restart activation latches at scheduling. Every other agent
+      # input (helper result, Wait result, peer note) stays owed until a turn
+      # carrying it records it received.
       claim_scheduled_wait_result(chat_id, next_user)
-      claim_scheduled_parent_wake(chat_id, next_user)
     except Exception:
       # The deterministic running row remains the recovery owner if this
       # second transaction fails. Product sweeps retry the still-open latch.
       log.warning(
-        "scheduled product-result latch failed chat_id=%s run_token=%s",
+        "scheduled activation latch failed chat_id=%s run_token=%s",
         chat_id, run_token, exc_info=True,
       )
     return True
@@ -4653,12 +4654,14 @@ _MEMORY_RECLAIM_DISPOSITIONS = frozenset({
 
 async def _acknowledge_provider_success(
   *, chat_id: str, run_token: str, delivered_through,
+  wait_results: tuple[str, ...] = (),
 ) -> None:
-  """Best-effort provider-success and peer-delivery acknowledgement.
+  """Best-effort provider-success and delivery acknowledgement.
 
   A failed acknowledgement conservatively leaves provider availability limited
-  and repeats an already-seen peer note on a later turn; it never records either
-  success before the provider call has actually returned successfully.
+  and repeats an already-seen peer note or Wait result on a later turn; it
+  never records success before the provider call has actually returned
+  successfully.
   """
   if not chat_id or not run_token:
     return
@@ -4672,7 +4675,15 @@ async def _acknowledge_provider_success(
       peer_message_through_id=(
         delivered_through.message_id if delivered_through is not None else None
       ),
+      wait_results=wait_results,
     )))
+    if wait_results:
+      from app.chat_waits import (
+        _broadcast_changed,
+        withdraw_delivered_resume_notices,
+      )
+      _broadcast_changed(chat_id)
+      await withdraw_delivered_resume_notices(chat_id)
   except Exception:
     _get_logger().warning(
       "provider success acknowledgement failed; availability remains "
@@ -5206,8 +5217,20 @@ async def _run_chat_impl_with_db(
         db, chat_id, run_token or "",
       )
     )
+    turn_message = next((
+      message for message in reversed(
+        list(chat_row.messages or []) if chat_row is not None else []
+      )
+      if isinstance(message, dict) and message.get("role") == "user"
+    ), None)
     activity_delivery = build_delegation_result_context(
       db, chat_id, source_work_id=activity_source_work_id,
+      turn_message=(
+        turn_message
+        if isinstance(turn_message, dict)
+        and turn_message.get("content") == raw_user_message
+        else None
+      ),
     )
     activity_results = activity_delivery.results
     if activity_delivery.text:
@@ -5240,8 +5263,14 @@ async def _run_chat_impl_with_db(
   # Only the top-level chat owns durable waits; delegated children return any
   # future condition to this parent instead. A result that lands after this
   # snapshot queues behind the live turn rather than mutating its request.
+  wait_results: tuple[str, ...] = ()
   if run_policy is None and chat_id:
-    from app.chat_waits import build_active_waits_context
+    from app.chat_waits import build_active_waits_context, owed_wait_results
+    owed_waits_text, wait_results = owed_wait_results(
+      db, chat_id, raw_user_message,
+    )
+    if owed_waits_text:
+      user_message = f"{owed_waits_text}\n\n{user_message}"
     waits_context = build_active_waits_context(db, chat_id)
     if waits_context:
       user_message = f"{waits_context}\n\n{user_message}"
@@ -5693,11 +5722,12 @@ async def _run_chat_impl_with_db(
       )
       new_session_id = runner_result.get("session_id")
       err = runner_result.get("error")
-      if not err:
+      if not err and runner_result.get("prompt_sent", True):
         await _acknowledge_provider_success(
           chat_id=chat_id,
           run_token=run_token or "",
           delivered_through=coordination_message_through,
+          wait_results=wait_results,
         )
       usage_metrics = runner_result.get("usage_metrics")
       await _record_run_metrics(
@@ -5885,11 +5915,12 @@ async def _run_chat_impl_with_db(
         )
       new_session_id = runner_result.get("session_id")
       err = runner_result.get("error")
-      if not err:
+      if not err and runner_result.get("prompt_sent", True):
         await _acknowledge_provider_success(
           chat_id=chat_id,
           run_token=run_token or "",
           delivered_through=coordination_message_through,
+          wait_results=wait_results,
         )
       usage_metrics = runner_result.get("usage_metrics")
       await _record_run_metrics(

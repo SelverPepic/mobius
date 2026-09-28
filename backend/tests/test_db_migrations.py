@@ -1755,6 +1755,7 @@ def test_run_migrations_records_an_inspectable_append_only_history(tmp_path):
     "0070_delegation_goal_task",
     "0071_delegation_result_identity",
     "0072_owner_timezone",
+    "0073_schedule_provenance",
   ]
   assert second == first
 

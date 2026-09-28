@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import threading
 import time
 
 import pytest
@@ -167,14 +168,20 @@ def test_an_exhausted_budget_leaves_work_for_the_next_sweep(tmp_path):
   _logs(tmp_path, [5] * 100)
   _history(tmp_path, {"retired": (20, False)})
 
+  old = NOW - 3 * DAY
+  (tmp_path / "cache" / "stale").mkdir(parents=True)
+  os.utime(tmp_path / "cache" / "stale", (old, old))
+
   first = _compact(tmp_path, budget=0)
   assert first["complete"] is False
+  assert (tmp_path / "cache" / "stale").exists()
   assert _count(tmp_path / "logs_2.sqlite", "SELECT count(*) FROM logs") == 100
 
   second = _compact(tmp_path)
   assert second["complete"] is True
   assert _count(tmp_path / "logs_2.sqlite", "SELECT count(*) FROM logs") == 0
   assert second["thread_history"]["dropped_threads"] == 1
+  assert not (tmp_path / "cache" / "stale").exists()
 
 
 def test_scratch_cleanup_is_limited_to_stale_temp_and_cache_entries(tmp_path):
@@ -240,7 +247,7 @@ def test_store_failure_never_breaks_rollout_retention(tmp_path, monkeypatch):
   assert result["store_reclaimed_bytes"] == 0
 
 
-def test_a_spent_budget_never_starts_a_rebuild(tmp_path, monkeypatch):
+def test_free_pages_are_released_in_bounded_steps_never_by_a_rebuild(tmp_path, monkeypatch):
   _history(tmp_path, {"kept": (1, True)})
   conn = sqlite3.connect(tmp_path / "state_5.sqlite")
   conn.execute("CREATE TABLE filler (x TEXT)")
@@ -249,23 +256,89 @@ def test_a_spent_budget_never_starts_a_rebuild(tmp_path, monkeypatch):
   conn.execute("DROP TABLE filler")
   conn.commit()
   conn.close()
+  before = os.path.getsize(tmp_path / "state_5.sqlite")
   statements = []
   real_connect = compaction._connect
 
-  def recording_connect(path):
-    conn = real_connect(path)
+  def recording_connect(path, deadline):
+    conn = real_connect(path, deadline)
     conn.set_trace_callback(statements.append)
     return conn
 
   monkeypatch.setattr(compaction, "_connect", recording_connect)
   spent = _compact(tmp_path, budget=0)
-  assert "VACUUM" not in statements
   assert spent["state"]["status"] == "incomplete"
 
-  statements.clear()
   resumed = _compact(tmp_path)
-  assert "VACUUM" in statements
   assert resumed["state"]["status"] == "completed"
+  assert os.path.getsize(tmp_path / "state_5.sqlite") < before / 4
+  assert "VACUUM" not in statements
+
+
+def _endless_log_delete(home):
+  """Make every log DELETE run until SQLite is interrupted."""
+  _logs(home, [5] * 10)
+  conn = sqlite3.connect(home / "logs_2.sqlite")
+  conn.executescript("""
+    CREATE VIEW endless AS WITH RECURSIVE n(x) AS (
+      SELECT 1 UNION ALL SELECT x + 1 FROM n
+    ) SELECT count(*) FROM n;
+    CREATE TRIGGER slow_delete AFTER DELETE ON logs BEGIN
+      SELECT * FROM endless;
+    END;
+  """)
+  conn.close()
+
+
+def _finishes_within(seconds, fn):
+  outcome = {}
+  worker = threading.Thread(target=lambda: outcome.update(value=fn()), daemon=True)
+  started = time.monotonic()
+  worker.start()
+  worker.join(seconds)
+  assert not worker.is_alive(), f"still running after {seconds}s"
+  return outcome["value"], time.monotonic() - started
+
+
+def test_a_statement_that_outlives_the_budget_is_interrupted_at_the_deadline(tmp_path):
+  _endless_log_delete(tmp_path)
+
+  result, elapsed = _finishes_within(5, lambda: _compact(tmp_path, budget=0.5))
+
+  assert elapsed < 1.5
+  assert result["logs"]["status"] == "incomplete"
+  assert result["complete"] is False
+  # The interrupted batch rolled back; the next sweep starts it again.
+  assert _count(tmp_path / "logs_2.sqlite", "SELECT count(*) FROM logs") == 10
+
+
+def test_a_codex_launch_during_compaction_waits_no_longer_than_the_budget(
+  tmp_path, monkeypatch,
+):
+  home = tmp_path / "cli-auth" / "codex"
+  home.mkdir(parents=True)
+  _endless_log_delete(home)
+  compacting = threading.Event()
+  real_compact = compaction.compact_codex_stores
+
+  def signalling_compact(*args, **kwargs):
+    compacting.set()
+    return real_compact(*args, **kwargs)
+
+  monkeypatch.setattr(compaction, "compact_codex_stores", signalling_compact)
+  sweep = threading.Thread(
+    target=sweep_stale_provider_sessions, args=(tmp_path,),
+    kwargs={"now": NOW, "store_budget_seconds": 1.0}, daemon=True,
+  )
+  sweep.start()
+  assert compacting.wait(5)
+
+  launch, waited = _finishes_within(5, lambda: acquire_codex_session_activity(tmp_path))
+  launch.release()
+  sweep.join(5)
+
+  assert waited < 2.0
+  assert not sweep.is_alive()
 
 
 def test_an_open_codex_file_marks_codex_busy_even_without_the_launcher_lock(tmp_path):

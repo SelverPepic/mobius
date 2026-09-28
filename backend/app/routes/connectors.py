@@ -27,6 +27,7 @@ from app.deps import (
   require_nondelegated_owner_or_app_control,
   reject_cross_site,
 )
+from app.response_policy import serves_platform_code
 from app.timeutil import now_naive_utc
 
 log = logging.getLogger(__name__)
@@ -1691,7 +1692,8 @@ async def oauth_clear_client(
   return {"ok": True, "removed": bool(removed)}
 
 
-@public_router.get("/oauth/callback")
+# The completion page posts its result to the opener and closes itself.
+@public_router.get("/oauth/callback", dependencies=[Depends(serves_platform_code)])
 async def oauth_callback(
   code: str = "",
   state: str = "",

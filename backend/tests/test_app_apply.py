@@ -1235,6 +1235,35 @@ def test_store_ordinary_apply_warns_when_local_package_declarations_diverge(
   assert not (row.capability_contract.get("agent") or {}).get("tools")
 
 
+@pytest.mark.parametrize("edit", [
+  lambda source: _declare_model_provider(source),
+  lambda source: _edit_manifest(source, permissions={"manage_apps": True}),
+  lambda source: _edit_manifest(source, name="Renamed locally"),
+])
+def test_store_ordinary_apply_warns_on_any_dropped_manifest_edit(
+  client, auth, db, edit,
+):
+  """Every local mobius.json edit ordinary Store apply drops is reported."""
+  source = _source()
+  app_id = _apply(client, auth, source).json()["app"]["id"]
+  row = db.query(models.App).populate_existing().filter_by(id=app_id).one()
+  row.manifest_url = "https://store.example/demo/mobius.json"
+  db.commit()
+
+  edit(source)
+  applied = _apply(client, auth, source)
+
+  assert applied.status_code == 200, applied.text
+  assert applied.json()["warnings"] == [
+    app_apply._STORE_LOCAL_PACKAGE_DIVERGED
+  ]
+
+
+def _edit_manifest(source: Path, **changes) -> None:
+  manifest = json.loads((source / "mobius.json").read_text())
+  (source / "mobius.json").write_text(json.dumps({**manifest, **changes}))
+
+
 def test_store_local_package_apply_explicitly_accepts_manifest_authority(
   client, auth, db,
 ):

@@ -71,10 +71,10 @@ _LOCAL_PACKAGE_WARNING = (
 )
 
 _STORE_LOCAL_PACKAGE_DIVERGED = (
-  "This app is Store-managed, so its live tools, service, schedule, and "
-  "skills come from the reviewed package. Your local mobius.json changes to "
-  "those were NOT applied by this ordinary apply. Re-apply with "
-  "--accept-local-package to make the local manifest authoritative."
+  "This app is Store-managed, so its live package comes from the accepted "
+  "manifest. Your local mobius.json changes were NOT applied by this "
+  "ordinary apply. Re-apply with --accept-local-package to make the local "
+  "manifest authoritative."
 )
 
 
@@ -384,68 +384,24 @@ def _read_manifest(snapshot_dir: Path) -> dict:
   return dict(manifest)
 
 
-def _reviewed_package_surface(contract) -> dict:
-  """Author-declared package fields that ordinary Store apply cannot change.
-
-  Kept deliberately narrow to the surface an agent edits in mobius.json and
-  that the reviewed contract owns for a Store app — tools, service, schedule,
-  skills, embedded agent, and system prompt. Host-normalized parts (schema,
-  runtime, public, offline) are excluded so a contract-schema bump since
-  install can never masquerade as a local edit.
-  """
-  contract = contract if isinstance(contract, dict) else {}
-  agent = contract.get("agent")
-  agent = agent if isinstance(agent, dict) else {}
-  return {
-    "tools": agent.get("tools") or [],
-    "skills": agent.get("skills") or [],
-    "system_prompt": agent.get("system_prompt"),
-    "embeds_agent": bool(agent.get("embeds_agent", False)),
-    "service": contract.get("service"),
-    "background": contract.get("background"),
-  }
-
-
 def _store_local_package_divergence(app: models.App, snapshot_dir: Path) -> str | None:
-  """Warn when a Store app's local package declarations differ from live.
+  """Warn when ordinary Store apply drops local mobius.json edits.
 
-  Ordinary apply of a Store-managed app publishes the compiled entry but keeps
-  the reviewed package metadata, so local mobius.json edits to tools, service,
-  schedule, or skills are silently dropped. This compares the contract those
-  local declarations *would* produce under --accept-local-package against the
-  live one and returns a warning only when they genuinely differ. It is
-  best-effort: any read or parse problem returns None so a valid apply is never
-  blocked by the check.
+  Ordinary apply of a Store-managed app publishes code but keeps the accepted
+  package manifest, the runtime root's mobius.json. Any local manifest that
+  differs from it was not applied. Best-effort: a read or parse problem
+  returns None so a valid apply is never blocked by the check.
   """
+  from app import applied_app_runtime
+
   try:
-    raw = (snapshot_dir / "mobius.json").read_bytes()
-    if len(raw) > MANIFEST_MAX_BYTES:
-      return None
-    manifest = json.loads(raw)
-    validate_manifest_contract(manifest)
-  except (OSError, UnicodeDecodeError, json.JSONDecodeError, ManifestContractError):
+    local = json.loads((snapshot_dir / "mobius.json").read_bytes())
+    accepted = json.loads(
+      (applied_app_runtime.runtime_root(app) / "mobius.json").read_bytes()
+    )
+  except (OSError, ValueError, applied_app_runtime.AppliedRuntimeUnavailable):
     return None
-  if not isinstance(manifest, dict):
-    return None
-  # Mirror the effective normalization the accept-local path applies before
-  # building the contract, so the comparison reflects exactly what accepting
-  # this manifest would install.
-  effective = dict(manifest)
-  effective.setdefault("offline_capable", app.offline_capable)
-  effective.setdefault("embeds_agent", app.embeds_agent)
-  service = effective.get("service")
-  if isinstance(service, dict):
-    service = dict(service)
-    service.setdefault("id", app.service_id)
-    effective["service"] = service
-  try:
-    accepted = contract_from_manifest(effective)
-  except Exception:
-    return None
-  live = app.capability_contract if isinstance(app.capability_contract, dict) else {}
-  if _reviewed_package_surface(accepted) != _reviewed_package_surface(live):
-    return _STORE_LOCAL_PACKAGE_DIVERGED
-  return None
+  return _STORE_LOCAL_PACKAGE_DIVERGED if local != accepted else None
 
 
 def _entry_source(snapshot_dir: Path, relative: str) -> str:

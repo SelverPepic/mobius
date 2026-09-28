@@ -1,9 +1,9 @@
 """Cross-process ownership boundary for Codex rollout storage.
 
-Every Codex launcher holds a shared advisory lock for its complete process
-lifetime. Retention takes the exclusive side non-blockingly, so it can never
-unlink an old rollout while a web turn, Reflection, or a settings probe may be
-resuming or writing it.
+Every Codex turn, usage probe, and session fork holds a shared advisory lock
+while it runs. Retention takes the exclusive side non-blockingly, so it can
+never unlink an old rollout while one of them may be resuming or writing it. A Codex
+process idle between turns holds no lock; ``codex_home_in_use`` covers it.
 """
 
 from __future__ import annotations

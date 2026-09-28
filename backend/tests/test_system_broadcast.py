@@ -488,7 +488,6 @@ def test_notify_rejects_cross_site_request(client, auth):
 def test_notify_body_type_validator_rejects_unknown():
   """NotifyBody rejects unknown system-event types."""
   assert NotifyBody(type="app_build_failed").type == "app_build_failed"
-  assert NotifyBody(type="app_update_stale").type == "app_update_stale"
   preview = NotifyBody(
     type="app_preview_ready", appId="7", chatId="building-chat",
   )
@@ -566,7 +565,7 @@ async def test_notify_app_preview_ready_is_system_bus_only(client, auth):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("event_type", ["shell_rebuilt", "app_update_stale"])
+@pytest.mark.parametrize("event_type", ["shell_rebuilt", "app_build_failed"])
 async def test_notify_catch_up_unsafe_event_is_system_bus_only(
   client, auth, event_type,
 ):

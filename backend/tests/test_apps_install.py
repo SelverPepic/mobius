@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 
 import pytest
 
-from app import app_git, install, models
+from app import app_apply, app_git, install, models
 from app.config import get_settings
 from test_app_fixtures import create_local_app
 
@@ -656,7 +656,7 @@ def test_register_cron_gives_scaffold_the_complete_zone_identity(tmp_path):
   ("Europe/Belgrade", None, 42),
   (None, "30 2 * * *", 42),
   ("Not/AZone", "30 2 * * *", 42),
-  ("Europe/Belgrade", "30 2 * * 1", 42),
+  ("Europe/Belgrade", "30 2 1 * *", 42),
   ("Europe/Belgrade", "30 2 * * *", None),
 ])
 def test_register_cron_rejects_invalid_zone_contract_before_subprocess(
@@ -1343,6 +1343,104 @@ def test_store_schedule_follows_owner_timezone_and_keeps_owner_choice(
   assert len(calls) == registrations
   from app import app_cron
   assert not (app_cron.schedule_state_dir(app_id) / "choice.json").exists()
+
+
+def test_owner_timezone_reported_after_install_moves_only_manifest_defaults(
+  client, auth, bypass_url_validation, recorded_cron,
+):
+  from app import app_cron
+
+  calls, _drop = recorded_cron
+  news = _install_from_store(
+    client, auth, "https://x.test/repo-late-tz/", MANIFEST_NEWS,
+  )["id"]
+  chosen = _install_from_store(client, auth, "https://x.test/repo-chosen/", {
+    **MANIFEST_NEWS, "id": "test-chosen", "name": "Chosen",
+  })["id"]
+  assert client.post(
+    f"/api/apps/{chosen}/schedule",
+    json={"cron": "15 7 * * *", "job": "fetch.sh", "timezone": "Europe/Oslo"},
+    headers=auth,
+  ).status_code == 200
+  assert calls[0] == ("0 10 * * *", "fetch.sh", None, None)
+  before = len(calls)
+
+  def report(zone):
+    assert client.put(
+      "/api/owner/timezone", json={"timezone": zone}, headers=auth,
+    ).status_code == 200
+
+  report("Asia/Tokyo")
+  assert calls[before:] == [
+    ("* * * * *", "fetch.sh", "Asia/Tokyo", "0 10 * * *"),
+  ]
+  assert app_cron.read_schedule_choice(news).timezone == "Asia/Tokyo"
+
+  report("Asia/Tokyo")
+  assert len(calls) == before + 1
+
+  report("Europe/Belgrade")
+  assert calls[-1] == ("* * * * *", "fetch.sh", "Europe/Belgrade", "0 10 * * *")
+  assert len(calls) == before + 2
+  assert app_cron.read_schedule_choice(chosen).timezone == "Europe/Oslo"
+
+
+def test_failed_zone_move_is_retried_by_the_next_report(
+  client, auth, bypass_url_validation, recorded_cron,
+):
+  from app import app_cron
+
+  calls, _drop = recorded_cron
+  app_id = _install_from_store(
+    client, auth, "https://x.test/repo-retry-tz/", MANIFEST_NEWS,
+  )["id"]
+
+  def crontab_down(*args, **kwargs):
+    raise app_cron.CronInfrastructureError(500, "crontab unavailable")
+
+  with patch("app.app_cron.register_cron", crontab_down):
+    assert client.put(
+      "/api/owner/timezone", json={"timezone": "Asia/Tokyo"}, headers=auth,
+    ).status_code == 200
+  assert app_cron.read_schedule_choice(app_id).timezone is None
+
+  assert client.put(
+    "/api/owner/timezone", json={"timezone": "Asia/Tokyo"}, headers=auth,
+  ).status_code == 200
+  assert calls[-1] == ("* * * * *", "fetch.sh", "Asia/Tokyo", "0 10 * * *")
+
+
+def test_weekday_default_follows_owner_timezone(
+  client, auth, bypass_url_validation, recorded_cron,
+):
+  calls, _drop = recorded_cron
+  assert client.put(
+    "/api/owner/timezone", json={"timezone": "Asia/Tokyo"}, headers=auth,
+  ).status_code == 200
+
+  _install_from_store(client, auth, "https://x.test/repo-weekday/", {
+    **MANIFEST_NEWS,
+    "schedule": {"default": "0 9 * * 1-5", "job": "fetch.sh"},
+  })
+
+  assert calls == [("* * * * *", "fetch.sh", "Asia/Tokyo", "0 9 * * 1-5")]
+
+
+def test_schedule_is_never_registered_without_its_recorded_choice(
+  client, auth, bypass_url_validation, recorded_cron,
+):
+  calls, _drop = recorded_cron
+
+  def lost_write(app_id, choice):
+    raise OSError("disk full")
+
+  with patch("app.app_cron.record_schedule_choice", lost_write):
+    body = _install_from_store(
+      client, auth, "https://x.test/repo-lost-choice/", MANIFEST_NEWS,
+    )
+
+  assert calls == []
+  assert any("disk full" in warning for warning in body["warnings"])
 
 
 def test_installed_version_persisted_in_app_list(
@@ -3109,10 +3207,15 @@ def test_version_only_conflict_auto_resolves_to_upstream(
   assert 'APP_VERSION = "2.0.0"' in jsx_file.read_text()  # upstream version won
 
 
-def test_resolved_conflict_changed_candidate_fails_closed_and_stays_retryable(
+def test_resolved_conflict_changed_candidate_fails_closed_and_clears_receipt(
   client, auth, bypass_url_validation,
 ):
-  """A moving URL cannot mix release-C artifacts into a release-B resolve."""
+  """A moving URL cannot mix release-C artifacts into a release-B resolve.
+
+  Release B can never be replayed again, so its receipt is cleared: the live
+  version stays, and the next update check offers the new candidate instead
+  of reporting a pending update that can never finish.
+  """
   from app.models import App
   from app.database import SessionLocal
 
@@ -3174,13 +3277,16 @@ def test_resolved_conflict_changed_candidate_fails_closed_and_stays_retryable(
   finally:
     db.close()
   assert bundle.read_bytes() == old_bundle
-  assert pending.is_file(), "journal must survive for restart/user retry"
   assert not (app_dir / ".git" / "MERGE_HEAD").exists()
   assert jsx_file.read_text() == JSX_MULTI.replace("ORIGINAL TITLE", "LOCAL TITLE")
-  # The committed resolution stays in its checkout for the retry.
-  assert (checkout / "index.jsx").read_text() == resolved
-  retry = client.get(f"/api/apps/{app_id}/update-check", headers=auth)
-  assert retry.json()["pending_update_state"] == "replay_pending"
+  assert not pending.exists()
+  assert not checkout.exists()
+  recheck = _update_check(
+    client, auth, base, app_id, {**manifest_v1, "version": "3.0.0"}, jsx_v2,
+  )
+  assert recheck.status_code == 200, recheck.text
+  assert recheck.json()["pending_update_state"] == "none"
+  assert recheck.json()["upstream_version"] == "3.0.0"
 
 
 def test_resolved_conflict_converges_static_metadata_and_bundle_once(
@@ -6893,37 +6999,155 @@ def test_ordinary_store_source_apply_preserves_package_assets_and_runtime_manife
   assert client.get(f"/app-assets/by-id/{row.id}/asset.txt").content == b"accepted static"
 
 
-def test_update_check_offers_manifest_only_release_over_legacy_baseline(
-  client, auth, db, bypass_url_validation,
-):
-  """A migration baseline without mobius.json cannot hide a new release.
-
-  The legacy bridge records only code, so a release that changes nothing but
-  the manifest (version, offline metadata) must still be offered once;
-  installing it replaces the bridge with an exact package record.
-  """
+def _legacy_bridge_update_check(client, auth, db, owner):
+  """Install a legacy bridge, attach its catalog origin, check an update."""
   base = "https://uc-legacy.test/repo/"
   m = {**MANIFEST_NEWS, "id": "uc-legacy"}
   r1 = _install_v1(client, auth, base, m, JSX)
   assert r1.status_code == 201, r1.text
   app_id = r1.json()["id"]
-  repo = db.query(models.App).filter(models.App.id == app_id).one().source_dir
-
+  row = db.query(models.App).filter(models.App.id == app_id).one()
+  repo = row.source_dir
+  # The migration records the app's root GitHub manifest identity.
+  row.manifest_url = install._canonical_identity_key(
+    f"https://raw.githubusercontent.com/{owner}/app-uc-legacy/main/mobius.json",
+    "uc-legacy",
+  )
+  db.commit()
   assert "mobius.json" not in app_git.read_ref_tree(Path(repo), "upstream")
 
   unchanged = _update_check(
     client, auth, base, app_id, {**m, "version": "1.0.1"}, JSX,
   )
-  # A plain URL import has no origin to adopt, so it keeps comparing code.
+  # Without an origin there is no bridge to replace: compare code.
   assert unchanged.json()["update_available"] is False
 
-  # The migration attaches the catalog repository as origin.
+  # The migration attaches the repository as origin.
   subprocess.run(
     ["git", "-C", repo, "remote", "add", "origin",
-     "https://github.com/example/uc-legacy.git"],
+     f"https://github.com/{owner}/app-uc-legacy.git"],
     check=True,
   )
   res = _update_check(client, auth, base, app_id, {**m, "version": "1.0.1"}, JSX)
-
   assert res.status_code == 200, res.text
-  assert res.json()["update_available"] is True
+  return res.json()["update_available"]
+
+
+def test_update_check_offers_manifest_only_release_over_legacy_baseline(
+  client, auth, db, bypass_url_validation,
+):
+  """A trusted catalog bridge without mobius.json cannot hide a release.
+
+  The legacy bridge records only code, so a release that changes nothing but
+  the manifest (version, offline metadata) must still be offered once;
+  installing it replaces the bridge with an exact package record.
+  """
+  assert _legacy_bridge_update_check(client, auth, db, "mobius-os") is True
+
+
+def test_update_check_offers_only_bridges_install_can_replace(
+  client, auth, db, bypass_url_validation,
+):
+  """An origin install cannot adopt keeps the code comparison.
+
+  Install replaces a migration bridge only for a trusted catalog origin, so
+  offering a manifest-only release elsewhere would be an Update that always
+  fails and never goes away.
+  """
+  assert _legacy_bridge_update_check(client, auth, db, "example") is False
+
+
+
+def _code_only_apply(client, auth, source: Path, marker: str):
+  (source / "index.jsx").write_text(
+    f"export default function App() {{ return <div>{marker}</div> }}\n"
+  )
+  return client.post(
+    "/api/apps/apply", headers=auth, json={"source_dir": str(source)},
+  )
+
+
+def _install_git_store_app(client, auth, db, tmp_path, slug):
+  """Install a Store app whose Git repository carries its mobius.json."""
+  base = f"https://raw.githubusercontent.com/acme/{slug}/main/"
+  manifest = {
+    "id": slug, "name": "Git store app", "version": "1.0.0",
+    "description": "Store package with a manifest", "entry": "index.jsx",
+    "permissions": {"cross_app_access": "none", "share_with_apps": "none"},
+  }
+  work, bare, _ = _make_clone_fixture(tmp_path, JSX_MULTI, "")
+  # Author formatting differs from install's own serialization on purpose.
+  (work / "mobius.json").write_text(json.dumps(manifest, indent=4))
+  _fixture_commit(work, "manifest")
+  subprocess.run(
+    ["git", "-C", str(work), "push", "-q", str(bare), "main"],
+    check=True, env=app_git._git_env(work),
+  )
+  installed = _install_clone_fixture(
+    client, auth, base, manifest, JSX_MULTI, "", bare,
+  )
+  assert installed.status_code == 201, installed.text
+  source = Path(db.get(models.App, installed.json()["id"]).source_dir)
+  assert "mobius.json" in app_git.read_ref_tree(source, app_git.LOCAL_BRANCH)
+  return base, manifest, work, bare, source
+
+
+def test_store_install_then_code_only_apply_does_not_warn(
+  client, auth, db, tmp_path, bypass_url_validation,
+):
+  """An untouched Store manifest never reads as a dropped local edit."""
+  *_, source = _install_git_store_app(client, auth, db, tmp_path, "quiet-store")
+
+  applied = _code_only_apply(client, auth, source, "code only")
+
+  assert applied.status_code == 200, applied.text
+  assert applied.json()["warnings"] == []
+
+
+def test_store_install_then_manifest_edit_apply_warns(
+  client, auth, db, tmp_path, bypass_url_validation,
+):
+  """The same install path reports a real dropped manifest edit."""
+  *_, source = _install_git_store_app(client, auth, db, tmp_path, "loud-store")
+  local = json.loads((source / "mobius.json").read_text())
+  (source / "mobius.json").write_text(json.dumps({**local, "version": "9.9.9"}))
+
+  applied = _code_only_apply(client, auth, source, "code and manifest")
+
+  assert applied.status_code == 200, applied.text
+  assert applied.json()["warnings"] == [
+    app_apply._STORE_LOCAL_PACKAGE_DIVERGED
+  ]
+
+
+def test_store_merge_replay_then_code_only_apply_does_not_warn(
+  client, auth, db, tmp_path, bypass_url_validation,
+):
+  """A merged Store update without manifest edits stays quiet on apply."""
+  base, manifest, work, bare, source = _install_git_store_app(
+    client, auth, db, tmp_path, "quiet-merge",
+  )
+  (source / "index.jsx").write_text(
+    JSX_MULTI.replace("ORIGINAL TITLE", "LOCAL TITLE"),
+  )
+  next_manifest = {**manifest, "version": "2.0.0"}
+  jsx_v2 = JSX_MULTI.replace("ORIGINAL FOOTER", "UPSTREAM FOOTER")
+  (work / "mobius.json").write_text(json.dumps(next_manifest, indent=4))
+  _push_clone_fixture(work, bare, jsx_v2, "")
+  updated = _install_clone_fixture(
+    client, auth, base, next_manifest, jsx_v2, "", bare,
+  )
+  assert updated.status_code == 201, updated.text
+  assert updated.json()["divergence"] == "clean_merge"
+  from app.applied_app_runtime import runtime_root
+  row = db.get(models.App, updated.json()["id"])
+  db.refresh(row)
+  accepted = json.loads((runtime_root(row) / "mobius.json").read_text())
+  assert accepted["version"] == "2.0.0"
+
+  applied = client.post(
+    "/api/apps/apply", headers=auth, json={"source_dir": str(source)},
+  )
+
+  assert applied.status_code == 200, applied.text
+  assert applied.json()["warnings"] == []

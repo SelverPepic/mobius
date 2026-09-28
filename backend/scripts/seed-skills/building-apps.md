@@ -268,7 +268,8 @@ manifest, layered by how always-on they are:
   `description`, and `input_schema` (a JSON Schema `object`). Requires a
   `service`: agents see `<app slug>_<name>`, and each call reaches the service
   as `POST /tools/<name>` with body `{"arguments": ..., "call": ...}` and the
-  app's own authority (`backend/app/app_tools.py`). Helpers get the tools too:
+  app's own authority (`backend/app/app_tools.py`). Only the platform reaches
+  `tools/`: HTTP calls to the service there get 404, so `call` is trustworthy. Helpers get the tools too:
   the request's `actor` has `delegated: true` for a helper and
   `access: "read"` for a read-only one, so refuse any change for a read-only
   caller. Tool calls run on their own concurrency lane that is NOT serialized
@@ -469,14 +470,13 @@ const res = await fetch(`/api/storage/apps/${appId}/${path}`, {
 
 The extension picks the form (same `.json`-no-envelope rule as above).
 
+Shared storage is owner-written. An app token cannot write or delete there, and it can read and list only `skills/`, `self-reminders.jsonl`, and `memory/` (the last only with a declared `shared_memory` read contract). Every other shared path returns 403 to an app.
+
 ### Cross-app feedback
 
-When an app asks the partner for feedback that another agent should notice, write it twice:
+When an app asks the partner for feedback that another agent should notice, store it in the app's own storage as `feedback/<id>.json` via `window.mobius.storage`, so the app owns its audit trail and offline/read-your-writes behavior. Apps cannot write shared storage.
 
-- Local app storage: `feedback/<id>.json` via `window.mobius.storage`, so the app owns its audit trail and offline/read-your-writes behavior.
-- Shared storage: `app-feedback/<app-slug>/<id>.json` via `PUT /api/storage/shared/...`, best-effort and honestly surfaced if it fails, so Reflection and future cross-app agents can enumerate it without knowing the app's numeric id.
-
-Use a small structured object: `app`, `kind`, `created_at`, `signal`, `text`, and domain context such as `report_date`, `article_headlines`, `source_id`, or `screen`. Keep one record per file. Consumers must enumerate `shared-list/app-feedback/` and app subfolders; do not probe guessed ids.
+Use a small structured object: `app`, `kind`, `created_at`, `signal`, `text`, and domain context such as `report_date`, `article_headlines`, `source_id`, or `screen`. Keep one record per file. Consumers enumerate `apps-list/{appId}/feedback/`; do not probe guessed ids.
 
 ---
 

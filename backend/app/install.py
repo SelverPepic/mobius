@@ -492,22 +492,45 @@ def _trusted_origin_catalog_identity_matches(
   """Whether a local identity-free row has the catalog package's Git origin."""
   if app.manifest_url is not None or app.slug != manifest_id:
     return False
-  return _trusted_catalog_origin_matches(app, source_url)
+  return _trusted_catalog_origin_matches(app.source_dir, source_url)
 
 
 def _trusted_catalog_origin_matches(
-  app: models.App,
+  source_dir: str | Path,
   source_url: str,
 ) -> bool:
   """Whether an app checkout has the canonical catalog repository origin."""
   expected_origin = _trusted_catalog_origin_url(source_url)
   if expected_origin is None:
     return False
-  actual_origin = app_git.origin_url(app.source_dir)
+  actual_origin = app_git.origin_url(source_dir)
   return bool(
     actual_origin
     and actual_origin.rstrip("/") == expected_origin.rstrip("/")
   )
+
+
+def trusted_catalog_checkout(
+  identity: str | None,
+  source_dir: str | Path,
+  source_url: str,
+  manifest_id: str,
+) -> bool:
+  """Whether an installed package's checkout is its trusted catalog repo."""
+  return _catalog_identity_matches(
+    identity, source_url, manifest_id,
+  ) and _trusted_catalog_origin_matches(source_dir, source_url)
+
+
+def replaces_migration_bridge(upstream_tree: dict, *, trusted_origin: bool) -> bool:
+  """Whether install replaces the recorded upstream instead of continuing it.
+
+  The one-time migration bridge records code but no manifest and shares no
+  history with the real repository. Only a trusted origin may replace it
+  outright; the Store's update check asks this same question so it never
+  offers an update install cannot apply.
+  """
+  return trusted_origin and "mobius.json" not in upstream_tree
 
 
 def _find_ref_independent_catalog_row(
@@ -2595,6 +2618,10 @@ class InstallTarget:
   source_identity: str | None
   source_handoff_required: bool
 
+  @property
+  def trusted_origin(self) -> bool:
+    return self.adopting_trusted_origin or self.trusted_catalog_origin
+
 
 @dataclass
 class InstallJournal:
@@ -3063,10 +3090,10 @@ def _select_install_target(
     ),
     trusted_catalog_origin=bool(
       existing is not None
-      and _catalog_identity_matches(
-        existing.manifest_url, source_for_key, manifest_id,
+      and trusted_catalog_checkout(
+        existing.manifest_url, existing.source_dir, source_for_key,
+        manifest_id,
       )
-      and _trusted_catalog_origin_matches(existing, source_for_key)
     ),
     canonical_manifest_url=canonical_manifest_url,
     origin_migration=origin_migration,
@@ -3090,42 +3117,83 @@ def _manifest_default_timezone(
 ) -> str | None:
   """The zone a manifest default is registered in; ``None`` is server time.
 
-  A plain daily default (``M H * * *``) means that wall time for the owner,
-  so it is owned in the owner's timezone once known. Other cadences, and a
-  zone the server already runs in, stay ordinary server cron.
+  A fixed wall-time default (``M H * * *``, ``M H * * 1-5``) means that time
+  for the owner, so it is owned in the owner's timezone once known. Other
+  cadences, and a zone the server already runs in, stay ordinary server cron.
   """
   from app import cron_tz
 
   if (
     owner_zone is None
-    or cron_tz.parse_daily_cron(default) is None
+    or cron_tz.parse_wall_clock_cron(default) is None
     or owner_zone == cron_tz.server_timezone_name()
   ):
     return None
   return owner_zone
 
 
-def _register_app_schedule(
+def _apply_schedule_choice(
   app: models.App,
-  cron: str,
-  job_path: Path,
-  zone: str | None,
+  choice: app_cron.ScheduleChoice,
   scaffold: Path,
 ) -> None:
+  """Record who chose the schedule, then register it.
+
+  Provenance is written first so a failed or interrupted registration can
+  never leave a declaration whose origin a later update must guess.
+  """
   from app import cron_tz
 
-  if zone is None:
-    app_cron.register_cron(app.slug, cron, job_path, app.id, scaffold=scaffold)
+  app_cron.record_schedule_choice(app.id, choice)
+  job_path = Path(app.source_dir) / choice.job
+  if choice.timezone is None:
+    app_cron.register_cron(
+      app.slug, choice.cron, job_path, app.id, scaffold=scaffold,
+    )
     return
   app_cron.register_cron(
     app.slug,
-    cron_tz.materialize_zone_cron(cron, zone),
+    cron_tz.materialize_zone_cron(choice.cron, choice.timezone),
     job_path,
     app.id,
-    timezone=zone,
-    zone_cron=cron,
+    timezone=choice.timezone,
+    zone_cron=choice.cron,
     scaffold=scaffold,
   )
+
+
+async def converge_manifest_schedule_zones(
+  db: Session, owner_zone: str | None,
+) -> None:
+  """Move every manifest-default schedule into the zone it belongs in.
+
+  Runs when the owner's timezone is reported. Owner-chosen schedules keep
+  their own zone; a default already in the right zone is left alone, so
+  repeated reports are no-ops. A failure leaves that app for the next report.
+  """
+  scaffold = app_cron.cron_scaffold(CRON_SCAFFOLD)
+  if not scaffold.exists():
+    return
+  apps = db.query(models.App).filter(models.App.deleted_at.is_(None)).all()
+  for app in apps:
+    try:
+      async with fs_locks.source_dir_lock(app.source_dir):
+        choice = app_cron.read_schedule_choice(app.id)
+        if choice is None or choice.source != "manifest":
+          continue
+        zone = _manifest_default_timezone(choice.cron, owner_zone)
+        if zone == choice.timezone:
+          continue
+        try:
+          await asyncio.to_thread(
+            _apply_schedule_choice,
+            app, dataclasses.replace(choice, timezone=zone), scaffold,
+          )
+        except Exception:
+          app_cron.record_schedule_choice(app.id, choice)
+          raise
+    except Exception:
+      log.exception("schedule zone: app %s could not be moved", app.id)
 
 
 async def _sync_manifest_cron_unlocked(
@@ -3146,7 +3214,7 @@ async def _sync_manifest_cron_unlocked(
 
   A schedule the owner chose survives while the app keeps the same schedule
   contract (``app_cron.owner_schedule_to_keep``); otherwise the manifest
-  default is registered, in ``owner_zone`` when it is a plain daily time.
+  default is registered, in ``owner_zone`` when it is a fixed wall time.
   """
   schedule = manifest.get("schedule")
   job_name = schedule.get("job") if schedule else None
@@ -3165,7 +3233,6 @@ async def _sync_manifest_cron_unlocked(
     await asyncio.to_thread(_drop_app_cron, app_data_dir)
     (app_cron.schedule_state_dir(app.id) / "init-cron.sh").unlink(missing_ok=True)
     app_cron.clear_schedule_choice(app.id)
-  job_path = app_data_dir / cron_job_name
   active_cron_scaffold = app_cron.cron_scaffold(CRON_SCAFFOLD)
   if has_cron and active_cron_scaffold.exists():
     default = schedule["default"]
@@ -3180,10 +3247,8 @@ async def _sync_manifest_cron_unlocked(
         manifest_default=default,
       )
     await asyncio.to_thread(
-      _register_app_schedule,
-      app, choice.cron, job_path, choice.timezone, active_cron_scaffold,
+      _apply_schedule_choice, app, choice, active_cron_scaffold,
     )
-    app_cron.record_schedule_choice(app.id, choice)
   elif has_cron:
     sentinel = app_data_dir / ".cron-pending.json"
     sentinel.write_text(
@@ -4111,13 +4176,10 @@ async def install_from_manifest(
               git_source_dir,
               app_git.UPSTREAM_BRANCH,
             )
-            synthetic_baseline = (
-              bool(prev_upstream_commit)
-              and "mobius.json" not in previous_tree
-              and (
-                target.trusted_catalog_origin
-                or target.adopting_trusted_origin
-              )
+            synthetic_baseline = bool(
+              prev_upstream_commit
+            ) and replaces_migration_bridge(
+              previous_tree, trusted_origin=target.trusted_origin,
             )
             if synthetic_baseline:
               await asyncio.to_thread(
@@ -4136,10 +4198,7 @@ async def install_from_manifest(
                 app_git.promote_upstream,
                 git_source_dir,
                 reviewed_upstream_commit,
-                trusted_origin_adoption=(
-                  target.adopting_trusted_origin
-                  or target.trusted_catalog_origin
-                ),
+                trusted_origin_adoption=target.trusted_origin,
               )
           except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
             raise HTTPException(
@@ -4167,13 +4226,10 @@ async def install_from_manifest(
             git_source_dir,
             app_git.UPSTREAM_BRANCH,
           )
-          synthetic_baseline = (
-            bool(prev_upstream_commit)
-            and "mobius.json" not in previous_tree
-            and (
-              target.trusted_catalog_origin
-              or target.adopting_trusted_origin
-            )
+          synthetic_baseline = bool(
+            prev_upstream_commit
+          ) and replaces_migration_bridge(
+            previous_tree, trusted_origin=target.trusted_origin,
           )
           if synthetic_baseline:
             try:
@@ -4210,10 +4266,7 @@ async def install_from_manifest(
                 app_git.fetch_upstream,
                 git_source_dir,
                 ref,
-                trusted_origin_adoption=(
-                  target.adopting_trusted_origin
-                  or target.trusted_catalog_origin
-                ),
+                trusted_origin_adoption=target.trusted_origin,
                 verify=lambda commit: _verify_git_install_candidate(
                   git_source_dir, commit, candidate,
                 ),

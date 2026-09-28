@@ -4822,3 +4822,37 @@ def test_running_codex_helper_row_shows_what_its_child_is_doing(monkeypatch):
   progress = [e for e in bus.events if e.get("type") == "task_progress"]
   assert progress and progress[0]["last_tool_name"] == "Bash"
   assert progress[0]["task_id"] == start["task_id"]
+
+
+def test_a_stop_before_the_codex_turn_starts_reports_the_prompt_unsent(
+  monkeypatch,
+):
+  """Stop won after the thread was ready but before the turn was sent, so
+  nothing the turn carried reached Codex and it must not be acknowledged."""
+  thread = _FakeThread("thread-a", _FakeTurnHandle([]))
+
+  class FakeAsyncCodex:
+    def __init__(self, config=None):
+      self.config = config
+
+    async def __aenter__(self):
+      return self
+
+    async def __aexit__(self, _exc_type, _exc, _tb):
+      return None
+
+    async def thread_resume(self, *_args, **_kwargs):
+      return thread
+
+  monkeypatch.setattr(
+    codex_sdk_runner, "_sdk_imports", lambda: _fake_sdk(FakeAsyncCodex),
+  )
+  result = asyncio.run(codex_sdk_runner.run_codex_sdk_turn(
+    user_message="hello", session_id="thread-a", base_env={}, cwd="/tmp",
+    chat_id="chat-stop-before-turn", bc=_FakeBroadcast(),
+    pending_questions={}, db=None, should_abort=lambda: True,
+  ))
+
+  assert thread.turn_args is None
+  assert result["error"] is None
+  assert result["prompt_sent"] is False

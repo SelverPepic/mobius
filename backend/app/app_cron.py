@@ -50,9 +50,6 @@ def schedule_state_dir(app_id: int) -> Path:
 
 
 _SCHEDULE_CHOICE_FILE = "choice.json"
-_DECLARED_ENTRY_RE = re.compile(
-  r"""^\s*ENTRY=(?:"([^"]+)"|'([^']+)')\s*$""", re.M,
-)
 
 
 @dataclass(frozen=True)
@@ -88,7 +85,7 @@ def clear_schedule_choice(app_id: int) -> None:
   (schedule_state_dir(app_id) / _SCHEDULE_CHOICE_FILE).unlink(missing_ok=True)
 
 
-def _read_schedule_choice(app_id: int) -> ScheduleChoice | None:
+def read_schedule_choice(app_id: int) -> ScheduleChoice | None:
   try:
     raw = json.loads(
       (schedule_state_dir(app_id) / _SCHEDULE_CHOICE_FILE).read_text(),
@@ -104,32 +101,6 @@ def _read_schedule_choice(app_id: int) -> ScheduleChoice | None:
     return None
 
 
-def _undocumented_owner_choice(app_id: int) -> ScheduleChoice | None:
-  """A zone-owned declaration written before provenance was recorded.
-
-  Until provenance existed, every accepted update re-registered the manifest
-  default in server time, so a surviving timezone-owned declaration could
-  only have come from the schedule route: it is the owner's choice.
-  """
-  from app import cron_tz
-
-  try:
-    text = (schedule_state_dir(app_id) / "init-cron.sh").read_text()
-    declaration = cron_tz.parse_zone_declaration(text)
-  except (OSError, ValueError):
-    return None
-  entry = _DECLARED_ENTRY_RE.search(text)
-  if declaration is None or entry is None:
-    return None
-  job = crontab_command_path(entry.group(1) or entry.group(2) or "")
-  if not job:
-    return None
-  timezone, zone_cron = declaration
-  return ScheduleChoice(
-    source="owner", cron=zone_cron, job=Path(job).name, timezone=timezone,
-  )
-
-
 def owner_schedule_to_keep(
   app_id: int, default: str, job: str,
 ) -> ScheduleChoice | None:
@@ -137,24 +108,21 @@ def owner_schedule_to_keep(
 
   An update or local apply keeps the owner's choice while the app's schedule
   contract is unchanged: the same scheduled job, and either the same manifest
-  default as when the owner chose, or a daily default where the owner also
-  chose a daily time (an app retiming its daily default does not override the
-  owner's daily time). A different job or cadence kind returns ``None`` so the
-  new default applies.
+  default as when the owner chose, or a wall-time default on the same weekdays
+  as the owner's wall time (an app retiming its daily default does not override
+  the owner's daily time). A different job or cadence kind returns ``None`` so
+  the new default applies.
   """
   from app import cron_tz
 
-  choice = _read_schedule_choice(app_id)
-  if choice is None:
-    choice = _undocumented_owner_choice(app_id)
+  choice = read_schedule_choice(app_id)
   if choice is None or choice.source != "owner" or choice.job != job:
     return None
   if choice.manifest_default == default:
     return choice
-  if (
-    cron_tz.parse_daily_cron(choice.cron) is not None
-    and cron_tz.parse_daily_cron(default) is not None
-  ):
+  chosen = cron_tz.parse_wall_clock_cron(choice.cron)
+  offered = cron_tz.parse_wall_clock_cron(default)
+  if chosen and offered and chosen[2] == offered[2]:
     return choice
   return None
 
@@ -203,9 +171,9 @@ def register_cron(
       raise CronDeclarationError(
         500, f"Unknown IANA timezone: {timezone!r}",
       )
-    if cron_tz.parse_daily_cron(zone_cron) is None:
+    if cron_tz.parse_wall_clock_cron(zone_cron) is None:
       raise CronDeclarationError(
-        500, f"Zone-owned schedule must be a plain daily cron: {zone_cron!r}",
+        500, f"Zone-owned schedule must be a fixed wall time: {zone_cron!r}",
       )
   active_scaffold = scaffold or cron_scaffold()
   if not active_scaffold.exists():

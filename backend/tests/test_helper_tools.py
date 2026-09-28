@@ -304,7 +304,22 @@ def _live_parent(monkeypatch, accepted):
   return steered
 
 
-def test_a_result_is_steered_into_the_running_parent_turn_once(db, monkeypatch):
+def _steer_cut(parent_id, user_msgs, consume):
+  """The live turn lands its steer: the queued carrier moves into the transcript."""
+  from app.chat_writer import AppendSteeredUserMessage, get_writer
+
+  get_writer().submit(AppendSteeredUserMessage(
+    chat_id=parent_id, user_msgs=user_msgs, consume_pending_cids=consume,
+  )).result(timeout=5)
+
+
+def test_a_steered_result_is_delivered_at_the_steer_cut_once(db, monkeypatch):
+  """A steered result travels as a queued carrier, like a peer note.
+
+  Both providers consume that carrier at the steer cut. Until then the result
+  is owed; after it, the result is delivered and the after-turn wake has
+  nothing left to start.
+  """
   parent_id, child_id, delegation_id = _running_parent(db, "steer-yes")
   steered = _live_parent(monkeypatch, accepted=True)
 
@@ -312,11 +327,75 @@ def test_a_result_is_steered_into_the_running_parent_turn_once(db, monkeypatch):
 
   (chat_id, content, user_msgs, consume), = steered
   assert chat_id == parent_id and "Done while you worked." in content
-  assert user_msgs[0]["kind"] == "delegation_result" and consume is None
+  assert user_msgs[0]["kind"] == "delegation_result"
+  assert consume == [user_msgs[0]["cid"]]
   db.expire_all()
+  assert db.get(models.Chat, parent_id).pending_messages == user_msgs
+  assert db.get(models.Delegation, delegation_id).delivered_run_id is None
+
+  _steer_cut(parent_id, user_msgs, consume)
+
+  db.expire_all()
+  assert db.get(models.Chat, parent_id).pending_messages == []
   assert db.get(models.Delegation, delegation_id).delivered_run_id is not None
   # Delivered: the next turn's context does not repeat it.
   assert delegations_mod.available_delegation_results(db, parent_id) == []
+  db.get(models.ChatRun, "root-steer-yes").status = "completed"
+  db.commit()
+  monkeypatch.setattr(chat_mod, "is_chat_running", lambda _chat_id: False)
+  starts = []
+
+  async def record_start(**kwargs):
+    starts.append(kwargs)
+    return True
+
+  monkeypatch.setattr(
+    chat_start_mod, "start_programmatic_activity_continuation", record_start,
+  )
+  asyncio.run(delegations_mod.deliver_results_after_parent_settled(parent_id))
+  assert starts == []
+
+
+def test_a_steered_result_that_stop_cut_off_stays_owed_for_the_next_turn(
+  db, monkeypatch,
+):
+  """Claude buffers an accepted steer until its interrupt lands, and Stop
+  empties that buffer. The result was never received, so it stays owed:
+  Stop drops the queued carrier and the owner's next turn carries it."""
+  from app.claude_sdk_runner import ActiveClaudeClient
+  from app.runner_registry import RunnerKind, registry
+
+  parent_id, child_id, delegation_id = _running_parent(db, "steer-stopped")
+  monkeypatch.setattr(chat_mod, "is_chat_running", lambda _chat_id: True)
+
+  class _Client:
+    async def interrupt(self):
+      return None
+
+  async def steer_then_stop():
+    handle = ActiveClaudeClient(_Client(), chat_id=parent_id)
+    registry.register(handle)
+    try:
+      await delegations_mod.wake_parent_after_child_settled(child_id)
+      assert handle._steer_consume_cids == [
+        handle._steer_user_msgs[0]["cid"],
+      ]
+      cleared = await chat_mod._clear_pending(parent_id)
+      handle.mark_finished()
+      await handle.interrupt()
+    finally:
+      registry.unregister(parent_id, RunnerKind.CLAUDE_SDK)
+    return cleared, handle
+
+  cleared, handle = asyncio.run(steer_then_stop())
+
+  assert cleared == [] and handle._steer_user_msgs == []
+  db.expire_all()
+  assert db.get(models.Chat, parent_id).pending_messages == []
+  assert db.get(models.Delegation, delegation_id).delivered_run_id is None
+  assert delegations_mod.build_delegation_result_context(
+    db, parent_id,
+  ).delegation_ids == (delegation_id,)
 
 
 def test_a_result_the_live_turn_already_admitted_is_not_steered_again(
@@ -353,10 +432,8 @@ def test_a_reopened_helper_result_is_steered_again_not_deduplicated(
   steered = _live_parent(monkeypatch, accepted=True)
 
   asyncio.run(delegations_mod.wake_parent_after_child_settled(child_id))
-  (_chat, _content, first_msgs, _consume), = steered
-  # The live turn persists the carrier it accepted.
-  parent = db.get(models.Chat, parent_id)
-  parent.messages = [*first_msgs]
+  (_chat, _content, first_msgs, first_consume), = steered
+  _steer_cut(parent_id, first_msgs, first_consume)
   db.add(make_goal_run(db,
     id="child-run-steer-again-2", root_run_id="child-run-steer-again-2",
     chat_id=child_id, status="completed", provider="claude",
@@ -367,9 +444,14 @@ def test_a_reopened_helper_result_is_steered_again_not_deduplicated(
   asyncio.run(delegations_mod.wake_parent_after_child_settled(child_id))
 
   assert len(steered) == 2
-  second_msgs = steered[1][2]
+  _chat, _content, second_msgs, second_consume = steered[1]
   assert second_msgs[0]["cid"] != first_msgs[0]["cid"]
   assert '"run_id":"child-run-steer-again-2"' in second_msgs[0]["content"]
+  db.expire_all()
+  assert db.get(
+    models.Delegation, delegation_id,
+  ).delivered_run_id == "child-run-steer-again"
+  _steer_cut(parent_id, second_msgs, second_consume)
   db.expire_all()
   assert db.get(
     models.Delegation, delegation_id,
@@ -377,7 +459,12 @@ def test_a_reopened_helper_result_is_steered_again_not_deduplicated(
   assert delegations_mod.available_delegation_results(db, parent_id) == []
 
 
-def test_a_refused_steer_leaves_the_result_for_after_the_turn(db, monkeypatch):
+def test_a_refused_steer_leaves_the_result_queued_for_after_the_turn(
+  db, monkeypatch,
+):
+  """A turn that ends before taking the steer (Codex refuses a second
+  simultaneous steer; a closing turn refuses any) leaves the carrier queued,
+  exactly like a peer note, and the result owed until a turn carries it."""
   parent_id, child_id, delegation_id = _running_parent(db, "steer-no")
   _live_parent(monkeypatch, accepted=False)
 
@@ -385,10 +472,9 @@ def test_a_refused_steer_leaves_the_result_for_after_the_turn(db, monkeypatch):
 
   db.expire_all()
   assert db.get(models.Delegation, delegation_id).delivered_run_id is None
-  assert db.get(models.Chat, parent_id).pending_messages == []
-  assert [row.id for row in delegations_mod.available_delegation_results(db, parent_id)] == [
-    delegation_id,
-  ]
+  [carrier] = db.get(models.Chat, parent_id).pending_messages
+  assert carrier["kind"] == "delegation_result"
+  assert delegation_id in delegations_mod.carrier_results(db, carrier)
 
 
 # ----------------------------------------------------------------- display

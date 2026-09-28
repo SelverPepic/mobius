@@ -69,7 +69,8 @@ from app.config import get_settings
 from app.database import get_db
 from app.deps import (
   get_current_owner, get_current_owner_for_lifecycle_control,
-  get_current_owner_or_app, get_principal, Principal,
+  get_current_owner_or_app, get_principal, get_principal_or_public_service,
+  Principal,
   get_owner_or_app_with_manage_apps, reject_cross_site,
   require_nondelegated_owner_control,
 )
@@ -615,7 +616,7 @@ async def _hard_delete_app(db: Session, app: models.App) -> None:
 @router.get("/", response_model=list[schemas.AppOut])
 async def list_apps(
   db: Session = Depends(get_db),
-  _: models.Owner = Depends(get_current_owner_or_app),
+  _: Principal = Depends(get_principal_or_public_service),
 ):
   """Returns all LIVE registered mini-apps (tombstoned ones are hidden).
 
@@ -1506,12 +1507,10 @@ async def update_check(
     if pending is not None:
       return _pending_result(pending, pending_state)
     # One digest owns the complete declared package: manifest/capabilities,
-    # executable source, icon, static assets, and seeds. The one-time synthetic
-    # migration baseline of a catalog app has no manifest but does have its
-    # Git origin, so no exact compare exists: its first real-origin commit is
-    # offered once (install replaces the bridge on exactly this condition) and
-    # future checks compare exact packages. Comparing only code here would hide
-    # manifest-only releases forever.
+    # executable source, icon, static assets, and seeds. A trusted catalog
+    # app's migration bridge has no manifest to compare, so its first real
+    # release is offered once: install replaces the bridge on exactly this
+    # predicate, and later checks compare exact packages.
     if "mobius.json" in recorded_tree:
       try:
         _, recorded_digest = install.package_content_digest_from_tree(
@@ -1520,7 +1519,14 @@ async def update_check(
       except install.PackageContentError:
         return _unknown()
       update_available = recorded_digest != candidate.source_digest
-    elif await asyncio.to_thread(app_git.has_origin, repo):
+    elif install.replaces_migration_bridge(
+      recorded_tree,
+      trusted_origin=await asyncio.to_thread(
+        install.trusted_catalog_checkout,
+        installed_manifest_url, repo, fetch_manifest_url,
+        candidate.manifest.get("id"),
+      ),
+    ):
       update_available = True
     else:
       try:
@@ -2071,7 +2077,6 @@ async def resolve_app_update(
         _require_pending_resolution, Path(source_dir),
         receipt["upstream_commit"],
       )
-      replay_app_name = app.name
       replay_upstream_commit = app.upstream_commit
 
     # The installer owns promotion of source, bundle, metadata, static assets,
@@ -2096,11 +2101,16 @@ async def resolve_app_update(
         and isinstance(detail, dict)
         and detail.get("code") == "pending_update_changed"
       ):
-        get_system_broadcast().publish({
-          "type": "app_update_stale",
-          "appId": str(app_id),
-          "appName": replay_app_name,
-        })
+        # The reviewed release can never be replayed again. The live version
+        # is untouched, so drop its receipt and let the next update check
+        # offer the new candidate instead of a pending update that never ends.
+        async with (
+          fs_locks.app_storage_lock(app_id),
+          fs_locks.source_dir_lock(source_dir),
+        ):
+          await asyncio.to_thread(
+            install.clear_pending_conflict_update, source_dir,
+          )
       raise
 
   reapplied = result.app

@@ -29,7 +29,9 @@ Configuration schema::
   }
 
 Services with ``public_surface`` enabled are served only on the configured
-gateway origin; requests on non-gateway hosts redirect to that gateway.
+gateway origin; requests on non-gateway hosts redirect to that gateway. Other
+services answer on the shell origin as inert content (the platform default:
+no scripts), which suits APIs and files; a scripted web UI needs the gateway.
 
 The gateway deliberately isolates services from the shell, not from one
 another. Cookies remain host-only and should use the service mount path, but

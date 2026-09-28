@@ -1235,6 +1235,68 @@ async def test_resumed_turn_reads_past_the_inherited_task_notification_result(
   )["content"] == "Resumed the owner's work."
 
 
+@pytest.mark.asyncio
+async def test_a_stop_during_the_inherited_notification_ends_the_resumed_turn(
+  monkeypatch,
+):
+  """Stop between the inherited notification and its empty result wins.
+
+  The CLI drops an interrupt sent before the query is generating, so that
+  empty result arrives clean. It must end the stopped turn instead of being
+  skipped, or the runner reads on into the resumed query's model work.
+  """
+  inherited = TaskNotificationMessage(
+    subtype="task_notification", data={}, task_id="old-shell",
+    status="stopped", output_file="/tmp/old-shell",
+    summary="Background shell command didn't finish",
+    uuid="done-old-shell", session_id="sess-resumed", tool_use_id="old-bash",
+  )
+  empty = ResultMessage(
+    subtype="success", duration_ms=1, duration_api_ms=0, is_error=False,
+    num_turns=0, session_id="sess-resumed", stop_reason=None,
+    total_cost_usd=0.0, usage={"input_tokens": 0, "output_tokens": 0},
+    result="",
+  )
+  stops: list[asyncio.Task] = []
+
+  class _Client(_OneStreamClient):
+    def _messages(self):
+      return [
+        inherited,
+        empty,
+        AssistantMessage(
+          content=[TextBlock(text="Work the owner already stopped.")],
+          model="claude-sonnet", session_id="sess-resumed",
+        ),
+        _success_result("sess-resumed", cost=0.05),
+      ]
+
+    async def receive_response(self):
+      for message in self._stream:
+        self.read.append(message)
+        yield message
+        if message is inherited:
+          handle = registry.get_handle(
+            "inherited-stop", RunnerKind.CLAUDE_SDK,
+          )
+          stops.append(asyncio.create_task(handle.interrupt()))
+          while not self.interrupts:
+            await asyncio.sleep(0)
+        if isinstance(message, ResultMessage):
+          return
+
+  clients = _install_fake_client(monkeypatch, _Client)
+  monkeypatch.setattr(
+    claude_sdk_runner, "_persist_session_id", _ignore_session_persistence,
+  )
+
+  await _run_turn("inherited-stop", bc=_Bus(), prompt="resume", cwd="/data")
+  for stop in stops:
+    await stop
+
+  assert len(clients[0].read) == 2
+
+
 def test_inherited_notification_marks_only_its_own_model_less_result():
   tracker = claude_events.NativeContinuationTracker()
   tracker.task_started("own-shell", "local_bash", "spawn-own")

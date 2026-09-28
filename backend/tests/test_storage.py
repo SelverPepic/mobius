@@ -195,13 +195,12 @@ def test_shared_memory_reads_require_live_declared_contract(
   assert client.get(
     "/api/storage/shared-list/.%2Fmemory", headers=app_auth,
   ).status_code == 403
-  # Other longstanding shared resources retain their existing app-readable
-  # behavior; the new gate is scoped to the optional graph namespace.
+  # Skills stay app-readable without a contract; only memory is gated by one.
   client.put(
-    "/api/storage/shared/config.json", json={"ok": True}, headers=auth,
+    "/api/storage/shared/skills/cron.md", json={"content": "x"}, headers=auth,
   )
   assert client.get(
-    "/api/storage/shared/config.json", headers=app_auth,
+    "/api/storage/shared/skills/cron.md", headers=app_auth,
   ).status_code == 200
 
   app = db.query(models.App).filter(models.App.id == app_id).one()
@@ -1760,7 +1759,12 @@ def test_app_storage_if_none_match_create_if_absent(client, auth, owner_token):
   assert client.get(path, headers=auth).json() == {"v": 1}
 
 
-def test_shared_connect_credentials_are_owner_only(client, auth, owner_token):
+def test_app_reads_only_allowlisted_shared_paths(client, auth, owner_token):
+  """An app token reads skills and self-reminders, never other shared data.
+
+  Agents write credentials anywhere under /data/shared, so the app gate is an
+  allowlist rather than a list of known-secret roots. Owner reads are unchanged.
+  """
   app_id = _make_app(client, owner_token)
   token = client.post(
     "/api/auth/app-token",
@@ -1768,19 +1772,53 @@ def test_shared_connect_credentials_are_owner_only(client, auth, owner_token):
     headers={"Authorization": f"Bearer {owner_token}"},
   ).json()["token"]
   app_auth = {"Authorization": f"Bearer {token}"}
-  runner = Path(get_settings().data_dir) / "shared" / "connect" / "outbound"
-  runner.mkdir(parents=True, exist_ok=True)
-  (runner / "config.json").write_text('{"token":"x"}', encoding="utf-8")
+  shared = Path(get_settings().data_dir) / "shared"
+  for rel in (
+    "connect/outbound/config.json",
+    "vendor/token",
+    "vendor/.env",
+    "theme.css",
+    "skills/cron.md",
+    "self-reminders.jsonl",
+  ):
+    (shared / rel).parent.mkdir(parents=True, exist_ok=True)
+    (shared / rel).write_text("x", encoding="utf-8")
+  repo = shared / "vendor" / "repository"
+  subprocess.run(
+    ["git", "init", "-b", "main", str(repo)], check=True, capture_output=True,
+  )
+  (repo / "token").write_text("x", encoding="utf-8")
+  subprocess.run(["git", "-C", str(repo), "add", "token"], check=True)
+  subprocess.run(
+    ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t",
+     "commit", "-m", "i"],
+    check=True, capture_output=True,
+  )
+  revision = subprocess.run(
+    ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+    capture_output=True, text=True,
+  ).stdout.strip()
 
-  for path in (
+  denied = (
     "/api/storage/shared/connect/outbound/config.json",
     "/api/storage/shared/%2E/connect/outbound/config.json",
+    "/api/storage/shared/vendor/token",
+    "/api/storage/shared/vendor/.env",
+    "/api/storage/shared/theme.css",
+    "/api/storage/shared-list/",
+    "/api/storage/shared-list/vendor",
     "/api/storage/shared-list/connect/outbound",
+    f"/api/storage/shared-git/vendor/repository?revision={revision}&file=token",
+  )
+  for path in denied:
+    assert client.get(path, headers=app_auth).status_code == 403, path
+    assert client.get(path, headers=auth).status_code == 200, path
+  for path in (
+    "/api/storage/shared/skills/cron.md",
+    "/api/storage/shared-list/skills",
+    "/api/storage/shared/self-reminders.jsonl",
   ):
-    assert client.get(path, headers=app_auth).status_code == 403
-  assert client.get(
-    "/api/storage/shared/connect/outbound/config.json", headers=auth,
-  ).status_code == 200
+    assert client.get(path, headers=app_auth).status_code == 200, path
 
 
 def test_full_size_content_pages_deliver_every_body_in_few_requests(
