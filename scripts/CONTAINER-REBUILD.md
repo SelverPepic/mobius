@@ -126,9 +126,37 @@ already available. Connect is one optional way to reach the host, not a product
 dependency. That path scratch-boots the exact locally built image before
 cutover and uses the same authenticated chat handoff and rollback contract.
 It can carry image-definition and protected-runtime changes. A release that
-changes Python packages currently stops before source installation: supporting
-that safely requires one executor that validates the new source in the new
-interpreter before either is published.
+changes Python packages stops before source installation when the running image
+predates the image-owned boot transaction; cross it with a container-only
+upgrade first (below).
+
+## Container-only upgrade for images before the boot transaction
+
+An image that predates `backend/runtime/boot-protocol` cannot install a release
+that changes Python packages: its served code refuses source whose packages it
+does not have, and no newer served code can reach it. Move only the container
+first, with the helper installed above. From inside the Möbius container, as the
+`mobius` user, run the script from the fetched upstream, so nothing new has to
+be installed:
+
+```sh
+git -C /data/platform fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+git -C /data/platform show origin/main:scripts/request-container-upgrade.py | python3 -
+```
+
+The script queues the helper for the latest official image (`--target` names an
+exact release instead; `--check` only reports whether it would) after checking that the target descends from both the
+running image and the source's installed release, that no update is prepared
+or parked, and that the helper is idle. The helper drains chats, replaces only
+the container, and restores the previous container if the new one is unhealthy.
+
+The new image's boot transaction serves the unchanged source only after proving
+the image is not older than that source's release, then probes it, with the
+image's own release as the floor. Install the release from Settings right away:
+its packages are now in the image, so the ordinary update proceeds. Until then,
+older source runs on the newer packages; the probe proves that it imports,
+nothing more. A release that also advances `deployment/self-hosted-helper.required`
+then asks you to reinstall the helper from a current trusted checkout.
 
 ## Boundary and lifecycle
 

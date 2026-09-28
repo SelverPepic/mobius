@@ -6007,3 +6007,36 @@ async def test_only_an_unplaced_swap_stops_startup(monkeypatch):
   monkeypatch.setattr(pu, "complete_platform_swap", unplaced)
   with pytest.raises(pu.BootTransactionError):
     await startup._complete_platform_swap(context)
+
+
+def test_a_release_marker_on_a_local_commit_still_allows_a_newer_image(clone_env):
+  """Older updaters could record a local merge commit as the installed
+  release. The image's own history proves the source's packages are not
+  newer, so a container-only upgrade still boots."""
+  origin, platform = clone_env
+  _with_python_inputs(platform, origin)
+  old_lock = (platform / "backend/requirements.lock").read_bytes()
+  local = _local_commit(platform, edits={"notes.txt": "local reconcile\n"})
+  pu._set_upstream(platform, local)
+  newer = _advance_origin(origin, edits={"backend/requirements.lock": "new-package==1\n"})
+  pu._fetch(platform)
+
+  _boot_image(newer)
+  _record_image_inputs(platform, b"new-package==1\n")
+  assert (platform / "backend/requirements.lock").read_bytes() == old_lock
+  assert pu.settle_prepared_update_for_this_image(platform) == "none"
+
+
+def test_an_image_whose_history_is_missing_proves_nothing(clone_env):
+  origin, platform = clone_env
+  _with_python_inputs(platform, origin)
+  old_lock = (platform / "backend/requirements.lock").read_bytes()
+  newer = _advance_origin(origin, edits={"backend/requirements.lock": "new-package==1\n"})
+  pu._fetch(platform)
+  _git(platform, "merge", "-q", "--ff-only", newer)
+  pu._set_upstream(platform, newer)
+
+  _boot_image("e" * 40)  # an image whose commit this checkout has never seen
+  _record_image_inputs(platform, old_lock)
+  with pytest.raises(pu.BootTransactionError, match="newer release"):
+    pu.settle_prepared_update_for_this_image(platform)
