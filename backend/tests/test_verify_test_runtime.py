@@ -744,7 +744,8 @@ def test_manual_and_pull_request_runs_cover_suites_and_main_image():
   ).exists()
   test_triggers = test_workflow.split("\npermissions:\n", 1)[0]
   image_triggers = image_workflow.split("\npermissions:\n", 1)[0]
-  backend = test_workflow.split("\n  backend:\n", 1)[1].split(
+  # The backend check spans its checks, test shards, and combining gate.
+  backend = test_workflow.split("\n  backend-checks:\n", 1)[1].split(
     "\n  frontend-unit:\n", 1,
   )[0]
   e2e = test_workflow.split("\n  e2e:\n", 1)[1]
