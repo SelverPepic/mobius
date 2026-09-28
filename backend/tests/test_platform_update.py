@@ -4019,7 +4019,6 @@ def test_update_preview_accepts_target_dependencies_already_in_running_image(
 
   preview = pu.platform_update_preview(platform, target_sha=target)
 
-  assert pu.target_python_inputs_baked_into_image(platform, target) is True
   assert preview["activation"]["level"] == "live"
   assert all(
     reason["code"] != "python_dependencies"
@@ -4064,7 +4063,6 @@ def test_target_dependency_proof_fails_closed_for_incomplete_provenance(
 
   preview = pu.platform_update_preview(platform, target_sha=target)
 
-  assert pu.target_python_inputs_baked_into_image(platform, target) is False
   assert preview["activation"]["level"] == "image_rebuild"
 
 
@@ -4074,7 +4072,13 @@ _IMAGE_LOCK = (
   "    --hash=sha256:windowswheelold\n"
   "    # via -r requirements.txt\n"
 )
-_HASH_ONLY_TARGET_LOCK = _IMAGE_LOCK.replace("windowswheelold", "windowswheelnew")
+_REPLACED_HASH_TARGET_LOCK = _IMAGE_LOCK.replace("windowswheelold", "windowswheelnew")
+_ADDED_HASH_TARGET_LOCK = _IMAGE_LOCK.replace(
+  "windowswheelold\n", "windowswheelold \\\n    --hash=sha256:macwheel\n",
+)
+_DROPPED_HASH_TARGET_LOCK = _IMAGE_LOCK.replace(
+  " \\\n    --hash=sha256:windowswheelold", "",
+)
 
 
 def _lock_only_update(clone_env, target_lock: str):
@@ -4098,32 +4102,11 @@ def _lock_only_update(clone_env, target_lock: str):
   return platform, base, target, image_inputs
 
 
-def test_update_preview_accepts_hash_only_lock_change_on_running_image(
-  clone_env, monkeypatch,
-):
-  platform, base, target, image_inputs = _lock_only_update(
-    clone_env, _HASH_ONLY_TARGET_LOCK,
-  )
-  monkeypatch.setattr(
-    pu, "_build_info", lambda: {"sha": base, "image_inputs": image_inputs},
-  )
-
-  preview = pu.platform_update_preview(platform, target_sha=target)
-
-  assert pu.target_python_inputs_baked_into_image(platform, target) is True
-  assert preview["activation"]["level"] == "live"
-  assert all(
-    reason["code"] != "python_dependencies"
-    for reason in preview["incoming_activation"]["reasons"]
-  )
-
-
-@pytest.mark.parametrize("case", ["version", "unproven_image_lock", "no_build_sha"])
+@pytest.mark.parametrize("case", ["unproven_image_lock", "no_build_sha"])
 def test_hash_only_lock_proof_fails_closed(clone_env, monkeypatch, case):
-  target_lock = _HASH_ONLY_TARGET_LOCK
-  if case == "version":
-    target_lock = target_lock.replace("package-a==1", "package-a==2")
-  platform, base, target, image_inputs = _lock_only_update(clone_env, target_lock)
+  platform, base, target, image_inputs = _lock_only_update(
+    clone_env, _ADDED_HASH_TARGET_LOCK,
+  )
   build_info = {"sha": base, "image_inputs": image_inputs}
   if case == "unproven_image_lock":
     # The named build commit's lock is not the one the image recorded.
@@ -4134,11 +4117,63 @@ def test_hash_only_lock_proof_fails_closed(clone_env, monkeypatch, case):
 
   preview = pu.platform_update_preview(platform, target_sha=target)
 
-  assert pu.target_python_inputs_baked_into_image(platform, target) is False
   assert any(
     reason["code"] == "python_dependencies"
     for reason in preview["incoming_activation"]["reasons"]
   )
+
+
+def test_hash_only_lock_update_needs_no_image_from_preview_to_boot(
+  clone_env, monkeypatch,
+):
+  """Preview, prepare, the boot guard and drift give one answer for a lock
+  that only adds artifact hashes to what the running image installed."""
+  platform, base, target, image_inputs = _lock_only_update(
+    clone_env, _ADDED_HASH_TARGET_LOCK,
+  )
+  monkeypatch.setattr(
+    pu, "_build_info", lambda: {"sha": base, "image_inputs": image_inputs},
+  )
+
+  preview = pu.platform_update_preview(platform, target_sha=target)
+  assert preview["activation"]["level"] == "live"
+  plan = _apply_plan(preview["current_sha"], target, platform)
+  plan.pop("repo")
+  record = pu.prepare_reviewed_update(**plan, repo=platform)
+  assert record["requires_image"] is False
+
+  # The outgoing server swaps it in and the same image boots the new source.
+  assert pu.swap_in_prepared_update(cutover=True, repo=platform) is True
+  pu.settle_prepared_update_for_this_image(platform)
+  assert pu.recorded_upstream_sha(platform) == target
+  assert pu.release_packages_missing_from_image(platform) is None
+  assert pu.image_input_drift(platform) == []
+
+
+@pytest.mark.parametrize("target_lock", [
+  _DROPPED_HASH_TARGET_LOCK,
+  _REPLACED_HASH_TARGET_LOCK,  # a replaced hash drops the one the image accepted
+  _IMAGE_LOCK.replace("package-a==1", "package-a==2"),
+], ids=["dropped_hash", "replaced_hash", "version"])
+def test_lock_update_the_image_may_not_install_still_needs_an_image(
+  clone_env, monkeypatch, target_lock,
+):
+  platform, base, target, image_inputs = _lock_only_update(clone_env, target_lock)
+  monkeypatch.setattr(
+    pu, "_build_info", lambda: {"sha": base, "image_inputs": image_inputs},
+  )
+
+  preview = pu.platform_update_preview(platform, target_sha=target)
+  assert preview["activation"]["level"] == "image_rebuild"
+  plan = _apply_plan(preview["current_sha"], target, platform)
+  plan.pop("repo")
+  assert pu.prepare_reviewed_update(**plan, repo=platform)["requires_image"] is True
+
+  # Served on the old image anyway, the release is refused and reported.
+  _git(platform, "merge", "-q", "--ff-only", target)
+  pu._set_upstream(platform, target)
+  assert "newer release" in pu.release_packages_missing_from_image(platform)
+  assert pu.image_input_drift(platform) == ["backend/requirements.lock"]
 
 
 @pytest.mark.asyncio

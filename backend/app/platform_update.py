@@ -1417,10 +1417,7 @@ def reviewed_container_rebuild_plan(
       "merge-base", current_sha, target_sha, repo=repo, check=False,
     ).stdout.strip() or current_sha
     incoming_activation = _incoming_activation_impact(repo, base, target_sha)
-    activation = platform_activation.classify_activation([
-      *_pending_activation_paths(repo),
-      *_activation_paths_between(repo, base, target_sha),
-    ])
+    activation = _owed_activation(repo, base, target_sha)
     blockers = container_replacement_blockers(
       target_sha, repo, local_change_base=base,
     )
@@ -1579,83 +1576,79 @@ def _git_blob(repo: Path, rev: str, path: str) -> bytes | None:
   return blob.stdout if blob.returncode == 0 else None
 
 
-def _locked_requirements(lock: bytes) -> frozenset[str] | None:
-  """A pip lock's requirement entries with artifact hashes and comments removed.
+def _lock_entries(lock: bytes) -> dict[str, frozenset[str]] | None:
+  """A pip lock's requirement entries, each with its accepted artifact hashes.
 
-  Each logical (backslash-continued) line keeps every token except
-  ``--hash=...``, so any change to a name, version, marker, extra, or pip
-  option still differs. Undecodable input fails closed.
+  Each logical (backslash-continued) line is keyed by every token except
+  ``--hash=...`` and comments, so any change to a name, version, marker,
+  extra, or pip option is a different entry. Undecodable input fails closed.
   """
   try:
     text = lock.decode("utf-8")
   except UnicodeDecodeError:
     return None
-  entries: set[str] = set()
+  entries: dict[str, frozenset[str]] = {}
   for logical in re.sub(r"\\\r?\n", " ", text).splitlines():
-    line = re.sub(r"(^|\s)#.*$", "", logical)
-    tokens = [token for token in line.split() if not token.startswith("--hash=")]
-    if tokens:
-      entries.add(" ".join(tokens))
-  return frozenset(entries)
+    tokens = re.sub(r"(^|\s)#.*$", "", logical).split()
+    key = " ".join(token for token in tokens if not token.startswith("--hash="))
+    if key:
+      hashes = {token for token in tokens if token.startswith("--hash=")}
+      entries[key] = entries.get(key, frozenset()) | hashes
+  return entries
 
 
-def _image_lock_pins_target_packages(
-  repo: Path, target_lock: bytes, expected: str,
+def image_installs_python_input(
+  repo: Path, path: str, content: bytes | None,
 ) -> bool:
-  """Whether the image's own lock pins exactly the target lock's packages.
+  """Whether this image already installs one Python package input's ``content``.
 
-  The image records only its lock's hash. Recover those bytes from the
-  image's build commit and prove them against that hash before comparing, so a
-  mutable or missing object can never stand in for the installed environment.
-  A lock that changes only artifact hashes (for example a corrected checksum
-  for another platform's wheel) installs the same distributions, so the running
-  image can already import and check the target's source.
+  The image records each input's hash. ``requirements.txt`` must match it
+  exactly. The lock may also keep the same entries and only add artifact
+  hashes (for example another platform's wheel): the image's own lock is
+  recovered from its build commit and proven against the recorded hash, so a
+  mutable or missing object never stands in for the installed environment.
+  A dropped or replaced hash is not installed: it can revoke the artifact the
+  image holds. Missing provenance or content fails closed.
   """
-  build_sha = str(_build_info().get("sha") or "").strip()
-  if not re.fullmatch(r"[0-9a-f]{40}", build_sha):
+  baked = _build_info().get("image_inputs")
+  expected = baked.get(path) if isinstance(baked, dict) else None
+  if content is None or not isinstance(expected, str):
     return False
-  image_lock = _git_blob(repo, build_sha, _PYTHON_LOCK_INPUT)
+  if hashlib.sha256(content).hexdigest() == expected:
+    return True
+  if path != _PYTHON_LOCK_INPUT:
+    return False
+  image = frozen_image_sha()
+  image_lock = _git_blob(repo, image, path) if image else None
   if image_lock is None or hashlib.sha256(image_lock).hexdigest() != expected:
     return False
-  image_entries = _locked_requirements(image_lock)
-  return image_entries is not None and image_entries == _locked_requirements(
-    target_lock,
+  installed, wanted = _lock_entries(image_lock), _lock_entries(content)
+  return (
+    installed is not None and wanted is not None
+    and installed.keys() == wanted.keys()
+    and all(installed[key] <= wanted[key] for key in installed)
   )
 
 
-def target_python_inputs_baked_into_image(
-  repo: Path,
-  target_sha: str | None,
-) -> bool:
-  """Whether this process's image already installs the target's Python inputs.
+def _served_bytes(repo: Path, path: str) -> bytes | None:
+  try:
+    return (repo / path).read_bytes()
+  except OSError:
+    return None
 
-  The served checkout can intentionally lag the image during an image-first
-  deployment. Compare immutable target objects with the hashes recorded by
-  that image instead of comparing either side with mutable working-tree bytes.
-  ``requirements.txt`` must match exactly; the lock may instead pin the same
-  packages with different artifact hashes (see
-  ``_image_lock_pins_target_packages``). Missing provenance, target objects,
-  or inputs fail closed.
-  """
-  if not target_sha or _rev(repo, target_sha) != target_sha:
-    return False
-  baked = _build_info().get("image_inputs")
-  if not isinstance(baked, dict) or not baked:
-    return False
-  for path in _PYTHON_DEPENDENCY_INPUTS:
-    expected = baked.get(path)
-    if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
-      return False
-    blob = _git_blob(repo, target_sha, path)
-    if blob is None:
-      return False
-    if hashlib.sha256(blob).hexdigest() == expected:
-      continue
-    if path != _PYTHON_LOCK_INPUT or not _image_lock_pins_target_packages(
-      repo, blob, expected,
-    ):
-      return False
-  return True
+
+def _without_python_inputs_installed_for(
+  repo: Path, paths: list[str], commit: str | None,
+) -> list[str]:
+  """``paths`` minus the Python package inputs when this image already installs
+  every one of them as ``commit`` declares; otherwise (including an
+  unresolvable commit) they stay owed."""
+  if not commit or _rev(repo, commit) != commit or not all(
+    image_installs_python_input(repo, path, _git_blob(repo, commit, path))
+    for path in _PYTHON_DEPENDENCY_INPUTS
+  ):
+    return paths
+  return [path for path in paths if path not in _PYTHON_DEPENDENCY_INPUTS]
 
 
 def _incoming_activation_impact(
@@ -1664,10 +1657,24 @@ def _incoming_activation_impact(
   target_sha: str | None,
 ) -> PlatformActivationImpact:
   """Classify target work that is not already proven active in this image."""
-  paths = _activation_paths_between(repo, before, target_sha)
-  if target_python_inputs_baked_into_image(repo, target_sha):
-    paths = [path for path in paths if path not in _PYTHON_DEPENDENCY_INPUTS]
-  return platform_activation.classify_activation(paths)
+  return platform_activation.classify_activation(
+    _without_python_inputs_installed_for(
+      repo, _activation_paths_between(repo, before, target_sha), target_sha,
+    ),
+  )
+
+
+def _owed_activation(
+  repo: Path, before: str, target: str,
+) -> PlatformActivationImpact:
+  """Everything the running process owes once it serves ``target``: its
+  still-pending activation plus the changes from ``before``."""
+  return platform_activation.classify_activation(
+    _without_python_inputs_installed_for(repo, [
+      *_pending_activation_paths(repo),
+      *_activation_paths_between(repo, before, target),
+    ], target),
+  )
 
 
 def activation_changes_python_dependencies(
@@ -1712,10 +1719,19 @@ def _paths_already_active_in_image(
     path for path in paths
     if not (
       platform_activation.path_is_image_owned(path)
-      and isinstance(baked.get(path), str)
-      and baked[path] == current.get(path)
+      and _image_runs_served(repo, path, baked, current)
     )
   ]
+
+
+def _image_runs_served(
+  repo: Path, path: str, baked: dict, current: dict[str, str],
+) -> bool:
+  """Whether this image already runs the served content of one image input:
+  the exact recorded bytes, or Python package inputs it installs."""
+  if path in _PYTHON_DEPENDENCY_INPUTS:
+    return image_installs_python_input(repo, path, _served_bytes(repo, path))
+  return isinstance(baked.get(path), str) and baked[path] == current.get(path)
 
 
 def _pending_activation_paths(
@@ -1827,7 +1843,10 @@ def image_input_drift(repo: Path = PLATFORM_REPO) -> list[str] | None:
   installed = _dependency_receipt()
   return sorted(
     path for path in candidates
-    if installed.get(path, baked.get(path)) != current.get(path)
+    if (
+      installed[path] != current.get(path) if path in installed
+      else not _image_runs_served(repo, path, baked, current)
+    )
   )
 
 
@@ -2821,10 +2840,7 @@ def _prepare(
   # The image is owed for this release's changes and for any activation the
   # running image still owes (a Finish after the source already contains the
   # release has no incoming changes but still needs its image).
-  impact = platform_activation.classify_activation([
-    *_pending_activation_paths(repo),
-    *_activation_paths_between(repo, snapshot, prepared),
-  ])
+  impact = _owed_activation(repo, snapshot, prepared)
   requires_image = (
     platform_activation.ActivationLevel.IMAGE_REBUILD.value
     in impact["required_actions"]
@@ -3243,7 +3259,7 @@ def release_packages_missing_from_image(
   Running an older image under source from a newer release (historical
   image-only rollback) is unsupported: that source declares Python packages
   the image does not have. The checkout is refused when any package input is
-  exactly its release's yet differs from this image's, and this image is not
+  exactly its release's yet not installed by this image, and this image is not
   provably that release or newer. A live update record is settled before
   this runs; image-first moves (an image newer than the source) and local
   package declarations stay allowed.
@@ -3259,13 +3275,10 @@ def release_packages_missing_from_image(
   # path, never a release's input that the image provably lacks.
   differs = False
   for path in _PYTHON_DEPENDENCY_INPUTS:
-    try:
-      served = (repo / path).read_bytes()
-    except OSError:
+    served = _served_bytes(repo, path)
+    if served is None or image_installs_python_input(repo, path, served):
       continue
-    if hashlib.sha256(served).hexdigest() == baked.get(path):
-      continue
-    if _blob_bytes(repo, release, path) == served:
+    if _git_blob(repo, release, path) == served:
       differs = True
   if not differs:
     return None
@@ -3276,18 +3289,6 @@ def release_packages_missing_from_image(
     "this container image; starting an older image under newer source is not "
     "supported. Replace the container with the release's image."
   )
-
-
-def _blob_bytes(repo: Path, commit: str, path: str) -> bytes | None:
-  try:
-    shown = subprocess.run(
-      ["git", "-C", str(repo), "show", f"{commit}:{path}"],
-      capture_output=True, check=False, timeout=_GIT_TIMEOUT,
-      env=_scrubbed_git_env(repo),
-    )
-  except (OSError, subprocess.SubprocessError):
-    return None
-  return shown.stdout if shown.returncode == 0 else None
 
 
 def _refuse_source_newer_than_image_packages(repo: Path, image: str | None) -> None:
