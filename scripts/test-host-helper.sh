@@ -96,6 +96,16 @@ for _ in $(seq 1 60); do
 done
 [[ $(docker inspect -f '{{.State.Health.Status}}' mobius) == healthy ]] \
   || fail "the previous release did not become healthy"
+# An owner's instance has an owner; its service token authenticates the
+# chat drain the worker asks for before the cutover.
+docker exec mobius curl -fsS -o /dev/null -X POST -H 'Content-Type: application/json' \
+  -d '{"username":"owner","password":"host-helper-owner-password"}' \
+  http://127.0.0.1:8000/api/auth/setup || fail "owner setup failed"
+for _ in $(seq 1 30); do
+  docker exec mobius test -s /data/service-token.txt && break
+  sleep 2
+done
+docker exec mobius test -s /data/service-token.txt || fail "the instance has no service token"
 
 echo "2. the owner installs the helper once"
 # Compose labels name this checkout; the installer freezes that topology.
