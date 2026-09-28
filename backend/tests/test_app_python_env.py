@@ -493,7 +493,7 @@ def test_missing_declared_lock_fails_the_build_clearly(tmp_path):
     app_python_env.prepare_env(tmp_path, 7, root)
 
 
-def test_boot_discards_unlinked_builds_and_pending_links_only(tmp_path):
+def test_boot_discards_unlinked_builds_only(tmp_path):
   builds = tmp_path / "app-envs" / "builds"
   kept, orphan = builds / "kept", builds / "orphan"
   _fake_env(kept)
@@ -501,10 +501,76 @@ def test_boot_discards_unlinked_builds_and_pending_links_only(tmp_path):
   parent = app_python_env.envs_parent(tmp_path, 7)
   parent.mkdir(parents=True)
   (parent / "key").symlink_to(os.path.relpath(kept, parent))
-  (parent / ".key.pending").symlink_to(os.path.relpath(orphan, parent))
   app_python_env.discard_interrupted_builds(tmp_path)
   assert kept.is_dir() and not orphan.exists()
   assert [path.name for path in parent.iterdir()] == ["key"]
+
+
+def test_build_step_wait_is_bounded_when_an_escaped_child_holds_the_pipes(tmp_path):
+  import signal
+  import time
+  pid_file = tmp_path / "escaped.pid"
+  child = f"import os, time; open({str(pid_file)!r}, 'w').write(str(os.getpid())); time.sleep(60)"
+  program = (
+    "import subprocess, sys, time\n"
+    f"subprocess.Popen([sys.executable, '-c', {child!r}], start_new_session=True)\n"
+    "time.sleep(60)\n"
+  )
+  started = time.monotonic()
+  try:
+    with pytest.raises(app_python_env.PythonEnvBuildError, match="exceeded 1 seconds"):
+      app_python_env._run([sys.executable, "-c", program], step="Smoke", timeout=1, env=dict(os.environ))
+    assert time.monotonic() - started < 1 + app_python_env._REAP_SECONDS + 5
+  finally:
+    for _ in range(50):
+      if pid_file.exists() and pid_file.read_text():
+        break
+      time.sleep(0.1)
+    if pid_file.exists() and pid_file.read_text():
+      try:
+        os.kill(int(pid_file.read_text()), signal.SIGKILL)
+      except ProcessLookupError:
+        pass
+
+
+def _staged(tmp_path, name: str, key: str = "k") -> app_python_env.StagedEnv:
+  build = tmp_path / "app-envs" / "builds" / name
+  _fake_env(build)
+  return app_python_env.StagedEnv(key=key, root=build, reused=False)
+
+
+def test_competing_publishers_of_one_key_never_replace_the_winner(tmp_path):
+  from concurrent.futures import ThreadPoolExecutor
+  staged = [_staged(tmp_path, f"b{index}") for index in range(8)]
+  with ThreadPoolExecutor(max_workers=8) as pool:
+    results = list(pool.map(lambda item: app_python_env.publish_env(tmp_path, 7, item), staged))
+  winners = [result for result in results if result is not None]
+  assert len(winners) == 1
+  link = app_python_env.envs_parent(tmp_path, 7) / "k"
+  assert link.resolve() == winners[0].build.resolve()
+  assert [path.name for path in (tmp_path / "app-envs" / "builds").iterdir()] == [winners[0].build.name]
+
+
+def test_rollback_of_a_publication_that_lost_the_race_keeps_the_winner(tmp_path):
+  winner = app_python_env.publish_env(tmp_path, 7, _staged(tmp_path, "winner"))
+  late = _staged(tmp_path, "late")
+  # Rolling back a publication whose link is not its own removes only its build.
+  app_python_env.unpublish_env(app_python_env.PublishedEnv(link=winner.link, build=late.root))
+  assert winner.link.resolve() == winner.build.resolve() and winner.build.is_dir()
+  assert not late.root.exists()
+  assert app_python_env.publish_env(tmp_path, 7, _staged(tmp_path, "loser")) is None
+  app_python_env.unpublish_env(None)
+  assert winner.link.resolve() == winner.build.resolve()
+  app_python_env.unpublish_env(winner)
+  assert not os.path.lexists(winner.link) and not winner.build.exists()
+
+
+def test_publication_replaces_only_a_link_whose_build_is_gone(tmp_path):
+  parent = app_python_env.envs_parent(tmp_path, 7)
+  parent.mkdir(parents=True)
+  (parent / "k").symlink_to("../builds/deleted")
+  published = app_python_env.publish_env(tmp_path, 7, _staged(tmp_path, "fresh"))
+  assert published is not None and (parent / "k").resolve() == published.build.resolve()
 
 
 # --- Apply -----------------------------------------------------------------
@@ -693,6 +759,34 @@ def test_store_update_rebuilds_for_a_new_lock_and_a_failed_build_keeps_the_old_o
   assert db.get(models.App, app_id).runtime_revision == live
   assert _keyed(_data_dir(), app_id, "a==2\n").exists()
   assert not _keyed(_data_dir(), app_id, "brokenpkg==1\n").exists()
+
+
+def test_store_update_whose_merged_lock_diverges_is_refused_and_leaves_no_build(
+  client, auth, db, monkeypatch, store,
+):
+  builds = _fake_builds(monkeypatch)
+  padding = "".join(f"# {index}\n" for index in range(8))
+  first = store(client, auth, lock=f"a==1\n{padding}b==1\n", version="1.0.0")
+  assert first.status_code == 201, first.text
+  app_id = first.json()["id"]
+  source = Path(db.get(models.App, app_id).source_dir)
+  (source / "requirements.lock").write_text(f"a==9\n{padding}b==1\n")
+  applied = _apply(client, auth, source)
+  assert applied.status_code == 200, applied.text
+  db.expire_all()
+  live = db.get(models.App, app_id).runtime_revision
+
+  diverged = store(client, auth, lock=f"a==1\n{padding}b==2\n", version="1.1.0")
+
+  assert diverged.status_code == 409, diverged.text
+  assert diverged.json()["detail"]["code"] == "python_lock_diverged"
+  assert builds[-1] == f"a==1\n{padding}b==2\n"
+  db.expire_all()
+  assert db.get(models.App, app_id).runtime_revision == live
+  linked = {
+    link.resolve() for link in app_python_env.envs_parent(_data_dir(), app_id).iterdir()
+  }
+  assert {path.resolve() for path in (_data_dir() / "app-envs" / "builds").iterdir()} == linked
 
 
 # --- GC --------------------------------------------------------------------------

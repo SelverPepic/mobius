@@ -184,11 +184,15 @@ module-level setup (everything but its `__main__` block), or else a Python
 job's top-level imports. It is the app's own code running as the backend user
 with no sandbox, like the service itself, given inert `APP_*` values and
 throwaway storage. Each build step runs in its own process group, killed when
-the step ends or after its time limit (60 s for the smoke run). A matching
-environment is reused. A build failure fails the Apply or install with pip's
-diagnostics, which name the package, and the previous revision stays live. A
-Store update whose merged local edits change the lock is refused, not built
-inside the install's database transaction.
+the step ends or after its time limit (60 s for the smoke run). That cleanup
+is best effort, since a process that calls `setsid` leaves the group, but a
+build never waits past its limits. A matching environment is reused. A build
+failure fails the Apply or install with pip's diagnostics, which name the
+package, and the previous revision stays live. A Store install or update
+builds from the fetched package before its database transaction, so it
+smoke-tests the fetched service. If the owner's local edits merge into that
+update, the merged service is not what was tested. A merge that changes the
+lock is refused rather than built inside the transaction.
 
 The declaring revision's service, preload host, and every job run with the
 environment's `bin` first on `PATH`, so a spawned `python3` is the app's too.
@@ -199,7 +203,9 @@ the app is applied or installed. Other jobs keep their own interpreter.
 
 Nothing falls back to the platform interpreter. After an image replacement
 that changes the interpreter, the key no longer matches, and an accepted
-revision whose manifest cannot be read is treated the same way. Service calls
+revision whose manifest cannot be read is treated the same way. A revision
+with no `mobius.json` at all is deliberately undeclared, because accepted
+revisions may legitimately lack one. Service calls
 answer 503 and the app's jobs log a failure until Apply rebuilds the
 environment, which needs network. Environments that no retained runtime
 revision references are removed with those revisions.

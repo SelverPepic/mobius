@@ -24,10 +24,19 @@ Lifecycle:
   smoke run of the app's Python entry. The smoke run executes the app's own
   setup code as the backend user with no sandbox: it is reviewed app code,
   like the service it checks. Every build step runs in its own process group,
-  which is killed when the step ends or times out. A matching env is reused;
-  a failure fails the Apply or install, so the previous revision stays live.
+  which is killed when the step ends or times out; this is best effort, since
+  a descendant that calls ``setsid`` leaves the group, but waiting for a step
+  is always bounded. A matching env is reused; a failure fails the Apply or
+  install, so the previous revision stays live. A Store install or update
+  builds from the fetched package before its database transaction, so the
+  smoke run checks the fetched service. When local edits are merged into the
+  update, the locally merged service is not what was smoke-tested; only a
+  changed lock is detected (and refused).
 - Use (``resolve_env``): a declaring revision gets its env or
-  ``PythonEnvUnavailable``, never the platform interpreter. An image
+  ``PythonEnvUnavailable``, never the platform interpreter. A revision with no
+  mobius.json is deliberately undeclared: accepted revisions may legitimately
+  lack one (Store sources without a runtime manifest, legacy baselines). A
+  manifest that exists but cannot be read fails closed instead. An image
   replacement that changes the interpreter changes the key, so the process
   fails with a message telling the owner to Apply the app again, which
   rebuilds it (with network). ``activated_environment`` puts the env's
@@ -297,6 +306,26 @@ def _kill_group(pid: int) -> None:
     pass
 
 
+_REAP_SECONDS = 5
+
+
+def _stop(process: subprocess.Popen) -> None:
+  """Kill a step's process group and reap it within a bound.
+
+  Best effort: a descendant that left the group (``setsid``) survives the
+  group kill and may still hold the output pipes, so they are closed rather
+  than drained.
+  """
+  _kill_group(process.pid)
+  try:
+    process.wait(timeout=_REAP_SECONDS)
+  except subprocess.TimeoutExpired:
+    pass
+  for stream in (process.stdout, process.stderr):
+    if stream is not None:
+      stream.close()
+
+
 def _run(command: list[str], *, step: str, timeout: int, env: dict[str, str], cwd=None) -> None:
   try:
     process = subprocess.Popen(
@@ -307,16 +336,16 @@ def _run(command: list[str], *, step: str, timeout: int, env: dict[str, str], cw
   except OSError as exc:
     raise PythonEnvBuildError(f"{step} could not start: {exc}") from exc
   try:
+    # A descendant holding the pipes keeps this from returning, so the
+    # step's own deadline also bounds waiting for them.
     stdout, stderr = process.communicate(timeout=timeout)
   except subprocess.TimeoutExpired as exc:
-    _kill_group(process.pid)
-    process.communicate()
+    _stop(process)
     raise PythonEnvBuildError(f"{step} exceeded {timeout} seconds.") from exc
   except BaseException:
-    _kill_group(process.pid)
-    process.communicate()
+    _stop(process)
     raise
-  # Nothing a step started outlives it.
+  # Best effort: stop anything the step left running in its process group.
   _kill_group(process.pid)
   if process.returncode != 0:
     raise PythonEnvBuildError(f"{step} failed:\n{_tail(stdout, stderr)}")
@@ -425,35 +454,49 @@ def prepare_env(
 
 
 def publish_env(data_dir: Path | str, app_id: int, staged: StagedEnv) -> PublishedEnv | None:
-  """Atomically link a validated build at its keyed location.
+  """Link a validated build at its keyed location, never replacing a link.
 
-  Returns what was created, or None when an existing env was reused.
+  Creating the symlink at its final name is atomic and exclusive, so of two
+  overlapping publications of one key exactly one wins; the loser discards
+  its equivalent build. Returns what was created, or None when an existing
+  env is used.
   """
   target = envs_parent(data_dir, app_id) / staged.key
   if staged.reused:
     return None
   target.parent.mkdir(parents=True, exist_ok=True)
-  pending = target.parent / f".{staged.key}.{uuid.uuid4().hex[:8]}"
-  os.symlink(os.path.relpath(staged.root, target.parent), pending)
-  try:
-    pending.rename(target)
-  except OSError:
-    pending.unlink()
-    if not _usable(target):
-      raise
-    # Another publication won; its env is equivalent.
-    shutil.rmtree(staged.root)
-    return None
-  return PublishedEnv(link=target, build=staged.root)
+  relative = os.path.relpath(staged.root, target.parent)
+  for _attempt in range(2):
+    try:
+      os.symlink(relative, target)
+      return PublishedEnv(link=target, build=staged.root)
+    except FileExistsError:
+      if _usable(target):
+        # Same key, so an equivalent build from the same lock and interpreter.
+        shutil.rmtree(staged.root)
+        return None
+      if not target.is_symlink():
+        raise
+      # A link whose build is gone publishes nothing; replace it once.
+      target.unlink(missing_ok=True)
+  raise PythonEnvBuildError(f"Could not publish the Python environment `{staged.key}`.")
 
 
 def unpublish_env(published: PublishedEnv | None) -> None:
-  """Undo ``publish_env`` for a rolled-back Apply or install."""
-  if published is None:
+  """Undo ``publish_env`` for a rolled-back Apply or install.
+
+  Only a link that still points at this publication's own build is removed.
+  """
+  if published is None or published.build is None:
     return
-  published.link.unlink(missing_ok=True)
-  if published.build is not None:
-    shutil.rmtree(published.build, ignore_errors=True)
+  link = published.link
+  try:
+    ours = link.is_symlink() and link.resolve() == published.build.resolve()
+  except OSError:
+    ours = False
+  if ours:
+    link.unlink(missing_ok=True)
+  shutil.rmtree(published.build, ignore_errors=True)
 
 
 def discard_env(staged: StagedEnv | None) -> None:
@@ -481,7 +524,7 @@ def remove_app_envs(data_dir: Path | str, app_id: int) -> None:
 
 
 def discard_interrupted_builds(data_dir: Path | str) -> None:
-  """Remove builds and pending links no app uses; call only before Apply or install can run."""
+  """Remove builds no app links to; call only before Apply or install can run."""
   root = Path(data_dir) / ENVS_DIRNAME
   builds = _builds(data_dir)
   if not builds.is_dir():
@@ -491,9 +534,7 @@ def discard_interrupted_builds(data_dir: Path | str) -> None:
     if not parent.name.isdigit() or not parent.is_dir():
       continue
     for link in parent.iterdir():
-      if link.name.startswith("."):
-        link.unlink()
-      elif link.is_symlink():
+      if link.is_symlink():
         linked.add(link.resolve())
   for build in builds.iterdir():
     if build.resolve() not in linked:
@@ -519,8 +560,6 @@ def prune_envs(data_dir: Path | str, app_id: int, kept_runtimes) -> int:
       return 0
   removed = 0
   for env in parent.iterdir():
-    if env.name.startswith("."):
-      continue
     if env.name not in referenced:
       _remove_env(env, _builds(data_dir))
       removed += 1
