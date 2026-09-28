@@ -129,7 +129,15 @@ nonce=$(queue "$TARGET")
 wait_status "$nonce" no_change
 if [[ -n $SEED ]]; then
   target_revision=$(latest "$ROOT")
-  active=$(python3 -c 'import json; print(json.load(open("/var/lib/mobius-rebuild/workers.json"))["active"]["revision"])')
+  # The worker reports before it exits; the launcher then settles the
+  # candidate. Wait for the service to finish and the record to name it.
+  active_revision() { python3 -c 'import json; print(json.load(open("/var/lib/mobius-rebuild/workers.json"))["active"]["revision"])'; }
+  for _ in $(seq 1 60); do
+    if ! systemctl is-active --quiet mobius-rebuild.service \
+       && [[ $(active_revision) == "$target_revision" ]]; then break; fi
+    sleep 2
+  done
+  active=$(active_revision)
   [[ $active == "$target_revision" ]] \
     || fail "the image's worker revision $target_revision did not become active (active: $active; adoption: $adoption)"
   [[ $(field "$STATUS" 'd.get("worker_revision")') == "$target_revision" ]] \

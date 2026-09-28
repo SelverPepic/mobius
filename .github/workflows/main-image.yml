@@ -121,7 +121,10 @@ jobs:
 
   promote-main:
     if: github.repository == 'mobius-os/mobius'
-    needs: publish
+    # A release is promoted only once its worker has proven it reaches an
+    # installed launcher by itself. (Until the previous release has a
+    # launcher, that check passes with nothing to prove.)
+    needs: [publish, host-helper-adoption]
     runs-on: ubuntu-latest
     concurrency:
       group: mobius-main-image-promotion

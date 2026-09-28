@@ -106,8 +106,12 @@ def execute(worker: dict, command: str) -> int:
     ).returncode
 
 
-def settle_candidate(ran: dict, result: int, before: bytes) -> None:
-    """Promote the candidate that just ran if it proved itself, else drop it."""
+def settle_candidate(ran: dict, result: int, before: bytes, replaced: str) -> None:
+    """Promote the candidate that just ran if it proved itself, else drop it.
+
+    ``replaced`` is the active worker's digest when the candidate started. A
+    newer worker installed meanwhile (the installer waits only for the
+    worker's lock) is never superseded by this older decision."""
     after = _status()
     if after == before and result == 0:
         return  # nothing was queued: the candidate has not been tried
@@ -124,11 +128,11 @@ def settle_candidate(ran: dict, result: int, before: bytes) -> None:
         stored = json.loads(INDEX.read_text(encoding="utf-8"))
         if (stored.get("candidate") or {}).get("sha256") == ran["sha256"]:
             stored["candidate"] = None
-        if proven:
+        if not proven:
+            stored["rejected"] = sorted({*stored.get("rejected", []), ran["sha256"]})
+        elif (stored.get("active") or {}).get("sha256") == replaced:
             stored["previous"] = stored.get("active")
             stored["active"] = entry
-        else:
-            stored["rejected"] = sorted({*stored.get("rejected", []), ran["sha256"]})
         _publish(stored)
 
 
@@ -167,7 +171,7 @@ def main(argv: list[str]) -> int:
     before = _status()
     result = execute(ran, "run")
     if ran is index["candidate"]:
-        settle_candidate(ran, result, before)
+        settle_candidate(ran, result, before, index["active"]["sha256"])
     return result
 
 

@@ -85,7 +85,8 @@ async def test_reviewed_settings_request_reaches_host_worker_without_connect(
   assert not (inbox / "request.json").exists()
   assert events[0] == "drain"
   assert events[1][0] == "compose"
-  assert events[1][2] == f"{host.IMAGE}:sha-{target}"
+  # Compose starts the verified image through the helper-owned pinned tag.
+  assert events[1][2] == host.TARGET_TAG
   assert events[2] == ("verified", "new-container", target)
   status = json.loads((control / "status.json").read_text(encoding="utf-8"))
   assert status["state"] == "succeeded"

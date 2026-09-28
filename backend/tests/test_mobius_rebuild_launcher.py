@@ -214,6 +214,18 @@ def test_a_newer_offer_made_by_a_succeeding_candidate_survives(state, monkeypatc
   _run_launcher(monkeypatch, {2: (0, {"state": "succeeded"}, offer)})
   index = _index(state)
   assert (index["active"]["revision"], index["candidate"]["revision"]) == (2, 3)
+  # The promoted worker's file survived the newer offer: it still runs.
+  loaded = launcher.load_index()
+  assert loaded and loaded["active"]["path"].read_bytes() == worker(2)
+
+
+def test_a_worker_installed_while_a_candidate_ran_is_not_superseded(state, monkeypatch):
+  _with_candidate(state)
+  reinstall = lambda: host.seed_worker(worker(4))  # noqa: E731
+  _run_launcher(monkeypatch, {2: (0, {"state": "succeeded"}, reinstall)})
+  index = _index(state)
+  assert index["active"]["revision"] == 4 and index["candidate"] is None
+  assert launcher.load_index()["active"]["revision"] == 4
 
 
 def test_a_failing_candidate_never_reactivates_itself(state, monkeypatch):
@@ -415,7 +427,24 @@ def test_a_claimed_directory_is_left_not_deleted(tmp_path):
   assert (claimed / "keep").exists()
 
 
-def test_extraction_output_is_bounded_by_the_real_reader():
-  with pytest.raises(RuntimeError, match="too large"):
-    host._bounded_output(["python3", "-c", "print('x' * 100)"], 10)
+def test_extraction_is_bounded_while_reading():
+  import time
   assert host._bounded_output(["python3", "-c", "print('ok')"], 10) == b"ok\n"
+  started = time.monotonic()
+  # An endless stream is cut off at the size bound, not after it ends.
+  with pytest.raises(RuntimeError, match="too large"):
+    host._bounded_output(
+      ["python3", "-c", "import sys\nwhile True: sys.stdout.write('x' * 65536)"], 1024,
+    )
+  # A stalled reader is killed at the deadline.
+  with pytest.raises(RuntimeError, match="timed out"):
+    host._bounded_output(["python3", "-c", "import time; time.sleep(30)"], 1024, timeout=0.5)
+  assert time.monotonic() - started < 10
+
+
+def test_recovery_restores_the_journaled_previous_image(journal, monkeypatch):
+  tagged = []
+  monkeypatch.setattr(host.subprocess, "run", lambda args, **_k: tagged.append(args))
+  monkeypatch.setattr(host, "wait_healthy", lambda *a: False)
+  host.recover({}, host.read_transaction())
+  assert ["docker", "tag", TXN["previous_image"], host.ROLLBACK_TAG] in tagged

@@ -200,8 +200,11 @@ The candidate runs the next replacement. If that replacement succeeds, the
 candidate becomes the active worker. Any other outcome (a reported failure,
 rollback, or crash) drops it for good, and the proven active worker handles
 the retry. Withdrawn or already-running requests say nothing about the worker
-and leave it as candidate. `reconcile` always runs the proven worker. A faulty
-worker change therefore costs one update attempt, never the ability to update.
+and leave it as candidate. A worker installed while the candidate ran is never
+superseded by that candidate. `reconcile` always runs the proven worker. A
+faulty worker change therefore costs one update attempt, never the ability to
+update. Worker files are small and never deleted, so any recorded worker can
+still run.
 
 Worker changes reach installed hosts through ordinary updates, taking effect
 from the replacement after the release that ships them, so keep each change
@@ -212,7 +215,11 @@ revision, and CI refuses any change to a released revision's recorded digest.
 
 Before it drains the running app, a worker records the replacement in
 `/var/lib/mobius-rebuild/transaction.json`: operation, nonce, target and
-previous image IDs. The record is removed only once the outcome is settled.
+previous image IDs. Compose starts the verified image through a helper-owned
+tag pointed at its ID (`mobius-rebuild-target`), and recovery restores the
+journaled previous ID. The record is removed only once the outcome is settled.
+Failure handling, rollback and settlement all run under the replacement lock
+that the installer and `reconcile` also take.
 If a worker is interrupted, `reconcile` (after the run and at boot) finishes
 the replacement when the target image is running, healthy and serving the
 requested revision. Otherwise it restores the previous container with the

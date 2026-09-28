@@ -36,6 +36,9 @@ CONTAINER_RE = re.compile(r"^[0-9a-f]{12,64}$")
 IMAGE = "ghcr.io/mobius-os/mobius"
 IMAGE_SOURCE = "https://github.com/mobius-os/mobius"
 ROLLBACK_TAG = f"{IMAGE}:mobius-rebuild-last-good"
+# Helper-owned local tag pointed at the verified image ID right before Compose
+# starts it, so a concurrent pull of the release tag cannot change what runs.
+TARGET_TAG = f"{IMAGE}:mobius-rebuild-target"
 ACTIVE_STATES = {"queued", "preparing", "replacing", "verifying"}
 HANDOFF_VERSION = "external-cutover-v1"
 # Version 2 requests carry the app's nonce, echoed as ``request_nonce`` so the
@@ -464,15 +467,11 @@ def _worker_entry(source: bytes, revision: int, origin: str) -> dict:
 
 
 def _publish_index(index: dict) -> None:
-    """Publish the selection record, then drop files no entry names."""
+    """Publish the selection record. Worker files are small and never
+    deleted: a running candidate and the record may still name any of them."""
     _durable_write(
         WORKER_INDEX, json.dumps(index, separators=(",", ":")).encode(), 0o600,
     )
-    keep = {(index.get(key) or {}).get("file")
-            for key in ("active", "candidate", "previous")}
-    for stale in WORKERS.glob("*.py"):
-        if stale.name not in keep:
-            stale.unlink(missing_ok=True)
 
 
 def _checked(source: bytes) -> tuple[int | None, str | None]:
@@ -550,16 +549,38 @@ def seed_worker(source: bytes) -> str:
     return f"installed: revision {revision}"
 
 
-def _bounded_output(args: list[str], limit: int) -> bytes:
-    """Run ``args`` with a deadline (the child is killed when it expires) and
-    return its output, refusing more than ``limit`` bytes."""
-    with tempfile.TemporaryFile() as out:
-        subprocess.run(args, stdout=out, stderr=subprocess.DEVNULL,
-                       check=True, timeout=300)
-        if out.tell() > limit:
-            raise RuntimeError("the image's worker is too large")
-        out.seek(0)
-        return out.read()
+def _bounded_output(args: list[str], limit: int, timeout: float = 300) -> bytes:
+    """Run ``args`` and collect at most ``limit`` bytes of its output within
+    ``timeout`` seconds; the child is killed as soon as either is exceeded."""
+    import select
+
+    deadline = time.monotonic() + timeout
+    chunks: list[bytes] = []
+    size = 0
+    with subprocess.Popen(args, stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL) as process:
+        try:
+            assert process.stdout is not None
+            fd = process.stdout.fileno()
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("reading the image's worker timed out")
+                if not select.select([fd], [], [], remaining)[0]:
+                    continue
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > limit:
+                    raise RuntimeError("the image's worker is too large")
+                chunks.append(chunk)
+            if process.wait(timeout=max(deadline - time.monotonic(), 0.1)) != 0:
+                raise RuntimeError("the image's worker could not be read")
+        except BaseException:
+            process.kill()
+            raise
+    return b"".join(chunks)
 
 
 def worker_from_image(image_id: str) -> bytes:
@@ -718,9 +739,19 @@ def run() -> int:
     image_ref = None
     pulled_recorded = False
     replacement_started = False
+    lock = LOCK.open("a+")
     try:
-        with LOCK.open("a+") as lock:
-            acquire_lock(lock)
+        acquire_lock(lock)
+    except BlockingIOError:
+        lock.close()
+        write_status(config_value, operation_id=operation, state="failed",
+                     expected_sha=expected, code="already_running",
+                     message="Another container rebuild is already running.")
+        return 1
+    # Everything below, including rollback and transaction settlement after
+    # a failure, runs under the lock the installer and reconcile also take.
+    with lock:
+        try:
             if TRANSACTION.exists():
                 # An interrupted replacement is settled first: this unit's
                 # ExecStopPost reconcile recovers it, and the request stays
@@ -810,10 +841,10 @@ def run() -> int:
                          expected_sha=expected, code=None,
                          message="Rebuilding the container.")
             replacement_started = True
-            if inspect_image(image_ref, "{{.Id}}") != digest:
-                raise RuntimeError("the image tag moved during the replacement")
+            subprocess.run(["docker", "tag", digest, TARGET_TAG], check=True,
+                           text=True, capture_output=True)
             compose(config_value, "up", "-d", "--no-build", "--no-deps",
-                    "--force-recreate", "app", image=image_ref)
+                    "--force-recreate", "app", image=TARGET_TAG)
             write_status(config_value, operation_id=operation, state="verifying",
                          expected_sha=expected, message="Checking the new container.")
             if not wait_healthy(config_value):
@@ -829,7 +860,7 @@ def run() -> int:
             verify_served_generation(cid, expected)
             handoff_finalized = restart_ledger(
                 config_value, cid, "finalize-cutover", operation,
-                image=image_ref,
+                image=digest,
             )
             retain_images(image_ref, previous)
             if handoff_finalized:
@@ -848,38 +879,33 @@ def run() -> int:
                          message=message,
                          worker_adoption=adopt_from_image(digest))
             return 0
-    except BlockingIOError:
-        write_status(config_value, operation_id=operation, state="failed",
-                     expected_sha=expected, code="already_running",
-                     message="Another container rebuild is already running.")
-        return 1
-    except Exception as exc:
-        detail = str(exc)[:300]
-        if replacement_started and previous and expected:
-            try:
-                result = rollback(config_value, operation, expected,
-                                  "replacement_failed", detail)
-                if image_ref and pulled_recorded:
-                    discard_pulled_image(image_ref)
-                return result
-            except Exception as rollback_exc:
-                detail = f"{detail}; rollback failed: {str(rollback_exc)[:160]}"
-                write_status(config_value, operation_id=operation,
-                             state="needs_recovery", expected_sha=expected,
-                             code="rollback_failed", message=detail[:300])
-                return 1
-        if image_ref and pulled_recorded:
-            discard_pulled_image(image_ref)
-        # A failure before replacement leaves the running app in place.
-        clear_transaction()
-        write_status(config_value, operation_id=operation, state="failed",
-                     expected_sha=expected, code="replacement_failed", message=detail)
-        return 1
-    finally:
-        # Only the verified claim is ever removed; whatever is still in the
-        # inbox may be a newer request and stays for the next run or withdrawal.
-        if claim_verified:
-            _discard_claim(claimed)
+        except Exception as exc:
+            detail = str(exc)[:300]
+            if replacement_started and previous and expected:
+                try:
+                    result = rollback(config_value, operation, expected,
+                                      "replacement_failed", detail)
+                    if image_ref and pulled_recorded:
+                        discard_pulled_image(image_ref)
+                    return result
+                except Exception as rollback_exc:
+                    detail = f"{detail}; rollback failed: {str(rollback_exc)[:160]}"
+                    write_status(config_value, operation_id=operation,
+                                 state="needs_recovery", expected_sha=expected,
+                                 code="rollback_failed", message=detail[:300])
+                    return 1
+            if image_ref and pulled_recorded:
+                discard_pulled_image(image_ref)
+            # A failure before replacement leaves the running app in place.
+            clear_transaction()
+            write_status(config_value, operation_id=operation, state="failed",
+                         expected_sha=expected, code="replacement_failed", message=detail)
+            return 1
+        finally:
+            # Only the verified claim is ever removed; whatever is still in the
+            # inbox may be a newer request and stays for the next run or withdrawal.
+            if claim_verified:
+                _discard_claim(claimed)
 
 
 def write_transaction(value: dict) -> None:
@@ -937,6 +963,14 @@ def recover(config_value: dict, transaction: dict) -> None:
                 return
     except Exception:
         pass
+    # Restore exactly the journaled previous image, whatever the tag says now.
+    previous = str(transaction.get("previous_image") or "")
+    if previous.startswith("sha256:"):
+        try:
+            subprocess.run(["docker", "tag", previous, ROLLBACK_TAG],
+                           text=True, capture_output=True, timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            pass  # rollback reports whether the restore worked
     rollback(config_value, operation, expected, "worker_interrupted",
              "the replacement worker stopped before it finished")
 

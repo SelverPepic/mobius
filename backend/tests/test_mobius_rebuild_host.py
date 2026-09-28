@@ -378,7 +378,7 @@ def test_replacement_drains_then_rolls_back_after_cutover_error(tmp_path, monkey
 
   def compose(_config, *args, image=None, **_kwargs):
     order.append(f"compose:{image}")
-    if image == f"{host.IMAGE}:sha-{expected}":
+    if image == host.TARGET_TAG:
       raise RuntimeError("cutover failed")
 
   monkeypatch.setattr(host, "compose", compose)
@@ -391,7 +391,7 @@ def test_replacement_drains_then_rolls_back_after_cutover_error(tmp_path, monkey
   assert host.run() == 1
   assert order == [
     "drain",
-    f"compose:{host.IMAGE}:sha-{expected}",
+    f"compose:{host.TARGET_TAG}",
     f"compose:{host.ROLLBACK_TAG}",
   ]
   assert statuses[-1]["state"] == "rolled_back"
