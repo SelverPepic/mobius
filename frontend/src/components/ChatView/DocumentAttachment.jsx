@@ -1,11 +1,46 @@
 /* Real document thumbnails that unfold into a reader without leaving the chat. */
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { Download } from '@openai/apps-sdk-ui/components/Icon'
-import { apiFetch } from '../../api/client.js'
+import { BASE, apiFetch } from '../../api/client.js'
+import { mediaTokenParam } from '../../api/mediaToken.js'
 import { StandardMarkdown } from './markdown/BlockRenderer.jsx'
 
 const filePath = (chatId, name) =>
   `/chats/${encodeURIComponent(chatId)}/generated-files/${encodeURIComponent(name)}`
+
+async function freshFileUrl(chatId, name, preview = false) {
+  const token = await mediaTokenParam(chatId)
+  if (!token) throw new Error('File access unavailable')
+  return `${BASE}/api${filePath(chatId, name)}${token}${preview ? '&preview=true' : ''}`
+}
+
+const WHEEL_GESTURE_IDLE_MS = 280
+
+export function transferReaderWheel(event, gesture) {
+  const reader = event.currentTarget
+  const direction = Math.sign(event.deltaY)
+  if (!direction) return
+  const atEdge = direction > 0
+    ? reader.scrollTop + reader.clientHeight >= reader.scrollHeight - 1
+    : reader.scrollTop <= 1
+  const time = event.timeStamp
+  const newGesture = time - gesture.lastTime > WHEEL_GESTURE_IDLE_MS
+  const canTransfer = atEdge && gesture.edge === direction &&
+    (gesture.transferring || newGesture)
+  gesture.lastTime = time
+  gesture.edge = atEdge ? direction : 0
+  gesture.transferring = canTransfer
+  if (!atEdge) return
+
+  // The reader contains momentum. A new gesture made after arriving at its
+  // edge can continue in the chat, but the first gesture cannot spill over.
+  event.preventDefault()
+  if (canTransfer) {
+    const chat = reader.closest('.chat__scroll')
+    const distance = event.deltaY * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? reader.clientHeight : 1)
+    chat?.scrollBy({ top: distance, behavior: 'auto' })
+  }
+}
 
 function useCardVisibility(ref) {
   const [visible, setVisible] = useState(false)
@@ -110,16 +145,60 @@ function PdfThumbnail({ chatId, file, visible }) {
 }
 
 export default function DocumentAttachment({
-  file, chatId, downloadHref, previewSrc, expanded, onToggle,
+  file, chatId, expanded, onToggle,
 }) {
   const cardRef = useRef(null)
   const previewButtonRef = useRef(null)
   const collapseButtonRef = useRef(null)
   const focusAfterToggleRef = useRef(false)
+  const readerRef = useRef(null)
+  const wheelGestureRef = useRef({ lastTime: 0, edge: 0, transferring: false })
   const visible = useCardVisibility(cardRef)
   const isMarkdown = file.mime_type === 'text/markdown'
   const [retry, setRetry] = useState(0)
   const [report, setReport] = useState({ status: 'loading', text: '' })
+  const [pdfPreview, setPdfPreview] = useState({ status: 'loading', src: '' })
+  const [downloadError, setDownloadError] = useState(false)
+
+  useEffect(() => {
+    if (isMarkdown || !expanded) return undefined
+    let active = true
+    setPdfPreview({ status: 'loading', src: '' })
+    freshFileUrl(chatId, file.name, true)
+      .then(src => { if (active) setPdfPreview({ status: 'ready', src }) })
+      .catch(() => { if (active) setPdfPreview({ status: 'error', src: '' }) })
+    return () => { active = false }
+  }, [chatId, expanded, file.name, isMarkdown, retry])
+
+  useEffect(() => {
+    if (!expanded || !isMarkdown) return undefined
+    const reader = readerRef.current
+    if (!reader) return undefined
+    const gesture = wheelGestureRef.current
+    const onWheel = event => transferReaderWheel(event, gesture)
+    reader.addEventListener('wheel', onWheel, { passive: false })
+    return () => reader.removeEventListener('wheel', onWheel)
+  }, [expanded, isMarkdown])
+
+  async function download() {
+    setDownloadError(false)
+    try {
+      const href = await freshFileUrl(chatId, file.name)
+      const link = document.createElement('a')
+      link.href = href
+      link.download = file.name
+      link.style.display = 'none'
+      document.body.append(link)
+      link.click()
+      link.remove()
+    } catch {
+      setDownloadError(true)
+    }
+  }
+
+  function continueInChat() {
+    cardRef.current?.closest('.chat__scroll')?.scrollBy({ top: 240, behavior: 'smooth' })
+  }
 
   useEffect(() => {
     if (!isMarkdown || !visible) return undefined
@@ -183,12 +262,11 @@ export default function DocumentAttachment({
           <small>{kind} · {size}</small>
         </span>
       </button>
-      {downloadHref
-        ? <a className="chat__document-card-download" href={downloadHref} download={file.name} aria-label={`Download ${file.name}`} title="Download">
-            <Download width={17} height={17} aria-hidden="true" />
-          </a>
-        : <span className="chat__document-card-download" aria-disabled="true"><Download width={17} height={17} aria-hidden="true" /></span>}
+      <button className="chat__document-card-download" type="button" onClick={download} aria-label={`Download ${file.name}`} title="Download">
+        <Download width={17} height={17} aria-hidden="true" />
+      </button>
     </div>
+    {downloadError && <p className="chat__document-card-status" role="alert">Couldn’t download the file. Try again.</p>}
     {expanded && <>
       <header className="chat__document-card-toolbar">
         <div className="chat__document-card-title">
@@ -196,27 +274,32 @@ export default function DocumentAttachment({
           <span>{kind} · {size}</span>
         </div>
         <div className="chat__document-card-actions">
-          {downloadHref
-            ? <a href={downloadHref} download={file.name}>Download</a>
-            : <span aria-disabled="true">Download</span>}
+          <button type="button" onClick={download}>Download</button>
           <button ref={collapseButtonRef} type="button" onClick={toggle}>Collapse</button>
         </div>
       </header>
-      {isMarkdown ? <div className="chat__document-card-reader">
+      {isMarkdown ? <div ref={readerRef} className="chat__document-card-reader">
         {report.status === 'loading' && <p role="status">Loading Markdown preview…</p>}
         {report.status === 'error' && <div role="alert">
           <p>Couldn’t load the preview. You can try again or download the file.</p>
           <button type="button" onClick={() => setRetry(value => value + 1)}>Try again</button>
         </div>}
         {report.status === 'ready' && <StandardMarkdown text={report.text} />}
-      </div> : previewSrc
+      </div> : pdfPreview.status === 'ready'
         ? <iframe
             className="chat__document-card-iframe"
             title={`PDF preview: ${file.name}`}
-            src={previewSrc}
+            src={pdfPreview.src}
             referrerPolicy="no-referrer"
           />
-        : <p className="chat__document-card-status" role="status">Loading PDF preview…</p>}
+        : <p className="chat__document-card-status" role="status">
+          {pdfPreview.status === 'error' ? <>
+            Couldn’t load the PDF preview. <button type="button" onClick={() => setRetry(value => value + 1)}>Try again</button>
+          </> : 'Loading PDF preview…'}
+        </p>}
+      {!isMarkdown && <div className="chat__document-card-continue">
+        <button type="button" onClick={continueInChat}>Continue in chat</button>
+      </div>}
     </>}
   </article>
 }

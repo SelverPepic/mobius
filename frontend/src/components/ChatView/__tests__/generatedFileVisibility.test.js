@@ -22,7 +22,7 @@ const {
 } = await vite.ssrLoadModule(
   '/src/components/ChatView/Attachments.jsx',
 )
-const { default: DocumentAttachment, markdownCardExcerpt } = await vite.ssrLoadModule(
+const { default: DocumentAttachment, markdownCardExcerpt, transferReaderWheel } = await vite.ssrLoadModule(
   '/src/components/ChatView/DocumentAttachment.jsx',
 )
 
@@ -153,7 +153,7 @@ test('generated Markdown offers a content-preview card and Download without chan
 
   assert.match(html, /chat__document-card-paper/)
   assert.match(html, /aria-label="Expand review\.md preview"/)
-  assert.match(html, /chat__document-card-download/)
+  assert.match(html, /<button[^>]+aria-label="Download review\.md"/)
   assert.doesNotMatch(html, /preview=true/)
 })
 
@@ -161,7 +161,7 @@ test('generated PDF offers a first-page preview card and Download', () => {
   const html = renderGeneratedMessage(false)
   assert.match(html, /chat__document-card-pdf/)
   assert.match(html, /aria-label="Expand report\.pdf preview"/)
-  assert.match(html, /chat__document-card-download/)
+  assert.match(html, /<button[^>]+aria-label="Download report\.pdf"/)
   assert.doesNotMatch(html, /target="_blank"/)
 })
 
@@ -169,8 +169,6 @@ test('document cards enlarge in chat without losing the original download', () =
   const file = { name: 'report.pdf', size: 700, mime_type: 'application/pdf' }
   const props = {
     file, chatId: 'chat-generated-file',
-    downloadHref: '/api/report.pdf?token=short',
-    previewSrc: '/api/report.pdf?token=short&preview=true',
     onToggle() {},
   }
   const closed = renderToStaticMarkup(createElement(DocumentAttachment, { ...props, expanded: false }))
@@ -178,11 +176,43 @@ test('document cards enlarge in chat without losing the original download', () =
 
   assert.match(closed, /chat__document-card-pdf/)
   assert.doesNotMatch(closed, /<iframe/)
-  assert.match(closed, /download="report.pdf"/)
+  assert.match(closed, /aria-label="Download report\.pdf"/)
   assert.match(open, /chat__document-card--expanded/)
   assert.match(open, />Collapse<\/button>/)
-  assert.match(open, /<iframe[^>]+preview=true/)
-  assert.match(open, /download="report.pdf"/)
+  assert.match(open, /Loading PDF preview/)
+  assert.match(open, /Continue in chat/)
+  assert.match(open, />Download<\/button>/)
+})
+
+test('reader contains the momentum gesture, then transfers a deliberate new one to chat', () => {
+  const moves = []
+  const gesture = { lastTime: 0, edge: 0, transferring: false }
+  const chat = { scrollBy: move => moves.push(move) }
+  const reader = {
+    scrollTop: 600, clientHeight: 400, scrollHeight: 1000,
+    closest: () => chat,
+  }
+  const wheel = (timeStamp, deltaY) => {
+    let prevented = false
+    transferReaderWheel({
+      currentTarget: reader, timeStamp, deltaY, deltaMode: 0,
+      preventDefault: () => { prevented = true },
+    }, gesture)
+    return prevented
+  }
+  assert.equal(wheel(1000, 80), true)
+  assert.equal(wheel(1050, 30), true)
+  assert.equal(wheel(1170, 8), true)
+  assert.deepEqual(moves, [], 'inertia after reaching the edge stays inside the reader')
+  assert.equal(wheel(1600, 50), true)
+  assert.deepEqual(moves, [{ top: 50, behavior: 'auto' }])
+  assert.equal(wheel(1640, 20), true)
+  assert.equal(moves.length, 2, 'the deliberate second gesture continues in the chat')
+  reader.scrollTop = 300
+  assert.equal(wheel(1700, 40), false)
+  reader.scrollTop = 600
+  assert.equal(wheel(2000, 40), true)
+  assert.equal(moves.length, 2, 'moving back into the reader resets the handoff')
 })
 
 test('Markdown card shows a readable excerpt of the actual report', () => {

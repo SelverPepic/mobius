@@ -3688,6 +3688,9 @@
   border-radius: 8px;
   color: var(--text);
   text-decoration: none;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
 }
 
 .chat__document-card-download:hover {
@@ -3778,6 +3781,23 @@
   margin: 0;
   padding: 24px;
   color: var(--muted);
+}
+
+.chat__document-card-continue {
+  display: flex;
+  justify-content: flex-end;
+  padding: 9px 12px;
+  border-top: 1px solid var(--border-light);
+}
+
+.chat__document-card-continue button {
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
 }
 
 @media (prefers-reduced-motion: no-preference) {

@@ -84,8 +84,6 @@ export default function Attachments({ attachments, chatId }) {
           key={f.name}
           file={f}
           chatId={chatId}
-          downloadHref={href}
-          previewSrc={isMarkdown || !tokenParam ? '' : `${href}&preview=true`}
           expanded={previewOpen}
           onToggle={() => setExpandedName(previewOpen ? null : f.name)}
         />
