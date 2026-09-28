@@ -115,7 +115,7 @@ export default function DocumentAttachment({
   const cardRef = useRef(null)
   const previewButtonRef = useRef(null)
   const collapseButtonRef = useRef(null)
-  const previousExpandedRef = useRef(expanded)
+  const focusAfterToggleRef = useRef(false)
   const visible = useCardVisibility(cardRef)
   const isMarkdown = file.mime_type === 'text/markdown'
   const [retry, setRetry] = useState(0)
@@ -143,14 +143,18 @@ export default function DocumentAttachment({
   const kind = isMarkdown ? 'Markdown' : 'PDF'
   const size = `${Math.max(1, Math.round(file.size / 1024))} KB`
 
-  // The card changes size inside the transcript. Hand focus to its new control
-  // before paint so the browser does not reveal a stale focused node at the
-  // composer and pull the reader away from the document.
+  const toggle = () => {
+    focusAfterToggleRef.current = true
+    onToggle()
+  }
+
+  // When another card opens, this card may collapse too. Only the card the
+  // person clicked should claim focus during that shared state update.
   useLayoutEffect(() => {
-    if (previousExpandedRef.current !== expanded) {
-      (expanded ? collapseButtonRef : previewButtonRef).current?.focus({ preventScroll: true })
-    }
-    previousExpandedRef.current = expanded
+    if (!focusAfterToggleRef.current) return
+    focusAfterToggleRef.current = false
+    const target = expanded ? collapseButtonRef.current : previewButtonRef.current
+    target?.focus({ preventScroll: true })
   }, [expanded])
 
   return <article
@@ -164,7 +168,7 @@ export default function DocumentAttachment({
         className="chat__document-card-open"
         aria-label={`Expand ${file.name} preview`}
         aria-expanded={expanded}
-        onClick={onToggle}
+        onClick={toggle}
       >
         <div className="chat__document-card-visual" aria-hidden="true">
           {isMarkdown ? <div className="chat__document-card-paper">
@@ -195,7 +199,7 @@ export default function DocumentAttachment({
           {downloadHref
             ? <a href={downloadHref} download={file.name}>Download</a>
             : <span aria-disabled="true">Download</span>}
-          <button ref={collapseButtonRef} type="button" onClick={onToggle}>Collapse</button>
+          <button ref={collapseButtonRef} type="button" onClick={toggle}>Collapse</button>
         </div>
       </header>
       {isMarkdown ? <div className="chat__document-card-reader">
