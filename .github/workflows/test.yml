@@ -292,6 +292,41 @@ jobs:
         if: matrix.shard == 1
         run: scripts/test-boot-transaction.sh mobius-test:ci
 
+      - name: Verify the previous release can install this one
+        # Existing instances update from the release they run, with that
+        # release's own updater. A change it refuses (as the previous updater
+        # refused Python package changes) strands every instance, and unit
+        # tests of the new code alone cannot see it. Install this candidate
+        # from the newest published main image through the in-product update.
+        if: matrix.shard == 1
+        env:
+          BASE_SHA: ${{ github.event.merge_group.base_sha || github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          git fetch -q --unshallow origin || git fetch -q origin
+          # main-image publishes after each merge, so the base may still be
+          # building: use the newest published image at or before it.
+          previous=""
+          for sha in $(git rev-list --first-parent --max-count=30 "${BASE_SHA:-origin/main}"); do
+            if docker manifest inspect "ghcr.io/mobius-os/mobius:sha-$sha" >/dev/null 2>&1; then
+              previous=$sha
+              break
+            fi
+          done
+          [ -n "$previous" ] || { echo "no published image at or before ${BASE_SHA}"; exit 1; }
+          docker pull -q "ghcr.io/mobius-os/mobius:sha-$previous"
+          scripts/test-upgrade-path.sh "ghcr.io/mobius-os/mobius:sha-$previous" mobius-test:ci .
+
+      - name: "TEMPORARY (remove before merge): the check catches #1469"
+        if: matrix.shard == 1
+        run: |
+          prev=ghcr.io/mobius-os/mobius:sha-63cba455eec663b79cf925cf2da7782ff3c72729
+          bump=ghcr.io/mobius-os/mobius:sha-74cd67ae245875ee116ab1af194dc65a45866183
+          docker pull -q "$prev" && docker pull -q "$bump"
+          if scripts/test-upgrade-path.sh "$prev" "$bump" . 2>&1 | tee /tmp/regression.log; then
+            echo "the check passed a release that stranded older instances"; exit 1
+          fi
+          grep -q "refused to install the candidate" /tmp/regression.log
+
       - name: Start test container
         run: |
           # Image is already built and loaded above — compose uses it.
