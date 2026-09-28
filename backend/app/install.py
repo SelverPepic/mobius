@@ -492,22 +492,45 @@ def _trusted_origin_catalog_identity_matches(
   """Whether a local identity-free row has the catalog package's Git origin."""
   if app.manifest_url is not None or app.slug != manifest_id:
     return False
-  return _trusted_catalog_origin_matches(app, source_url)
+  return _trusted_catalog_origin_matches(app.source_dir, source_url)
 
 
 def _trusted_catalog_origin_matches(
-  app: models.App,
+  source_dir: str | Path,
   source_url: str,
 ) -> bool:
   """Whether an app checkout has the canonical catalog repository origin."""
   expected_origin = _trusted_catalog_origin_url(source_url)
   if expected_origin is None:
     return False
-  actual_origin = app_git.origin_url(app.source_dir)
+  actual_origin = app_git.origin_url(source_dir)
   return bool(
     actual_origin
     and actual_origin.rstrip("/") == expected_origin.rstrip("/")
   )
+
+
+def trusted_catalog_checkout(
+  identity: str | None,
+  source_dir: str | Path,
+  source_url: str,
+  manifest_id: str,
+) -> bool:
+  """Whether an installed package's checkout is its trusted catalog repo."""
+  return _catalog_identity_matches(
+    identity, source_url, manifest_id,
+  ) and _trusted_catalog_origin_matches(source_dir, source_url)
+
+
+def replaces_migration_bridge(upstream_tree: dict, *, trusted_origin: bool) -> bool:
+  """Whether install replaces the recorded upstream instead of continuing it.
+
+  The one-time migration bridge records code but no manifest and shares no
+  history with the real repository. Only a trusted origin may replace it
+  outright; the Store's update check asks this same question so it never
+  offers an update install cannot apply.
+  """
+  return trusted_origin and "mobius.json" not in upstream_tree
 
 
 def _find_ref_independent_catalog_row(
@@ -2595,6 +2618,10 @@ class InstallTarget:
   source_identity: str | None
   source_handoff_required: bool
 
+  @property
+  def trusted_origin(self) -> bool:
+    return self.adopting_trusted_origin or self.trusted_catalog_origin
+
 
 @dataclass
 class InstallJournal:
@@ -3063,10 +3090,10 @@ def _select_install_target(
     ),
     trusted_catalog_origin=bool(
       existing is not None
-      and _catalog_identity_matches(
-        existing.manifest_url, source_for_key, manifest_id,
+      and trusted_catalog_checkout(
+        existing.manifest_url, existing.source_dir, source_for_key,
+        manifest_id,
       )
-      and _trusted_catalog_origin_matches(existing, source_for_key)
     ),
     canonical_manifest_url=canonical_manifest_url,
     origin_migration=origin_migration,
@@ -4111,13 +4138,10 @@ async def install_from_manifest(
               git_source_dir,
               app_git.UPSTREAM_BRANCH,
             )
-            synthetic_baseline = (
-              bool(prev_upstream_commit)
-              and "mobius.json" not in previous_tree
-              and (
-                target.trusted_catalog_origin
-                or target.adopting_trusted_origin
-              )
+            synthetic_baseline = bool(
+              prev_upstream_commit
+            ) and replaces_migration_bridge(
+              previous_tree, trusted_origin=target.trusted_origin,
             )
             if synthetic_baseline:
               await asyncio.to_thread(
@@ -4136,10 +4160,7 @@ async def install_from_manifest(
                 app_git.promote_upstream,
                 git_source_dir,
                 reviewed_upstream_commit,
-                trusted_origin_adoption=(
-                  target.adopting_trusted_origin
-                  or target.trusted_catalog_origin
-                ),
+                trusted_origin_adoption=target.trusted_origin,
               )
           except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
             raise HTTPException(
@@ -4167,13 +4188,10 @@ async def install_from_manifest(
             git_source_dir,
             app_git.UPSTREAM_BRANCH,
           )
-          synthetic_baseline = (
-            bool(prev_upstream_commit)
-            and "mobius.json" not in previous_tree
-            and (
-              target.trusted_catalog_origin
-              or target.adopting_trusted_origin
-            )
+          synthetic_baseline = bool(
+            prev_upstream_commit
+          ) and replaces_migration_bridge(
+            previous_tree, trusted_origin=target.trusted_origin,
           )
           if synthetic_baseline:
             try:
@@ -4210,10 +4228,7 @@ async def install_from_manifest(
                 app_git.fetch_upstream,
                 git_source_dir,
                 ref,
-                trusted_origin_adoption=(
-                  target.adopting_trusted_origin
-                  or target.trusted_catalog_origin
-                ),
+                trusted_origin_adoption=target.trusted_origin,
                 verify=lambda commit: _verify_git_install_candidate(
                   git_source_dir, commit, candidate,
                 ),
