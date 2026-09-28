@@ -20,7 +20,7 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 _BACKEND_DIR = _SCRIPT_DIR.parent
 if str(_BACKEND_DIR) not in sys.path:
   sys.path.insert(0, str(_BACKEND_DIR))
-from app import cron_tz
+from app import app_python_env, cron_tz
 from app.manifest_contract import (
   ManifestContractError,
   job_interpreter,
@@ -308,10 +308,14 @@ def _job_command(job: Path, app_id: int) -> list[str]:
 
   Job packages own their runtime choice. The platform only validates that
   declaration and passes the app id; it does not guess an interpreter from a
-  filename, executable bit, or historical Bash convention.
+  filename, executable bit, or historical Bash convention. A Python shebang in
+  an app that declares a Python lock runs with that app's own environment.
   """
   with job.open("rb") as script:
     interpreter = job_interpreter(script.read(257))
+  interpreter = app_python_env.job_interpreter_in_env(
+    interpreter, DATA_DIR, app_id, job.parent,
+  )
   return [*interpreter, str(job), str(app_id)]
 
 
@@ -395,6 +399,9 @@ def _execute_job(
       command = _job_command(runtime_job, app_id)
     except (OSError, ManifestContractError) as exc:
       _log(app_id, f"rejected: invalid job declaration {runtime_job}: {exc}")
+      return 4
+    except app_python_env.PythonEnvUnavailable as exc:
+      _log(app_id, f"failed: {runtime_job.name}: {exc}")
       return 4
     # Uninstall sends TERM to this entire process group. Keep the supervisor
     # alive to retain its lease while a TERM-ignoring child needs the existing

@@ -850,6 +850,20 @@ def validate_manifest_contract(manifest) -> None:
     if service.get("access", "self") not in {"self", "apps", "public"}:
       _fail("Manifest `service.access` must be `self`, `apps`, or `public`.")
 
+  # The app's own Python environment (app_python_env). Apply and install
+  # check that the listed file exists in the accepted tree.
+  python = manifest.get("python")
+  if python is not None:
+    if not isinstance(python, Mapping) or set(python) != {"lock"}:
+      _fail("Manifest `python` must contain only `lock`.")
+    lock = python["lock"]
+    validate_repo_relative_path(lock, "python.lock")
+    if not isinstance(source_files, list) or lock not in source_files:
+      _fail(
+        "Manifest `python.lock` must also be listed in `source_files` so "
+        "every install contains the reviewed dependency lock."
+      )
+
   skills = manifest.get("skills")
   if skills is not None:
     if not isinstance(skills, list):

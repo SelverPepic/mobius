@@ -17,7 +17,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
-from app import app_git
+from app import app_git, app_python_env
 from app.config import get_settings
 from app.manifest_contract import (
   MANIFEST_MAX_BYTES,
@@ -360,7 +360,9 @@ def hold_runtime(app_id: int):
 
 
 def prune_runtime(app, *, previous_revision: str | None = None) -> int:
-  """Bound full-tree copies, without removing files an active reader needs.
+  """Bound full-tree copies and the Python envs only they reference.
+
+  Nothing an active reader needs is removed.
 
   The existing single-flight job lock covers job-context lookup AND child
   lifetime, so pruning cannot race a job that has not published its path yet.
@@ -400,6 +402,11 @@ def prune_runtime(app, *, previous_revision: str | None = None) -> int:
       if root.name not in keep:
         shutil.rmtree(root)
         removed += 1
+    # These same locks pin every process that runs from an app env.
+    app_python_env.prune_envs(
+      get_settings().data_dir, app.id,
+      [root for root in roots if root.name in keep],
+    )
     return removed
   finally:
     for handle in reversed(handles):

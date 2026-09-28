@@ -276,6 +276,17 @@ manifest, layered by how always-on they are:
   per app (unlike a service's private/public requests), so several — from this
   chat, other chats, or helpers — can reach the service at once; a tool that
   writes must do its own file or database locking. Keep tools few.
+- **Python dependencies for a service or Python job.** Without a declaration,
+  these run on the platform's interpreter and borrow its libraries, which can
+  change on any platform update, and anything installed live disappears when
+  the container is replaced. To own them, commit a complete
+  `pip-compile --generate-hashes` lock (list it in `source_files`) and declare
+  `"python": {"lock": "requirements.lock"}`. Apply then builds an isolated
+  environment on `/data` from wheels only, checks it, and runs the service and
+  any `#!/usr/bin/env python3` job with it. If a package fails to build, the
+  Apply fails and names it. After a platform update that changes Python, the
+  service returns 503 until you Apply again. Details are in
+  `CAPABILITIES.md`.
 
 Anything that depends on your app being installed belongs in its fragment (the
 always-on default) and/or its skill (the how-to). A not-installed app then
