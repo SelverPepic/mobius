@@ -3144,11 +3144,15 @@ async def test_mid_turn_person_message_is_framed_as_owed_a_visible_reply():
   # A steer usually adds to the work; it replaces it only when it says so.
   assert "unless it asks you to stop or change course" in person
   assert "why not X?" in person and "helper finished" in person
+  assert "not the partner refusing that call" in person
+  assert "check for partial effects" in person
 
   context = claude_sdk_runner._steer_redirect_message(
     ["peer note"], from_person=False,
   )
   assert context.startswith("New context arrived while you were working.")
+  assert "not a partner refusal" in context
+  assert "check for partial effects" in context
 
 
 @pytest.mark.asyncio

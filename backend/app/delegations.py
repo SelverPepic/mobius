@@ -2484,11 +2484,11 @@ def _committed_parent_wake_is_unowned(
 async def steer_results_into_running_parent(
   parent_chat_id: str, source_work_id: str,
 ) -> bool:
-  """Hand finished helpers' results to a parent whose turn is still running.
+  """Hand finished helpers' results to a running Codex parent.
 
   The result travels exactly like a steered peer note: a hidden carrier is
-  queued first, then steered in naming that queued row. Either provider
-  consumes the row at its steer cut, which is also where the writer records
+  queued first, then steered in naming that queued row. Codex consumes the
+  row at its steer cut, which is also where the writer records
   the results delivered. Until then they are owed: the queued carrier keeps a
   second steer or wake from repeating them, a turn that ends first runs the
   carrier as its own turn, and a Stop drops it so the next turn carries them.
@@ -2734,8 +2734,17 @@ async def wake_parent_after_child_settled(child_chat_id: str) -> None:
         return
       parent_chat_id = row.parent_chat_id
       source_work_id = row.parent_root_run_id
+      parent_provider = db.query(models.Chat.provider).filter(
+        models.Chat.id == parent_chat_id,
+      ).scalar() or "claude"
     from app.chat import is_chat_running
     if is_chat_running(parent_chat_id):
+      if parent_provider == "claude":
+        # Claude interrupts its current command to accept a steer and reports
+        # the cut as an owner refusal. A routine result can stay in its durable
+        # Delegation row; deliver_results_after_parent_settled wakes the chat
+        # after this turn, without putting a carrier ahead of an owner message.
+        return
       await steer_results_into_running_parent(parent_chat_id, source_work_id)
       return
     await _deliver_parent_wake(parent_chat_id, source_work_id)

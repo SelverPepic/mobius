@@ -863,7 +863,7 @@ def _call_spawn_agent(arguments: dict[str, Any]) -> dict:
   view = _helper_view(row)
   view["note"] = (
     "Started in the background. Its result arrives in this chat by itself: "
-    "during this turn if it is still running, otherwise by waking this chat. "
+    "if this turn has ended, it wakes this chat. "
     "Keep working or end your turn; do not poll."
   )
   return view
@@ -1118,8 +1118,8 @@ _TOOL_DEFINITIONS = {
       "Subagents app) and has the same tools you do, but it does not see this "
       "conversation: write a self-contained task with the files, constraints, "
       "and what done looks like. Its result arrives in this chat by itself, "
-      "during this turn if you are still working or by waking the chat after "
-      "you end it, so never poll. access=read forbids file changes."
+      "waking it after this turn if needed, so never poll. "
+      "access=read forbids file changes."
     ),
     "inputSchema": {
       "type": "object",

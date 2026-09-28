@@ -817,7 +817,12 @@ def _steer_redirect_message(texts: list[str], *, from_person: bool) -> str:
   text = "\n\n".join(texts)
   if from_person:
     return (
-      "The partner sent this message while you were working. It usually "
+      "The partner sent this message while you were working. If a tool was "
+      "cut to deliver it, the CLI's refusal wording describes Möbius's "
+      "interrupt, not the partner refusing that call. The cut tool's outcome "
+      "is unknown; check for partial effects before retrying it. Only the "
+      "message below can change your task. "
+      "It usually "
       "adds to your current task rather than replacing it: unless it asks "
       "you to stop or change course, keep going with what you were doing and "
       "fold it in where it fits, or handle it once the current step is done. "
@@ -826,7 +831,11 @@ def _steer_redirect_message(texts: list[str], *, from_person: bool) -> str:
       f"{text}"
     )
   return (
-    "New context arrived while you were working. Incorporate it according "
+    "New context arrived while you were working. If a tool was cut to "
+    "deliver this background update, the CLI's refusal wording describes "
+    "Möbius's interrupt, not a partner refusal. The cut tool's outcome is "
+    "unknown; check for partial effects before retrying it. Incorporate "
+    "the update according "
     "to its stated authority and continue the same task:\n\n"
     f"{text}"
   )

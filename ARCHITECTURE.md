@@ -1265,12 +1265,17 @@ queue. If the bounded window overflows, the explicit overflow marker and its
 cursor form one cut: omitted older notes remain owner-visible history but never
 surface later behind newer notes and invert causal order.
 
-A helper result that settles while its parent's turn runs travels the same
-way: a queued hidden carrier, steered by its cid, recorded delivered in the
-steer cut's own commit. Until that cut the result is owed. A turn that ends
-first runs the carrier as its own turn, whose completed Finalize records it;
-Stop drops the carrier, because the Delegation row still owes the result and
-the next turn's context carries it.
+A helper result that settles while a Codex parent's turn runs travels as a
+queued hidden carrier, steered by its cid and recorded delivered in the steer
+cut's own commit. Claude leaves routine helper results in their existing durable
+Delegation rows rather than interrupting its current command or putting a
+carrier ahead of an owner's immediate message. After the Claude turn settles,
+the ordinary activity continuation delivers the result; a stopped turn leaves
+it owed for the next owner turn. A Codex turn that ends before the steer runs
+the carrier as its next turn, whose completed Finalize records it. Until a cut
+or completed Finalize, the result is owed. Stop drops a queued carrier, because
+the Delegation row still owes the result and the next owner turn's context
+carries it.
 
 An idle recipient is woken only when it has an unfinished Goal. An armed
 external Wait remains active but no longer suppresses an explicitly
