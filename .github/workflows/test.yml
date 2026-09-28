@@ -333,6 +333,7 @@ jobs:
           prev=ghcr.io/mobius-os/mobius:sha-63cba455eec663b79cf925cf2da7782ff3c72729
           bump=ghcr.io/mobius-os/mobius:sha-74cd67ae245875ee116ab1af194dc65a45866183
           docker pull -q "$prev" && docker pull -q "$bump"
+          set -o pipefail
           if scripts/test-upgrade-path.sh "$prev" "$bump" . 2>&1 | tee /tmp/regression.log; then
             echo "the check passed a release that stranded older instances"; exit 1
           fi

@@ -79,8 +79,8 @@ api() {
 }
 body() { sed '$d' <<<"$1"; }
 code() { tail -n1 <<<"$1"; }
-field() {  # <json> <python expression over d>
-  python3 -c 'import json, sys; d = json.loads(sys.argv[1]); print(eval(sys.argv[2]))' "$1" "$2"
+field() {  # <json> <python expression over d>; JSON on stdin (a preview can exceed ARG_MAX)
+  python3 -c 'import json, sys; d = json.load(sys.stdin); print(eval(sys.argv[1]))' "$2" <<<"$1"
 }
 
 previous=$(image_sha "$PREVIOUS")
@@ -177,8 +177,13 @@ if [ "$needs_image" = True ]; then
   write_status succeeded "Container rebuilt successfully."
 else
   reply=$(api POST /api/platform/apply "$plan")
-  [ "$(code "$reply")" = 200 ] && [ "$(field "$(body "$reply")" 'd.get("state")')" = updated ] \
-    || fail "the previous release refused to apply the candidate ($(code "$reply")): $(body "$reply")"
+  # Every applied outcome is fine (updated, up_to_date for live-only changes,
+  # restart_needed); conflict, rolled_back or an error is a refusal.
+  applied_state=$([ "$(code "$reply")" = 200 ] && field "$(body "$reply")" 'd.get("state")')
+  case "$applied_state" in
+    updated|up_to_date|restart_needed) ;;
+    *) fail "the previous release refused to apply the candidate ($(code "$reply")): $(body "$reply")" ;;
+  esac
   echo "5. the owner restarts to load the candidate"
   docker restart "$name" >/dev/null
   for _ in $(seq 1 240); do
