@@ -1265,6 +1265,13 @@ queue. If the bounded window overflows, the explicit overflow marker and its
 cursor form one cut: omitted older notes remain owner-visible history but never
 surface later behind newer notes and invert causal order.
 
+A helper result that settles while its parent's turn runs travels the same
+way: a queued hidden carrier, steered by its cid, recorded delivered in the
+steer cut's own commit. Until that cut the result is owed. A turn that ends
+first runs the carrier as its own turn, whose completed Finalize records it;
+Stop drops the carrier, because the Delegation row still owes the result and
+the next turn's context carries it.
+
 An idle recipient is woken only when it has an unfinished Goal. An armed
 external Wait remains active but no longer suppresses an explicitly
 interrupting peer message: the urgent turn can run now, and the independent

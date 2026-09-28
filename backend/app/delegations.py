@@ -1464,30 +1464,18 @@ def _envelope_named_results(envelope: object) -> dict[str, str | None]:
 def _recorded_parent_wake_ids(
   db: Session, parent_chat_id: str,
 ) -> set[str]:
-  """Return child results already committed to the parent's durable queue."""
+  """Results a queued hidden carrier holds for the parent's next steer or turn.
+
+  Only the queue reserves a result. A carrier in the transcript either
+  reached its provider, and its turn recorded the result delivered, or it did
+  not, and the result is owed again like any other.
+  """
   chat = db.query(models.Chat).filter(
     models.Chat.id == parent_chat_id,
   ).first()
   if chat is None:
     return set()
-  return _results_covered_by_carriers(
-    db, [*(chat.messages or []), *(chat.pending_messages or [])],
-  )
-
-
-def _repairable_parent_wake_ids(
-  db: Session, parent_chat_id: str,
-) -> set[str]:
-  """Recorded results whose queue/runner ownership is already durable."""
-  chat = db.query(models.Chat).filter(
-    models.Chat.id == parent_chat_id,
-  ).first()
-  if chat is None:
-    return set()
-  return _results_covered_by_carriers(db, [
-    message for message in chat.messages or []
-    if not _committed_parent_wake_is_unowned(db, chat, message)
-  ])
+  return _results_covered_by_carriers(db, list(chat.pending_messages or []))
 
 
 def claim_inline_delegation_observation(
@@ -1508,15 +1496,7 @@ def claim_inline_delegation_observation(
     # let a concurrent blocking attachment claim a second delivery path.
     return "parent_wake"
   if row.id in _recorded_parent_wake_ids(db, row.parent_chat_id):
-    if row.id not in _repairable_parent_wake_ids(db, row.parent_chat_id):
-      # The deterministic wake owns observation, but its commit-before-spawn
-      # attempt still needs recovery. Do not hand the same result inline and
-      # do not falsely mark it delivered.
-      return "parent_wake"
-    # Repair the narrow crash window where the writer committed the hidden
-    # result but the process died before the delivery mark transaction.
-    mark_results_delivered(db, current_result_run_ids(db, [row.id]))
-    db.commit()
+    # A queued carrier owns this result until a turn takes it.
     return "parent_wake"
   claimed = db.query(models.Delegation).filter(
     models.Delegation.id == row.id,
@@ -1534,18 +1514,46 @@ def claim_inline_delegation_observation(
   return "parent_wake" if row.notify_parent_on_complete else "inline"
 
 
-def _repair_recorded_parent_wakes(
-  db: Session, rows: list[models.Delegation],
-) -> set[str]:
-  """Mark results whose hidden carrier already survived a process crash."""
-  if not rows:
-    return set()
-  recorded = _repairable_parent_wake_ids(db, rows[0].parent_chat_id)
-  repaired = {row.id for row in rows if row.id in recorded}
-  if repaired:
-    mark_results_delivered(db, current_result_run_ids(db, repaired))
-    db.commit()
-  return repaired
+def parent_wake_blocker(
+  db: Session, parent_chat_id: str, source_work_id: str,
+  root_run_id: str | None,
+) -> tuple[str | None, models.ChatRun | None]:
+  """Why an idle parent's helper result cannot wake it, plus its source run.
+
+  The wake gate and the owner's "waiting" projection share this, so the
+  drawer never promises a resume the gate would refuse. A newer turn (for
+  example an answered question card) does not supersede the helper; what
+  decides is the parent's last outcome and the helper's own source work: a
+  closed Goal, or plain work whose latest run the owner stopped, stays quiet
+  until the owner returns.
+  """
+  from app.run_state import _recoverable_result_goal
+
+  latest_status = db.query(models.ChatRun.status).filter(
+    models.ChatRun.chat_id == parent_chat_id,
+  ).order_by(
+    models.ChatRun.started_at.desc(), models.ChatRun.id.desc(),
+  ).limit(1).scalar()
+  if latest_status not in (
+    None, "completed", *models.NONTERMINAL_RUN_STATUSES,
+  ):
+    return "parent_not_waiting", None
+  source = db.query(models.ChatRun).filter(
+    models.ChatRun.chat_id == parent_chat_id,
+    or_(
+      models.ChatRun.id == root_run_id,
+      models.ChatRun.root_run_id == root_run_id,
+      models.ChatRun.goal_id == source_work_id,
+    ),
+  ).order_by(
+    models.ChatRun.started_at.desc(), models.ChatRun.id.desc(),
+  ).first()
+  if source is not None and source.goal_id:
+    if _recoverable_result_goal(db, parent_chat_id, source)[0] is None:
+      return "goal_closed", source
+  elif source is not None and source.status == "stopped":
+    return "source_stopped", source
+  return None, source
 
 
 def _self_resuming_helper_rows(
@@ -1581,9 +1589,17 @@ def _self_resuming_helper_rows(
   delivered = _delivered_to_live_parent_runs(
     db, {row.parent_chat_id for row in rows},
   )
+  blocked: dict[tuple[str, str], bool] = {}
   projected = []
   for row in rows:
     if row.id in delivered:
+      continue
+    key = (row.parent_chat_id, row.parent_root_run_id)
+    if key not in blocked:
+      blocked[key] = parent_wake_blocker(
+        db, *key, _parent_wake_continuation_root(db, *key),
+      )[0] is not None
+    if blocked[key]:
       continue
     status, _run, _result = derived_status(db, row, load_result=False)
     if status in waiting_statuses:
@@ -2135,8 +2151,14 @@ def activity_continuation_delivery_source_work_id(
 
 def build_delegation_result_context(
   db: Session, parent_chat_id: str, *, source_work_id: str | None = None,
+  turn_message: object = None,
 ) -> DelegationResultContextDelivery:
-  """Render available helper results from their owning durable records."""
+  """Render available helper results from their owning durable records.
+
+  ``turn_message`` is the turn's own prompt row. When it is a queued result
+  carrier, the results it holds are recorded with the others (so the turn's
+  Finalize latches them) but not rendered a second time.
+  """
   rows = available_delegation_results(
     db, parent_chat_id, source_work_id=source_work_id,
   )
@@ -2144,8 +2166,10 @@ def build_delegation_result_context(
   rows = [row for row in rows if row.id in settled]
   if not rows:
     return DelegationResultContextDelivery(text="", results=())
+  carried = carrier_results(db, turn_message)
+  shown = [row for row in rows if carried.get(row.id) != settled[row.id]]
   return DelegationResultContextDelivery(
-    text=_compose_wake_notice(db, rows, settled),
+    text=_compose_wake_notice(db, shown, settled) if shown else "",
     results=tuple((row.id, settled[row.id]) for row in rows),
   )
 
@@ -2457,44 +2481,23 @@ def _committed_parent_wake_is_unowned(
   )
 
 
-async def _append_wake_pending(
-  content: str,
-  parent_chat_id: str,
-  source_work_id: str,
-) -> bool:
-  """Recognize an already-stored legacy carrier without creating a new one."""
-  from app.database import SessionLocal
-
-  with SessionLocal() as db:
-    chat = db.query(models.Chat).filter(
-      models.Chat.id == parent_chat_id,
-    ).first()
-    if chat is None:
-      return False
-    return any(
-      isinstance(message, dict)
-      and message.get("content") == content
-      and message.get("source_work_id") == source_work_id
-      and bool(_wake_message_delegation_ids(message))
-      for message in [*(chat.messages or []), *(chat.pending_messages or [])]
-    )
-
-
 async def steer_results_into_running_parent(
   parent_chat_id: str, source_work_id: str,
 ) -> bool:
   """Hand finished helpers' results to a parent whose turn is still running.
 
-  The result travels as the same hidden delegation-result message a wake
-  would carry, steered straight into the live turn. Only an accepted steer
-  latches the rows as delivered (like an admitted wake); otherwise nothing is
-  stored and the normal after-turn delivery owns them. The accepted row lands
-  in the parent's transcript, which also keeps later wakes from repeating it.
+  The result travels exactly like a steered peer note: a hidden carrier is
+  queued first, then steered in naming that queued row. Either provider
+  consumes the row at its steer cut, which is also where the writer records
+  the results delivered. Until then they are owed: the queued carrier keeps a
+  second steer or wake from repeating them, a turn that ends first runs the
+  carrier as its own turn, and a Stop drops it so the next turn carries them.
   """
   import app.chat_queue as chat_queue
   from app import questions
   from app.chat import is_chat_running, is_draining
   from app.chat_steering import has_live_steerable_turn, steer_into_active_turn
+  from app.chat_writer import AppendPending, await_ack, get_writer
   from app.continuations import DELEGATION_RESULT_MESSAGE_KIND
   from app.database import SessionLocal
 
@@ -2518,8 +2521,7 @@ async def steer_results_into_running_parent(
       # at that turn's Finalize; steering it in again would be a duplicate.
       rows = _wake_eligible_rows_for_parent(
         db, parent_chat_id, source_work_id,
-        pending_ids=_recorded_parent_wake_ids(db, parent_chat_id)
-        | _delivered_to_live_parent_runs(db, {parent_chat_id}),
+        pending_ids=_delivered_to_live_parent_runs(db, {parent_chat_id}),
       )
       if not rows:
         return False
@@ -2538,17 +2540,20 @@ async def steer_results_into_running_parent(
         "kind": DELEGATION_RESULT_MESSAGE_KIND,
         "source_work_id": rows[0].parent_root_run_id,
       }
+    stored = await await_ack(get_writer().submit(AppendPending(
+      chat_id=parent_chat_id,
+      run_token="",
+      user_msg=carrier,
+      initiated_by_app_id=None,
+    )))
+    carrier = stored.get("stored") or carrier
     try:
       accepted = await steer_into_active_turn(
-        provider, parent_chat_id, content, [carrier], None,
+        provider, parent_chat_id, content, [carrier], [cid],
       )
     except Exception:
       _LOG.warning("helper result steer failed chat=%s", parent_chat_id, exc_info=True)
       accepted = False
-    if accepted:
-      with SessionLocal() as db:
-        mark_results_delivered(db, results)
-        db.commit()
   publish_parent_waiting_changed(parent_chat_id)
   return bool(accepted)
 
@@ -2645,16 +2650,8 @@ async def _deliver_parent_wake_once(
       else:
         rows = _wake_eligible_rows_for_parent(
           db, parent_chat_id, source_work_id,
+          pending_ids=_recorded_parent_wake_ids(db, parent_chat_id),
         )
-        if not rows:
-          return False
-        repaired = _repair_recorded_parent_wakes(db, rows)
-        rows = [row for row in rows if row.id not in repaired]
-        if not rows:
-          publish_parent_waiting_changed(parent_chat_id)
-          return True
-        recorded_ids = _recorded_parent_wake_ids(db, parent_chat_id)
-        rows = [row for row in rows if row.id not in recorded_ids]
         if not rows:
           return False
         trigger = rows[0]
@@ -2692,44 +2689,6 @@ async def _deliver_parent_wake_once(
       activity_id=trigger.id,
       _transition_lock_held=True,
     )
-
-
-def claim_scheduled_parent_wake(chat_id: str, message: object) -> bool:
-  """Latch an exact Delegation result only after provider-task admission."""
-  from app.continuations import DELEGATION_RESULT_MESSAGE_KIND
-
-  if not isinstance(message, dict) or (
-    message.get("kind") != DELEGATION_RESULT_MESSAGE_KIND
-  ):
-    return False
-  source_work_id = message.get("source_work_id")
-  ids = _wake_message_delegation_ids(message)
-  if not isinstance(source_work_id, str) or not source_work_id or not ids:
-    return False
-  from app.database import SessionLocal
-
-  with SessionLocal() as db:
-    rows = db.query(models.Delegation).filter(
-      models.Delegation.id.in_(ids),
-    ).all()
-    if (
-      {row.id for row in rows} != ids
-      or any(
-        row.parent_chat_id != chat_id
-        or row.parent_root_run_id != source_work_id
-        or not row.notify_parent_on_complete
-        or row.cancelled_at is not None
-        or derived_status(db, row, load_result=False)[0]
-          not in WAKE_ELIGIBLE_STATUSES
-        for row in rows
-      )
-    ):
-      return False
-    claimed = mark_results_delivered(db, carrier_results(db, message))
-    db.commit()
-  if claimed:
-    publish_parent_waiting_changed(chat_id)
-  return len(claimed) == len(ids)
 
 
 async def wake_parent_after_child_settled(child_chat_id: str) -> None:

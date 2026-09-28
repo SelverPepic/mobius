@@ -3118,15 +3118,16 @@ def _schedule_continuation(
     coro = None
     try:
       from app.chat_waits import claim_scheduled_wait_result
-      from app.delegations import claim_scheduled_parent_wake
 
+      # Only a restart activation latches at scheduling. Every other agent
+      # input (helper result, Wait result, peer note) stays owed until a turn
+      # carrying it records it received.
       claim_scheduled_wait_result(chat_id, next_user)
-      claim_scheduled_parent_wake(chat_id, next_user)
     except Exception:
       # The deterministic running row remains the recovery owner if this
       # second transaction fails. Product sweeps retry the still-open latch.
       log.warning(
-        "scheduled product-result latch failed chat_id=%s run_token=%s",
+        "scheduled activation latch failed chat_id=%s run_token=%s",
         chat_id, run_token, exc_info=True,
       )
     return True
@@ -5216,8 +5217,20 @@ async def _run_chat_impl_with_db(
         db, chat_id, run_token or "",
       )
     )
+    turn_message = next((
+      message for message in reversed(
+        list(chat_row.messages or []) if chat_row is not None else []
+      )
+      if isinstance(message, dict) and message.get("role") == "user"
+    ), None)
     activity_delivery = build_delegation_result_context(
       db, chat_id, source_work_id=activity_source_work_id,
+      turn_message=(
+        turn_message
+        if isinstance(turn_message, dict)
+        and turn_message.get("content") == raw_user_message
+        else None
+      ),
     )
     activity_results = activity_delivery.results
     if activity_delivery.text:

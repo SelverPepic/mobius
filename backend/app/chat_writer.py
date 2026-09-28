@@ -3830,6 +3830,7 @@ class ChatWriterActor:
       _parent_wake_continuation_root,
       current_result_undelivered,
       derived_status,
+      parent_wake_blocker,
     )
     from app.models import ChatRun
 
@@ -3919,35 +3920,14 @@ class ChatWriterActor:
       db.rollback()
       return StartContinuationBlocked("active_run")
 
-    latest_status = db.query(ChatRun.status).filter(
-      ChatRun.chat_id == cmd.chat_id,
-    ).order_by(ChatRun.started_at.desc(), ChatRun.id.desc()).limit(1).scalar()
-    if latest_status != "completed":
+    blocker, source = parent_wake_blocker(
+      db, cmd.chat_id, cmd.source_work_id, cmd.root_run_id,
+    )
+    if blocker is not None:
       db.rollback()
-      return StartContinuationBlocked("parent_not_waiting")
-    # A newer turn (for example an answered question card) does not supersede
-    # the helper: the trigger query above already proved this exact result
-    # was never delivered, and every turn that receives a result latches it
-    # atomically. What still decides is the helper's own source work: a
-    # closed Goal, or plain work whose latest run the owner stopped, stays
-    # quiet until the owner returns.
-    from app.run_state import _recoverable_result_goal
-    source = db.query(ChatRun).filter(
-      ChatRun.chat_id == cmd.chat_id,
-      or_(
-        ChatRun.id == cmd.root_run_id,
-        ChatRun.root_run_id == cmd.root_run_id,
-        ChatRun.goal_id == cmd.source_work_id,
-      ),
-    ).order_by(ChatRun.started_at.desc(), ChatRun.id.desc()).first()
+      return StartContinuationBlocked(blocker)
     goal_id = source.goal_id if source is not None else None
     goal_objective = source.goal_objective if goal_id else None
-    if goal_id and _recoverable_result_goal(db, cmd.chat_id, source)[0] is None:
-      db.rollback()
-      return StartContinuationBlocked("goal_closed")
-    if not goal_id and source is not None and source.status == "stopped":
-      db.rollback()
-      return StartContinuationBlocked("source_stopped")
 
     existing = list(chat.messages or [])
     try:
@@ -4343,6 +4323,14 @@ class ChatWriterActor:
       stored_messages.append(new_msg)
     _stamp_provider_batch(stored_messages)
     chat.messages = msgs
+    # The steer cut is where a steered helper result reaches its provider, so
+    # its delivery is recorded in this same commit.
+    from app.delegations import carrier_results, mark_results_delivered
+    for stored in stored_messages:
+      mark_results_delivered(
+        db, carrier_results(db, stored),
+        filters=(models.Delegation.parent_chat_id == cmd.chat_id,),
+      )
     if cmd.consume_pending_cids:
       consumed = set(cmd.consume_pending_cids)
       chat.pending_messages = [
@@ -4791,16 +4779,19 @@ class ChatWriterActor:
     guard in ChatView.handleStop.
 
     A ``hidden`` queued row is never owner speech: it is usually a machine-owned
-    carrier (wait/delegation/activation result, a peer-message wake, or a
-    secure-input answer continuation) parked behind the owner-input barrier,
-    each with its own idempotent delivery latch. The Stop "collapse queued
-    text into one fresh follow-up turn" contract — and the terminal
-    setup-error cleanup that shares this command — must leave those carriers
-    queued so they deliver at their legitimate boundary (the owner answering
-    the open card), and must never report their cids for re-send. Re-sending
-    one as owner text was the phantom-queued-message bug: a wait result that
-    fired while a question card was open got re-sent as if the owner typed it
-    the moment they hit Stop.
+    carrier (wait/activation result, a peer-message wake, or a secure-input
+    answer continuation) parked behind the owner-input barrier, each with its
+    own idempotent delivery latch. The Stop "collapse queued text into one
+    fresh follow-up turn" contract — and the terminal setup-error cleanup that
+    shares this command — must leave those carriers queued so they deliver at
+    their legitimate boundary (the owner answering the open card), and must
+    never report their cids for re-send. Re-sending one as owner text was the
+    phantom-queued-message bug: a wait result that fired while a question card
+    was open got re-sent as if the owner typed it the moment they hit Stop.
+
+    A queued helper-result carrier is the exception: it only transports a
+    result its Delegation row still owes. Stop drops it silently, so stopped
+    work stays quiet and the owner's next turn carries the result instead.
     """
     from app.models import Chat
 
@@ -4808,12 +4799,16 @@ class ChatWriterActor:
     if chat is None:
       raise _PersistFailed("ClearPending: chat not found")
     pending = list(chat.pending_messages or [])
-    from app.continuations import is_retired_goal_handoff
+    from app.continuations import (
+      DELEGATION_RESULT_MESSAGE_KIND,
+      is_retired_goal_handoff,
+    )
 
     def preserved_carrier(message: object) -> bool:
       return bool(
         isinstance(message, dict)
         and message.get("hidden")
+        and message.get("kind") != DELEGATION_RESULT_MESSAGE_KIND
         and not is_retired_goal_handoff(message)
       )
 
