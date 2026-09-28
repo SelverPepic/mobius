@@ -311,6 +311,33 @@ jobs:
       - name: Run browser harness unit tests
         run: npm run test:e2e-harness
 
+  e2e-boot:
+    runs-on: ubuntu-latest
+    # The e2e shards run the disposable test runtime, which skips the image's
+    # boot transaction. Boot the production path on real restarts once per run
+    # so a broken transaction cannot reach main, in parallel with the shards.
+    if: github.event_name != 'pull_request'
+    timeout-minutes: 40
+    needs: privacy
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build test image (with GHA cache)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: mobius-test:ci
+          build-args: |
+            BUILD_SHA=${{ github.sha }}
+          cache-from: type=gha
+
+      - name: Verify the production boot transaction
+        run: scripts/test-boot-transaction.sh mobius-test:ci
+
   e2e:
     runs-on: ubuntu-latest
     # Keep the browser suite available for manual dispatches and any future
@@ -335,7 +362,7 @@ jobs:
       # reason to take down the others' results.
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
 
     steps:
       - uses: actions/checkout@v7
@@ -380,13 +407,6 @@ jobs:
 
       - name: Verify timed Docker probe cleanup
         run: scripts/test-docker-probe.sh
-
-      - name: Verify the production boot transaction
-        # The e2e container below runs the disposable test runtime, which
-        # skips the image's boot transaction. Boot the production path on real
-        # restarts once per run so a broken transaction cannot reach main.
-        if: matrix.shard == 1
-        run: scripts/test-boot-transaction.sh mobius-test:ci
 
       - name: Start test container
         run: |

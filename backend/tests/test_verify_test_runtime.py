@@ -759,10 +759,10 @@ def test_manual_and_pull_request_runs_cover_suites_and_main_image():
     assert "refs/heads/integration/" not in job
   assert "github.event_name != 'pull_request'" not in backend
   assert "if: github.event_name != 'pull_request'" in e2e
-  # e2e is split 4-way to reduce elapsed browser-suite time for merge-group
+  # e2e is split 8-way to reduce elapsed browser-suite time for merge-group
   # and manually dispatched runs.
   assert "fail-fast: false" in e2e
-  assert "shard: [1, 2, 3, 4]" in e2e
+  assert "shard: [1, 2, 3, 4, 5, 6, 7, 8]" in e2e
   # The shard denominator is derived from strategy.job-total rather than a
   # second hardcoded count, so resizing the matrix can't silently drop
   # coverage by leaving a duplicate total out of sync with it.
