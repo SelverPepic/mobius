@@ -400,10 +400,12 @@ def test_recovery_completes_a_verified_target(journal, monkeypatch):
 ])
 def test_recovery_restores_the_previous_container_otherwise(journal, monkeypatch, healthy, running):
   _writes, rollbacks = journal
+  monkeypatch.setattr(host.subprocess, "run", lambda args, **_k: None)  # docker tag
   monkeypatch.setattr(host, "wait_healthy", lambda *a: healthy)
   monkeypatch.setattr(host, "app_container", lambda _c: ("cid", running))
   host.recover({}, host.read_transaction())
   assert rollbacks and rollbacks[0][3] == "worker_interrupted"
+  assert rollbacks[0][5] == TXN["previous_image"]
 
 
 def test_a_new_request_waits_for_an_interrupted_replacement(tmp_path, monkeypatch):
@@ -448,3 +450,37 @@ def test_recovery_restores_the_journaled_previous_image(journal, monkeypatch):
   monkeypatch.setattr(host, "wait_healthy", lambda *a: False)
   host.recover({}, host.read_transaction())
   assert ["docker", "tag", TXN["previous_image"], host.ROLLBACK_TAG] in tagged
+
+
+def test_recovery_never_restores_an_unconfirmed_previous_image(journal, monkeypatch):
+  writes, rollbacks = journal
+
+  def failing_tag(args, **_kwargs):
+    raise subprocess.CalledProcessError(1, args)
+
+  monkeypatch.setattr(host.subprocess, "run", failing_tag)
+  monkeypatch.setattr(host, "wait_healthy", lambda *a: False)
+  host.recover({}, host.read_transaction())
+  assert not rollbacks
+  assert writes[-1]["state"] == "needs_recovery"
+  assert host.read_transaction() is not None
+
+
+def test_a_healthy_rollback_to_the_wrong_image_is_not_settled(tmp_path, monkeypatch):
+  monkeypatch.setattr(host, "TRANSACTION", tmp_path / "transaction.json")
+  host.write_transaction(TXN)
+  writes = []
+  monkeypatch.setattr(host, "write_status", lambda _c, **fields: writes.append(fields))
+  monkeypatch.setattr(host, "restart_ledger", lambda *a, **k: True)
+  monkeypatch.setattr(host, "compose", lambda *a, **k: None)
+  monkeypatch.setattr(host, "wait_healthy", lambda *a: True)
+  monkeypatch.setattr(host, "app_container", lambda _c: ("cid", "sha256:" + "e" * 64))
+  assert host.rollback({}, TXN["operation_id"], TXN["expected_sha"], "x", "y",
+                       TXN["previous_image"]) == 1
+  assert writes[-1]["state"] == "needs_recovery"
+  assert writes[-1]["code"] == "rollback_wrong_image"
+  assert host.read_transaction() is not None
+  monkeypatch.setattr(host, "app_container", lambda _c: ("cid", TXN["previous_image"]))
+  host.rollback({}, TXN["operation_id"], TXN["expected_sha"], "x", "y",
+                TXN["previous_image"])
+  assert writes[-1]["state"] == "rolled_back" and host.read_transaction() is None

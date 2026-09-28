@@ -373,9 +373,12 @@ def retain_images(target_ref: str, rollback_image_id: str | None = None) -> None
 
 
 def rollback(config_value: dict, operation: str, expected: str,
-             code: str, detail: str) -> int:
+             code: str, detail: str, previous_image: str | None = None) -> int:
     """Restore the previous container; a settled outcome retires the
-    transaction, while needs_recovery keeps it for the next reconcile."""
+    transaction, while needs_recovery keeps it for the next reconcile.
+
+    With ``previous_image``, the restore counts only when the healthy
+    container runs exactly that image ID."""
     write_status(config_value, operation_id=operation, state="verifying",
                  expected_sha=expected, code=code,
                  message="Replacement failed; restoring the previous container.")
@@ -389,7 +392,15 @@ def rollback(config_value: dict, operation: str, expected: str,
     compose(config_value, "up", "-d", "--no-build", "--no-deps",
             "--force-recreate", "app", image=ROLLBACK_TAG)
     if wait_healthy(config_value, 120):
-        cid, _current = app_container(config_value)
+        cid, current = app_container(config_value)
+        if previous_image and current != previous_image:
+            write_status(
+                config_value, operation_id=operation, state="needs_recovery",
+                expected_sha=expected, code="rollback_wrong_image",
+                message=("The restored container is not the recorded previous "
+                         f"image. Original failure: {detail}")[:300],
+            )
+            return 1
         handoff_finalized = restart_ledger(
             config_value, cid, "finalize-cutover", operation,
             image=ROLLBACK_TAG,
@@ -851,6 +862,7 @@ def run() -> int:
                 result = rollback(
                     config_value, operation, expected,
                     "health_check_failed", "the new container was unhealthy",
+                    previous,
                 )
                 discard_pulled_image(image_ref)
                 return result
@@ -884,7 +896,7 @@ def run() -> int:
             if replacement_started and previous and expected:
                 try:
                     result = rollback(config_value, operation, expected,
-                                      "replacement_failed", detail)
+                                      "replacement_failed", detail, previous)
                     if image_ref and pulled_recorded:
                         discard_pulled_image(image_ref)
                     return result
@@ -965,14 +977,21 @@ def recover(config_value: dict, transaction: dict) -> None:
         pass
     # Restore exactly the journaled previous image, whatever the tag says now.
     previous = str(transaction.get("previous_image") or "")
-    if previous.startswith("sha256:"):
-        try:
-            subprocess.run(["docker", "tag", previous, ROLLBACK_TAG],
-                           text=True, capture_output=True, timeout=60)
-        except (OSError, subprocess.SubprocessError):
-            pass  # rollback reports whether the restore worked
+    try:
+        if not previous.startswith("sha256:"):
+            raise RuntimeError("no recorded previous image")
+        subprocess.run(["docker", "tag", previous, ROLLBACK_TAG], check=True,
+                       text=True, capture_output=True, timeout=60)
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        write_status(
+            config_value, operation_id=operation, state="needs_recovery",
+            expected_sha=expected, code="rollback_failed", **fields,
+            message="The interrupted replacement could not select the "
+                    "recorded previous image to restore.",
+        )
+        return
     rollback(config_value, operation, expected, "worker_interrupted",
-             "the replacement worker stopped before it finished")
+             "the replacement worker stopped before it finished", previous)
 
 
 def reconcile() -> int:
