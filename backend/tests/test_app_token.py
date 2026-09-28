@@ -243,13 +243,13 @@ def test_app_token_cannot_delete_shared_storage(client, owner_token):
 
 def test_app_token_can_read_shared_storage(client, owner_token):
   client.put(
-    "/api/storage/shared/readable.txt",
+    "/api/storage/shared/skills/readable.md",
     json={"content": "hello"},
     headers={"Authorization": f"Bearer {owner_token}"},
   )
   _, app_token = _make_app_and_token(client, owner_token)
   r = client.get(
-    "/api/storage/shared/readable.txt",
+    "/api/storage/shared/skills/readable.md",
     headers={"Authorization": f"Bearer {app_token}"},
   )
   assert r.status_code == 200
@@ -411,16 +411,16 @@ def test_app_token_cannot_delete_upload(client, owner_token, db):
 
 
 def test_app_token_can_list_shared_storage(client, owner_token):
-  """App tokens can list shared directory contents (read-only)."""
+  """App tokens can list the shared skills tree (read-only)."""
   # Create a subdirectory with a file so we have something to list.
   client.put(
-    "/api/storage/shared/listtest/listed.txt",
+    "/api/storage/shared/skills/listtest/listed.txt",
     json={"content": "visible"},
     headers={"Authorization": f"Bearer {owner_token}"},
   )
   _, app_token = _make_app_and_token(client, owner_token)
   r = client.get(
-    "/api/storage/shared-list/listtest",
+    "/api/storage/shared-list/skills/listtest",
     headers={"Authorization": f"Bearer {app_token}"},
   )
   assert r.status_code == 200
@@ -541,18 +541,18 @@ def test_deleted_app_token_rejected_on_shared_storage(client, owner_token):
   app_id, app_token = _make_app_and_token(client, owner_token)
   app_auth = {"Authorization": f"Bearer {app_token}"}
   owner_auth = {"Authorization": f"Bearer {owner_token}"}
-  client.put("/api/storage/shared/s.txt", json={"content": "x"},
+  client.put("/api/storage/shared/skills/s.md", json={"content": "x"},
              headers=owner_auth)
   # App token can read shared while the app exists.
-  assert client.get("/api/storage/shared/s.txt",
+  assert client.get("/api/storage/shared/skills/s.md",
                     headers=app_auth).status_code == 200
   assert client.delete(f"/api/apps/{app_id}",
                        headers=owner_auth).status_code == 204
   # After uninstall the token is rejected on shared read AND shared-list,
   # not just the numeric per-app routes.
-  assert client.get("/api/storage/shared/s.txt",
+  assert client.get("/api/storage/shared/skills/s.md",
                     headers=app_auth).status_code == 401
-  assert client.get("/api/storage/shared-list/",
+  assert client.get("/api/storage/shared-list/skills",
                     headers=app_auth).status_code == 401
 
 

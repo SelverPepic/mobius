@@ -83,9 +83,10 @@ _GIT_BLOB_READ_MAX = 8 * 1024 * 1024
 _LEVELS = {"none": 0, "read": 1, "write": 2}
 
 
-# Platform-owned state under /data/shared that holds credentials (Connect
-# pairing codes and remote-runner tokens). Only the owner may read it.
-_SHARED_OWNER_ONLY_ROOTS = frozenset({"connect"})
+# The only /data/shared entries an app token may read. Agents write arbitrary
+# files (credentials included) under /data/shared, so apps get an allowlist,
+# never a denylist. Shared writes and deletes are owner-only regardless.
+_APP_SHARED_READ_ROOTS = frozenset({"skills", "memory", "self-reminders.jsonl"})
 
 
 def _require_shared_read(
@@ -93,17 +94,20 @@ def _require_shared_read(
   principal: Principal,
   db: Session,
 ) -> None:
-  """Gate app reads of owner-only and capability-scoped shared subtrees.
+  """Confine app reads to the allowlisted shared entries.
 
   Decide on the normalized first segment, the same one ``_resolve`` serves:
-  ``./memory/x`` and ``memory/x`` name the same file.
+  ``./memory/x`` and ``memory/x`` name the same file. ``memory`` additionally
+  needs the app's live ``shared_memory`` read contract.
   """
   if principal.app_id is None:
     return
   parts = Path(path).parts
   top = parts[0] if parts else ""
-  if top in _SHARED_OWNER_ONLY_ROOTS:
-    raise HTTPException(status_code=403, detail="Owner-only shared data.")
+  if top not in _APP_SHARED_READ_ROOTS:
+    raise HTTPException(
+      status_code=403, detail="Apps cannot read this shared path.",
+    )
   if top != "memory":
     return
   app = (
