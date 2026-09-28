@@ -59,51 +59,7 @@ jobs:
           # actual target revision; a shallow checkout cannot prove that
           # already-published entries remained unchanged.
           fetch-depth: 0
-      - uses: actions/setup-python@v7
-        id: python
-        with:
-          python-version: '3.12'
-      - name: Restore backend virtualenv
-        # A self-contained virtualenv restores cleanly; caching the toolcache
-        # Python itself would overlay one pip release on another.
-        id: python-deps
-        uses: actions/cache@v6
-        with:
-          path: ~/backend-venv
-          key: backend-venv-${{ runner.os }}-${{ steps.python.outputs.python-version }}-${{ hashFiles('backend/requirements.lock', 'backend/requirements-static.txt', 'Dockerfile') }}
-      - name: Install backend deps
-        if: steps.python-deps.outputs.cache-hit != 'true'
-        run: >-
-          python -m venv ~/backend-venv
-          && ~/backend-venv/bin/pip install --require-hashes -r backend/requirements.lock
-          && ~/backend-venv/bin/pip install -r backend/requirements-static.txt
-          && ~/backend-venv/bin/pip install --no-deps
-          "openai-codex==$(sed -n 's/^ARG CODEX_SDK_VERSION=//p' Dockerfile)"
-      - name: Use the backend virtualenv
-        run: |
-          echo "$HOME/backend-venv/bin" >> "$GITHUB_PATH"
-          echo "VIRTUAL_ENV=$HOME/backend-venv" >> "$GITHUB_ENV"
-      - name: Set up Node
-        uses: actions/setup-node@v7
-        with:
-          node-version: 24
-      - name: Restore frontend runtime deps
-        id: frontend-deps
-        uses: actions/cache@v6
-        with:
-          path: frontend/node_modules
-          key: frontend-deps-${{ runner.os }}-${{ hashFiles('frontend/package-lock.json') }}
-      - name: Install frontend runtime deps
-        # frontend_watcher's publish validation executes the locked Acorn /
-        # eslint-scope checker. compile_jsx also uses the lockfile's Rolldown,
-        # eliminating a separate global CI pin that can drift from production.
-        if: steps.frontend-deps.outputs.cache-hit != 'true'
-        working-directory: frontend
-        run: npm ci --ignore-scripts
-      - name: Use locked frontend tools
-        run: |
-          echo "$GITHUB_WORKSPACE/frontend/node_modules/.bin" >> "$GITHUB_PATH"
-          frontend/node_modules/.bin/rolldown --version
+      - uses: ./.github/actions/backend-env
       - name: Run backend static analysis
         working-directory: backend
         run: |
@@ -154,51 +110,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: actions/setup-python@v7
-        id: python
-        with:
-          python-version: '3.12'
-      - name: Restore backend virtualenv
-        # A self-contained virtualenv restores cleanly; caching the toolcache
-        # Python itself would overlay one pip release on another.
-        id: python-deps
-        uses: actions/cache@v6
-        with:
-          path: ~/backend-venv
-          key: backend-venv-${{ runner.os }}-${{ steps.python.outputs.python-version }}-${{ hashFiles('backend/requirements.lock', 'backend/requirements-static.txt', 'Dockerfile') }}
-      - name: Install backend deps
-        if: steps.python-deps.outputs.cache-hit != 'true'
-        run: >-
-          python -m venv ~/backend-venv
-          && ~/backend-venv/bin/pip install --require-hashes -r backend/requirements.lock
-          && ~/backend-venv/bin/pip install -r backend/requirements-static.txt
-          && ~/backend-venv/bin/pip install --no-deps
-          "openai-codex==$(sed -n 's/^ARG CODEX_SDK_VERSION=//p' Dockerfile)"
-      - name: Use the backend virtualenv
-        run: |
-          echo "$HOME/backend-venv/bin" >> "$GITHUB_PATH"
-          echo "VIRTUAL_ENV=$HOME/backend-venv" >> "$GITHUB_ENV"
-      - name: Set up Node
-        uses: actions/setup-node@v7
-        with:
-          node-version: 24
-      - name: Restore frontend runtime deps
-        id: frontend-deps
-        uses: actions/cache@v6
-        with:
-          path: frontend/node_modules
-          key: frontend-deps-${{ runner.os }}-${{ hashFiles('frontend/package-lock.json') }}
-      - name: Install frontend runtime deps
-        # frontend_watcher's publish validation executes the locked Acorn /
-        # eslint-scope checker. compile_jsx also uses the lockfile's Rolldown,
-        # eliminating a separate global CI pin that can drift from production.
-        if: steps.frontend-deps.outputs.cache-hit != 'true'
-        working-directory: frontend
-        run: npm ci --ignore-scripts
-      - name: Use locked frontend tools
-        run: |
-          echo "$GITHUB_WORKSPACE/frontend/node_modules/.bin" >> "$GITHUB_PATH"
-          frontend/node_modules/.bin/rolldown --version
+      - uses: ./.github/actions/backend-env
       - name: Run pytest shard
         working-directory: backend
         # MOBIUS_TEST_SHARD selects this job's slice, balanced by the recorded
