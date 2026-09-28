@@ -138,8 +138,8 @@ stays in an isolated worktree while the old checkout remains served. Working
 edits are carried through as a transient commit and returned uncommitted.
 
 **Prepared updates swap at shutdown, or on their own image's boot.** An update
-an agent resolves on the isolated copy (a committed conflict, or blockers
-handed over with **Fix with an agent**) and every combined source-and-container
+an agent resolves on the isolated copy (a committed conflict, or a predicted
+overlap handed over with **Fix with an agent**) and every combined source-and-container
 update are *prepared*, not applied: the answer is committed on the reviewed
 release and recorded in `.platform-prepared-update.json`. The live checkout
 keeps serving its snapshot, and nothing edited afterwards enters the update.

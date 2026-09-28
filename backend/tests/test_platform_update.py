@@ -3423,6 +3423,69 @@ def test_status_owes_no_image_for_a_local_edit_to_an_image_input(
   assert status["activation"]["level"] == "image_rebuild"
 
 
+def test_status_owes_the_image_of_a_contained_release_past_a_stale_marker(
+  clone_env, monkeypatch,
+):
+  """The image runs release A, the recorded upstream still says A, but the
+  checkout contains official release B, which changes an image input. B's
+  image is owed: a stale marker must not excuse it."""
+  origin, platform = clone_env
+  path = "backend/scripts/init_chat_summaries.py"
+  release_a = _advance_origin(origin, edits={path: "release a\n"})
+  pu._fetch(platform)
+  _git(platform, "merge", "-q", "--ff-only", release_a)
+  _git(platform, "branch", "-f", "upstream", release_a)
+  monkeypatch.setattr(pu, "_build_info", lambda: {
+    "image_inputs": {path: hashlib.sha256(b"release a\n").hexdigest()},
+  })
+  pu.SERVING_SOURCE_FILE.write_text("platform\n")
+  pu.SERVING_SHA_FILE.write_text(release_a + "\n")
+  assert pu.platform_status(platform)["activation"]["level"] == "live"
+
+  release_b = _advance_origin(origin, edits={path: "release b\n"})
+  pu._fetch(platform)
+  _git(platform, "merge", "-q", "--ff-only", release_b)
+  pu.SERVING_SHA_FILE.write_text(release_b + "\n")
+  assert pu.recorded_upstream_sha(platform) == release_a
+
+  status = pu.platform_status(platform)
+  assert status["activation"]["level"] == "image_rebuild"
+  finish = pu.platform_update_preview(platform, target_sha=release_b)
+  assert finish["operation"] == "finish"
+  assert "image_rebuild" in finish["activation"]["required_actions"]
+
+
+def test_damaged_deployed_runtime_stays_owed_even_when_the_release_matches(
+  clone_env, monkeypatch, tmp_path,
+):
+  """Filtering local customizations never hides a deployed protected module
+  that differs from what the image itself recorded."""
+  _, platform = clone_env
+  path = "backend/runtime/restart_ledger.py"
+  official = _local_commit(platform, edits={path: "image\n"})
+  _git(platform, "branch", "-f", "upstream", official)
+  monkeypatch.setattr(pu, "_build_info", lambda: {
+    "image_inputs": {path: hashlib.sha256(b"image\n").hexdigest()},
+  })
+  deployed = tmp_path / "deployed-runtime"
+  deployed.mkdir()
+  monkeypatch.setenv("MOBIUS_PROTECTED_RUNTIME_DIR", str(deployed))
+  pu.SERVING_SOURCE_FILE.write_text("platform\n")
+  pu.SERVING_SHA_FILE.write_text(official + "\n")
+
+  # A local edit with the image's own module deployed is a customization.
+  (deployed / "restart_ledger.py").write_text("image\n", encoding="utf-8")
+  _local_commit(platform, edits={path: "local\n"})
+  pu.SERVING_SHA_FILE.write_text(_served_sha(platform) + "\n")
+  assert pu.platform_status(platform)["activation"]["level"] == "live"
+
+  # The same checkout with a damaged deployed module still owes the image.
+  (deployed / "restart_ledger.py").write_text("damaged\n", encoding="utf-8")
+  status = pu.platform_status(platform)
+  assert status["activation"]["level"] == "image_rebuild"
+  assert status["activation"]["reasons"][0]["paths"] == [path]
+
+
 def test_status_requires_an_image_for_python_dependency_changes(
   clone_env,
 ):

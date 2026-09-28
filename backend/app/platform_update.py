@@ -1158,19 +1158,33 @@ def _update_source_tip(repo: Path) -> str:
   return tip
 
 
+def _contained_release(repo: Path) -> str | None:
+  """The newest official release the served history contains, or None.
+
+  A recorded upstream ref is a reconciliation marker, not proof of containment:
+  an owner can reset the served branch independently, and source can also move
+  past the marker. Prefer the newest known release, then the marker, and only
+  when the checkout's head descends from it.
+  """
+  head = _rev(repo, "HEAD")
+  for candidate in (_latest_known_release(repo), recorded_upstream_sha(repo)):
+    if head and candidate and _is_ancestor(repo, candidate, head):
+      return candidate
+  return None
+
+
 def applied_release_sha(repo: Path = PLATFORM_REPO) -> str:
   """Prove Finish's official target is already present in the served history.
 
-  A recorded upstream ref is a reconciliation marker, not proof of containment:
-  an owner can reset the served branch independently. Never turn Finish into a
-  source update merely because that marker survived the reset.
+  Never turn Finish into a source update merely because a marker survived a
+  reset (:func:`_contained_release`).
   """
   with _reconcile_flock():
-    current = _update_source_tip(repo)
-    for candidate in (_latest_known_release(repo), recorded_upstream_sha(repo)):
-      if candidate and _is_ancestor(repo, candidate, current):
-        return candidate
-    raise PlatformUpdateError("applied_release_unavailable")
+    _update_source_tip(repo)
+    release = _contained_release(repo)
+    if release is None:
+      raise PlatformUpdateError("applied_release_unavailable")
+    return release
 
 
 def _parse_legacy_activation_marker(raw: str) -> _ActivationMarker | None:
@@ -1381,8 +1395,8 @@ def local_image_changes(
         path for path in image_pending
         if _local_change_in_target(repo, local_change_base, head, expected_sha, path)
       )
-    # A target/head match says nothing about uncommitted bytes. Preserve those
-    # paths as blockers until the owner commits, reverts, or reviews them.
+    # A target/head match says nothing about uncommitted bytes. Keep reporting
+    # those paths until the owner commits or reverts them.
     covered = (exact_target_coverage | carried_marker_coverage) - working_paths
   return sorted(path for path in image_pending if path not in covered)
 
@@ -1658,7 +1672,7 @@ def _owed_activation(
   still-pending activation plus the changes from ``before``."""
   return platform_activation.classify_activation(
     _without_python_inputs_installed_for(repo, [
-      *_pending_activation_paths(repo),
+      *_pending_activation_paths(repo, release=target),
       *_activation_paths_between(repo, before, target),
     ], target),
   )
@@ -1732,18 +1746,25 @@ def _pending_activation_paths(
   repo: Path = PLATFORM_REPO,
   *,
   served_to_head: list[str] | None = None,
+  release: str | None = None,
 ) -> list[str]:
   """Every path whose activation is still owed by the running process.
 
   ``served_to_head`` lets a caller that has just diffed the served revision
   against the local head (to write the activation marker) hand that result
-  over instead of having the same pair diffed again.
+  over instead of having the same pair diffed again. Image work is judged
+  against ``release`` (an update's exact target), by default the newest
+  official release the checkout contains.
   """
   marker = _read_activation_marker()
   paths = list(marker["paths"]) if marker else []
-  paths.extend(runtime_provenance.activation_paths(
+  # A deployed protected module that is not the image's own is damage, not a
+  # local customization: it stays owed whatever the release says.
+  damaged: list[str] = []
+  for path in runtime_provenance.activation_paths(
     _protected_runtime_status(repo),
-  ))
+  ):
+    (paths if _deployed_runtime_is_image_own(path) else damaged).append(path)
   if served_to_head is None:
     served = _served_platform_sha()
     if served:
@@ -1756,9 +1777,28 @@ def _pending_activation_paths(
   paths.extend(image_input_drift(repo) or [])
   owed = _image_work_owed(
     repo, [str(path) for path in paths if str(path)],
-    recorded_upstream_sha(repo),
+    release or _contained_release(repo),
   )
-  return sorted(set(owed))
+  return sorted({*owed, *damaged})
+
+
+def _deployed_runtime_is_image_own(path: str) -> bool:
+  """Whether the deployed copy of one protected-runtime path is exactly what
+  the running image recorded for it. Unknown fails closed."""
+  prefix = "backend/runtime/"
+  baked = _build_info().get("image_inputs")
+  if not path.startswith(prefix) or not isinstance(baked, dict) or not baked:
+    return False
+  try:
+    content = (
+      runtime_provenance.deployed_runtime_root() / path[len(prefix):]
+    ).read_bytes()
+  except OSError:
+    content = None
+  expected = baked.get(path)
+  if content is None:
+    return expected is None
+  return expected == hashlib.sha256(content).hexdigest()
 
 
 def _build_info() -> dict:
@@ -1852,9 +1892,12 @@ def _platform_activation_impact(
   repo: Path = PLATFORM_REPO,
   *,
   served_to_head: list[str] | None = None,
+  release: str | None = None,
 ) -> PlatformActivationImpact:
   return platform_activation.classify_activation(
-    _pending_activation_paths(repo, served_to_head=served_to_head),
+    _pending_activation_paths(
+      repo, served_to_head=served_to_head, release=release,
+    ),
   )
 
 
@@ -3728,15 +3771,16 @@ def _record_update_activation(
   """
   served = _served_platform_sha()
   changed_paths = _activation_paths_between(repo, served, head)
-  changed_paths = _image_work_owed(
-    repo, changed_paths, target or recorded_upstream_sha(repo),
-  )
+  release = target or _contained_release(repo)
+  changed_paths = _image_work_owed(repo, changed_paths, release)
   incoming_impact = platform_activation.classify_activation(changed_paths)
   if incoming_impact["level"] != platform_activation.ActivationLevel.LIVE.value:
     mark_activation_needed(
       head or "", changed_paths, upstream_sha=target, repo=repo,
     )
-  return _platform_activation_impact(repo, served_to_head=changed_paths)
+  return _platform_activation_impact(
+    repo, served_to_head=changed_paths, release=release,
+  )
 
 
 def continue_platform_overlay_update(repo: Path = PLATFORM_REPO) -> str:
@@ -4507,7 +4551,7 @@ def _platform_update_preview_unlocked(
       current_sha=local_sha, target_sha=target,
       image_digest=image_digest,
     )
-    activation = _platform_activation_impact(repo)
+    activation = _platform_activation_impact(repo, release=target)
     if local_sha and target and activation["level"] != "live":
       preview.update(
         state=_state_for_activation(activation).value,
