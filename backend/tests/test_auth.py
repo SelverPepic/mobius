@@ -748,9 +748,7 @@ def test_providers_status_hides_mobius_trial_from_app_principals(
     "spendable_units": 500,
     "grants": [{"amount": 500, "expires_at": "2026-12-31"}],
   }
-  # Patch the class: undoing an instance patch pins the original bound method
-  # on the shared provider and shadows later tests' class patches.
-  monkeypatch.setattr(MobiusProvider, "check_auth", lambda self, data_dir: None)
+  monkeypatch.setattr(providers.PROVIDERS["mobius"], "check_auth", lambda data_dir: None)
   monkeypatch.setattr(MobiusProvider, "trial_status", lambda self: balance)
 
   # The owner sees the trial balance.

@@ -1018,19 +1018,6 @@ class MobiusProvider(BaseProvider):
       raise ValueError("invalid trial status")
     return value
 
-  def out_of_credit(self) -> bool:
-    """Whether the linked account has nothing left to spend on a turn.
-
-    check_auth only proves the account is linked, so a never-activated or
-    spent trial still looks selectable. An unreadable balance is not "out":
-    a broker hiccup must never block a send that would have succeeded.
-    """
-    try:
-      spendable = self.trial_status()["balance"]["spendable_units"]
-    except Exception:
-      return False
-    return type(spendable) is int and spendable <= 0
-
   def check_auth(self, data_dir: str) -> str | None:
     if not self.declaration:
       return "Install Möbius · You to use these models."

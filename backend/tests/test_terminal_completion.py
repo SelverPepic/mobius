@@ -279,50 +279,6 @@ def test_provider_entry_requires_durable_admission_ack(
   assert entered == ([] if ack_failure else [token])
 
 
-@pytest.mark.parametrize("out_of_credit", [True, False])
-def test_mobius_turn_without_credit_gets_guidance_instead_of_the_model(
-  monkeypatch, out_of_credit,
-):
-  """A linked Möbius account passes check_auth even with nothing to spend.
-  Such a turn must not reach the model; it settles as a provider-free reply
-  pointing at Möbius · You. With credit, the model runs as usual."""
-  from app.providers import MobiusProvider
-
-  cid, token = "mobius-credit-gate", "rt-mobius-credit-gate"
-  _seed_provider_turn(monkeypatch, "mobius", cid, token)
-  monkeypatch.setattr(MobiusProvider, "out_of_credit", lambda self: out_of_credit)
-  entered = []
-
-  async def codex_runner(**_kwargs):
-    entered.append(token)
-    return {"cost_usd": 0.0, "session_id": "sess"}
-
-  monkeypatch.setattr(
-    importlib.import_module("app.codex_sdk_runner"),
-    "run_codex_sdk_turn", codex_runner,
-  )
-  chat_mod.mark_starting(cid)
-  _run_real_chat(
-    cid, run_token=token, provider_id="mobius",
-    run_gen=chat_mod.current_run_generation(cid),
-  )
-  _drain_actor()
-
-  if not out_of_credit:
-    assert entered == [token]
-    return
-  assert entered == []
-  state = _load(cid)
-  assert state["running"] is False
-  assert [
-    block["content"]
-    for message in state["messages"]
-    if message.get("role") == "assistant"
-    for block in message.get("blocks", [])
-    if block.get("type") == "text"
-  ] == [chat_mod.MOBIUS_NO_CREDIT_MESSAGE]
-
-
 # -- 1. empty-queue final continuation CLEARS the marker -----------------
 def test_empty_queue_terminal_clears_marker(monkeypatch):
   """A normal turn with an empty pending queue: the marker is cleared

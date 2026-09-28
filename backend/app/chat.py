@@ -118,7 +118,6 @@ from app.events import (
 )
 from app.providers import (
   DEFAULT_PROVIDER,
-  MobiusProvider,
   authenticated_provider_ids,
   effective_agent_settings,
   get_provider,
@@ -134,12 +133,6 @@ NO_AGENT_CONNECTED_MESSAGE = (
   "In the meantime, browse the App Store\u2014many apps work without AI. "
   "You\u2019ll need a connected agent to modify an app, build a new one, or "
   "change how M\u00f6bius looks."
-)
-
-MOBIUS_NO_CREDIT_MESSAGE = (
-  "M\u00f6bius models need credit. "
-  "[Open M\u00f6bius \u00b7 You](/shell/?app=identity) to activate your $2 "
-  "trial or see your options."
 )
 
 _NO_AGENT_USAGE_METRICS = {
@@ -3939,57 +3932,6 @@ def _park_exit(
   }
 
 
-async def _reply_without_provider(
-  message: str,
-  *,
-  phase: str,
-  bc,
-  db: Session,
-  chat_id: str,
-  run_gen: int | None,
-  run_token: str | None,
-  provider_id: str | None,
-  agent_activity_binding,
-) -> chat_queue.TerminalDisposition:
-  """Answer a turn with product guidance instead of calling a provider.
-
-  The guidance goes through the same sink as a real assistant response, so it
-  typewrites live and survives reload.
-  """
-  await _record_run_metrics(
-    chat_id=chat_id,
-    run_token=run_token or "",
-    provider_session_id=None,
-    cost_usd=0.0,
-    usage=_NO_AGENT_USAGE_METRICS,
-  )
-  # Metrics are ordered through the writer actor and may await its ack.
-  # Stop can supersede this run while no provider handle or sink exists;
-  # revalidate before installing a sink so a stale turn cannot overwrite a
-  # fresh successor's steering target or publish guidance after Stop.
-  if _run_generation_superseded(chat_id, run_gen):
-    _log_superseded_run(chat_id, phase)
-    db.close()
-    return chat_queue.TerminalDisposition.STALE_NO_ACTION
-  sink = _ChatEventSink(
-    bc, chat_id, run_token=run_token,
-    agent_activity_binding=agent_activity_binding,
-  )
-  register_active_sink(chat_id, sink)
-  sink.publish({"type": "text", "content": message})
-  return await _complete_turn(
-    bc=bc,
-    sink=sink,
-    db=db,
-    chat_id=chat_id,
-    run_gen=run_gen,
-    provider_id=provider_id,
-    cost_usd=0,
-    close_browser=False,
-    provider_free=True,
-  )
-
-
 async def _complete_turn(
   *,
   bc,
@@ -5653,10 +5595,37 @@ async def _run_chat_impl_with_db(
     # provider genuinely failed and the existing error path below remains the
     # honest response.
     if not await run_in_threadpool(authenticated_provider_ids, settings.data_dir):
-      return await _reply_without_provider(
-        NO_AGENT_CONNECTED_MESSAGE, phase="no-agent-metrics",
-        bc=bc, db=db, chat_id=chat_id, run_gen=run_gen, run_token=run_token,
-        provider_id=provider_id, agent_activity_binding=agent_activity_binding,
+      await _record_run_metrics(
+        chat_id=chat_id,
+        run_token=run_token or "",
+        provider_session_id=None,
+        cost_usd=0.0,
+        usage=_NO_AGENT_USAGE_METRICS,
+      )
+      # Metrics are ordered through the writer actor and may await its ack.
+      # Stop can supersede this run while no provider handle or sink exists;
+      # revalidate before installing a sink so a stale turn cannot overwrite
+      # a fresh successor's steering target or publish guidance after Stop.
+      if _run_generation_superseded(chat_id, run_gen):
+        _log_superseded_run(chat_id, "no-agent-metrics")
+        db.close()
+        return chat_queue.TerminalDisposition.STALE_NO_ACTION
+      sink = _ChatEventSink(
+        bc, chat_id, run_token=run_token,
+        agent_activity_binding=agent_activity_binding,
+      )
+      register_active_sink(chat_id, sink)
+      sink.publish({"type": "text", "content": NO_AGENT_CONNECTED_MESSAGE})
+      return await _complete_turn(
+        bc=bc,
+        sink=sink,
+        db=db,
+        chat_id=chat_id,
+        run_gen=run_gen,
+        provider_id=provider_id,
+        cost_usd=0,
+        close_browser=False,
+        provider_free=True,
       )
     bc.publish({"type": "error", "message": auth_error})
     disposition = await _terminal_setup_error_cleanup(
@@ -5669,17 +5638,6 @@ async def _run_chat_impl_with_db(
       _publish_chat_run_finished(chat_id)
     db.close()
     return disposition
-  # A linked Möbius account passes check_auth with no credit to spend (a trial
-  # never activated or used up). Point the owner at Möbius · You rather than
-  # letting the model call fail with a raw gateway error.
-  if isinstance(provider, MobiusProvider) and await run_in_threadpool(
-    provider.out_of_credit,
-  ):
-    return await _reply_without_provider(
-      MOBIUS_NO_CREDIT_MESSAGE, phase="mobius-no-credit",
-      bc=bc, db=db, chat_id=chat_id, run_gen=run_gen, run_token=run_token,
-      provider_id=provider_id, agent_activity_binding=agent_activity_binding,
-    )
   helper_host_key = _helper_host_key(
     db, run_policy, provider_id=provider_id, connector_plan=connector_turn_plan,
   )

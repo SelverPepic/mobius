@@ -15,7 +15,8 @@ export const PROVIDER_AVAILABILITY_PHASE = Object.freeze({
 // A linked Möbius account stays configured with nothing to spend (a trial
 // never activated or used up); the owner-only balance says so.
 export function mobiusOutOfCredit(info) {
-  return info?.trial?.balance?.spendable_units === 0
+  const spendable = info?.trial?.balance?.spendable_units
+  return typeof spendable === 'number' && spendable <= 0
 }
 
 export function providerIsConfigured(info) {
