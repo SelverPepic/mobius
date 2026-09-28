@@ -319,8 +319,16 @@ jobs:
           docker pull -q "ghcr.io/mobius-os/mobius:sha-$previous"
           scripts/test-upgrade-path.sh "ghcr.io/mobius-os/mobius:sha-$previous" mobius-test:ci .
 
+      - name: "TEMPORARY (remove before merge): an image update installs end to end"
+        if: always() && matrix.shard == 1
+        run: |
+          prev=ghcr.io/mobius-os/mobius:sha-96be7c68ec6a99110973b4380121b94855aceb5f
+          next=ghcr.io/mobius-os/mobius:sha-9f47ed591135ed7b9ca0e53486f52104eccf858d
+          docker pull -q "$prev" && docker pull -q "$next"
+          scripts/test-upgrade-path.sh "$prev" "$next" .
+
       - name: "TEMPORARY (remove before merge): the check catches #1469"
-        if: matrix.shard == 1
+        if: always() && matrix.shard == 1
         run: |
           prev=ghcr.io/mobius-os/mobius:sha-63cba455eec663b79cf925cf2da7782ff3c72729
           bump=ghcr.io/mobius-os/mobius:sha-74cd67ae245875ee116ab1af194dc65a45866183

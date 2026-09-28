@@ -110,7 +110,7 @@ echo "2. the candidate release is offered and the owner signs in"
 docker cp "$work/candidate.bundle" "$name:/tmp/candidate.bundle"
 docker exec "$name" chmod 0644 /tmp/candidate.bundle
 as_mobius git -C /data/platform fetch -q /tmp/candidate.bundle \
-  "$bundle_ref:refs/remotes/origin/main"
+  "$bundle_ref:refs/remotes/origin/main" || fail "the previous release could not fetch the candidate"
 reply=$(api POST /api/auth/setup '{"username":"owner","password":"upgrade-path-owner-password"}')
 [ "$(code "$reply")" = 200 ] || fail "owner setup failed: $(body "$reply")"
 token=$(field "$(body "$reply")" 'd["access_token"]')
@@ -177,7 +177,7 @@ if [ "$needs_image" = True ]; then
   write_status succeeded "Container rebuilt successfully."
 else
   reply=$(api POST /api/platform/apply "$plan")
-  [ "$(code "$reply")" = 200 ] \
+  [ "$(code "$reply")" = 200 ] && [ "$(field "$(body "$reply")" 'd.get("state")')" = updated ] \
     || fail "the previous release refused to apply the candidate ($(code "$reply")): $(body "$reply")"
   echo "5. the owner restarts to load the candidate"
   docker restart "$name" >/dev/null
