@@ -131,9 +131,18 @@ EXPECTED_NETWORKS=$(python3 "$ROOT/scripts/rebuild-topology.py" \
 
 umask 077
 install -d -m 0700 /etc/mobius-rebuild /var/lib/mobius-rebuild
-# Seed the launcher's worker from this checkout under the replacement lock.
-# It never lowers a revision already adopted from a newer official image.
-/usr/bin/python3 -I -S "$ROOT/scripts/mobius-rebuild-host.py" adopt-self
+# Nothing may replace the app while the controller changes: stop new requests
+# from starting a run, wait for a running one, and hold its lock until the
+# installation is complete. Requests stay queued meanwhile.
+systemctl stop mobius-rebuild.path 2>/dev/null || true
+# A failed installation leaves the previous controller in charge, not paused.
+trap 'rm -f "$RESOLVED"; systemctl start mobius-rebuild.path 2>/dev/null || true' EXIT
+exec 9>>/var/lib/mobius-rebuild/replace.lock
+flock 9
+# Seed the launcher's worker from this checkout. It never lowers a revision
+# already adopted from a newer official image.
+MOBIUS_REBUILD_LOCK_HELD=1 \
+  /usr/bin/python3 -I -S "$ROOT/scripts/mobius-rebuild-host.py" adopt-self
 install -D -m 0755 "$ROOT/scripts/mobius-rebuild-launcher.py" \
   /usr/local/libexec/.mobius-rebuild-host.new
 mv -f /usr/local/libexec/.mobius-rebuild-host.new \
@@ -147,12 +156,14 @@ else
 fi
 chmod 0600 "$SNAPSHOT"
 mv -f "$SNAPSHOT" /etc/mobius-rebuild/compose.yml
-cat >/etc/mobius-rebuild/image.override.yml <<'EOF'
+OVERRIDE_NEW=$(mktemp /etc/mobius-rebuild/image.override.XXXXXX)
+cat >"$OVERRIDE_NEW" <<'EOF'
 services:
   app:
     image: ${MOBIUS_IMAGE:?MOBIUS_IMAGE is required}
 EOF
-chmod 0600 /etc/mobius-rebuild/image.override.yml
+chmod 0600 "$OVERRIDE_NEW"
+mv -f "$OVERRIDE_NEW" /etc/mobius-rebuild/image.override.yml
 python3 - "$PROJECT" "$DATA_SOURCE" <<'PY'
 import json, os, sys, tempfile
 value = {"version": 3, "project": sys.argv[1], "data_dir": sys.argv[2]}
@@ -212,6 +223,10 @@ chmod 0644 /etc/systemd/system/mobius-rebuild.service \
   /etc/systemd/system/mobius-rebuild.path \
   /etc/systemd/system/mobius-rebuild-reconcile.service
 systemctl daemon-reload
+# Release the lock so reconcile can settle interrupted work and refresh the
+# capability status, then let queued requests run.
+flock -u 9
+exec 9>&-
 /usr/local/libexec/mobius-rebuild-host reconcile
 systemctl enable mobius-rebuild-reconcile.service
 systemctl enable --now mobius-rebuild.path

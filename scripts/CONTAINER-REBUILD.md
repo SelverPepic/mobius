@@ -184,30 +184,40 @@ and refuses any file that is not root-owned, private and unchanged.
 After a replacement succeeds (or finds the image already live), the worker
 takes `/app/platform-baked/scripts/mobius-rebuild-host.py` out of that exact
 image ID. It creates a container without starting it, accepts exactly one
-regular file within a size bound, then removes the container and its volumes.
-It adopts the file as the next active worker only when the file:
+regular file within a size and time bound, and removes the container and its
+volumes. It offers the file to the launcher as a **candidate** only when the
+file:
 
-- declares a strictly higher `WORKER_REVISION`, read as text and never by running it;
+- declares a strictly higher `WORKER_REVISION`, read as text and never by
+  running it;
 - compiles;
-- is not a set-aside worker.
+- has never failed before.
 
-A different payload under an adopted revision is rejected, and adoption never
-lowers the revision, so a request for an older official image still runs the
-newest worker. The worker file is durable before the record that selects it.
-Worker changes therefore reach installed hosts through ordinary updates,
-effective from the replacement after the release that ships them, with no host
-command. Keep such a change compatible with the previous worker for one
-release. `scripts/rebuild-worker-revisions.json` ties every revision to its
-bytes; tests fail when the worker changes without a new revision.
+A different payload claiming an offered revision is refused. The file is
+durable before the record that names it.
 
-Recovery:
+The candidate runs the next replacement. If that replacement succeeds, the
+candidate becomes the active worker. Any other outcome (a reported failure,
+rollback, or crash) drops it for good, and the proven active worker handles
+the retry. Withdrawn or already-running requests say nothing about the worker
+and leave it as candidate. `reconcile` always runs the proven worker. A faulty
+worker change therefore costs one update attempt, never the ability to update.
 
-- If the active worker exits unsuccessfully without writing any status, it
-  failed before acting. The launcher runs the previous worker for the same
-  request, and if that one handles it, sets the new worker aside for good.
-- If the active worker's `reconcile` fails, the previous worker reconciles.
-- A worker that reported its own failure is working as intended and is not
-  set aside.
+Worker changes reach installed hosts through ordinary updates, taking effect
+from the replacement after the release that ships them, so keep each change
+compatible with its predecessor for one release. Reinstalling never lowers
+the adopted revision. `scripts/rebuild-worker-revisions.json` ties every
+revision to its bytes: tests fail when the worker changes without a new
+revision, and CI refuses any change to a released revision's recorded digest.
+
+Before it drains the running app, a worker records the replacement in
+`/var/lib/mobius-rebuild/transaction.json`: operation, nonce, target and
+previous image IDs. The record is removed only once the outcome is settled.
+If a worker is interrupted, `reconcile` (after the run and at boot) finishes
+the replacement when the target image is running, healthy and serving the
+requested revision. Otherwise it restores the previous container with the
+usual re-armed chat handoff. A new request waits until that settles. The
+record's schema is shared by every worker revision.
 
 Status reports `worker_revision`, `launcher_revision` (absent for a fixed
 helper from before the launcher) and the last `worker_adoption` outcome. Fixed

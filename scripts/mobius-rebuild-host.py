@@ -25,6 +25,11 @@ OVERRIDE = Path("/etc/mobius-rebuild/image.override.yml")
 STATUS = STATE_DIR / "status.json"
 LOCK = STATE_DIR / "replace.lock"
 IMAGES = STATE_DIR / "images.json"
+# A replacement in progress, written before the running app is drained and
+# removed only once its outcome is settled; reconcile() finishes or reverses
+# whatever an interrupted worker left. Its schema is shared by every worker
+# revision: keep it backward compatible.
+TRANSACTION = STATE_DIR / "transaction.json"
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 OPERATION_RE = re.compile(r"^[0-9a-f]{32}$")
 CONTAINER_RE = re.compile(r"^[0-9a-f]{12,64}$")
@@ -41,7 +46,7 @@ REQUEST_VERSIONS = [1, 2]
 # worker it has run. Increase it with every change to this file; never lower
 # it. The launcher reads it as text, so keep it a plain literal on one line.
 WORKER_REVISION = 1
-# The frozen launcher runs the worker adopted here; see adopt_worker().
+# The frozen launcher runs the worker selected here; see offer_worker().
 WORKERS = STATE_DIR / "workers"
 WORKER_INDEX = STATE_DIR / "workers.json"
 WORKER_IN_IMAGE = "/app/platform-baked/scripts/mobius-rebuild-host.py"
@@ -366,6 +371,8 @@ def retain_images(target_ref: str, rollback_image_id: str | None = None) -> None
 
 def rollback(config_value: dict, operation: str, expected: str,
              code: str, detail: str) -> int:
+    """Restore the previous container; a settled outcome retires the
+    transaction, while needs_recovery keeps it for the next reconcile."""
     write_status(config_value, operation_id=operation, state="verifying",
                  expected_sha=expected, code=code,
                  message="Replacement failed; restoring the previous container.")
@@ -401,6 +408,7 @@ def rollback(config_value: dict, operation: str, expected: str,
                 "verify and retire the exact chat handoff receipt. Check the "
                 f"affected chats. Original failure: {detail}"
             )
+        clear_transaction()
         write_status(config_value, operation_id=operation, state="rolled_back",
                      expected_sha=expected, code=status_code,
                      message=message[:300])
@@ -444,70 +452,114 @@ def _durable_write(path: Path, data: bytes, mode: int) -> None:
         Path(name).unlink(missing_ok=True)
 
 
-def adopt_worker(source: bytes, origin: str) -> str:
-    """Make ``source`` the launcher's active worker when it is strictly newer
-    than every worker adopted so far. Returns a short outcome for status.
+def _worker_entry(source: bytes, revision: int, origin: str) -> dict:
+    """Store ``source`` durably and describe it for the selection record."""
+    WORKERS.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(WORKERS, 0o700)
+    digest = hashlib.sha256(source).hexdigest()
+    name = f"{revision}-{digest[:16]}.py"
+    _durable_write(WORKERS / name, source, 0o700)
+    return {"revision": revision, "file": name, "sha256": digest,
+            "origin": origin[:80]}
 
-    Never lowers the adopted revision, never re-adopts bytes the launcher set
-    aside, and refuses a second payload claiming an adopted revision. The
-    worker file is durable before the index that selects it is published."""
+
+def _publish_index(index: dict) -> None:
+    """Publish the selection record, then drop files no entry names."""
+    _durable_write(
+        WORKER_INDEX, json.dumps(index, separators=(",", ":")).encode(), 0o600,
+    )
+    keep = {(index.get(key) or {}).get("file")
+            for key in ("active", "candidate", "previous")}
+    for stale in WORKERS.glob("*.py"):
+        if stale.name not in keep:
+            stale.unlink(missing_ok=True)
+
+
+def _checked(source: bytes) -> tuple[int | None, str | None]:
+    """The revision of a worker that may be adopted, or why it may not."""
     revision = worker_revision(source)
     if revision is None:
-        return "rejected: malformed WORKER_REVISION"
+        return None, "rejected: malformed WORKER_REVISION"
     if revision == 0:
-        return "not adopted: the image predates self-updating workers"
+        return None, "not adopted: the image predates self-updating workers"
     if len(source) > MAX_WORKER_BYTES:
-        return "rejected: worker too large"
+        return None, "rejected: worker too large"
     try:
         compile(source, "mobius-rebuild-host.py", "exec", dont_inherit=True)
     except (SyntaxError, ValueError) as exc:
-        return f"rejected: worker does not compile ({exc.__class__.__name__})"
+        return None, f"rejected: worker does not compile ({exc.__class__.__name__})"
+    return revision, None
+
+
+def offer_worker(source: bytes, origin: str) -> str:
+    """Offer a verified image's worker to the launcher as its candidate.
+
+    The launcher runs a candidate for the next replacement and promotes it
+    only when that replacement succeeds; otherwise it keeps the proven active
+    worker and never tries those bytes again. Only strictly higher revisions
+    are offered, and a different payload claiming an offered revision is
+    refused. Returns a short outcome for status."""
+    if not os.environ.get("MOBIUS_REBUILD_LAUNCHER"):
+        return "not adopted: this helper predates the launcher"
+    revision, refusal = _checked(source)
+    if refusal:
+        return refusal
+    try:
+        index = json.loads(WORKER_INDEX.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "not adopted: the launcher's worker record is unreadable"
     digest = hashlib.sha256(source).hexdigest()
+    high_water = int(index.get("high_water", 0))
+    known = {(index.get(key) or {}).get("sha256")
+             for key in ("active", "candidate")}
+    if digest in index.get("rejected", []):
+        return f"not adopted: revision {revision} failed before"
+    if revision < high_water:
+        return f"not adopted: revision {revision} is older than {high_water}"
+    if revision == high_water:
+        if digest in known:
+            return f"current: revision {revision}"
+        return f"rejected: a different worker already claims revision {revision}"
+    entry = _worker_entry(source, revision, origin)
+    _publish_index({**index, "high_water": revision, "candidate": entry})
+    return f"offered: revision {revision} runs the next replacement"
+
+
+def seed_worker(source: bytes) -> str:
+    """Install this trusted checkout's worker as the active one, unless a
+    newer worker was already adopted (reinstalling never downgrades)."""
+    revision, refusal = _checked(source)
+    if refusal:
+        return refusal
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     try:
         index = json.loads(WORKER_INDEX.read_text(encoding="utf-8"))
     except FileNotFoundError:
         index = {"version": 1, "high_water": 0, "active": None,
-                 "previous": None, "rejected": []}
-    active = index.get("active") or {}
-    if digest in index.get("rejected", []):
-        return f"not adopted: revision {revision} was set aside after failing"
-    if revision < int(index.get("high_water", 0)):
-        return f"not adopted: revision {revision} is older than {index['high_water']}"
-    if revision == int(index.get("high_water", 0)):
-        if active.get("sha256") == digest:
-            return f"current: revision {revision}"
-        return f"rejected: a different worker already claims revision {revision}"
-    WORKERS.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(WORKERS, 0o700)
-    name = f"{revision}-{digest[:16]}.py"
-    _durable_write(WORKERS / name, source, 0o700)
-    entry = {"revision": revision, "file": name, "sha256": digest,
-             "origin": origin[:80]}
-    updated = {
-        "version": 1, "high_water": revision, "active": entry,
-        "previous": index.get("active"),
-        "rejected": index.get("rejected", []),
-    }
-    _durable_write(
-        WORKER_INDEX, json.dumps(updated, separators=(",", ":")).encode(), 0o600,
-    )
-    keep = {name, (updated["previous"] or {}).get("file")}
-    for stale in WORKERS.glob("*.py"):
-        if stale.name not in keep:
-            stale.unlink(missing_ok=True)
-    return f"adopted: revision {revision}"
+                 "candidate": None, "previous": None, "rejected": []}
+    digest = hashlib.sha256(source).hexdigest()
+    if (index.get("active") or {}).get("sha256") == digest:
+        return f"current: revision {revision}"
+    if revision <= int(index.get("high_water", 0)) and index.get("active"):
+        return f"kept: a newer worker (revision {index['high_water']}) is installed"
+    entry = _worker_entry(source, revision, "checkout")
+    _publish_index({
+        **index, "high_water": revision, "active": entry,
+        "previous": index.get("active"), "candidate": None,
+    })
+    return f"installed: revision {revision}"
 
 
 def _bounded_output(args: list[str], limit: int) -> bytes:
-    with subprocess.Popen(args, stdout=subprocess.PIPE,
-                          stderr=subprocess.DEVNULL) as process:
-        data = process.stdout.read(limit + 1) if process.stdout else b""
-        if len(data) > limit:
-            process.kill()
+    """Run ``args`` with a deadline (the child is killed when it expires) and
+    return its output, refusing more than ``limit`` bytes."""
+    with tempfile.TemporaryFile() as out:
+        subprocess.run(args, stdout=out, stderr=subprocess.DEVNULL,
+                       check=True, timeout=300)
+        if out.tell() > limit:
             raise RuntimeError("the image's worker is too large")
-        if process.wait(timeout=300) != 0:
-            raise RuntimeError("the image's worker could not be read")
-    return data
+        out.seek(0)
+        return out.read()
 
 
 def worker_from_image(image_id: str) -> bytes:
@@ -548,7 +600,7 @@ def worker_from_image(image_id: str) -> bytes:
 def adopt_from_image(image_id: str) -> str:
     """After a verified replacement, adopt the worker that image carries."""
     try:
-        return adopt_worker(worker_from_image(image_id), image_id)
+        return offer_worker(worker_from_image(image_id), image_id)
     except Exception as exc:  # adoption never fails a finished replacement
         return f"not adopted: {str(exc)[:160]}"
 
@@ -629,6 +681,15 @@ def claim_request(
     return False
 
 
+def _discard_claim(claimed: Path) -> None:
+    """Remove a claimed request file, link or pipe. A claimed directory is
+    left in the root-owned control directory rather than deleted blindly."""
+    try:
+        claimed.unlink(missing_ok=True)
+    except (IsADirectoryError, PermissionError):
+        pass
+
+
 def return_unverified_request(request: Path, claimed: Path) -> None:
     """Put a file this worker did not read back in the inbox without
     overwriting a newer one; failing that, keep it under a durable name."""
@@ -643,7 +704,7 @@ def return_unverified_request(request: Path, claimed: Path) -> None:
 def run() -> int:
     config_value = config()
     request = config_value["control_dir"] / "inbox" / "request.json"
-    if not request.is_file():
+    if not os.path.lexists(request):
         return 0
     operation = uuid.uuid4().hex
     # Claim inside the root-owned control directory. The inbox and its parent
@@ -660,6 +721,11 @@ def run() -> int:
     try:
         with LOCK.open("a+") as lock:
             acquire_lock(lock)
+            if TRANSACTION.exists():
+                # An interrupted replacement is settled first: this unit's
+                # ExecStopPost reconcile recovers it, and the request stays
+                # queued for the next run.
+                return 0
             payload, identity = read_request(request)
             if identity is None:
                 return 0  # withdrawn before this worker looked
@@ -699,16 +765,18 @@ def run() -> int:
                            text=True, capture_output=True)
             record_pulled_image(image_ref)
             pulled_recorded = True
+            # Bind everything that follows to the exact image this pull
+            # produced: labels, deployment and worker adoption.
+            digest = inspect_image(image_ref, "{{.Id}}")
             revision = inspect_image(
-                image_ref, '{{index .Config.Labels "org.opencontainers.image.revision"}}',
+                digest, '{{index .Config.Labels "org.opencontainers.image.revision"}}',
             )
             source = inspect_image(
-                image_ref, '{{index .Config.Labels "org.opencontainers.image.source"}}',
+                digest, '{{index .Config.Labels "org.opencontainers.image.source"}}',
             )
-            architecture = inspect_image(image_ref, "{{.Architecture}}")
+            architecture = inspect_image(digest, "{{.Architecture}}")
             if revision != expected or source != IMAGE_SOURCE or architecture != "amd64":
                 raise RuntimeError("the downloaded image is not the requested official amd64 release")
-            digest = inspect_image(image_ref, "{{.Id}}")
             if previous == digest:
                 try:
                     verify_served_generation(cid, expected)
@@ -729,11 +797,21 @@ def run() -> int:
                 return 0
             subprocess.run(["docker", "tag", previous, ROLLBACK_TAG], check=True,
                            text=True, capture_output=True)
+            transaction = {
+                "version": 1, "operation_id": operation, "expected_sha": expected,
+                "request_nonce": nonce, "target_image": digest,
+                "previous_image": previous,
+            }
+            # From here an interruption can leave chats drained or the app
+            # removed; reconcile() settles it from this record.
+            write_transaction(transaction)
             request_drain(config_value, operation, cid)
             write_status(config_value, operation_id=operation, state="replacing",
                          expected_sha=expected, code=None,
                          message="Rebuilding the container.")
             replacement_started = True
+            if inspect_image(image_ref, "{{.Id}}") != digest:
+                raise RuntimeError("the image tag moved during the replacement")
             compose(config_value, "up", "-d", "--no-build", "--no-deps",
                     "--force-recreate", "app", image=image_ref)
             write_status(config_value, operation_id=operation, state="verifying",
@@ -745,7 +823,9 @@ def run() -> int:
                 )
                 discard_pulled_image(image_ref)
                 return result
-            cid, _current = app_container(config_value)
+            cid, current = app_container(config_value)
+            if current != digest:
+                raise RuntimeError("the new container does not run the verified image")
             verify_served_generation(cid, expected)
             handoff_finalized = restart_ledger(
                 config_value, cid, "finalize-cutover", operation,
@@ -762,6 +842,7 @@ def run() -> int:
                     "verify and retire the exact chat handoff receipt. Check "
                     "the affected chats."
                 )
+            clear_transaction()
             write_status(config_value, operation_id=operation, state="succeeded",
                          expected_sha=expected, code=status_code,
                          message=message,
@@ -789,6 +870,8 @@ def run() -> int:
                 return 1
         if image_ref and pulled_recorded:
             discard_pulled_image(image_ref)
+        # A failure before replacement leaves the running app in place.
+        clear_transaction()
         write_status(config_value, operation_id=operation, state="failed",
                      expected_sha=expected, code="replacement_failed", message=detail)
         return 1
@@ -796,7 +879,66 @@ def run() -> int:
         # Only the verified claim is ever removed; whatever is still in the
         # inbox may be a newer request and stays for the next run or withdrawal.
         if claim_verified:
-            claimed.unlink(missing_ok=True)
+            _discard_claim(claimed)
+
+
+def write_transaction(value: dict) -> None:
+    _durable_write(
+        TRANSACTION, json.dumps(value, separators=(",", ":")).encode(), 0o600,
+    )
+
+
+def clear_transaction() -> None:
+    TRANSACTION.unlink(missing_ok=True)
+    _fsync_dir(TRANSACTION.parent)
+
+
+def read_transaction() -> dict | None:
+    try:
+        value = read_json(TRANSACTION)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    ok = (
+        value.get("version") == 1
+        and OPERATION_RE.fullmatch(str(value.get("operation_id") or ""))
+        and SHA_RE.fullmatch(str(value.get("expected_sha") or ""))
+        and str(value.get("target_image") or "").startswith("sha256:")
+    )
+    return value if ok else None
+
+
+def recover(config_value: dict, transaction: dict) -> None:
+    """Settle a replacement a worker left unfinished: keep the target when it
+    is running and verified, otherwise restore the previous container."""
+    operation = transaction["operation_id"]
+    expected = transaction["expected_sha"]
+    fields = {"request_nonce": transaction.get("request_nonce")}
+    write_status(config_value, operation_id=operation, state="verifying",
+                 expected_sha=expected, code=None, **fields,
+                 message="Recovering an interrupted replacement.")
+    try:
+        if wait_healthy(config_value, 180):
+            cid, current = app_container(config_value)
+            if current == transaction["target_image"]:
+                verify_served_generation(cid, expected)
+                finalized = restart_ledger(
+                    config_value, cid, "finalize-cutover", operation,
+                    image=transaction["target_image"],
+                )
+                retain_images(f"{IMAGE}:sha-{expected}",
+                              transaction.get("previous_image"))
+                clear_transaction()
+                write_status(
+                    config_value, operation_id=operation, state="succeeded",
+                    expected_sha=expected, **fields,
+                    code=None if finalized else "handoff_finalize_failed",
+                    message="The interrupted replacement was completed.",
+                )
+                return
+    except Exception:
+        pass
+    rollback(config_value, operation, expected, "worker_interrupted",
+             "the replacement worker stopped before it finished")
 
 
 def reconcile() -> int:
@@ -815,8 +957,24 @@ def reconcile() -> int:
         # longer runnable and must not accumulate in the root-controlled area.
         for claimed in config_value["control_dir"].glob(".request-*.json"):
             if re.fullmatch(r"\.request-[0-9a-f]{32}\.json", claimed.name):
-                claimed.unlink(missing_ok=True)
-        if current is None:
+                _discard_claim(claimed)
+        # Extraction containers are never started; one left by a killed
+        # worker only holds a reference to its image.
+        try:
+            leftovers = subprocess.run(
+                ["docker", "ps", "-aq", "--filter",
+                 "label=mobius-rebuild.worker-extract=1"],
+                text=True, capture_output=True, timeout=60,
+            ).stdout.split()
+            if leftovers:
+                subprocess.run(["docker", "rm", "-f", "-v", *leftovers],
+                               text=True, capture_output=True, timeout=120)
+        except (OSError, subprocess.SubprocessError):
+            pass  # best effort; reconcile's real work follows
+        transaction = read_transaction()
+        if transaction is not None:
+            recover(config_value, transaction)
+        elif current is None:
             write_status(config_value)
         elif current.get("state") in ACTIVE_STATES:
             write_status(config_value, state="failed", code="worker_interrupted",
@@ -837,9 +995,12 @@ if __name__ == "__main__":
     if len(sys.argv) == 2 and sys.argv[1] == "adopt-self" and os.geteuid() == 0:
         # The installer seeds the launcher with this trusted checkout's worker.
         STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # The installer holds the replacement lock for its whole installation
+        # and says so; otherwise take it here.
         with LOCK.open("a+") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            outcome = adopt_worker(Path(__file__).read_bytes(), "checkout")
+            if os.environ.get("MOBIUS_REBUILD_LOCK_HELD") != "1":
+                fcntl.flock(lock, fcntl.LOCK_EX)
+            outcome = seed_worker(Path(__file__).read_bytes())
         print(outcome)
         raise SystemExit(1 if outcome.startswith("rejected") else 0)
     print("invalid invocation", file=sys.stderr)

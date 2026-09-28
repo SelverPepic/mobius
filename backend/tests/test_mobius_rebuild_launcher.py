@@ -43,10 +43,12 @@ def state(tmp_path, monkeypatch):
   workers, index, status = tmp_path / "workers", tmp_path / "workers.json", tmp_path / "status.json"
   for module in (launcher, host):
     monkeypatch.setattr(module, "WORKERS", workers)
+    monkeypatch.setattr(module, "STATE_DIR", tmp_path)
   monkeypatch.setattr(launcher, "INDEX", index)
-  monkeypatch.setattr(launcher, "STATE_DIR", tmp_path)
   monkeypatch.setattr(launcher, "STATUS", status)
+  monkeypatch.setattr(launcher, "LOCK", tmp_path / "replace.lock")
   monkeypatch.setattr(host, "WORKER_INDEX", index)
+  monkeypatch.setenv("MOBIUS_REBUILD_LAUNCHER", "1")
 
   def private(path, *, directory):
     try:
@@ -61,11 +63,16 @@ def state(tmp_path, monkeypatch):
   return tmp_path
 
 
+def _index(state) -> dict:
+  return json.loads((state / "workers.json").read_text())
+
+
 # --- The shipped worker's revision is tied to its bytes ----------------------
 
 def test_every_worker_change_bumps_its_revision():
   """The launcher adopts only strictly higher revisions, so changed worker
-  bytes under an old revision would never reach installed hosts."""
+  bytes under an old revision would never reach installed hosts. (CI also
+  refuses any change to a released revision's recorded digest.)"""
   source = WORKER_SCRIPT.read_bytes()
   revision = host.worker_revision(source)
   registry = json.loads(REGISTRY.read_text())
@@ -85,33 +92,46 @@ def test_revision_is_read_as_text():
   assert host.worker_revision(b"WORKER_REVISION=4\n") is None
 
 
-# --- Adoption ---------------------------------------------------------------
+# --- Seeding and offers -----------------------------------------------------
 
-def test_adopts_only_strictly_newer_compiling_workers(state):
-  assert host.adopt_worker(worker(1), "checkout") == "adopted: revision 1"
-  assert host.adopt_worker(worker(1), "checkout") == "current: revision 1"
-  assert host.adopt_worker(worker(3), IMAGE_ID) == "adopted: revision 3"
+def test_seed_installs_the_checkout_worker_and_never_downgrades(state):
+  assert host.seed_worker(worker(1)) == "installed: revision 1"
+  assert host.seed_worker(worker(1)) == "current: revision 1"
+  assert host.offer_worker(worker(3), IMAGE_ID).startswith("offered: revision 3")
+  # Reinstalling from an older checkout keeps the newer offered worker.
+  assert host.seed_worker(worker(2)).startswith("kept")
+  assert _index(state)["candidate"]["revision"] == 3
+  assert host.seed_worker(worker(4, "def broken(:")).startswith("rejected")
+
+
+def test_offers_only_strictly_newer_compiling_workers(state):
+  host.seed_worker(worker(1))
+  assert host.offer_worker(worker(1), IMAGE_ID) == "current: revision 1"
+  assert host.offer_worker(worker(3), IMAGE_ID).startswith("offered")
+  assert host.offer_worker(worker(3), IMAGE_ID) == "current: revision 3"
   # An older official image (possibly one a compromised app asked for)
-  # never replaces the newest worker.
-  assert host.adopt_worker(worker(2), IMAGE_ID).startswith("not adopted")
-  assert host.adopt_worker(worker(None), IMAGE_ID).startswith("not adopted")
-  assert host.adopt_worker(worker(3, "print(1)"), IMAGE_ID).startswith(
+  # never displaces the newest worker.
+  assert host.offer_worker(worker(2), IMAGE_ID).startswith("not adopted: revision 2 is older")
+  assert host.offer_worker(worker(None), IMAGE_ID).startswith("not adopted")
+  assert host.offer_worker(worker(3, "print(1)"), IMAGE_ID).startswith(
     "rejected: a different worker already claims revision 3",
   )
-  assert host.adopt_worker(worker(4, "def broken(:"), IMAGE_ID).startswith(
+  assert host.offer_worker(worker(4, "def broken(:"), IMAGE_ID).startswith(
     "rejected: worker does not compile",
   )
   index = launcher.load_index()
-  assert index["active"]["revision"] == 3
-  assert index["previous"]["revision"] == 1
-  assert index["active"]["path"].read_bytes() == worker(3)
-  assert oct(index["active"]["path"].stat().st_mode & 0o777) == "0o700"
-  assert host.adopt_worker(worker(4), IMAGE_ID) == "adopted: revision 4"
-  assert sorted(p.name.split("-")[0] for p in (state / "workers").glob("*.py")) == ["3", "4"]
+  assert (index["active"]["revision"], index["candidate"]["revision"]) == (1, 3)
+  assert oct(index["candidate"]["path"].stat().st_mode & 0o777) == "0o700"
+
+
+def test_a_fixed_helper_never_writes_a_launcher_record(state, monkeypatch):
+  monkeypatch.delenv("MOBIUS_REBUILD_LAUNCHER")
+  assert host.offer_worker(worker(3), IMAGE_ID).startswith("not adopted: this helper predates")
+  assert not (state / "workers.json").exists()
 
 
 def test_a_tampered_worker_or_index_is_never_run(state):
-  host.adopt_worker(worker(2), "checkout")
+  host.seed_worker(worker(2))
   active = launcher.load_index()["active"]["path"]
   active.write_bytes(worker(2, "print('changed')"))
   active.chmod(0o700)
@@ -120,23 +140,26 @@ def test_a_tampered_worker_or_index_is_never_run(state):
   active.chmod(0o755)
   assert launcher.load_index() is None
   active.chmod(0o700)
-  index = json.loads((state / "workers.json").read_text())
+  index = _index(state)
   index["active"]["file"] = "../elsewhere.py"
   (state / "workers.json").write_text(json.dumps(index))
   assert launcher.load_index() is None
 
 
-# --- Launcher recovery ------------------------------------------------------
+# --- Launcher: candidates prove themselves ----------------------------------
 
-def _run_launcher(monkeypatch, behaviour: dict, command: str) -> tuple[int, list]:
-  """``behaviour`` maps worker revision to (exit code, writes status)."""
+def _run_launcher(monkeypatch, behaviour: dict, command: str = "run") -> tuple[int, list]:
+  """``behaviour`` maps a worker revision to (exit code, status written or
+  None, callback run inside the worker)."""
   calls = []
 
   def execute(entry, cmd):
     calls.append((entry["revision"], cmd))
-    code, writes = behaviour[entry["revision"]]
-    if writes:
-      launcher.STATUS.write_text(json.dumps({"by": entry["revision"], "cmd": cmd}))
+    code, status, inside = behaviour[entry["revision"]]
+    if inside:
+      inside()
+    if status is not None:
+      launcher.STATUS.write_text(json.dumps({"by": entry["revision"], **status}))
     return code
 
   monkeypatch.setattr(launcher, "execute", execute)
@@ -144,46 +167,70 @@ def _run_launcher(monkeypatch, behaviour: dict, command: str) -> tuple[int, list
   return launcher.main(["launcher", command]), calls
 
 
-def test_launcher_runs_the_active_worker(state, monkeypatch):
-  host.adopt_worker(worker(1), "checkout")
-  host.adopt_worker(worker(2), IMAGE_ID)
-  assert _run_launcher(monkeypatch, {2: (0, True)}, "run") == (0, [(2, "run")])
+def _with_candidate(state):
+  host.seed_worker(worker(1))
+  host.offer_worker(worker(2), IMAGE_ID)
 
 
-def test_a_worker_that_fails_before_acting_is_set_aside(state, monkeypatch):
-  host.adopt_worker(worker(1), "checkout")
-  host.adopt_worker(worker(2), IMAGE_ID)
-  result, calls = _run_launcher(monkeypatch, {2: (1, False), 1: (0, True)}, "run")
-  assert (result, calls) == (0, [(2, "run"), (1, "run")])
-  index = launcher.load_index()
-  assert index["active"]["revision"] == 1 and index["previous"] is None
+def test_a_candidate_that_succeeds_becomes_active(state, monkeypatch):
+  _with_candidate(state)
+  result, calls = _run_launcher(monkeypatch, {2: (0, {"state": "succeeded"}, None)})
+  assert (result, calls) == (0, [(2, "run")])
+  index = _index(state)
+  assert (index["active"]["revision"], index["previous"]["revision"]) == (2, 1)
+  assert index["candidate"] is None
+
+
+@pytest.mark.parametrize("status", [
+  {"state": "failed", "code": "replacement_failed"},
+  {"state": "rolled_back", "code": "health_check_failed"},
+  {"state": "replacing"},  # crashed mid-operation
+  None,  # crashed before writing anything
+])
+def test_any_other_candidate_outcome_drops_it_for_good(state, monkeypatch, status):
+  _with_candidate(state)
+  result, _calls = _run_launcher(monkeypatch, {2: (1, status, None)})
+  assert result == 1
+  index = _index(state)
+  assert index["active"]["revision"] == 1 and index["candidate"] is None
   assert index["high_water"] == 2
-  # Its exact bytes are never adopted again; a newer revision still is.
-  assert host.adopt_worker(worker(2), IMAGE_ID).startswith("not adopted: revision 2 was set aside")
-  assert host.adopt_worker(worker(3), IMAGE_ID) == "adopted: revision 3"
+  # The retry runs the proven worker, and those bytes are never offered again.
+  assert _run_launcher(monkeypatch, {1: (0, {"state": "succeeded"}, None)})[1] == [(1, "run")]
+  assert host.offer_worker(worker(2), IMAGE_ID).startswith("not adopted: revision 2 failed before")
+  assert host.offer_worker(worker(3), IMAGE_ID).startswith("offered")
 
 
-def test_an_environment_failure_does_not_blame_the_worker(state, monkeypatch):
-  host.adopt_worker(worker(1), "checkout")
-  host.adopt_worker(worker(2), IMAGE_ID)
-  result, calls = _run_launcher(monkeypatch, {2: (1, False), 1: (1, False)}, "run")
-  assert (result, calls) == (1, [(2, "run"), (1, "run")])
-  assert launcher.load_index()["active"]["revision"] == 2
+def test_a_candidate_is_kept_when_nothing_was_queued_or_withdrawn(state, monkeypatch):
+  _with_candidate(state)
+  assert _run_launcher(monkeypatch, {2: (0, None, None)})[1] == [(2, "run")]
+  assert _index(state)["candidate"]["revision"] == 2
+  _run_launcher(monkeypatch, {2: (1, {"state": "failed", "code": "withdrawn"}, None)})
+  assert _index(state)["candidate"]["revision"] == 2
 
 
-def test_a_reported_failure_is_the_worker_doing_its_job(state, monkeypatch):
-  host.adopt_worker(worker(1), "checkout")
-  host.adopt_worker(worker(2), IMAGE_ID)
-  assert _run_launcher(monkeypatch, {2: (1, True)}, "run") == (1, [(2, "run")])
-  assert launcher.load_index()["active"]["revision"] == 2
+def test_a_newer_offer_made_by_a_succeeding_candidate_survives(state, monkeypatch):
+  _with_candidate(state)
+  offer = lambda: host.offer_worker(worker(3), IMAGE_ID)  # noqa: E731
+  _run_launcher(monkeypatch, {2: (0, {"state": "succeeded"}, offer)})
+  index = _index(state)
+  assert (index["active"]["revision"], index["candidate"]["revision"]) == (2, 3)
 
 
-def test_a_failed_reconcile_falls_back_without_setting_aside(state, monkeypatch):
-  host.adopt_worker(worker(1), "checkout")
-  host.adopt_worker(worker(2), IMAGE_ID)
-  result, calls = _run_launcher(monkeypatch, {2: (1, False), 1: (0, True)}, "reconcile")
-  assert (result, calls) == (0, [(2, "reconcile"), (1, "reconcile")])
-  assert launcher.load_index()["active"]["revision"] == 2
+def test_a_failing_candidate_never_reactivates_itself(state, monkeypatch):
+  """Astra's sequence: the failing worker must not come back as active."""
+  _with_candidate(state)
+  _run_launcher(monkeypatch, {2: (1, {"state": "failed", "code": "x"}, None)})
+  offer = lambda: host.offer_worker(worker(3), IMAGE_ID)  # noqa: E731
+  _run_launcher(monkeypatch, {1: (0, {"state": "succeeded"}, offer)})
+  index = _index(state)
+  assert (index["active"]["revision"], index["candidate"]["revision"]) == (1, 3)
+  assert hashlib.sha256(worker(2)).hexdigest() in index["rejected"]
+
+
+def test_reconcile_always_runs_the_proven_worker(state, monkeypatch):
+  _with_candidate(state)
+  assert _run_launcher(monkeypatch, {1: (0, None, None)}, "reconcile")[1] == [(1, "reconcile")]
+  assert _index(state)["candidate"]["revision"] == 2
 
 
 def test_launcher_refuses_without_a_verified_worker(state, monkeypatch):
@@ -193,7 +240,7 @@ def test_launcher_refuses_without_a_verified_worker(state, monkeypatch):
 
 
 def test_launcher_runs_workers_isolated(state, monkeypatch):
-  host.adopt_worker(worker(1), "checkout")
+  host.seed_worker(worker(1))
   seen = {}
 
   def fake_run(args, **kwargs):
@@ -301,3 +348,74 @@ def test_a_linked_request_is_claimed_and_refused_not_followed(tmp_path):
   _payload, identity = host.read_request(request)
   assert host.claim_request(request, claimed, identity) is True
   assert claimed.is_symlink() and not request.exists()
+
+
+# --- Interrupted replacements are settled from the journal -------------------
+
+TXN = {
+  "version": 1, "operation_id": "1" * 32, "expected_sha": "a" * 40,
+  "request_nonce": "2" * 32, "target_image": IMAGE_ID,
+  "previous_image": "sha256:" + "c" * 64,
+}
+
+
+@pytest.fixture
+def journal(tmp_path, monkeypatch):
+  monkeypatch.setattr(host, "TRANSACTION", tmp_path / "transaction.json")
+  host.write_transaction(TXN)
+  writes, rollbacks = [], []
+  monkeypatch.setattr(host, "write_status", lambda _c, **fields: writes.append(fields))
+  monkeypatch.setattr(host, "rollback", lambda *args: rollbacks.append(args) or 1)
+  monkeypatch.setattr(host, "retain_images", lambda *a: None)
+  monkeypatch.setattr(host, "restart_ledger", lambda *a, **k: True)
+  monkeypatch.setattr(host, "verify_served_generation", lambda cid, sha: None)
+  return writes, rollbacks
+
+
+def test_recovery_completes_a_verified_target(journal, monkeypatch):
+  writes, rollbacks = journal
+  monkeypatch.setattr(host, "wait_healthy", lambda *a: True)
+  monkeypatch.setattr(host, "app_container", lambda _c: ("cid", IMAGE_ID))
+  host.recover({}, host.read_transaction())
+  assert writes[-1]["state"] == "succeeded"
+  assert writes[-1]["request_nonce"] == TXN["request_nonce"]
+  assert not rollbacks and host.read_transaction() is None
+
+
+@pytest.mark.parametrize("healthy,running", [
+  (True, TXN["previous_image"]),  # stopped before the new container started
+  (False, IMAGE_ID),  # the new container never became healthy
+])
+def test_recovery_restores_the_previous_container_otherwise(journal, monkeypatch, healthy, running):
+  _writes, rollbacks = journal
+  monkeypatch.setattr(host, "wait_healthy", lambda *a: healthy)
+  monkeypatch.setattr(host, "app_container", lambda _c: ("cid", running))
+  host.recover({}, host.read_transaction())
+  assert rollbacks and rollbacks[0][3] == "worker_interrupted"
+
+
+def test_a_new_request_waits_for_an_interrupted_replacement(tmp_path, monkeypatch):
+  control = tmp_path / "control"
+  (control / "inbox").mkdir(parents=True)
+  request = control / "inbox" / "request.json"
+  request.write_text(json.dumps({"version": 1, "expected_sha": "a" * 40}))
+  monkeypatch.setattr(host, "config", lambda: {"control_dir": control})
+  monkeypatch.setattr(host, "LOCK", tmp_path / "replace.lock")
+  monkeypatch.setattr(host, "TRANSACTION", tmp_path / "transaction.json")
+  host.write_transaction(TXN)
+  assert host.run() == 0
+  assert request.exists()
+
+
+def test_a_claimed_directory_is_left_not_deleted(tmp_path):
+  claimed = tmp_path / ".request-x.json"
+  claimed.mkdir()
+  (claimed / "keep").write_text("x")
+  host._discard_claim(claimed)
+  assert (claimed / "keep").exists()
+
+
+def test_extraction_output_is_bounded_by_the_real_reader():
+  with pytest.raises(RuntimeError, match="too large"):
+    host._bounded_output(["python3", "-c", "print('x' * 100)"], 10)
+  assert host._bounded_output(["python3", "-c", "print('ok')"], 10) == b"ok\n"

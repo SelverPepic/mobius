@@ -2,20 +2,24 @@
 """Frozen root launcher for the self-hosted Möbius replacement worker.
 
 Installed once as ``/usr/local/libexec/mobius-rebuild-host`` and never changed
-by updates. It holds no replacement logic: it runs the active worker (a copy of
-``scripts/mobius-rebuild-host.py``) that the worker itself adopted from a
-verified official image after a successful replacement. Worker changes
-therefore ship in releases and activate without a host command. Only a change
-to this file needs a reinstall (``deployment/self-hosted-helper.required``).
+by updates. It holds no replacement logic. It runs a copy of
+``scripts/mobius-rebuild-host.py`` recorded in ``workers.json``:
 
-Recovery: a worker that fails before changing anything (its status untouched)
-is set aside and the previous worker runs the same command; its bytes are never
-adopted again. A worker that fails mid-operation is reconciled by the previous
-worker when its own reconcile fails. Neither path lowers the adopted revision.
+- ``active``: the proven worker. It always runs ``reconcile`` and runs a
+  replacement when there is no candidate.
+- ``candidate``: a newer worker the active one took from a verified official
+  image after a successful replacement. It runs the next replacement. If that
+  replacement succeeds it becomes active; any other outcome drops it for good
+  and the proven worker handles the retry. So worker changes ship in releases
+  and activate without a host command, and a faulty one costs one attempt.
+
+Only a change to this file needs a reinstall
+(``deployment/self-hosted-helper.required``).
 """
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -29,6 +33,7 @@ STATE_DIR = Path("/var/lib/mobius-rebuild")
 WORKERS = STATE_DIR / "workers"
 INDEX = STATE_DIR / "workers.json"
 STATUS = STATE_DIR / "status.json"
+LOCK = STATE_DIR / "replace.lock"
 PYTHON = "/usr/bin/python3"
 ENV = {
     "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -36,6 +41,9 @@ ENV = {
     "LANG": "C.UTF-8",
     "MOBIUS_REBUILD_LAUNCHER": str(LAUNCHER_REVISION),
 }
+PROVEN = {"succeeded", "no_change"}
+# Outcomes that say nothing about the worker that reported them.
+NEUTRAL_CODES = {"withdrawn", "already_running"}
 
 
 def _root_private(path: Path, *, directory: bool) -> bool:
@@ -80,43 +88,8 @@ def load_index() -> dict | None:
     active = _worker(index.get("active"))
     if active is None:
         return None
-    previous = _worker(index.get("previous")) if index.get("previous") else None
-    return {**index, "active": active, "previous": previous}
-
-
-def _fsync_dir(path: Path) -> None:
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
-def set_aside(index: dict) -> None:
-    """Make the previous worker active and never adopt the failed bytes again."""
-    stored = json.loads(INDEX.read_text(encoding="utf-8"))
-    failed = index["active"]["sha256"]
-    stored["active"] = stored["previous"]
-    stored["previous"] = None
-    stored["rejected"] = sorted({*stored.get("rejected", []), failed})
-    fd, name = tempfile.mkstemp(dir=STATE_DIR, prefix=".workers.json.")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(stored, handle, separators=(",", ":"))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(name, 0o600)
-        os.replace(name, INDEX)
-        _fsync_dir(STATE_DIR)
-    finally:
-        Path(name).unlink(missing_ok=True)
-
-
-def execute(worker: dict, command: str) -> int:
-    return subprocess.run(
-        [PYTHON, "-I", "-S", str(worker["path"]), command],
-        env=ENV, cwd="/", check=False,
-    ).returncode
+    candidate = _worker(index["candidate"]) if index.get("candidate") else None
+    return {**index, "active": active, "candidate": candidate}
 
 
 def _status() -> bytes:
@@ -126,35 +99,76 @@ def _status() -> bytes:
         return b""
 
 
+def execute(worker: dict, command: str) -> int:
+    return subprocess.run(
+        [PYTHON, "-I", "-S", str(worker["path"]), command],
+        env=ENV, cwd="/", check=False,
+    ).returncode
+
+
+def settle_candidate(ran: dict, result: int, before: bytes) -> None:
+    """Promote the candidate that just ran if it proved itself, else drop it."""
+    after = _status()
+    if after == before and result == 0:
+        return  # nothing was queued: the candidate has not been tried
+    try:
+        reported = json.loads(after) if after != before else {}
+    except ValueError:
+        reported = {}
+    if reported.get("code") in NEUTRAL_CODES:
+        return
+    proven = reported.get("state") in PROVEN
+    entry = {key: value for key, value in ran.items() if key != "path"}
+    with LOCK.open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        stored = json.loads(INDEX.read_text(encoding="utf-8"))
+        if (stored.get("candidate") or {}).get("sha256") == ran["sha256"]:
+            stored["candidate"] = None
+        if proven:
+            stored["previous"] = stored.get("active")
+            stored["active"] = entry
+        else:
+            stored["rejected"] = sorted({*stored.get("rejected", []), ran["sha256"]})
+        _publish(stored)
+
+
+def _publish(index: dict) -> None:
+    fd, name = tempfile.mkstemp(dir=STATE_DIR, prefix=".workers.json.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(index, handle, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(name, 0o600)
+        os.replace(name, INDEX)
+        directory = os.open(STATE_DIR, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
 def main(argv: list[str]) -> int:
     os.umask(0o077)
     if (os.geteuid() != 0 or len(argv) != 2
             or argv[1] not in {"run", "reconcile"}):
         print("invalid invocation", file=sys.stderr)
         return 2
-    command = argv[1]
     index = load_index()
     if index is None:
         print("no verified replacement worker is installed; rerun "
               "scripts/install-rebuild-helper.sh", file=sys.stderr)
         return 1
+    if argv[1] == "reconcile":
+        return execute(index["active"], "reconcile")
+    ran = index["candidate"] or index["active"]
     before = _status()
-    result = execute(index["active"], command)
-    previous = index["previous"]
-    if result == 0 or previous is None:
-        return result
-    if command == "reconcile":
-        return execute(previous, "reconcile")
-    if _status() != before:
-        # The worker reported its own outcome, or stopped mid-operation;
-        # systemd's ExecStopPost reconcile settles the latter.
-        return result
-    # The worker failed before changing anything. If the previous worker
-    # handles the same request, the new one is at fault: set it aside.
-    fallback = execute(previous, "run")
-    if fallback == 0 or _status() != before:
-        set_aside(index)
-    return fallback
+    result = execute(ran, "run")
+    if ran is index["candidate"]:
+        settle_candidate(ran, result, before)
+    return result
 
 
 if __name__ == "__main__":

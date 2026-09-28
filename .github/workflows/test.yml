@@ -374,6 +374,24 @@ jobs:
           fi
           echo "run=$run" >> "$GITHUB_OUTPUT"
 
+      - name: Worker revisions are append-only
+        if: steps.scope.outputs.run == 'true'
+        env:
+          BASE_SHA: ${{ github.event.merge_group.base_sha || github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          # Installed launchers adopt only strictly higher revisions, so a
+          # released revision's bytes may never change.
+          git fetch -q origin main
+          base=${BASE_SHA:-$(git merge-base HEAD FETCH_HEAD)}
+          git show "$base:scripts/rebuild-worker-revisions.json" > /tmp/base-revisions.json 2>/dev/null || echo '{}' > /tmp/base-revisions.json
+          python3 - <<'PY'
+          import json
+          base = json.load(open("/tmp/base-revisions.json"))
+          head = json.load(open("scripts/rebuild-worker-revisions.json"))
+          changed = [key for key, digest in base.items() if head.get(key) != digest]
+          assert not changed, f"released worker revisions changed: {changed}"
+          PY
+
       - name: Replace a published release through the installed helper
         if: steps.scope.outputs.run == 'true'
         env:
@@ -390,6 +408,8 @@ jobs:
             [ "${#found[@]}" -eq 2 ] && break
           done
           [ "${#found[@]}" -eq 2 ] || { echo "infrastructure: fewer than two published releases before $base"; exit 1; }
+          # The installer runs as root over this runner-owned checkout.
+          sudo git config --global --add safe.directory '*'
           sudo scripts/test-host-helper.sh "${found[1]}" "${found[0]}"
 
   e2e:

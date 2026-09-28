@@ -3,7 +3,11 @@
 # replace a running official release with another, driven only by the request
 # the app writes into /data. Nothing here stands in for the helper.
 #
-#   sudo scripts/test-host-helper.sh <previous-sha> <target-sha>
+#   sudo scripts/test-host-helper.sh <previous-sha> <target-sha> [<seed-sha>]
+#
+# With <seed-sha>, the helper is installed from that older checkout instead of
+# this one, so the target image's newer worker must arrive by itself: it is
+# offered as the candidate, runs the next request, and becomes active.
 #
 # Both SHAs must have published official images. Run on a disposable systemd
 # host with Docker Compose (a CI runner); it installs root-owned units there.
@@ -21,6 +25,7 @@ set -euo pipefail
 
 PREVIOUS="${1:?previous sha}"
 TARGET="${2:?target sha}"
+SEED="${3:-}"
 IMAGE=ghcr.io/mobius-os/mobius
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 STATUS=/var/lib/mobius-rebuild/status.json
@@ -69,8 +74,20 @@ echo "host helper: $IMAGE:sha-${PREVIOUS:0:12} -> sha-${TARGET:0:12}"
 printf 'SECRET_KEY=host-helper-regression-key-0123456789abcdef\nDOMAIN=localhost\n' >"$ENV_FILE"
 chmod 0600 "$ENV_FILE"
 
+# The checkout the owner deploys from and installs the helper with.
+INSTALL_ROOT=$ROOT
+if [[ -n $SEED ]]; then
+  INSTALL_ROOT=$(mktemp -d /tmp/mobius-seed.XXXXXX)
+  git -C "$ROOT" worktree add --detach -q "$INSTALL_ROOT/checkout" "$SEED"
+  INSTALL_ROOT=$INSTALL_ROOT/checkout
+  if [[ ! -f $INSTALL_ROOT/scripts/mobius-rebuild-launcher.py ]]; then
+    echo "host helper: ${SEED:0:12} predates the launcher; nothing to prove yet"
+    exit 0
+  fi
+fi
+
 echo "1. the previous release runs as an owner deploys it"
-cd "$ROOT"
+cd "$INSTALL_ROOT"
 MOBIUS_IMAGE="$IMAGE:sha-$PREVIOUS" docker compose --env-file "$ENV_FILE" \
   up -d --no-build --no-deps app
 for _ in $(seq 1 60); do
@@ -81,12 +98,14 @@ done
   || fail "the previous release did not become healthy"
 
 echo "2. the owner installs the helper once"
+# Compose labels name this checkout; the installer freezes that topology.
 scripts/install-rebuild-helper.sh || fail "the installer failed"
 [[ $(field "$STATUS" 'd.get("launcher_revision")') == 1 ]] \
   || fail "the installed helper is not the launcher"
 revision=$(field "$STATUS" 'd.get("worker_revision")')
-[[ $revision == $(python3 -c 'import json; print(max(map(int, json.load(open("scripts/rebuild-worker-revisions.json")))))') ]] \
-  || fail "the seeded worker is not this checkout's revision"
+latest() { python3 -c 'import json, sys; print(max(map(int, json.load(open(sys.argv[1])))))' "$1/scripts/rebuild-worker-revisions.json"; }
+[[ $revision == $(latest "$INSTALL_ROOT") ]] \
+  || fail "the seeded worker is not the installing checkout's revision"
 
 echo "3. Settings queues an update to the target release"
 nonce=$(queue "$TARGET")
@@ -108,4 +127,13 @@ echo "   worker adoption: $adoption"
 echo "5. the same request again changes nothing"
 nonce=$(queue "$TARGET")
 wait_status "$nonce" no_change
+if [[ -n $SEED ]]; then
+  target_revision=$(latest "$ROOT")
+  active=$(python3 -c 'import json; print(json.load(open("/var/lib/mobius-rebuild/workers.json"))["active"]["revision"])')
+  [[ $active == "$target_revision" ]] \
+    || fail "the image's worker revision $target_revision did not become active (active: $active; adoption: $adoption)"
+  [[ $(field "$STATUS" 'd.get("worker_revision")') == "$target_revision" ]] \
+    || fail "the second replacement was not run by the adopted worker"
+  echo "   worker revision $revision -> $target_revision arrived with the image and is active"
+fi
 echo "host helper: sha-${PREVIOUS:0:12} replaced by sha-${TARGET:0:12} through the installed launcher"
