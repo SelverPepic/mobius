@@ -43,7 +43,7 @@ from fastapi.responses import FileResponse, PlainTextResponse
 from app import models
 from app.config import get_settings
 from app.deps import get_owner_or_app_with_filesystem_access, reject_cross_site
-from app.path_utils import validate_path_within_base
+from app.path_utils import has_overlong_segment, validate_path_within_base
 
 router = APIRouter(prefix="/api/fs", tags=["fs"])
 
@@ -188,7 +188,7 @@ def _resolve(path: str, root: Path) -> Path:
   rel = (path or "").lstrip("/")
   # A component past the 255-byte filesystem limit makes every later stat
   # raise ENAMETOOLONG; no such file can exist, so refuse it up front.
-  if any(len(part.encode("utf-8", "surrogatepass")) > 255 for part in Path(rel).parts):
+  if has_overlong_segment(rel):
     raise HTTPException(status_code=400, detail="A path name is too long.")
   return validate_path_within_base(rel, root)
 
