@@ -302,17 +302,20 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.merge_group.base_sha || github.event.pull_request.base.sha || github.event.before }}
         run: |
-          git fetch -q --unshallow origin || git fetch -q origin
+          git fetch -q --unshallow origin || true
+          git fetch -q origin main
+          # The release this change branches from (a manual run has no base).
+          base=${BASE_SHA:-$(git merge-base HEAD FETCH_HEAD)}
           # main-image publishes after each merge, so the base may still be
           # building: use the newest published image at or before it.
           previous=""
-          for sha in $(git rev-list --first-parent --max-count=30 "${BASE_SHA:-origin/main}"); do
+          for sha in $(git rev-list --first-parent --max-count=30 "$base"); do
             if docker manifest inspect "ghcr.io/mobius-os/mobius:sha-$sha" >/dev/null 2>&1; then
               previous=$sha
               break
             fi
           done
-          [ -n "$previous" ] || { echo "no published image at or before ${BASE_SHA}"; exit 1; }
+          [ -n "$previous" ] || { echo "no published image at or before $base"; exit 1; }
           docker pull -q "ghcr.io/mobius-os/mobius:sha-$previous"
           scripts/test-upgrade-path.sh "ghcr.io/mobius-os/mobius:sha-$previous" mobius-test:ci .
 

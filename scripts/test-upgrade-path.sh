@@ -140,22 +140,34 @@ if [ "$needs_image" = True ]; then
   nonce=$(field "$request" 'd.get("nonce") or ""')
 
   echo "5. the helper replaces the container with the candidate image"
-  operation=$(printf '%032x' "$$")
-  helper_status() {  # <state> <message>: what the real helper mirrors into /data
+  # The same sequence as scripts/mobius-rebuild-host.py run(): claim, drain
+  # through the root ledger (an old updater swaps its update here), recreate,
+  # verify, finalize the chat handoff, report success.
+  operation=$(python3 -c 'import uuid; print(uuid.uuid4().hex)')
+  helper_status() {  # <state> <message>: what the helper mirrors into /data
     printf '{"supported":true,"operation_id":"%s","state":"%s","expected_sha":"%s","request_nonce":"%s","code":null,"message":"%s","handoff":"external-cutover-v1","request_versions":[1,2],"updated_at":"%s"}\n' \
       "$operation" "$1" "$candidate" "$nonce" "$2" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   }
+  write_status() { helper_status "$@" | docker exec -i "$name" sh -c 'cat > /data/mobius-rebuild/status.json'; }
+  ledger() { docker exec "$name" python3 -P /app/runtime/restart_ledger.py "$1" "$operation"; }
   docker exec "$name" rm -f /data/mobius-rebuild/inbox/request.json
+  write_status preparing "Downloading and checking the official image."
+  ledger open-cutover || fail "the previous release does not support a safe cutover"
+  docker exec "$name" python3 /data/platform/backend/scripts/prepare-container-cutover.py "$operation" \
+    || fail "the previous release could not drain for the cutover"
+  ledger accept-cutover || fail "the previous release's supervisor did not accept the handoff"
+  write_status replacing "Rebuilding the container."
   docker stop -t 60 "$name" >/dev/null
   docker rm "$name" >/dev/null
-  # Like the helper: report verification while the new container boots, and
-  # success only once it is healthy.
   helper_status verifying "Checking the new container." \
     | docker run --rm -i --entrypoint sh -v "$volume:/data" "$CANDIDATE" \
       -c 'cat > /data/mobius-rebuild/status.json'
   start "$CANDIDATE"
-  helper_status succeeded "Container rebuilt successfully." \
-    | docker exec -i "$name" sh -c 'cat > /data/mobius-rebuild/status.json'
+  [ "$(docker exec "$name" curl -fsS http://127.0.0.1:8000/api/version \
+      | python3 -c 'import json, sys; print(json.load(sys.stdin).get("sha"))')" = "$candidate" ] \
+    || fail "the new container does not report the candidate revision"
+  ledger finalize-cutover || fail "the candidate could not finalize the chat handoff"
+  write_status succeeded "Container rebuilt successfully."
 else
   reply=$(api POST /api/platform/apply "$plan")
   [ "$(code "$reply")" = 200 ] \
@@ -173,9 +185,10 @@ fi
 as_mobius git -C /data/platform merge-base --is-ancestor "$candidate" HEAD \
   || fail "the served checkout does not contain the candidate"
 if [ "$needs_image" = True ]; then
-  for _ in $(seq 1 120); do  # the started server confirms the exact replacement
+  for _ in $(seq 1 60); do  # reading the status confirms the exact replacement
+    api GET /api/admin/rebuild >/dev/null
     as_mobius test -e "$record" || break
-    sleep 1
+    sleep 2
   done
   as_mobius test ! -e "$record" || fail "the update never settled: $(as_mobius cat "$record")"
 fi
