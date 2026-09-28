@@ -1,6 +1,7 @@
 /* Resolve image-view tool results without handing their base64 payload to the generic text renderer. */
 
 const CHAT_IMAGE_PATH = /^\/data\/chats\/([A-Za-z0-9_-]+)\/(uploads|media)\/([^/]+)$/
+const GENERATED_IMAGE_PATH = /^\/data\/chats\/([A-Za-z0-9_-]+)\/deliverables\/inbox\/([^/]+)$/
 const TMP_IMAGE_PATH = /^\/tmp\/(.+)$/
 const INLINE_IMAGE_TYPES = new Set([
   'image/png',
@@ -56,10 +57,22 @@ export function temporaryImageReference(input, chatId) {
   }
 }
 
+/** A viewed deliverable is still in its inbox while the agent runs. The
+ * tool-specific route checks that exact completed view before serving it. */
+export function generatedImageReference(input, chatId, toolUseId) {
+  if (!chatId || !toolUseId) return null
+  const path = imagePathFromInput(input)
+  const match = path.match(GENERATED_IMAGE_PATH)
+  if (!match || match[1] !== chatId) return null
+  return { kind: 'generated-view', chatId, toolUseId, filename: match[2] }
+}
+
 /** References that can render through an existing protected route without
  * loading the image tool's much larger base64 sidecar. */
-export function servedImageReference(input, chatId) {
-  return chatImageReference(input) || temporaryImageReference(input, chatId)
+export function servedImageReference(input, chatId, toolUseId) {
+  return chatImageReference(input)
+    || temporaryImageReference(input, chatId)
+    || generatedImageReference(input, chatId, toolUseId)
 }
 
 /** Fallback for image tools that viewed a path outside chat media. This work
@@ -89,6 +102,6 @@ export function inlineImageReference(output) {
   }
 }
 
-export function toolImageReference(input, output, chatId) {
-  return servedImageReference(input, chatId) || inlineImageReference(output)
+export function toolImageReference(input, output, chatId, toolUseId) {
+  return servedImageReference(input, chatId, toolUseId) || inlineImageReference(output)
 }

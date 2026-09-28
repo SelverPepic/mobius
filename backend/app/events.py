@@ -908,6 +908,10 @@ def _process_tool_event(event: dict, assistant_blocks: list) -> bool:
     if blk is None:
       return False
     blk["status"] = "done"
+    if "viewed_image_sha256" in event and blk.get("tool") == "ViewImage":
+      digest = event["viewed_image_sha256"]
+      if isinstance(digest, str):
+        blk["viewed_image_sha256"] = digest
     return True
 
   if event_type == "skill_loaded":

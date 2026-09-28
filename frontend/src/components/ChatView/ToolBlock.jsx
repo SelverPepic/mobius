@@ -148,8 +148,8 @@ function GenericToolBlock({ t, chatId, compact = false, disclosureKey }) {
     [failed, t.edit_preview, wantsPreparation],
   )
   const servedImage = useMemo(() => (
-    isImageTool ? servedImageReference(t.input, chatId) : null
-  ), [isImageTool, t.input, chatId])
+    isImageTool ? servedImageReference(t.input, chatId, t.tool_use_id) : null
+  ), [isImageTool, t.input, chatId, t.tool_use_id])
   // `t.sources` is NOT rendered here: the turn's sources surface once at the
   // end of the message (MessageSources), where they belong to the answer
   // rather than to the one search that found them. They deliberately do not
@@ -253,8 +253,8 @@ function GenericToolBlock({ t, chatId, compact = false, disclosureKey }) {
     || !!t.output_truncated
     || (t.status !== 'running' && shownOutput === '')
   const imageReference = useMemo(
-    () => (isImageTool ? toolImageReference(t.input, shownOutput, chatId) : null),
-    [isImageTool, shownOutput, t.input, chatId],
+    () => (isImageTool ? toolImageReference(t.input, shownOutput, chatId, t.tool_use_id) : null),
+    [isImageTool, shownOutput, t.input, chatId, t.tool_use_id],
   )
   const r = useMemo(
     () => (hasOutput && !isImageTool

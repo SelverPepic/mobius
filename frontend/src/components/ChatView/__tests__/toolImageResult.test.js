@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import {
   chatImageReference,
+  generatedImageReference,
   imagePathFromInput,
   inlineImageReference,
   servedImageReference,
@@ -72,6 +73,23 @@ test('a viewed /tmp image resolves through the owning chat only', () => {
   )
   assert.equal(temporaryImageReference('/tmp/visual.png', ''), null)
   assert.equal(temporaryImageReference('/var/tmp/visual.png', 'chat-123'), null)
+})
+
+test('a viewed generated image uses its completed tool identity, not an open inbox URL', () => {
+  const path = '/data/chats/chat-123/deliverables/inbox/format comparison.png'
+  assert.deepEqual(generatedImageReference(path, 'chat-123', 'tool-7'), {
+    kind: 'generated-view',
+    chatId: 'chat-123',
+    toolUseId: 'tool-7',
+    filename: 'format comparison.png',
+  })
+  assert.deepEqual(servedImageReference(path, 'chat-123', 'tool-7'),
+    generatedImageReference(path, 'chat-123', 'tool-7'))
+  assert.equal(generatedImageReference(path, 'another-chat', 'tool-7'), null)
+  assert.equal(generatedImageReference(path, 'chat-123', ''), null)
+  assert.equal(generatedImageReference('/data/chats/chat-123/deliverables/files/secret.png', 'chat-123', 'tool-7'), null)
+  assert.equal(generatedImageReference('/data/chats/chat-123/deliverables/inbox/nested/x.png', 'chat-123', 'tool-7'), null)
+  assert.equal(generatedImageReference('/other/chats/chat-123/deliverables/inbox/image.png', 'chat-123', 'tool-7'), null)
 })
 
 test('a base64 image result is an explicit fallback for non-chat paths', () => {
