@@ -10,6 +10,9 @@
 #
 # 1. Boot the previous image on a fresh volume (production path, like an owner).
 # 2. Offer it the candidate release and create its owner through the setup API.
+#    Like an agent customizing its instance, commit local edits to image-owned
+#    files (Dockerfile, Python package list). They must never block the update,
+#    and must still be in the source afterwards.
 # 3. Stand in for a current self-hosted host helper. This checks the old
 #    updater and the new image's boot against the helper's contract; the
 #    helper's own code (scripts/mobius-rebuild-host.py) is not exercised.
@@ -118,6 +121,18 @@ as_mobius git -C /data/platform fetch -q /tmp/candidate.bundle \
 reply=$(api POST /api/auth/setup '{"username":"owner","password":"upgrade-path-owner-password"}')
 [ "$(code "$reply")" = 200 ] || fail "owner setup failed: $(body "$reply")"
 token=$(field "$(body "$reply")" 'd["access_token"]')
+# Releases before #1561 refused such edits by design; test the promise from
+# the first release that makes it.
+local_edits=false
+if as_mobius grep -q "def local_image_changes" /data/platform/backend/app/platform_update.py; then
+  local_edits=true
+  as_mobius sh -c 'cd /data/platform &&
+    printf "\n# upgrade-path: local image customization\n" >> Dockerfile &&
+    printf "# upgrade-path: local package note\n" >> backend/requirements.txt &&
+    git -c user.name=upgrade-path -c user.email=upgrade-path@localhost \
+      commit -q -m "Local image-owned customization" -- Dockerfile backend/requirements.txt' \
+    || fail "could not commit the local image-owned customization"
+fi
 
 echo "3. a current host helper is installed"
 docker exec "$name" sh -c '
@@ -141,6 +156,10 @@ conflicts=$(field "$preview" 'len(d.get("conflict_paths") or []) + len(d.get("bl
   || fail "the previous release does not offer the candidate as an actionable update: $preview"
 plan=$(field "$preview" 'json.dumps({k: d.get(k) for k in ("plan_id", "current_sha", "target_sha", "image_digest")})')
 needs_image=$(field "$preview" '"image_rebuild" in ((d.get("activation") or {}).get("required_actions") or [])')
+if [ "$local_edits" = true ] && [ "$needs_image" = True ]; then
+  [ "$(field "$preview" '"Dockerfile" in (d.get("local_image_paths") or [])')" = True ] \
+    || fail "the review does not report the local Dockerfile customization: $preview"
+fi
 
 if [ "$needs_image" = True ]; then
   reply=$(api POST /api/platform/rebuild "$plan")
@@ -202,6 +221,11 @@ fi
   || fail "the updated instance does not serve its platform checkout"
 as_mobius git -C /data/platform merge-base --is-ancestor "$candidate" HEAD \
   || fail "the served checkout does not contain the candidate"
+if [ "$local_edits" = true ]; then
+  as_mobius grep -q "upgrade-path: local image customization" /data/platform/Dockerfile \
+    && as_mobius grep -q "upgrade-path: local package note" /data/platform/backend/requirements.txt \
+    || fail "the update dropped the local image-owned customization"
+fi
 if [ "$needs_image" = True ]; then
   for _ in $(seq 1 60); do  # reading the status confirms the exact replacement
     api GET /api/admin/rebuild >/dev/null
