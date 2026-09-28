@@ -31,19 +31,17 @@ import './ProviderAuth.css'
  *   actionLabel     — optional override for the action button text
  *                     (e.g. "Reconfigure" / "Configure"); the default
  *                     is the Connect/Reconnect/Close verb below.
- *   icon            — optional small brand mark shown before the name.
  *   disabled        — greys the informational row and disables its action.
  */
 export default function ProviderRow({
   name, connected, expanded, onToggleExpand, children,
-  badge, version, subtitle, statusNode, detailNode, actionLabel, icon, disabled = false,
+  badge, version, subtitle, statusNode, detailNode, actionLabel, disabled = false,
 }) {
   // Name + installed CLI/SDK version are informational. The status slot can
   // optionally carry a compact disclosure; auth remains a separate action.
   const info = (
     <span className="provider-row__info">
       <span className="provider-row__name-line">
-        {icon && <span className="provider-row__icon" aria-hidden="true">{icon}</span>}
         <span className="provider-row__name">{name}</span>
         {connected && version && (
           <span

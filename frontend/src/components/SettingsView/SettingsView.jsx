@@ -47,12 +47,6 @@ const DEFAULT_BACKGROUND_MODELS = {
   codex: 'gpt-5.6-terra',
 }
 
-// Brand mark for an account row, from the shared provider registry.
-function ProviderLogo({ provider }) {
-  const Logo = PROVIDER_INFO[provider]?.Logo
-  return Logo ? <Logo /> : null
-}
-
 function defaultEffort(provider) {
   const efforts = PROVIDER_INFO[provider]?.efforts || []
   return efforts.find(e => e.value === 'medium')?.value || efforts[0]?.value || ''
@@ -1002,7 +996,6 @@ export default function SettingsView({
               <div className="settings__providers">
                 <ProviderRow
                   name="OpenAI Codex"
-                  icon={<ProviderLogo provider="codex" />}
                   connected={codexAuthenticated}
                   actionLabel={codexAuthenticated ? 'Manage' : 'Connect'}
                   version={codexVersion}
@@ -1035,7 +1028,6 @@ export default function SettingsView({
 
                 <ProviderRow
                   name="Claude Code"
-                  icon={<ProviderLogo provider="claude" />}
                   connected={claudeAuthenticated}
                   actionLabel={claudeAuthenticated ? 'Manage' : 'Connect'}
                   version={claudeVersion}
@@ -1076,7 +1068,6 @@ export default function SettingsView({
                 {mobiusAvailable && (
                   <ProviderRow
                     name="Möbius"
-                    icon={<ProviderLogo provider="mobius" />}
                     connected={mobiusAuthenticated}
                     subtitle={mobiusTrialSubtitle}
                     statusNode={(
