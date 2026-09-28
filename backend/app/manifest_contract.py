@@ -3,6 +3,7 @@
 from collections.abc import Mapping
 import json
 from urllib.parse import unquote, urlparse
+import posixpath
 import re
 import shlex
 
@@ -57,6 +58,7 @@ _SKILL_FILENAME_OK = re.compile(r"^[a-z0-9][a-z0-9._-]*\.md$")
 _SKILL_FOLDER_OK = re.compile(r"^([a-z0-9][a-z0-9._-]*)/$")
 FOLDER_SKILL_ENTRY = "SKILL.md"
 _PACKAGE_ID_OK = re.compile(r"^[a-z0-9][a-z0-9._:-]{2,127}$")
+_PYTHON_PROGRAM = re.compile(r"python(?:[0-9]+(?:\.[0-9]+)?)?")
 _AGENT_TOOL_NAME = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 
 
@@ -123,6 +125,54 @@ def job_interpreter(job: bytes) -> tuple[str, ...]:
     raise ManifestContractError("Schedule job has an invalid shebang.") from exc
   if not interpreter or not interpreter[0].startswith("/"):
     _fail("Schedule job shebang must name an absolute interpreter.")
+  return interpreter
+
+
+def python_lock(manifest) -> str | None:
+  """The dependency lock a manifest declares for its own Python, or None.
+
+  The one reading of ``python`` shared by validation and by the runtime
+  lookup in ``app_python_env``, so the two cannot disagree.
+  """
+  python = manifest.get("python")
+  if python is None:
+    return None
+  if not isinstance(python, Mapping) or set(python) != {"lock"}:
+    _fail("Manifest `python` must contain only `lock`.")
+  validate_repo_relative_path(python["lock"], "python.lock")
+  return python["lock"]
+
+
+def python_job_arguments(interpreter: tuple[str, ...]) -> tuple[str, ...] | None:
+  """The interpreter arguments of a Python job shebang, or None for another program.
+
+  Supported forms are ``/path/to/pythonX[.Y] [args]`` and
+  ``/usr/bin/env [-S] pythonX[.Y] [args]``. Anything else that names Python
+  is rejected: in an app with its own environment it would otherwise run on
+  the platform interpreter.
+  """
+  program, rest = interpreter[0], interpreter[1:]
+  if posixpath.basename(program) == "env":
+    if rest[:1] == ("-S",):
+      rest = rest[1:]
+    if rest and _PYTHON_PROGRAM.fullmatch(rest[0]):
+      return rest[1:]
+  elif _PYTHON_PROGRAM.fullmatch(posixpath.basename(program)):
+    return rest
+  if any("python" in posixpath.basename(token) for token in interpreter):
+    _fail(
+      "Schedule job shebang names Python in an unsupported form. In an app "
+      "with a Python lock, use `#!/usr/bin/env python3` or an absolute Python "
+      "path so the job runs with the app's environment."
+    )
+  return None
+
+
+def validate_schedule_job(manifest, job: bytes) -> tuple[str, ...]:
+  """Validate one app's job declaration against that app's manifest."""
+  interpreter = job_interpreter(job)
+  if python_lock(manifest) is not None:
+    python_job_arguments(interpreter)
   return interpreter
 
 
@@ -852,12 +902,8 @@ def validate_manifest_contract(manifest) -> None:
 
   # The app's own Python environment (app_python_env). Apply and install
   # check that the listed file exists in the accepted tree.
-  python = manifest.get("python")
-  if python is not None:
-    if not isinstance(python, Mapping) or set(python) != {"lock"}:
-      _fail("Manifest `python` must contain only `lock`.")
-    lock = python["lock"]
-    validate_repo_relative_path(lock, "python.lock")
+  lock = python_lock(manifest)
+  if lock is not None:
     if not isinstance(source_files, list) or lock not in source_files:
       _fail(
         "Manifest `python.lock` must also be listed in `source_files` so "

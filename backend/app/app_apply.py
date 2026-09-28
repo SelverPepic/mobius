@@ -45,10 +45,10 @@ from app.manifest_contract import (
   STATIC_ASSET_MAX_BYTES,
   STATIC_ASSETS_TOTAL_MAX,
   ManifestContractError,
-  job_interpreter,
   static_asset_entries,
   validate_manifest_contract,
   validate_repo_relative_path,
+  validate_schedule_job,
 )
 
 
@@ -719,6 +719,7 @@ async def apply_source_revision(
   staged = None
   runtime_staged = None
   python_env = None
+  published_env = None
   static_created: list[Path] = []
   static_rollback: list = []
   static_commit: list = []
@@ -763,7 +764,7 @@ async def apply_source_revision(
         job_name = schedule.get("job") if isinstance(schedule, dict) else None
         if job_name:
           try:
-            job_interpreter((snapshot_dir / job_name).read_bytes())
+            validate_schedule_job(manifest, (snapshot_dir / job_name).read_bytes())
           except (OSError, ManifestContractError) as exc:
             raise AppApplyError(
               "invalid_schedule_job", str(exc), status_code=422,
@@ -942,7 +943,9 @@ async def apply_source_revision(
         db.add(app)
         db.flush()
       if python_env is not None:
-        app_python_env.publish_env(get_settings().data_dir, app.id, python_env)
+        published_env = app_python_env.publish_env(
+          get_settings().data_dir, app.id, python_env,
+        )
         python_env = None
       applied_app_runtime.publish_runtime(app, runtime_staged)
       runtime_staged = None
@@ -1020,6 +1023,9 @@ async def apply_source_revision(
     if runtime_staged is not None:
       shutil.rmtree(runtime_staged.root)
     app_python_env.discard_env(python_env)
+    if not durable_commit:
+      # No row may reference it; a rolled-back new app has none to drive GC.
+      app_python_env.unpublish_env(published_env)
     if not durable_commit and static_materialized:
       _rollback_static_assets(static_created, static_rollback)
     if staged is not None:

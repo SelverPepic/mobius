@@ -303,7 +303,7 @@ def _job_env(app_token: str) -> dict[str, str]:
   return env
 
 
-def _job_command(job: Path, app_id: int) -> list[str]:
+def _job_command(job: Path, app_id: int, python_env: Path | None) -> list[str]:
   """Build the command declared by a job's shebang.
 
   Job packages own their runtime choice. The platform only validates that
@@ -313,9 +313,7 @@ def _job_command(job: Path, app_id: int) -> list[str]:
   """
   with job.open("rb") as script:
     interpreter = job_interpreter(script.read(257))
-  interpreter = app_python_env.job_interpreter_in_env(
-    interpreter, DATA_DIR, app_id, job.parent,
-  )
+  interpreter = app_python_env.job_command_interpreter(interpreter, python_env)
   return [*interpreter, str(job), str(app_id)]
 
 
@@ -396,12 +394,17 @@ def _execute_job(
     job_state.mkdir(parents=True, exist_ok=True)
     child_env["APP_JOB_STATE_DIR"] = str(job_state)
     try:
-      command = _job_command(runtime_job, app_id)
-    except (OSError, ManifestContractError) as exc:
-      _log(app_id, f"rejected: invalid job declaration {runtime_job}: {exc}")
-      return 4
+      # Every job of a declaring app needs its env: a Bash job's `python3`
+      # resolves to it through PATH.
+      python_env = app_python_env.resolve_env(DATA_DIR, app_id, runtime_job.parent)
     except app_python_env.PythonEnvUnavailable as exc:
       _log(app_id, f"failed: {runtime_job.name}: {exc}")
+      return 4
+    child_env = app_python_env.activated_environment(child_env, python_env)
+    try:
+      command = _job_command(runtime_job, app_id, python_env)
+    except (OSError, ManifestContractError) as exc:
+      _log(app_id, f"rejected: invalid job declaration {runtime_job}: {exc}")
       return 4
     # Uninstall sends TERM to this entire process group. Keep the supervisor
     # alive to retain its lease while a TERM-ignoring child needs the existing

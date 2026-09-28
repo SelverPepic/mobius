@@ -281,12 +281,14 @@ manifest, layered by how always-on they are:
   change on any platform update, and anything installed live disappears when
   the container is replaced. To own them, commit a complete
   `pip-compile --generate-hashes` lock (list it in `source_files`) and declare
-  `"python": {"lock": "requirements.lock"}`. Apply then builds an isolated
-  environment on `/data` from wheels only, checks it, and runs the service and
-  any `#!/usr/bin/env python3` job with it. If a package fails to build, the
-  Apply fails and names it. After a platform update that changes Python, the
-  service returns 503 until you Apply again. Details are in
-  `CAPABILITIES.md`.
+  `"python": {"lock": "requirements.lock"}`. Apply or install then builds the
+  app's own environment on `/data` from wheels only. It checks the environment
+  by running the service's setup code, which is your code, unsandboxed. The
+  service and every job then run with the environment first on `PATH`, and a
+  `#!/usr/bin/env python3` job uses its interpreter. If a package fails to
+  build, the Apply fails and names it. After a platform update that changes
+  Python, the service returns 503 and jobs fail until you Apply again. Details
+  are in `CAPABILITIES.md`.
 
 Anything that depends on your app being installed belongs in its fragment (the
 always-on default) and/or its skill (the how-to). A not-installed app then

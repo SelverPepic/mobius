@@ -116,10 +116,10 @@ def service_entry(app, service: dict) -> Path:
   return entry
 
 
-def service_interpreter(app, entry: Path) -> str:
-  """The Python an accepted service runs with: its own env when it declares one."""
+def service_python_env(app, entry: Path) -> Path | None:
+  """The accepted service's own Python env, None when it declares none."""
   try:
-    return app_python_env.interpreter(get_settings().data_dir, app.id, entry.parent)
+    return app_python_env.resolve_env(get_settings().data_dir, app.id, entry.parent)
   except app_python_env.PythonEnvUnavailable as exc:
     log.warning("App service %s cannot start: %s", app.slug, exc)
     raise HTTPException(503, str(exc)) from exc
@@ -319,8 +319,12 @@ async def invoke_service(
   try:
     async with slot, _global_slots[lane]:
       entry = service_entry(app, service)
-      python = service_interpreter(app, entry)
-      environment = service_environment(app, owner, service, public=public)
+      python_env = service_python_env(app, entry)
+      python = app_python_env.python_for(python_env)
+      # The preload host and its request children inherit this PATH too.
+      environment = app_python_env.activated_environment(
+        service_environment(app, owner, service, public=public), python_env,
+      )
       outcome = None
       host = service_preload.ready_host(app, python, entry, environment)
       if host is not None:
