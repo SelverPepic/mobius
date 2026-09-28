@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -34,6 +36,19 @@ HANDOFF_VERSION = "external-cutover-v1"
 # Version 2 requests carry the app's nonce, echoed as ``request_nonce`` so the
 # app can tell its exact replacement's outcome from any earlier one.
 REQUEST_VERSIONS = [1, 2]
+# The frozen launcher (scripts/mobius-rebuild-launcher.py) adopts a worker from
+# each requested official image only when this number is higher than every
+# worker it has run. Increase it with every change to this file; never lower
+# it. The launcher reads it as text, so keep it a plain literal on one line.
+WORKER_REVISION = 1
+# The frozen launcher runs the worker adopted here; see adopt_worker().
+WORKERS = STATE_DIR / "workers"
+WORKER_INDEX = STATE_DIR / "workers.json"
+WORKER_IN_IMAGE = "/app/platform-baked/scripts/mobius-rebuild-host.py"
+MAX_WORKER_BYTES = 1024 * 1024
+MAX_REQUEST_BYTES = 4096
+_REVISION_LINE = re.compile(rb"^WORKER_REVISION\s*=.*$", re.MULTILINE)
+_REVISION_EXACT = re.compile(rb"^WORKER_REVISION = ([1-9][0-9]{0,5})$")
 
 
 def now() -> str:
@@ -151,6 +166,9 @@ def write_status(config_value: dict, **fields) -> dict:
     current.update(fields)
     current["handoff"] = HANDOFF_VERSION
     current["request_versions"] = REQUEST_VERSIONS
+    current["worker_revision"] = WORKER_REVISION
+    launcher = os.environ.get("MOBIUS_REBUILD_LAUNCHER", "")
+    current["launcher_revision"] = int(launcher) if launcher.isdigit() else None
     current.pop("runtime_overlay", None)
     current["updated_at"] = now()
     _atomic_json(STATUS, current)
@@ -393,6 +411,148 @@ def rollback(config_value: dict, operation: str, expected: str,
     return 1
 
 
+def worker_revision(source: bytes) -> int | None:
+    """A worker's declared revision, read as text and never by running it:
+    0 for a worker from before revisions, None when the declaration is
+    malformed or repeated."""
+    lines = _REVISION_LINE.findall(source)
+    if not lines:
+        return 0
+    match = _REVISION_EXACT.fullmatch(lines[0].rstrip(b"\r"))
+    return int(match[1]) if len(lines) == 1 and match else None
+
+
+def _fsync_dir(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _durable_write(path: Path, data: bytes, mode: int) -> None:
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(name, mode)
+        os.replace(name, path)
+        _fsync_dir(path.parent)
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
+def adopt_worker(source: bytes, origin: str) -> str:
+    """Make ``source`` the launcher's active worker when it is strictly newer
+    than every worker adopted so far. Returns a short outcome for status.
+
+    Never lowers the adopted revision, never re-adopts bytes the launcher set
+    aside, and refuses a second payload claiming an adopted revision. The
+    worker file is durable before the index that selects it is published."""
+    revision = worker_revision(source)
+    if revision is None:
+        return "rejected: malformed WORKER_REVISION"
+    if revision == 0:
+        return "not adopted: the image predates self-updating workers"
+    if len(source) > MAX_WORKER_BYTES:
+        return "rejected: worker too large"
+    try:
+        compile(source, "mobius-rebuild-host.py", "exec", dont_inherit=True)
+    except (SyntaxError, ValueError) as exc:
+        return f"rejected: worker does not compile ({exc.__class__.__name__})"
+    digest = hashlib.sha256(source).hexdigest()
+    try:
+        index = json.loads(WORKER_INDEX.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        index = {"version": 1, "high_water": 0, "active": None,
+                 "previous": None, "rejected": []}
+    active = index.get("active") or {}
+    if digest in index.get("rejected", []):
+        return f"not adopted: revision {revision} was set aside after failing"
+    if revision < int(index.get("high_water", 0)):
+        return f"not adopted: revision {revision} is older than {index['high_water']}"
+    if revision == int(index.get("high_water", 0)):
+        if active.get("sha256") == digest:
+            return f"current: revision {revision}"
+        return f"rejected: a different worker already claims revision {revision}"
+    WORKERS.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(WORKERS, 0o700)
+    name = f"{revision}-{digest[:16]}.py"
+    _durable_write(WORKERS / name, source, 0o700)
+    entry = {"revision": revision, "file": name, "sha256": digest,
+             "origin": origin[:80]}
+    updated = {
+        "version": 1, "high_water": revision, "active": entry,
+        "previous": index.get("active"),
+        "rejected": index.get("rejected", []),
+    }
+    _durable_write(
+        WORKER_INDEX, json.dumps(updated, separators=(",", ":")).encode(), 0o600,
+    )
+    keep = {name, (updated["previous"] or {}).get("file")}
+    for stale in WORKERS.glob("*.py"):
+        if stale.name not in keep:
+            stale.unlink(missing_ok=True)
+    return f"adopted: revision {revision}"
+
+
+def _bounded_output(args: list[str], limit: int) -> bytes:
+    with subprocess.Popen(args, stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL) as process:
+        data = process.stdout.read(limit + 1) if process.stdout else b""
+        if len(data) > limit:
+            process.kill()
+            raise RuntimeError("the image's worker is too large")
+        if process.wait(timeout=300) != 0:
+            raise RuntimeError("the image's worker could not be read")
+    return data
+
+
+def worker_from_image(image_id: str) -> bytes:
+    """The worker inside the exact verified image, without starting it."""
+    import io
+    import tarfile
+
+    created = subprocess.run(
+        ["docker", "create", "--network", "none", "--entrypoint", "/bin/false",
+         "--label", "mobius-rebuild.worker-extract=1", image_id],
+        text=True, capture_output=True, check=True, timeout=300,
+    )
+    cid = created.stdout.strip()
+    try:
+        archive = _bounded_output(
+            ["docker", "cp", f"{cid}:{WORKER_IN_IMAGE}", "-"],
+            MAX_WORKER_BYTES + 64 * 1024,
+        )
+    finally:
+        subprocess.run(["docker", "rm", "-f", "-v", cid], capture_output=True,
+                       text=True, timeout=300)
+    try:
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tar:
+            members = tar.getmembers()
+            if (len(members) != 1 or members[0].type != tarfile.REGTYPE
+                    or members[0].name != Path(WORKER_IN_IMAGE).name
+                    or members[0].size > MAX_WORKER_BYTES):
+                raise RuntimeError("the image's worker is not one regular file")
+            handle = tar.extractfile(members[0])
+            source = handle.read(MAX_WORKER_BYTES + 1) if handle else b""
+    except tarfile.TarError as exc:
+        raise RuntimeError("the image's worker archive is invalid") from exc
+    if len(source) != members[0].size:
+        raise RuntimeError("the image's worker archive is truncated")
+    return source
+
+
+def adopt_from_image(image_id: str) -> str:
+    """After a verified replacement, adopt the worker that image carries."""
+    try:
+        return adopt_worker(worker_from_image(image_id), image_id)
+    except Exception as exc:  # adoption never fails a finished replacement
+        return f"not adopted: {str(exc)[:160]}"
+
+
 def parse_request(payload: dict) -> tuple[str, str | None]:
     """The requested target and, for a version 2 request, the app's nonce."""
     version = payload.get("version")
@@ -413,18 +573,33 @@ def read_request(request: Path) -> tuple[dict | None, tuple[int, int, bytes] | N
     the exact file read (device, inode, bytes), or ``(None, None)`` when
     nothing is queued."""
     try:
-        fd = os.open(request, os.O_RDONLY)
+        info = os.lstat(request)
     except FileNotFoundError:
         return None, None
-    with os.fdopen(fd, "rb") as handle:
-        info = os.fstat(handle.fileno())
-        raw = handle.read()
+    raw = _read_regular(request, info)
     try:
-        value = json.loads(raw)
+        value = json.loads(raw) if raw is not None else None
     except (ValueError, UnicodeError):
         value = None
     payload = value if isinstance(value, dict) else None
-    return payload, (info.st_dev, info.st_ino, raw)
+    return payload, (info.st_dev, info.st_ino, raw or b"")
+
+
+def _read_regular(path: Path, info: os.stat_result) -> bytes | None:
+    """A bounded read of exactly the regular file ``info`` describes; None for
+    a link, pipe, oversized or swapped file (still claimed, then refused)."""
+    if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_REQUEST_BYTES:
+        return None
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    with os.fdopen(fd, "rb") as handle:
+        opened = os.fstat(handle.fileno())
+        if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+            return None
+        raw = handle.read(MAX_REQUEST_BYTES + 1)
+    return raw if len(raw) <= MAX_REQUEST_BYTES else None
 
 
 def claim_request(
@@ -442,9 +617,9 @@ def claim_request(
     except FileNotFoundError:
         return False
     try:
-        info = os.stat(claimed)
+        info = os.lstat(claimed)
         verified = (info.st_dev, info.st_ino) == identity[:2] and (
-            claimed.read_bytes() == identity[2]
+            (_read_regular(claimed, info) or b"") == identity[2]
         )
     except OSError:
         verified = False
@@ -549,6 +724,7 @@ def run() -> int:
                     config_value, operation_id=operation, state="no_change",
                     expected_sha=expected, code=None,
                     message="This container already uses that official image.",
+                    worker_adoption=adopt_from_image(digest),
                 )
                 return 0
             subprocess.run(["docker", "tag", previous, ROLLBACK_TAG], check=True,
@@ -588,7 +764,8 @@ def run() -> int:
                 )
             write_status(config_value, operation_id=operation, state="succeeded",
                          expected_sha=expected, code=status_code,
-                         message=message)
+                         message=message,
+                         worker_adoption=adopt_from_image(digest))
             return 0
     except BlockingIOError:
         write_status(config_value, operation_id=operation, state="failed",
@@ -657,5 +834,13 @@ if __name__ == "__main__":
         raise SystemExit(run())
     if len(sys.argv) == 2 and sys.argv[1] == "reconcile" and os.geteuid() == 0:
         raise SystemExit(reconcile())
+    if len(sys.argv) == 2 and sys.argv[1] == "adopt-self" and os.geteuid() == 0:
+        # The installer seeds the launcher with this trusted checkout's worker.
+        STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with LOCK.open("a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            outcome = adopt_worker(Path(__file__).read_bytes(), "checkout")
+        print(outcome)
+        raise SystemExit(1 if outcome.startswith("rejected") else 0)
     print("invalid invocation", file=sys.stderr)
     raise SystemExit(2)

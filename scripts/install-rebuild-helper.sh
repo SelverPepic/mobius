@@ -3,6 +3,8 @@ set -euo pipefail
 
 # Install the root-owned self-host replacement controller from the trusted
 # checkout that owns the live Compose app. No executable code is downloaded.
+# This installs the frozen launcher and seeds it with this checkout's worker;
+# later worker changes arrive with verified official images, so this runs once.
 #
 # Helper protocol revision: 1 (request version 2 echoes the app's nonce).
 # Keep in step with deployment/self-hosted-helper.required; never decrement.
@@ -25,6 +27,7 @@ git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
   || { echo "Run from a committed Möbius checkout, not copied app data." >&2; exit 1; }
 git -C "$ROOT" ls-files --error-unmatch \
   scripts/install-rebuild-helper.sh scripts/mobius-rebuild-host.py \
+  scripts/mobius-rebuild-launcher.py \
   scripts/rebuild-topology.py backend/scripts/prepare-container-replacement.py \
   backend/scripts/prepare-container-cutover.py \
   docker-compose.yml >/dev/null \
@@ -81,12 +84,14 @@ else
 fi
 git -C "$ROOT" diff --quiet HEAD -- \
   scripts/install-rebuild-helper.sh scripts/mobius-rebuild-host.py \
+  scripts/mobius-rebuild-launcher.py \
   scripts/rebuild-topology.py backend/scripts/prepare-container-replacement.py \
   backend/scripts/prepare-container-cutover.py \
   "${FILES[@]#"$ROOT/"}" \
   || { echo "Commit and review every helper and Compose input first." >&2; exit 1; }
 [[ -z $(git -C "$ROOT" status --porcelain=v1 --untracked-files=all -- \
   scripts/install-rebuild-helper.sh scripts/mobius-rebuild-host.py \
+  scripts/mobius-rebuild-launcher.py \
   scripts/rebuild-topology.py backend/scripts/prepare-container-replacement.py \
   backend/scripts/prepare-container-cutover.py \
   "${FILES[@]#"$ROOT/"}") ]] \
@@ -126,7 +131,12 @@ EXPECTED_NETWORKS=$(python3 "$ROOT/scripts/rebuild-topology.py" \
 
 umask 077
 install -d -m 0700 /etc/mobius-rebuild /var/lib/mobius-rebuild
-install -D -m 0755 "$ROOT/scripts/mobius-rebuild-host.py" \
+# Seed the launcher's worker from this checkout under the replacement lock.
+# It never lowers a revision already adopted from a newer official image.
+/usr/bin/python3 -I -S "$ROOT/scripts/mobius-rebuild-host.py" adopt-self
+install -D -m 0755 "$ROOT/scripts/mobius-rebuild-launcher.py" \
+  /usr/local/libexec/.mobius-rebuild-host.new
+mv -f /usr/local/libexec/.mobius-rebuild-host.new \
   /usr/local/libexec/mobius-rebuild-host
 SNAPSHOT=$(mktemp /etc/mobius-rebuild/compose.XXXXXX)
 if [[ -n $FROZEN_SOURCE ]]; then

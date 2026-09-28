@@ -170,6 +170,63 @@ older source runs on the newer packages; the probe proves that it imports,
 nothing more. A release that also advances `deployment/self-hosted-helper.required`
 then asks you to reinstall the helper from a current trusted checkout.
 
+## Self-updating worker
+
+The installer puts a small frozen **launcher** at
+`/usr/local/libexec/mobius-rebuild-host` (`scripts/mobius-rebuild-launcher.py`)
+and seeds it with the checkout's **worker** (`scripts/mobius-rebuild-host.py`).
+The systemd units are unchanged. The launcher contains no replacement logic: it
+runs the active worker with an allowlisted environment (`python3 -I -S`, fixed
+`PATH`, `/` as working directory). It stores workers and their selection record
+(`workers.json`, with sha256 per file) root-private in `/var/lib/mobius-rebuild`,
+and refuses any file that is not root-owned, private and unchanged.
+
+After a replacement succeeds (or finds the image already live), the worker
+takes `/app/platform-baked/scripts/mobius-rebuild-host.py` out of that exact
+image ID. It creates a container without starting it, accepts exactly one
+regular file within a size bound, then removes the container and its volumes.
+It adopts the file as the next active worker only when the file:
+
+- declares a strictly higher `WORKER_REVISION`, read as text and never by running it;
+- compiles;
+- is not a set-aside worker.
+
+A different payload under an adopted revision is rejected, and adoption never
+lowers the revision, so a request for an older official image still runs the
+newest worker. The worker file is durable before the record that selects it.
+Worker changes therefore reach installed hosts through ordinary updates,
+effective from the replacement after the release that ships them, with no host
+command. Keep such a change compatible with the previous worker for one
+release. `scripts/rebuild-worker-revisions.json` ties every revision to its
+bytes; tests fail when the worker changes without a new revision.
+
+Recovery:
+
+- If the active worker exits unsuccessfully without writing any status, it
+  failed before acting. The launcher runs the previous worker for the same
+  request, and if that one handles it, sets the new worker aside for good.
+- If the active worker's `reconcile` fails, the previous worker reconciles.
+- A worker that reported its own failure is working as intended and is not
+  set aside.
+
+Status reports `worker_revision`, `launcher_revision` (absent for a fixed
+helper from before the launcher) and the last `worker_adoption` outcome. Fixed
+helpers keep working: the app does not require the launcher, and
+`deployment/self-hosted-helper.required` advances only for a change the
+launcher itself or an older fixed helper cannot provide.
+
+**Trust.** The worker runs as root on the host, so the authority to publish
+`ghcr.io/mobius-os/mobius:sha-*` becomes authority to publish host-root code on
+self-hosted installations that update. Only a push to `main` publishes (see
+`.github/workflows/main-image.yml`). The worker checks the image's labels
+(revision, source, architecture) for consistency. They are not a cryptographic
+publisher identity, and it pins the verified image ID rather than the mutable
+tag. The app, even compromised, can only choose among published official SHAs,
+resend or withdraw requests, and consume pull and disk resources. It cannot
+choose the repository, executable, worker, Compose topology, or host commands.
+Revision monotonicity stops an older worker from being selected; it does not
+stop an older official application image from being deployed.
+
 ## Boundary and lifecycle
 
 The app writes one fixed `request.json` into the persistent `/data` inbox. A
@@ -182,7 +239,8 @@ as `request_nonce` in its status, so the app can tell its exact replacement's
 outcome from any earlier one. It is claimed atomically on the same persistent
 filesystem before use. The app requires a helper that advertises request
 version 2 (`request_versions`); `deployment/self-hosted-helper.required`
-revision 1 asks older installations to reinstall it.
+revision 1 asks older installations to reinstall it. Installing the launcher
+once makes later worker changes arrive with updates (see above).
 
 The worker:
 
