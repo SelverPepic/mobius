@@ -131,6 +131,22 @@ def test_blank_project_starts_without_chat_and_has_confined_files(
   assert not any(p.startswith("artifacts/") for p in recursive_paths)
 
 
+def test_project_path_name_longer_than_the_filesystem_allows_is_rejected(
+  client, auth,
+):
+  project = client.post(
+    "/api/projects", headers=auth,
+    json={"name": "Long names", "template_id": "blank"},
+  ).json()
+  response = client.put(
+    f"/api/projects/{project['id']}/file?path=notes/{'a' * 300}.md",
+    headers=auth, json={"content": "x", "expected_revision": None},
+  )
+  assert response.status_code == 400, response.text
+  listing = client.get(f"/api/projects/{project['id']}/files", headers=auth).json()
+  assert listing["entries"] == []
+
+
 def test_project_files_reserve_git_metadata_from_browse_and_mutation(
   client, auth, db,
 ):

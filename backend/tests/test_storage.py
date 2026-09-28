@@ -1565,6 +1565,19 @@ def test_move_rejects_traversal_in_source(client, auth, owner_token):
   assert r.status_code == 400
 
 
+def test_overlong_path_name_is_rejected_without_creating_folders(
+  client, auth, owner_token,
+):
+  """A name past the 255-byte filesystem limit is a 400, not a 500."""
+  app_id = _make_app(client, owner_token)
+  r = client.put(
+    f"/api/storage/apps/{app_id}/fresh/{'a' * 300}.json", json={}, headers=auth,
+  )
+  assert r.status_code == 400
+  listing = client.get(f"/api/storage/apps-list/{app_id}/", headers=auth).json()
+  assert [entry["name"] for entry in listing["entries"]] == []
+
+
 # -- recursive folder delete --------------------------------------------
 
 
