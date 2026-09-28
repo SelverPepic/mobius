@@ -208,6 +208,7 @@ import { rememberRecentDestination } from '../../lib/recentSelections.js'
 const APP_SETTINGS_SECTIONS = new Set([
   'ai-providers',
   'background-agents',
+  'github',
   'models',
 ])
 const EMPTY_LIST = Object.freeze([])

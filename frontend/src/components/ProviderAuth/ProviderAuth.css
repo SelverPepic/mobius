@@ -383,6 +383,14 @@
   min-width: 0;
 }
 
+.provider-row__icon {
+  display: inline-flex;
+  align-self: center;
+  color: var(--text);
+}
+
+.provider-row__icon svg { width: 16px; height: 16px; }
+
 .provider-row__name {
   font-weight: 500;
   font-size: 14px;
