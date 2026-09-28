@@ -92,8 +92,15 @@ echo "upgrade path: ${previous:0:12} -> ${candidate:0:12}"
 
 # The seeded checkout already holds the previous commit, so the bundle carries
 # only what the candidate adds (a shallow seed cannot resolve more history).
-git -C "$REPO" bundle create "$work/candidate.bundle" "$candidate" "^$previous" >/dev/null 2>&1 \
-  || fail "the repository must contain both ${previous:0:12} and ${candidate:0:12}"
+# A bundle carries refs, not bare commits: name the candidate for the bundle.
+bundle_ref=refs/upgrade-path/candidate-$$
+git -C "$REPO" update-ref "$bundle_ref" "$candidate" \
+  || fail "the repository does not contain the candidate ${candidate:0:12}"
+bundled=0
+git -C "$REPO" bundle create "$work/candidate.bundle" "$bundle_ref" "^$previous" \
+  >/dev/null 2>"$work/bundle.err" && bundled=1
+git -C "$REPO" update-ref -d "$bundle_ref"
+[ "$bundled" = 1 ] || fail "could not bundle ${candidate:0:12} on ${previous:0:12}: $(cat "$work/bundle.err")"
 
 echo "1. the previous release boots like an owner's instance"
 docker volume create "$volume" >/dev/null
@@ -103,7 +110,7 @@ echo "2. the candidate release is offered and the owner signs in"
 docker cp "$work/candidate.bundle" "$name:/tmp/candidate.bundle"
 docker exec "$name" chmod 0644 /tmp/candidate.bundle
 as_mobius git -C /data/platform fetch -q /tmp/candidate.bundle \
-  "$candidate:refs/remotes/origin/main"
+  "$bundle_ref:refs/remotes/origin/main"
 reply=$(api POST /api/auth/setup '{"username":"owner","password":"upgrade-path-owner-password"}')
 [ "$(code "$reply")" = 200 ] || fail "owner setup failed: $(body "$reply")"
 token=$(field "$(body "$reply")" 'd["access_token"]')
