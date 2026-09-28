@@ -268,7 +268,8 @@ manifest, layered by how always-on they are:
   `description`, and `input_schema` (a JSON Schema `object`). Requires a
   `service`: agents see `<app slug>_<name>`, and each call reaches the service
   as `POST /tools/<name>` with body `{"arguments": ..., "call": ...}` and the
-  app's own authority (`backend/app/app_tools.py`). Helpers get the tools too:
+  app's own authority (`backend/app/app_tools.py`). Only the platform reaches
+  `tools/`: HTTP calls to the service there get 404, so `call` is trustworthy. Helpers get the tools too:
   the request's `actor` has `delegated: true` for a helper and
   `access: "read"` for a read-only one, so refuse any change for a read-only
   caller. Tool calls run on their own concurrency lane that is NOT serialized

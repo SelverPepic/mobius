@@ -113,14 +113,19 @@ def service_entry(app, service: dict) -> Path:
   return entry
 
 
-def service_environment(app, owner, *, provider_credentials: bool) -> dict[str, str]:
+def service_environment(app, owner, service: dict, *, public: bool) -> dict[str, str]:
+  """The environment of one invocation; its APP_TOKEN's authority follows the caller.
+
+  A public invocation acts for an anonymous visitor, so its token has the narrow
+  public-service scope (auth.create_app_token), which cannot start or drive the
+  owner's agents. This bounds what the platform does on the owner's behalf, not
+  file access: a service is owner-installed reviewed code.
+  """
   allowed = {"PATH", "LANG", "LC_ALL", "TZ", "HOME"}
-  if provider_credentials:
-    # A reviewed service reached only through an authenticated caller may run a
-    # provider CLI (Memory's recall navigator does), so it receives the same
-    # credential locations as its scheduled job. A publicly reachable service
-    # never does: an anonymous visitor must not be able to spend on the owner's
-    # provider accounts.
+  if service.get("access", "self") != "public":
+    # A service reached only through an authenticated caller may run a provider
+    # CLI (Memory's recall navigator does), so it receives the same credential
+    # locations as its scheduled job.
     allowed |= {"DATA_DIR", "CLAUDE_CONFIG_DIR", "CODEX_HOME"}
   env = {key: value for key, value in os.environ.items() if key in allowed}
   settings = get_settings()
@@ -137,7 +142,7 @@ def service_environment(app, owner, *, provider_credentials: bool) -> dict[str, 
       owner.token_epoch,
       app_nonce=app.token_nonce,
       expires_delta=timedelta(minutes=5),
-      is_service=True,
+      service="public" if public else "private",
     ),
   })
   return env
@@ -262,16 +267,8 @@ async def invoke_service(
   timeout_seconds: float = SERVICE_TIMEOUT_SECONDS,
   lane: str | None = None,
 ) -> tuple[int, object, dict[str, str], str | None]:
-  service = service_contract(
-    app, access="public" if request_envelope.get("public") else "self",
-  )
-  # Provider-credential locations reach a service only when every path to it is
-  # authenticated: never on a public invocation, and never for a service the
-  # owner reviewed as publicly reachable.
-  provider_credentials = (
-    not request_envelope.get("public")
-    and service.get("access", "self") != "public"
-  )
+  public = request_envelope.get("public") is True
+  service = service_contract(app, access="public" if public else "self")
   try:
     request_bytes = json.dumps(
       request_envelope, ensure_ascii=False, separators=(",", ":"),
@@ -296,7 +293,7 @@ async def invoke_service(
   # the app's own screen or another chat's call. A tool owns its concurrency,
   # as a public service already must.
   if lane is None:
-    lane = "public" if request_envelope.get("public") else "private"
+    lane = "public" if public else "private"
   slot = (
     contextlib.nullcontext() if lane == "tools"
     else _app_slots.setdefault((app.id, lane), asyncio.Semaphore(1))
@@ -309,7 +306,7 @@ async def invoke_service(
   try:
     async with slot, _global_slots[lane]:
       entry = service_entry(app, service)
-      environment = service_environment(app, owner, provider_credentials=provider_credentials)
+      environment = service_environment(app, owner, service, public=public)
       outcome = None
       host = service_preload.ready_host(app, entry, environment)
       if host is not None:

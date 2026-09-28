@@ -69,7 +69,8 @@ from app.config import get_settings
 from app.database import get_db
 from app.deps import (
   get_current_owner, get_current_owner_for_lifecycle_control,
-  get_current_owner_or_app, get_principal, Principal,
+  get_current_owner_or_app, get_principal, get_principal_or_public_service,
+  Principal,
   get_owner_or_app_with_manage_apps, reject_cross_site,
   require_nondelegated_owner_control,
 )
@@ -615,7 +616,7 @@ async def _hard_delete_app(db: Session, app: models.App) -> None:
 @router.get("/", response_model=list[schemas.AppOut])
 async def list_apps(
   db: Session = Depends(get_db),
-  _: models.Owner = Depends(get_current_owner_or_app),
+  _: Principal = Depends(get_principal_or_public_service),
 ):
   """Returns all LIVE registered mini-apps (tombstoned ones are hidden).
 

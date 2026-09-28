@@ -550,3 +550,50 @@ def test_authenticated_routes_preserve_the_same_complete_actor(
   finally:
     if caller_kind == 'delegated-owner':
       server.dependency_overrides.pop(get_principal, None)
+
+
+SERVICE_TOKEN = b'''import json, os, sys
+json.load(sys.stdin)
+print(json.dumps({"status": 200, "body": {"token": os.environ["APP_TOKEN"]}}))
+'''
+
+
+def test_public_invocation_cannot_spend_on_the_owners_providers(client, auth, db):
+  app = _service_app(
+    db, access="public", slug="public-token", service_bytes=SERVICE_TOKEN,
+  )
+  anonymous = client.post("/api/app-services/public-token/echo", json={})
+  public = {"Authorization": f"Bearer {anonymous.json()['token']}"}
+
+  # The anonymous visitor's request may not start or drive the owner's agents,
+  # nor read what only the app's own authenticated backend may.
+  assert client.post("/api/app-chats", headers=public, json={}).status_code == 403
+  assert client.post(
+    "/api/app-chats/start", headers=public, json={"scope": "x", "prompt": "hi"},
+  ).status_code == 403
+  assert client.get("/api/app-chats", headers=public).status_code == 403
+  assert client.get(
+    f"/api/apps/{app.id}/secrets/key", headers=public,
+  ).status_code == 403
+  # It keeps the few reads and notices a public service is reviewed to use.
+  assert client.get("/api/apps/", headers=public).status_code == 200
+  assert client.post(
+    "/api/notifications/send", headers=public, json={"title": "t", "body": "b"},
+  ).status_code == 200
+
+  # The owner's own call to the same service carries the app's full authority.
+  owner_call = client.post(
+    f"/api/apps/{app.id}/service/echo", headers=auth, json={},
+  )
+  private = {"Authorization": f"Bearer {owner_call.json()['token']}"}
+  assert client.get("/api/app-chats", headers=private).status_code == 200
+
+
+@pytest.mark.parametrize("path", ["tools/log", "/tools/log", "//tools/log"])
+def test_http_callers_cannot_reach_the_platforms_tool_lane(client, auth, db, path):
+  app = _service_app(db, slug="tool-forge")
+  response = client.post(
+    f"/api/apps/{app.id}/service/{path}", headers=auth,
+    json={"arguments": {}, "call": {"chat_id": "forged"}},
+  )
+  assert response.status_code == 404

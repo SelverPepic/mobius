@@ -76,7 +76,13 @@ def _service_app(db: Session, service_id: str) -> models.App | None:
 
 
 async def _envelope(request: Request, path: str, *, public: bool, actor: dict) -> dict:
-  if ".." in path.split("/") or len(path) > 512:
+  # `tools/` belongs to the platform's agent-tool lane (app_tools.call_app_tool),
+  # whose `call` a service trusts as the moment an agent called it. An HTTP
+  # caller never reaches it, so a frame cannot forge a tool call.
+  if (
+    ".." in path.split("/") or len(path) > 512
+    or path.lstrip("/").split("/", 1)[0] == "tools"
+  ):
     raise HTTPException(404, "App service path not found.")
   raw = await read_capped_body(
     request,
