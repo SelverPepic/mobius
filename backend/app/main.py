@@ -1029,8 +1029,13 @@ def health(response: Response):
     "container_replacement_handoff": None,
   }
   from app.deployment_control import managed_cutover_ready
+  from app.platform_update import BOOT_PROTOCOL, image_activates_updates
   if managed_cutover_ready():
     payload["container_replacement_handoff"] = "external-cutover-v1"
+  # The boot protocol this boot's image ran, or None. The account service
+  # offers a container-only upgrade to a runtime that reports none: its image
+  # predates the boot transaction and cannot take a package-changing release.
+  payload["boot_protocol"] = BOOT_PROTOCOL if image_activates_updates() else None
   if degraded:
     # Still HTTP 200: database failure must never masquerade as device offline.
     # The strict and readiness variants below carry the 5xx service verdict.

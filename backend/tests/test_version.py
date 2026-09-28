@@ -355,3 +355,18 @@ def test_image_build_applied_rejects_newer_unapplied_image(
 
   assert identity["applied_upstream_sha"] == applied_sha
   assert identity["image_build_applied"] is False
+
+
+def test_health_reports_the_boot_protocol_only_when_this_boot_ran_it(
+  client, monkeypatch, tmp_path,
+):
+  """The account service offers a container-only upgrade to a runtime that
+  reports no boot protocol; a runtime that ran the boot transaction must say so."""
+  from app import platform_update
+
+  marker = tmp_path / "platform-boot-transaction"
+  monkeypatch.setattr(platform_update, "BOOT_TRANSACTION_MARKER", marker)
+  assert client.get("/api/health").json()["boot_protocol"] is None
+
+  marker.write_text(f"{platform_update.BOOT_PROTOCOL}\n")
+  assert client.get("/api/health").json()["boot_protocol"] == platform_update.BOOT_PROTOCOL
