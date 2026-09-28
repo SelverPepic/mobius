@@ -94,6 +94,23 @@ def test_unsafe_generated_file_preview_still_downloads(client, db, auth, chat):
   assert res.headers["content-disposition"] == 'attachment; filename="drawing.svg"'
 
 
+def test_markdown_generated_file_remains_download_only(client, db, auth, chat):
+  stored_name = _stored_file(chat, name="stored.md", content=b"# Review\n")
+  _write_row(
+    db, chat, name="review.md", path=stored_name,
+    mime_type="text/markdown",
+  )
+
+  res = client.get(
+    f"/api/chats/{chat.id}/generated-files/review.md",
+    params={"token": _media_token(client, auth, chat.id), "preview": True},
+  )
+
+  assert res.status_code == 200
+  assert res.headers["content-disposition"] == 'attachment; filename="review.md"'
+  assert res.headers["x-content-type-options"] == "nosniff"
+
+
 def test_preview_policy_keeps_active_images_out_of_inline_documents():
   assert gf.previewable_mime_type("image/png") is True
   assert gf.previewable_mime_type("image/svg+xml") is False

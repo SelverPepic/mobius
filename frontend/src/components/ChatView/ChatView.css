@@ -3412,6 +3412,19 @@
   max-width: min(85%, 75ch);
 }
 
+.chat__attachments--documents {
+  width: min(100%, 780px);
+  max-width: min(100%, 780px);
+}
+
+.chat__attach-files {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  width: 100%;
+}
+
 .chat__attach-images {
   display: flex;
   flex-wrap: wrap;
@@ -3528,6 +3541,253 @@
   color: var(--muted); /* CONTRACT: low-contrast text on opaque fill */
   font-size: 11px;
   white-space: nowrap;
+}
+
+.chat__document-card {
+  position: relative;
+  width: min(232px, 100%);
+  overflow: hidden;
+  border: 1px solid var(--border-light);
+  border-radius: 13px;
+  background: var(--surface);
+  color: var(--text);
+}
+
+.chat__document-card--expanded {
+  width: 100%;
+}
+
+.chat__document-card-open {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: zoom-in;
+}
+
+.chat__document-card-open:hover .chat__document-card-visual {
+  background: var(--surface-2);
+}
+
+.chat__document-card-open:focus-visible,
+.chat__document-card-download:focus-visible,
+.chat__document-card-actions > :focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -3px;
+}
+
+.chat__document-card-visual {
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  height: 154px;
+  overflow: hidden;
+  padding: 12px 15px 0;
+  border-bottom: 1px solid var(--border-light);
+  background: color-mix(in srgb, var(--surface-2) 70%, var(--bg));
+}
+
+.chat__document-card-paper,
+.chat__document-card-pdf {
+  width: 100%;
+  min-height: 210px;
+  overflow: hidden;
+  border: 1px solid var(--border-light);
+  border-radius: 5px 5px 0 0;
+  background: var(--bg);
+  box-shadow: 0 8px 18px rgba(0, 0, 0, .12);
+}
+
+.chat__document-card-paper {
+  padding: 15px 14px;
+}
+
+.chat__document-card-paper strong {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  font-size: 15px;
+  line-height: 1.22;
+}
+
+.chat__document-card-paper p {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 5;
+  margin: 12px 0 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.chat__document-card-paper > span,
+.chat__document-card-pdf > span {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.chat__document-card-pdf {
+  position: relative;
+  background: white;
+}
+
+.chat__document-card-pdf canvas {
+  display: block;
+  max-width: 100%;
+}
+
+.chat__document-card-pdf canvas.is-loading {
+  visibility: hidden;
+}
+
+.chat__document-card-pdf > span {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: #53565d;
+}
+
+.chat__document-card-caption {
+  display: block;
+  min-width: 0;
+  padding: 10px 42px 11px 12px;
+}
+
+.chat__document-card-caption strong {
+  display: block;
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat__document-card-caption small {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.chat__document-card-download {
+  position: absolute;
+  right: 7px;
+  bottom: 8px;
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  color: var(--text);
+  text-decoration: none;
+}
+
+.chat__document-card-download:hover {
+  background: var(--surface-2);
+}
+
+.chat__document-card-download[aria-disabled="true"] {
+  opacity: .45;
+}
+
+.chat__document-card-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-height: 51px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--border-light);
+}
+
+.chat__document-card-title {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.chat__document-card-title strong {
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat__document-card-title span {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.chat__document-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.chat__document-card-actions > a,
+.chat__document-card-actions > button,
+.chat__document-card-reader button {
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.chat__document-card-actions > :hover,
+.chat__document-card-reader button:hover {
+  background: var(--surface-2);
+}
+
+.chat__document-card-reader {
+  max-height: min(62vh, 620px);
+  overflow: auto;
+  padding: 24px clamp(16px, 4vw, 34px) 36px;
+  overscroll-behavior: contain;
+}
+
+.chat__document-card-reader > .standard-markdown {
+  max-width: 75ch;
+  margin: 0 auto;
+}
+
+.chat__document-card-iframe {
+  display: block;
+  width: 100%;
+  height: min(62vh, 620px);
+  border: 0;
+  background: white;
+}
+
+.chat__document-card-status {
+  margin: 0;
+  padding: 24px;
+  color: var(--muted);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .chat__document-card--expanded {
+    animation: chat-document-open .18s cubic-bezier(.2, .7, .2, 1) both;
+  }
+  @keyframes chat-document-open {
+    from { opacity: .72; transform: translateY(4px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
 }
 
 /* ── Shared chat-foot entrance ─────────────────────── */

@@ -1,0 +1,218 @@
+/* Real document thumbnails that unfold into a reader without leaving the chat. */
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { Download } from '@openai/apps-sdk-ui/components/Icon'
+import { apiFetch } from '../../api/client.js'
+import { StandardMarkdown } from './markdown/BlockRenderer.jsx'
+
+const filePath = (chatId, name) =>
+  `/chats/${encodeURIComponent(chatId)}/generated-files/${encodeURIComponent(name)}`
+
+function useCardVisibility(ref) {
+  const [visible, setVisible] = useState(false)
+  useEffect(() => {
+    const element = ref.current
+    if (!element || typeof IntersectionObserver === 'undefined') {
+      setVisible(true)
+      return undefined
+    }
+    const observer = new IntersectionObserver(entries => {
+      if (entries.some(entry => entry.isIntersecting)) {
+        setVisible(true)
+        observer.disconnect()
+      }
+    }, { rootMargin: '180px' })
+    observer.observe(element)
+    return () => observer.disconnect()
+  }, [ref])
+  return visible
+}
+
+function stripPreviewMarkup(line) {
+  return line
+    .replace(/^\s{0,3}(?:#{1,6}\s*|>\s*|[-*+]\s*)/, '')
+    .replace(/!?\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/[*_`~]/g, '')
+    .trim()
+}
+
+export function markdownCardExcerpt(text) {
+  const lines = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean)
+  const titleLine = lines.find(line => /^#{1,3}\s/.test(line)) || lines[0] || ''
+  const bodyLine = lines.find(line => line !== titleLine && !/^#{1,6}\s/.test(line)
+    && !/^```/.test(line) && !/^\|[-:\s|]+\|$/.test(line)) || ''
+  return { title: stripPreviewMarkup(titleLine), body: stripPreviewMarkup(bodyLine) }
+}
+
+function PdfThumbnail({ chatId, file, visible }) {
+  const canvasRef = useRef(null)
+  const [status, setStatus] = useState('loading')
+
+  useEffect(() => {
+    if (!visible) return undefined
+    const controller = new AbortController()
+    let active = true
+    let loadingTask = null
+    let renderTask = null
+    let page = null
+    setStatus('loading')
+
+    async function renderFirstPage() {
+      const response = await apiFetch(filePath(chatId, file.name), { signal: controller.signal })
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      const bytes = new Uint8Array(await response.arrayBuffer())
+      if (!active) return
+      const pdfjs = await import('pdfjs-dist')
+      if (!active) return
+      pdfjs.GlobalWorkerOptions.workerSrc = '/vendor/pdfjs/pdf.worker.mjs'
+      loadingTask = pdfjs.getDocument({ data: bytes })
+      const pdf = await loadingTask.promise
+      if (!active) return
+      page = await pdf.getPage(1)
+      if (!active) return
+      const canvas = canvasRef.current
+      const context = canvas?.getContext('2d')
+      if (!canvas || !context) throw new Error('Canvas unavailable')
+      const natural = page.getViewport({ scale: 1 })
+      const available = canvas.parentElement.clientWidth || 220
+      const viewport = page.getViewport({ scale: available / natural.width })
+      const outputScale = Math.min(2, window.devicePixelRatio || 1)
+      canvas.width = Math.ceil(viewport.width * outputScale)
+      canvas.height = Math.ceil(viewport.height * outputScale)
+      canvas.style.width = `${viewport.width}px`
+      canvas.style.height = `${viewport.height}px`
+      renderTask = page.render({
+        canvasContext: context,
+        viewport,
+        transform: outputScale === 1 ? null : [outputScale, 0, 0, outputScale, 0, 0],
+      })
+      await renderTask.promise
+      if (active) setStatus('ready')
+    }
+
+    void renderFirstPage().catch(error => {
+      if (active && error.name !== 'AbortError' && error.name !== 'RenderingCancelledException') {
+        setStatus('error')
+      }
+    })
+    return () => {
+      active = false
+      controller.abort()
+      renderTask?.cancel?.()
+      page?.cleanup?.()
+      void loadingTask?.destroy?.()
+    }
+  }, [chatId, file.name, visible])
+
+  return <div className="chat__document-card-pdf" aria-hidden="true">
+    <canvas ref={canvasRef} className={status === 'ready' ? '' : 'is-loading'} />
+    {status !== 'ready' && <span>{status === 'error' ? 'Preview unavailable' : 'Preparing first page…'}</span>}
+  </div>
+}
+
+export default function DocumentAttachment({
+  file, chatId, downloadHref, previewSrc, expanded, onToggle,
+}) {
+  const cardRef = useRef(null)
+  const previewButtonRef = useRef(null)
+  const collapseButtonRef = useRef(null)
+  const previousExpandedRef = useRef(expanded)
+  const visible = useCardVisibility(cardRef)
+  const isMarkdown = file.mime_type === 'text/markdown'
+  const [retry, setRetry] = useState(0)
+  const [report, setReport] = useState({ status: 'loading', text: '' })
+
+  useEffect(() => {
+    if (!isMarkdown || !visible) return undefined
+    const controller = new AbortController()
+    setReport({ status: 'loading', text: '' })
+    apiFetch(filePath(chatId, file.name), { signal: controller.signal })
+      .then(response => {
+        if (!response.ok) throw new Error(`HTTP ${response.status}`)
+        return response.text()
+      })
+      .then(text => setReport({ status: 'ready', text }))
+      .catch(error => {
+        if (error.name !== 'AbortError') setReport({ status: 'error', text: '' })
+      })
+    return () => controller.abort()
+  }, [chatId, file.name, isMarkdown, retry, visible])
+
+  const excerpt = isMarkdown && report.status === 'ready'
+    ? markdownCardExcerpt(report.text)
+    : null
+  const kind = isMarkdown ? 'Markdown' : 'PDF'
+  const size = `${Math.max(1, Math.round(file.size / 1024))} KB`
+
+  // The card changes size inside the transcript. Hand focus to its new control
+  // before paint so the browser does not reveal a stale focused node at the
+  // composer and pull the reader away from the document.
+  useLayoutEffect(() => {
+    if (previousExpandedRef.current !== expanded) {
+      (expanded ? collapseButtonRef : previewButtonRef).current?.focus({ preventScroll: true })
+    }
+    previousExpandedRef.current = expanded
+  }, [expanded])
+
+  return <article
+    ref={cardRef}
+    className={`chat__document-card${expanded ? ' chat__document-card--expanded' : ''}`}
+  >
+    <div className="chat__document-card-collapsed" hidden={expanded}>
+      <button
+        ref={previewButtonRef}
+        type="button"
+        className="chat__document-card-open"
+        aria-label={`Expand ${file.name} preview`}
+        aria-expanded={expanded}
+        onClick={onToggle}
+      >
+        <div className="chat__document-card-visual" aria-hidden="true">
+          {isMarkdown ? <div className="chat__document-card-paper">
+            {excerpt ? <>
+              <strong>{excerpt.title || 'Markdown report'}</strong>
+              <p>{excerpt.body || 'Open to read this report.'}</p>
+            </> : <span>{report.status === 'error' ? 'Preview unavailable' : 'Preparing preview…'}</span>}
+          </div> : <PdfThumbnail chatId={chatId} file={file} visible={visible} />}
+        </div>
+        <span className="chat__document-card-caption">
+          <strong title={file.name}>{file.name}</strong>
+          <small>{kind} · {size}</small>
+        </span>
+      </button>
+      {downloadHref
+        ? <a className="chat__document-card-download" href={downloadHref} download={file.name} aria-label={`Download ${file.name}`} title="Download">
+            <Download width={17} height={17} aria-hidden="true" />
+          </a>
+        : <span className="chat__document-card-download" aria-disabled="true"><Download width={17} height={17} aria-hidden="true" /></span>}
+    </div>
+    {expanded && <>
+      <header className="chat__document-card-toolbar">
+        <div className="chat__document-card-title">
+          <strong title={file.name}>{file.name}</strong>
+          <span>{kind} · {size}</span>
+        </div>
+        <div className="chat__document-card-actions">
+          {downloadHref
+            ? <a href={downloadHref} download={file.name}>Download</a>
+            : <span aria-disabled="true">Download</span>}
+          <button ref={collapseButtonRef} type="button" onClick={onToggle}>Collapse</button>
+        </div>
+      </header>
+      {isMarkdown ? <div className="chat__document-card-reader">
+        {report.status === 'loading' && <p role="status">Loading Markdown preview…</p>}
+        {report.status === 'error' && <div role="alert">
+          <p>Couldn’t load the preview. You can try again or download the file.</p>
+          <button type="button" onClick={() => setRetry(value => value + 1)}>Try again</button>
+        </div>}
+        {report.status === 'ready' && <StandardMarkdown text={report.text} />}
+      </div> : previewSrc
+        ? <iframe
+            className="chat__document-card-iframe"
+            title={`PDF preview: ${file.name}`}
+            src={previewSrc}
+            referrerPolicy="no-referrer"
+          />
+        : <p className="chat__document-card-status" role="status">Loading PDF preview…</p>}
+    </>}
+  </article>
+}
