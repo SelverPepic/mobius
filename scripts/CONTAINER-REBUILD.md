@@ -145,15 +145,21 @@ git -C /data/platform show origin/main:scripts/request-container-upgrade.py | py
 ```
 
 The script queues the helper for the latest official image (`--target` names an
-exact release instead; `--check` only reports whether it would) after checking that the target descends from both the
-running image and the source's installed release, that no update is prepared
-or parked, and that the helper is idle. The helper drains chats, replaces only
+exact release instead; `--check` only reports whether it would) after checking,
+under the updater's lock, that the target is an official release that ships this
+bridge and is newer than the running image and the source's official package
+declarations, that no update is prepared or parked, and that the helper is
+idle. The helper drains chats, replaces only
 the container, and restores the previous container if the new one is unhealthy.
 
 The new image's boot transaction serves the unchanged source only after proving
-the image is not older than that source's release, then probes it, with the
-image's own release as the floor. Install the release from Settings right away:
-its packages are now in the image, so the ordinary update proceeds. Until then,
+from the image's own history that none of that source's official Python
+package declarations is newer than the image, then probes it, with the image's
+own release as the floor. Install the release from Settings right away:
+its packages are now in the image, so the ordinary update proceeds (served code
+from #1311 on, 23 September 2026, discounts package inputs the running image
+already carries; older served code needs an update to at least that release
+first). Until then,
 older source runs on the newer packages; the probe proves that it imports,
 nothing more. A release that also advances `deployment/self-hosted-helper.required`
 then asks you to reinstall the helper from a current trusted checkout.

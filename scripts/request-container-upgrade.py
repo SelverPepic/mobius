@@ -19,9 +19,11 @@ upstream so an older installation needs nothing new installed::
       | python3 - [--check] [--target <40-hex official release>]
 
 It changes nothing but the helper's inbox, and only after these checks pass:
-the target is a fetched official release that descends from the running image
-and whose history already declares the installed source's Python packages;
-no update is prepared or parked; and the helper is installed and idle. The helper then drains chats, replaces the
+the target is a fetched official release that ships this bridge, descends
+from the running image, and is not older than any official Python package
+declaration of the installed source; no update is prepared or parked; and the
+helper is installed and idle. They hold the updater's lock while checking and
+requesting. The helper then drains chats, replaces the
 container, verifies it, and restores the previous container if it is not
 healthy. See scripts/CONTAINER-REBUILD.md.
 """
@@ -29,6 +31,7 @@ healthy. See scripts/CONTAINER-REBUILD.md.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -43,6 +46,8 @@ CONTROL = DATA / "mobius-rebuild"
 BUILD_INFO = Path(os.environ.get("MOBIUS_BUILD_INFO_PATH", "/app/build-info.json"))
 ACTIVE_STATES = {"queued", "preparing", "replacing", "verifying"}
 PYTHON_INPUTS = ("backend/requirements.txt", "backend/requirements.lock")
+BRIDGE_FILES = ("backend/runtime/boot-protocol", "scripts/request-container-upgrade.py")
+RECONCILE_LOCK = DATA / ".platform-reconcile.lock"
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 
 
@@ -78,32 +83,51 @@ def running_image() -> str:
 
 
 def declared_in_history(commit: str, path: str, data: bytes) -> bool:
+    """Whether ``path`` held exactly ``data`` at some commit ``commit`` contains.
+
+    Mirrors the boot transaction's own judgment
+    (``platform_update._declared_in_history``), which the target image applies
+    before it serves the unchanged source.
+    """
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     blob = subprocess.run(
         ["git", "-C", str(PLATFORM), "hash-object", "--stdin"],
         input=data, capture_output=True, check=True, env=env, timeout=120,
     ).stdout.decode().strip()
     history = subprocess.run(
-        ["git", "-C", str(PLATFORM), "log", "--format=", "--raw", "--no-abbrev",
+        ["git", "-C", str(PLATFORM), "log", "-m", "--format=", "--raw", "--no-abbrev",
          "--no-renames", commit, "--", path],
-        capture_output=True, check=False, env=env, timeout=120,
+        capture_output=True, text=True, check=False, env=env, timeout=120,
     )
-    return history.returncode == 0 and blob.encode() in history.stdout
+    if history.returncode != 0:
+        return False
+    for line in history.stdout.splitlines():
+        fields = line.split("\t", 1)[0].split()
+        if len(fields) >= 4 and blob in fields[2:4]:
+            return True
+    return False
 
 
 def check_target(target: str) -> str:
     image = running_image()
     if target == image:
         raise Refused("this container already runs that release")
-    if not descends(target, resolve("refs/remotes/origin/main") or target):
+    official = resolve("refs/remotes/origin/main")
+    if not official:
+        raise Refused("fetch origin main first; no official history is available")
+    if not descends(target, official):
         raise Refused("the target is not part of the fetched official history")
     if not descends(image, target):
         raise Refused("the target is not newer than the running container")
-    # The same judgment the new image's boot transaction makes before it
-    # serves the unchanged source: every package input the installed source
-    # took from its release must appear in the target's own history, so the
-    # target's packages are not older than the source's.
-    release = resolve("refs/heads/upstream")
+    # Only a release that ships this bridge also judges the unchanged source
+    # the way these checks do; an older target could not finish the crossing.
+    for required in BRIDGE_FILES:
+        if git("cat-file", "-e", f"{target}:{required}").returncode != 0:
+            raise Refused("the target release predates the container-only upgrade")
+    # The target image's boot serves the unchanged source only if none of its
+    # package inputs comes from an official release newer than the target:
+    # an input declared in the target's history is older or equal, and one
+    # never declared officially is a local declaration.
     for path in PYTHON_INPUTS:
         try:
             served = (PLATFORM / path).read_bytes()
@@ -111,11 +135,10 @@ def check_target(target: str) -> str:
             continue
         if declared_in_history(target, path, served):
             continue
-        shown = git("show", f"{release}:{path}") if release else None
-        if shown is not None and shown.returncode == 0 and shown.stdout.encode() == served:
+        if declared_in_history(official, path, served):
             raise Refused(
                 "the installed source declares newer Python packages than the "
-                "target; fetch origin main and use the latest release"
+                "target; use the latest official release"
             )
     return image
 
@@ -183,16 +206,21 @@ def main(argv: list[str] | None = None) -> int:
         target = resolve(args.target) if args.target else resolve("refs/remotes/origin/main")
         if not target or (args.target and not SHA_RE.fullmatch(args.target)):
             raise Refused("name a fetched, complete 40-character official release")
-        image = check_target(target)
-        check_no_pending_update()
-        inbox = check_helper_idle()
-        if args.check:
-            print(
-                f"Ready: a container-only upgrade from {image[:12]} to "
-                f"{target[:12]} would be requested."
-            )
-            return 0
-        write_request(inbox, target)
+        # The updater prepares updates under this lock; holding it while
+        # checking and requesting keeps Settings from preparing one in between.
+        # One prepared afterwards is settled by the new image's own boot.
+        with open(RECONCILE_LOCK, "a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            image = check_target(target)
+            check_no_pending_update()
+            inbox = check_helper_idle()
+            if args.check:
+                print(
+                    f"Ready: a container-only upgrade from {image[:12]} to "
+                    f"{target[:12]} would be requested."
+                )
+                return 0
+            write_request(inbox, target)
     except Refused as exc:
         print(f"Container upgrade not requested: {exc}.", file=sys.stderr)
         return 1

@@ -23,11 +23,17 @@ def _git(repo: Path, *args: str) -> str:
   ).stdout.strip()
 
 
-def _commit(repo: Path, name: str, lock: str | None = None) -> str:
+def _commit(
+  repo: Path, name: str, lock: str | None = None, *, bridge: bool = False,
+) -> str:
   (repo / name).write_text(name + "\n")
   if lock is not None:
     (repo / "backend").mkdir(exist_ok=True)
     (repo / "backend/requirements.lock").write_text(lock)
+  if bridge:
+    for required in upgrade.BRIDGE_FILES:
+      (repo / required).parent.mkdir(parents=True, exist_ok=True)
+      (repo / required).write_text("1\n")
   _git(repo, "add", "-A")
   _git(repo, "commit", "-q", "-m", name)
   return _git(repo, "rev-parse", "HEAD")
@@ -42,7 +48,7 @@ def install(tmp_path, monkeypatch):
   platform.mkdir(parents=True)
   _git(platform, "init", "-q", "-b", "main")
   old = _commit(platform, "old-release", lock="pkg==1\n")
-  new = _commit(platform, "new-release", lock="pkg==2\n")
+  new = _commit(platform, "new-release", lock="pkg==2\n", bridge=True)
   _git(platform, "reset", "-q", "--hard", old)
   _git(platform, "branch", "-f", "upstream", old)
   _git(platform, "update-ref", "refs/remotes/origin/main", new)
@@ -55,6 +61,7 @@ def install(tmp_path, monkeypatch):
   monkeypatch.setattr(upgrade, "PLATFORM", platform)
   monkeypatch.setattr(upgrade, "CONTROL", control)
   monkeypatch.setattr(upgrade, "BUILD_INFO", build_info)
+  monkeypatch.setattr(upgrade, "RECONCILE_LOCK", data / ".platform-reconcile.lock")
   return {"data": data, "control": control, "old": old, "new": new, "platform": platform}
 
 
@@ -88,18 +95,30 @@ def test_an_explicit_target_must_be_a_complete_fetched_release(install):
 
 @pytest.mark.parametrize("case", [
   "same_image", "older_than_source_release", "pending_update", "parked_update",
-  "helper_running", "request_queued", "helper_missing",
+  "helper_running", "request_queued", "helper_missing", "target_without_bridge",
+  "no_official_history",
 ])
 def test_refuses_without_touching_the_inbox_when_a_precondition_fails(
   install, case, capsys,
 ):
   data, control = install["data"], install["control"]
+  upgrade_target: list[str] = []
   if case == "same_image":
     upgrade.BUILD_INFO.write_text(json.dumps({"sha": install["new"]}))
   elif case == "older_than_source_release":
-    # The installed source took packages from a release the target lacks.
-    newer = _commit(install["platform"], "later-release", lock="pkg==3\n")
-    _git(install["platform"], "branch", "-f", "upstream", newer)
+    # The installed source took packages from an official release newer than
+    # the requested target.
+    later = _commit(install["platform"], "later-release", lock="pkg==3\n", bridge=True)
+    _git(install["platform"], "update-ref", "refs/remotes/origin/main", later)
+    _git(install["platform"], "branch", "-f", "upstream", later)
+    upgrade_target.append(install["new"])
+  elif case == "target_without_bridge":
+    bare = _commit(install["platform"], "release-before-bridge", lock="pkg==2\n")
+    _git(install["platform"], "reset", "-q", "--hard", install["old"])
+    _git(install["platform"], "update-ref", "refs/remotes/origin/main", bare)
+  elif case == "no_official_history":
+    _git(install["platform"], "update-ref", "-d", "refs/remotes/origin/main")
+    upgrade_target.append(install["new"])
   elif case == "pending_update":
     (data / ".platform-prepared-update.json").write_text("{}")
   elif case == "parked_update":
@@ -112,8 +131,9 @@ def test_refuses_without_touching_the_inbox_when_a_precondition_fails(
     (control / "status.json").unlink()
 
   before = _request(install).read_text() if _request(install).exists() else None
+  args = ["--target", upgrade_target[0]] if upgrade_target else []
 
-  assert upgrade.main([]) == 1
+  assert upgrade.main(args) == 1
 
   after = _request(install).read_text() if _request(install).exists() else None
   assert after == before
@@ -133,3 +153,31 @@ def test_a_local_package_declaration_does_not_block_the_upgrade(install):
   (install["platform"] / "backend/requirements.lock").write_text("pkg==1\nlocal==1\n")
 
   assert upgrade.main(["--check"]) == 0
+
+
+def test_a_committed_local_package_edit_under_a_local_release_marker_is_allowed(install):
+  """The marker can name a local commit that also carries a local package
+  declaration; neither makes the declaration an official newer release."""
+  local = _commit(install["platform"], "local-packages", lock="pkg==1\nlocal==1\n")
+  _git(install["platform"], "branch", "-f", "upstream", local)
+
+  assert upgrade.main(["--check"]) == 0
+
+
+def test_checks_and_request_hold_the_updater_lock(install, monkeypatch):
+  held = []
+  real = upgrade.check_no_pending_update
+
+  def observed():
+    import fcntl
+    with open(upgrade.RECONCILE_LOCK, "a+") as other:
+      try:
+        fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        held.append(False)
+      except BlockingIOError:
+        held.append(True)
+    return real()
+
+  monkeypatch.setattr(upgrade, "check_no_pending_update", observed)
+  assert upgrade.main([]) == 0
+  assert held == [True]

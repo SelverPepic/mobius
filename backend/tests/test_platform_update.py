@@ -6040,3 +6040,20 @@ def test_an_image_whose_history_is_missing_proves_nothing(clone_env):
   _record_image_inputs(platform, old_lock)
   with pytest.raises(pu.BootTransactionError, match="newer release"):
     pu.settle_prepared_update_for_this_image(platform)
+
+
+def test_a_committed_local_package_edit_under_a_local_marker_still_boots(clone_env):
+  """A local release marker may carry a local package declaration; it is not
+  an official newer release, so an older image may still serve it."""
+  origin, platform = clone_env
+  _with_python_inputs(platform, origin)
+  image = _served_sha(platform)
+  image_lock = (platform / "backend/requirements.lock").read_bytes()
+  local = _local_commit(platform, edits={
+    "backend/requirements.lock": "fastapi==1\nlocally-added==1\n",
+  })
+  pu._set_upstream(platform, local)
+
+  _boot_image(image)
+  _record_image_inputs(platform, image_lock)
+  assert pu.settle_prepared_update_for_this_image(platform) == "none"

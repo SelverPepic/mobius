@@ -3245,22 +3245,22 @@ def release_packages_missing_from_image(
   the image does not have. Each package input that differs from this image's
   is judged on its own:
 
-  - declared somewhere in this image's own history: older than or equal to
-    the image, so a newer image under older source (a container-only
-    upgrade) is fine;
-  - exactly the installed release's bytes otherwise: a newer release than
-    the image, so the checkout is refused;
-  - anything else is a local package declaration and stays allowed.
+  - declared somewhere in this image's own history: not newer than the image,
+    so a newer image under older source (a container-only upgrade) is fine;
+  - declared in the official history (``origin/main``) but never in the
+    image's: a newer official release, so the checkout is refused;
+  - declared in neither: a local package declaration, which stays allowed.
 
-  The image's history is the proof, not the recorded release: that marker
-  can name a local commit. Without the image's objects nothing is proven,
-  so an unmodified release input is refused. A live update record is
-  settled before this runs.
+  Official history is the proof, not the recorded release marker, which older
+  updaters could set to a local commit. Without fetched official history the
+  recorded release stands in for it, so an unproven input is refused rather
+  than trusted. A live update record is settled before this runs.
   """
   baked = _build_info().get("image_inputs")
   if not isinstance(baked, dict) or not baked:
     return None
   image = image or frozen_image_sha()
+  official = _rev(repo, "refs/remotes/origin/main")
   release = recorded_upstream_sha(repo)
   for path in _PYTHON_DEPENDENCY_INPUTS:
     try:
@@ -3271,7 +3271,11 @@ def release_packages_missing_from_image(
       continue
     if image and _declared_in_history(repo, image, path, served):
       continue
-    if release and _blob_bytes(repo, release, path) == served:
+    if official:
+      newer = _declared_in_history(repo, official, path, served)
+    else:
+      newer = bool(release) and _blob_bytes(repo, release, path) == served
+    if newer:
       return (
         "the platform source declares Python packages from a newer release "
         "than this container image; starting an older image under newer "
@@ -3282,7 +3286,8 @@ def release_packages_missing_from_image(
 
 
 def _declared_in_history(repo: Path, commit: str, path: str, data: bytes) -> bool:
-  """Whether ``path`` held exactly ``data`` at some commit ``commit`` contains."""
+  """Whether ``path`` held exactly ``data`` at some commit ``commit`` contains,
+  merge results included."""
   try:
     blob = subprocess.run(
       ["git", "-C", str(repo), "hash-object", "--stdin"],
@@ -3290,14 +3295,21 @@ def _declared_in_history(repo: Path, commit: str, path: str, data: bytes) -> boo
       env=_scrubbed_git_env(repo),
     ).stdout.decode().strip()
     history = subprocess.run(
-      ["git", "-C", str(repo), "log", "--format=", "--raw", "--no-abbrev",
+      ["git", "-C", str(repo), "log", "-m", "--format=", "--raw", "--no-abbrev",
        "--no-renames", commit, "--", path],
-      capture_output=True, check=False, timeout=_GIT_TIMEOUT,
+      capture_output=True, text=True, check=False, timeout=_GIT_TIMEOUT,
       env=_scrubbed_git_env(repo),
     )
   except (OSError, subprocess.SubprocessError):
     return False
-  return history.returncode == 0 and blob.encode() in history.stdout
+  if history.returncode != 0:
+    return False
+  # Raw lines read ":<mode> <mode> <old blob> <new blob> <status>\t<path>".
+  for line in history.stdout.splitlines():
+    fields = line.split("\t", 1)[0].split()
+    if len(fields) >= 4 and blob in fields[2:4]:
+      return True
+  return False
 
 
 def _blob_bytes(repo: Path, commit: str, path: str) -> bytes | None:
