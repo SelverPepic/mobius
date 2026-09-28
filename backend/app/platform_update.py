@@ -1169,6 +1169,12 @@ def applied_release_sha(repo: Path = PLATFORM_REPO) -> str:
     current = _update_source_tip(repo)
     for candidate in (_latest_known_release(repo), recorded_upstream_sha(repo)):
       if candidate and _is_ancestor(repo, candidate, current):
+        # Source that already holds newer official commits (merged outside an
+        # update) needs a newer image than this release's; Finish cannot name
+        # one, and the update to the newer release installs it.
+        newer = _contained_official_source(repo)
+        if newer and newer != candidate and _is_ancestor(repo, candidate, newer):
+          break
         return candidate
     raise PlatformUpdateError("applied_release_unavailable")
 

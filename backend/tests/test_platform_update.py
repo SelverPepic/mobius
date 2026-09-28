@@ -3459,6 +3459,10 @@ def test_status_owes_the_image_of_a_contained_release_past_a_stale_marker(
   pu._fetch(platform)
   assert pu._contained_official_source(platform) == release_b
   assert pu.platform_status(platform)["activation"]["level"] == "image_rebuild"
+  # Finish cannot offer release A's image for source that holds B; the owner
+  # is sent to the update that installs a release containing B.
+  with pytest.raises(pu.PlatformUpdateError, match="applied_release_unavailable"):
+    pu.applied_release_sha(platform)
 
 
 def test_damaged_deployed_runtime_stays_owed_even_when_the_release_matches(
