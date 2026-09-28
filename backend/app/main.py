@@ -461,20 +461,20 @@ _APP_FRAME_PATH = re.compile(r"^/api/apps/[^/]+/frame$")
 _ARTIFACT_OUTPUT_PATH = re.compile(
   r"^/api/projects/[^/]+/artifacts/[^/]+/output/"
 )
-# Stored bytes whose content an app, a chat participant, or a third-party site
-# controls. They are served as subresources, never as shell documents, so a
+# Stored bytes whose content an app, an agent, a chat participant, or a
+# third-party site controls. They are served as subresources, never as shell documents, so a
 # direct navigation to one (a popup that escaped an app sandbox, a link, or a
 # cached proxy response) must not execute on the shell origin, where the owner
 # credential lives.
 _INERT_CONTENT_PATH = re.compile(
   r"^(?:/app-assets/"
   r"|/api/proxy(?:/|$)"
-  r"|/api/chats/[^/]+/uploads/"
+  r"|/api/chats/[^/]+/(?:uploads|generated-files)/"
   r"|/api/community/publications/github/preview/assets/)"
 )
 # App service responses are app-authored documents. They keep scripts, like a
 # published site, but only inside an opaque origin.
-_APP_SERVICE_PATH = re.compile(r"^/api/(?:app-)?services/")
+_APP_SERVICE_PATH = re.compile(r"^/api/(?:(?:app-)?services|apps/[^/]+/service)/")
 
 # This isolation boundary must always be enforced, never Report-Only: browsers
 # ignore the CSP sandbox directive in a Report-Only policy. The sandbox omits

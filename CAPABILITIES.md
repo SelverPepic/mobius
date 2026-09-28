@@ -130,7 +130,10 @@ each request. It sends one JSON object on stdin and accepts one JSON response
 on stdout: `{ "status": 200, "body": ..., "headers": {...} }`. The platform
 owns authentication, immutable source selection, the short-lived app token,
 8 MiB request/response ceilings, timeout, concurrency, and response-header
-safety. Private and public requests use separate serialized lanes so a private
+safety: only `Cache-Control`, `Content-Disposition`, `Content-Language`,
+`ETag`, `Last-Modified`, and `Vary` pass, other headers are dropped, and an
+authenticated response may not opt into shared caching (`public`, `s-maxage`).
+Private and public requests use separate serialized lanes so a private
 request can synchronously receive a public callback without deadlocking. An
 agent-tool call (below) runs on a third lane that is not serialized per app, so
 several can run at once alongside the two request lanes. When lanes that run at

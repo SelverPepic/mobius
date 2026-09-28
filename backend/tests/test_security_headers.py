@@ -444,6 +444,7 @@ def test_untrusted_stored_bytes_never_execute_as_shell_documents():
     "/api/proxy/favicon",
     "/api/chats/c1/uploads/page.html",
     "/api/community/publications/github/preview/assets/1/abc/x.svg",
+    "/api/chats/c1/generated-files/page.html",
   ):
     policy = _headers(path).get("content-security-policy")
     assert policy == _INERT_CONTENT_CSP, path
@@ -453,10 +454,14 @@ def test_untrusted_stored_bytes_never_execute_as_shell_documents():
 
 
 def test_app_service_documents_run_only_at_an_opaque_origin():
-  for path in ("/api/app-services/svc/page", "/api/services/svc/page"):
+  for path in (
+    "/api/app-services/svc/page", "/api/services/svc/page", "/api/apps/7/service/page",
+  ):
     assert _headers(path).get("content-security-policy") == _PUBLISHED_SITE_CSP
 
 
 def test_untrusted_namespaces_do_not_capture_neighbouring_shell_routes():
-  for path in ("/api/proxyish", "/api/chats/c1/media/x.png", "/api/apps/"):
+  for path in (
+    "/api/proxyish", "/api/chats/c1/media/x.png", "/api/apps/", "/api/apps/7/services",
+  ):
     assert _headers(path).get("content-security-policy") == _SHELL_CSP, path

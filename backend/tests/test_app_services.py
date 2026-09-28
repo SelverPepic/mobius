@@ -199,7 +199,7 @@ print(json.dumps({
     "scope": request["actor"]["scope"],
     "app_slug": request["actor"].get("app_slug"),
   },
-  "headers": {"X-App-Service": "yes"},
+  "headers": {"Content-Language": "en"},
 }))
 '''
 
@@ -254,7 +254,7 @@ def test_authenticated_service_receives_one_bounded_json_envelope(
   )
 
   assert response.status_code == 201
-  assert response.headers["x-app-service"] == "yes"
+  assert response.headers["content-language"] == "en"
   assert response.json() == {
     "method": "POST",
     "path": "review/decision",
@@ -424,28 +424,59 @@ def test_service_runtime_stays_pinned_through_process_exit(
   assert state["closed"] is True
 
 
-def test_service_cannot_set_transport_or_credential_headers(client, auth, db):
+def test_service_headers_outside_the_allowlist_never_reach_the_response(client, auth, db):
+  # A service answers on the shell origin, so a header such as Set-Cookie,
+  # Clear-Site-Data, or NEL/Report-To would act on the owner's whole session
+  # rather than on this one response. Only the allowlisted names pass.
   app = _service_app(db, slug="header-service")
   accepted = runtime_parent(app.id) / ("a" * 64)
   (accepted / "service.py").write_text(
-    "import json\nprint(json.dumps({\"headers\":{\"Set-Cookie\":\"x=y\"}}))\n"
+    "import json\nprint(json.dumps({\"headers\":{"
+    "\"Set-Cookie\":\"x=y\",\"NEL\":\"{}\",\"Report-To\":\"{}\","
+    "\"Service-Worker-Allowed\":\"/\",\"X-Anything\":\"1\","
+    "\"ETag\":\"\\\"v1\\\"\",\"Content-Disposition\":\"inline\"}}))\n"
   )
 
   response = client.get(f"/api/apps/{app.id}/service/status", headers=auth)
 
-  assert response.status_code == 502
-  assert response.json()["detail"] == "response contains an invalid header"
-  assert "set-cookie" not in response.headers
+  assert response.status_code == 200
+  for name in ("set-cookie", "nel", "report-to", "service-worker-allowed", "x-anything"):
+    assert name not in response.headers
+  assert response.headers["etag"] == '"v1"'
+  assert response.headers["content-disposition"] == "inline"
 
 
-@pytest.mark.parametrize(
-  "name", ["Clear-Site-Data", "Refresh", "Service-Worker-Allowed"],
-)
-def test_service_cannot_set_origin_wide_headers(name):
-  # A service answers on the shell origin, so these would act on the owner's
-  # whole session rather than on the app's own response.
+@pytest.mark.parametrize("name", [
+  "Set-Cookie", "Clear-Site-Data", "Refresh", "Service-Worker-Allowed",
+  "NEL", "Report-To", "Content-Type", "Content-Length", "Transfer-Encoding",
+])
+def test_service_cannot_set_session_transport_or_origin_wide_headers(name):
+  assert app_services._response_headers({name: "*"}, public=True) == {}
+
+
+@pytest.mark.parametrize("value", [
+  "public, max-age=60", "max-age=60, s-maxage=600", "max-age=60, must-revalidate",
+])
+def test_authenticated_service_response_is_never_shared_cacheable(value):
+  # A shared cache may store a response to an authorized request only when
+  # the response opts in (RFC 9111 section 3.5). An owner-authenticated service
+  # response must not.
+  assert app_services._response_headers({"Cache-Control": value}, public=False) == {}
+  assert app_services._response_headers({"Cache-Control": value}, public=True) == {
+    "Cache-Control": value,
+  }
+
+
+@pytest.mark.parametrize("value", ["no-store", "private, max-age=60", "no-cache"])
+def test_authenticated_service_keeps_private_cache_policy(value):
+  assert app_services._response_headers({"Cache-Control": value}, public=False) == {
+    "Cache-Control": value,
+  }
+
+
+def test_service_rejects_a_malformed_allowed_header():
   with pytest.raises(ValueError):
-    app_services._response_headers({name: "*"})
+    app_services._response_headers({"ETag": "a\r\nSet-Cookie: x=y"}, public=True)
 
 
 def test_service_rejects_nonstandard_json_constants(client, auth, db):

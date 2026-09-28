@@ -38,16 +38,20 @@ MAX_REQUEST_BYTES = SERVICE_REQUEST_MAX_BYTES
 MAX_RESPONSE_BYTES = SERVICE_REQUEST_MAX_BYTES
 MAX_ERROR_BYTES = 16 * 1024
 SERVICE_TIMEOUT_SECONDS = 15
-_HEADER_NAME = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 _MEDIA_TYPE = re.compile(r"^[a-z0-9][a-z0-9.+-]{0,63}/[a-z0-9][a-z0-9.+-]{0,63}$")
-_FORBIDDEN_HEADERS = frozenset({
-  "connection", "content-length", "content-type", "keep-alive", "proxy-authenticate",
-  "proxy-authorization", "set-cookie", "te", "trailer",
-  "transfer-encoding", "upgrade",
-  # Origin-wide effects a shell-origin response must never carry for an app:
-  # wiping the owner's storage, widening a service-worker scope, or a
-  # header-driven redirect.
-  "clear-site-data", "refresh", "service-worker-allowed",
+# The only headers an app service may add. A service answers on the shell
+# origin, so anything else (Set-Cookie, Clear-Site-Data, NEL/Report-To,
+# Service-Worker-Allowed, framing, transport) would act on the owner's whole
+# session or on the platform's own response contract, and is dropped. The
+# platform sets the content type from `media_type`.
+_SERVICE_RESPONSE_HEADERS = frozenset({
+  "cache-control", "content-disposition", "content-language", "etag",
+  "last-modified", "vary",
+})
+# Cache-Control directives that let a shared cache store a response to an
+# authorized request (RFC 9111 section 3.5), unless private/no-store also apply.
+_SHARED_CACHE_DIRECTIVES = frozenset({
+  "public", "s-maxage", "must-revalidate", "proxy-revalidate",
 })
 _global_slots = {
   "private": asyncio.Semaphore(8),
@@ -170,23 +174,23 @@ async def _stop_process(process, *tasks) -> None:
   await asyncio.gather(*tasks, return_exceptions=True)
 
 
-def _response_headers(value) -> dict[str, str]:
+def _response_headers(value, *, public: bool) -> dict[str, str]:
   if value is None:
     return {}
   if not isinstance(value, dict) or len(value) > 16:
     raise ValueError("response headers must be a bounded object")
   headers: dict[str, str] = {}
   for name, raw in value.items():
-    if (
-      not isinstance(name, str)
-      or _HEADER_NAME.fullmatch(name) is None
-      or name.lower() in _FORBIDDEN_HEADERS
-      or not isinstance(raw, str)
-      or len(raw) > 4096
-      or "\r" in raw
-      or "\n" in raw
-    ):
+    lower = name.lower() if isinstance(name, str) else ""
+    if lower not in _SERVICE_RESPONSE_HEADERS:
+      continue
+    if not isinstance(raw, str) or len(raw) > 4096 or "\r" in raw or "\n" in raw:
       raise ValueError("response contains an invalid header")
+    if lower == "cache-control" and not public:
+      directives = {part.split("=", 1)[0].strip().lower() for part in raw.split(",")}
+      if directives & _SHARED_CACHE_DIRECTIVES and not directives & {"private", "no-store"}:
+        # An owner-authenticated response must never be stored by a shared cache.
+        continue
     headers[name] = raw
   return headers
 
@@ -351,7 +355,9 @@ async def invoke_service(
       # its bounded diagnostics without exposing them in the HTTP response.
       log.warning("App service %s returned %d: %s", app.slug, status, detail)
   try:
-    headers = _response_headers(response.get("headers"))
+    headers = _response_headers(
+      response.get("headers"), public=bool(request_envelope.get("public")),
+    )
   except ValueError as exc:
     raise HTTPException(502, str(exc)) from exc
   encoded = response.get("body_base64")
