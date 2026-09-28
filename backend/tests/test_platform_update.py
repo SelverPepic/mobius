@@ -3454,6 +3454,12 @@ def test_status_owes_the_image_of_a_contained_release_past_a_stale_marker(
   assert finish["operation"] == "finish"
   assert "image_rebuild" in finish["activation"]["required_actions"]
 
+  # A newer release fetched but not installed does not hide B's image either.
+  _advance_origin(origin, edits={"release-c.txt": "c\n"})
+  pu._fetch(platform)
+  assert pu._contained_official_source(platform) == release_b
+  assert pu.platform_status(platform)["activation"]["level"] == "image_rebuild"
+
 
 def test_damaged_deployed_runtime_stays_owed_even_when_the_release_matches(
   clone_env, monkeypatch, tmp_path,
@@ -3484,6 +3490,60 @@ def test_damaged_deployed_runtime_stays_owed_even_when_the_release_matches(
   status = pu.platform_status(platform)
   assert status["activation"]["level"] == "image_rebuild"
   assert status["activation"]["reasons"][0]["paths"] == [path]
+
+  # A link to the image's bytes is not the image's module, and a named pipe
+  # is never opened for reading (it would block status forever).
+  genuine = tmp_path / "genuine.py"
+  genuine.write_text("image\n", encoding="utf-8")
+  (deployed / "restart_ledger.py").unlink()
+  (deployed / "restart_ledger.py").symlink_to(genuine)
+  assert pu.platform_status(platform)["activation"]["level"] == "image_rebuild"
+  (deployed / "restart_ledger.py").unlink()
+  os.mkfifo(deployed / "restart_ledger.py")
+
+  def stalled(_signum, _frame):
+    raise AssertionError("status blocked opening a deployed named pipe")
+
+  previous = signal.signal(signal.SIGALRM, stalled)
+  signal.alarm(5)
+  try:
+    status = pu.platform_status(platform)
+  finally:
+    signal.alarm(0)
+    signal.signal(signal.SIGALRM, previous)
+  assert status["activation"]["level"] == "image_rebuild"
+
+
+def test_source_only_update_keeping_a_local_dockerfile_needs_no_image(
+  clone_env, monkeypatch,
+):
+  """An agent-finished update that keeps a local Dockerfile customization
+  and changes no official image input is a restart, not a replacement."""
+  origin, platform = clone_env
+  official = _advance_origin(origin, edits={"Dockerfile": "FROM official\n"})
+  pu._fetch(platform)
+  _git(platform, "merge", "-q", "--ff-only", official)
+  _git(platform, "branch", "-f", "upstream", official)
+  monkeypatch.setattr(pu, "_build_info", lambda: {
+    "image_inputs": {"Dockerfile": hashlib.sha256(b"FROM official\n").hexdigest()},
+  })
+  _local_commit(platform, edits={"Dockerfile": "FROM official\nRUN local\n"})
+  current = _served_sha(platform)
+  pu.SERVING_SOURCE_FILE.write_text("platform\n")
+  pu.SERVING_SHA_FILE.write_text(current + "\n")
+  target = _advance_origin(origin, edits={"release.txt": "reviewed\n"})
+  pu._fetch(platform)
+  plan = _apply_plan(current, target, platform)
+  plan.pop("repo")
+
+  pu.park_update_for_agent(**plan, repo=platform)
+  assert pu.continue_platform_overlay_update(platform) == "prepared"
+
+  prepared = pu.read_prepared_update()
+  assert prepared["requires_image"] is False
+  assert pu._git_blob(platform, prepared["prepared"], "Dockerfile") == (
+    b"FROM official\nRUN local\n"
+  )
 
 
 def test_status_requires_an_image_for_python_dependency_changes(

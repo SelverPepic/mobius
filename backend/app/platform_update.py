@@ -1158,33 +1158,43 @@ def _update_source_tip(repo: Path) -> str:
   return tip
 
 
-def _contained_release(repo: Path) -> str | None:
-  """The newest official release the served history contains, or None.
-
-  A recorded upstream ref is a reconciliation marker, not proof of containment:
-  an owner can reset the served branch independently, and source can also move
-  past the marker. Prefer the newest known release, then the marker, and only
-  when the checkout's head descends from it.
-  """
-  head = _rev(repo, "HEAD")
-  for candidate in (_latest_known_release(repo), recorded_upstream_sha(repo)):
-    if head and candidate and _is_ancestor(repo, candidate, head):
-      return candidate
-  return None
-
-
 def applied_release_sha(repo: Path = PLATFORM_REPO) -> str:
   """Prove Finish's official target is already present in the served history.
 
-  Never turn Finish into a source update merely because a marker survived a
-  reset (:func:`_contained_release`).
+  A recorded upstream ref is a reconciliation marker, not proof of containment:
+  an owner can reset the served branch independently. Never turn Finish into a
+  source update merely because that marker survived the reset.
   """
   with _reconcile_flock():
-    _update_source_tip(repo)
-    release = _contained_release(repo)
-    if release is None:
-      raise PlatformUpdateError("applied_release_unavailable")
-    return release
+    current = _update_source_tip(repo)
+    for candidate in (_latest_known_release(repo), recorded_upstream_sha(repo)):
+      if candidate and _is_ancestor(repo, candidate, current):
+        return candidate
+    raise PlatformUpdateError("applied_release_unavailable")
+
+
+def _contained_official_source(repo: Path) -> str | None:
+  """The newest official commit the checkout contains, or None.
+
+  Official history is what the newest known release descends from; its merge
+  base with the checkout is the latest official source the checkout holds,
+  even when a stale upstream marker lags it or a newer release is fetched but
+  not installed. A recorded upstream the checkout contains that is newer
+  (installed from outside the tracking ref) wins.
+  """
+  head = _rev(repo, "HEAD")
+  if not head:
+    return None
+  known = _latest_known_release(repo)
+  base = _git(
+    "merge-base", head, known, repo=repo, check=False,
+  ).stdout.strip() if known else ""
+  upstream = recorded_upstream_sha(repo)
+  if upstream and not _is_ancestor(repo, upstream, head):
+    upstream = None
+  if base and upstream:
+    return upstream if _is_ancestor(repo, base, upstream) else base
+  return base or upstream
 
 
 def _parse_legacy_activation_marker(raw: str) -> _ActivationMarker | None:
@@ -1666,13 +1676,15 @@ def _incoming_activation_impact(
 
 
 def _owed_activation(
-  repo: Path, before: str, target: str,
+  repo: Path, before: str, target: str, *, release: str | None = None,
 ) -> PlatformActivationImpact:
   """Everything the running process owes once it serves ``target``: its
-  still-pending activation plus the changes from ``before``."""
+  still-pending activation plus the changes from ``before``. Image work is
+  judged against the official ``release`` ``target`` carries (``target``
+  itself unless it is a prepared local revision on top of one)."""
   return platform_activation.classify_activation(
     _without_python_inputs_installed_for(repo, [
-      *_pending_activation_paths(repo, release=target),
+      *_pending_activation_paths(repo, release=release or target),
       *_activation_paths_between(repo, before, target),
     ], target),
   )
@@ -1777,7 +1789,7 @@ def _pending_activation_paths(
   paths.extend(image_input_drift(repo) or [])
   owed = _image_work_owed(
     repo, [str(path) for path in paths if str(path)],
-    release or _contained_release(repo),
+    release or _contained_official_source(repo),
   )
   return sorted({*owed, *damaged})
 
@@ -1789,16 +1801,25 @@ def _deployed_runtime_is_image_own(path: str) -> bool:
   baked = _build_info().get("image_inputs")
   if not path.startswith(prefix) or not isinstance(baked, dict) or not baked:
     return False
-  try:
-    content = (
-      runtime_provenance.deployed_runtime_root() / path[len(prefix):]
-    ).read_bytes()
-  except OSError:
-    content = None
   expected = baked.get(path)
-  if content is None:
+  deployed = runtime_provenance.deployed_runtime_root() / path[len(prefix):]
+  try:
+    # Never follow a link or open a FIFO: only the image's own regular file
+    # counts, and anything else stays owed as damage.
+    descriptor = os.open(deployed, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+  except FileNotFoundError:
     return expected is None
-  return expected == hashlib.sha256(content).hexdigest()
+  except OSError:
+    return False
+  try:
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+      return False
+    digest = hashlib.sha256()
+    while chunk := os.read(descriptor, 65536):
+      digest.update(chunk)
+  finally:
+    os.close(descriptor)
+  return expected == digest.hexdigest()
 
 
 def _build_info() -> dict:
@@ -2880,7 +2901,7 @@ def _prepare(
   # The image is owed for this release's changes and for any activation the
   # running image still owes (a Finish after the source already contains the
   # release has no incoming changes but still needs its image).
-  impact = _owed_activation(repo, snapshot, prepared)
+  impact = _owed_activation(repo, snapshot, prepared, release=target)
   requires_image = (
     platform_activation.ActivationLevel.IMAGE_REBUILD.value
     in impact["required_actions"]
@@ -3771,7 +3792,7 @@ def _record_update_activation(
   """
   served = _served_platform_sha()
   changed_paths = _activation_paths_between(repo, served, head)
-  release = target or _contained_release(repo)
+  release = target or _contained_official_source(repo)
   changed_paths = _image_work_owed(repo, changed_paths, release)
   incoming_impact = platform_activation.classify_activation(changed_paths)
   if incoming_impact["level"] != platform_activation.ActivationLevel.LIVE.value:
