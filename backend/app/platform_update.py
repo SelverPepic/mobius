@@ -3252,15 +3252,17 @@ def release_packages_missing_from_image(
   - declared in neither: a local package declaration, which stays allowed.
 
   Official history is the proof, not the recorded release marker, which older
-  updaters could set to a local commit. Without fetched official history the
-  recorded release stands in for it, so an unproven input is refused rather
-  than trusted. A live update record is settled before this runs.
+  updaters could set to a local commit. Without complete fetched official
+  history (a shallow clone, or none fetched) the recorded release stands in
+  for it, so an unproven input is refused rather than trusted. A live update record is settled before this runs.
   """
   baked = _build_info().get("image_inputs")
   if not isinstance(baked, dict) or not baked:
     return None
   image = image or frozen_image_sha()
-  official = _rev(repo, "refs/remotes/origin/main")
+  # Absence from history proves nothing in a shallow clone (images seed one),
+  # so only a complete clone may call an input local by its absence.
+  official = "" if _is_shallow(repo) else _rev(repo, "refs/remotes/origin/main")
   release = recorded_upstream_sha(repo)
   for path in _PYTHON_DEPENDENCY_INPUTS:
     try:

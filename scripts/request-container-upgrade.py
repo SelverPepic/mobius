@@ -15,6 +15,7 @@ Run it inside the Möbius container as the ``mobius`` user, from the fetched
 upstream so an older installation needs nothing new installed::
 
     git -C /data/platform fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+    # (add --unshallow when the checkout is still the image's shallow seed)
     git -C /data/platform show origin/main:scripts/request-container-upgrade.py \
       | python3 - [--check] [--target <40-hex official release>]
 
@@ -123,6 +124,13 @@ def check_target(target: str) -> str:
     official = resolve("refs/remotes/origin/main")
     if not official:
         raise Refused("fetch origin main first; no official history is available")
+    # The checks below reason from what history does not contain, which only
+    # a complete clone can show; image seeds are shallow.
+    if git("rev-parse", "--is-shallow-repository").stdout.strip() != "false":
+        raise Refused(
+            "the platform checkout has shallow history; fetch it completely "
+            "first (git fetch --unshallow origin)"
+        )
     if not descends(target, official):
         raise Refused("the target is not part of the fetched official history")
     if not descends(image, target):

@@ -192,3 +192,24 @@ def test_checks_and_request_hold_the_updater_lock(install, monkeypatch):
   monkeypatch.setattr(upgrade, "check_no_pending_update", observed)
   assert upgrade.main([]) == 0
   assert held == [True]
+
+
+def test_refuses_a_shallow_checkout_whose_history_cannot_prove_anything(
+  install, tmp_path, monkeypatch, capsys,
+):
+  """Image seeds are shallow; an input missing from shallow history is not
+  proof that it is local."""
+  shallow = tmp_path / "shallow"
+  _git(install["platform"], "branch", "-f", "release", install["new"])
+  subprocess.run(
+    ["git", "clone", "-q", "--depth", "2", "--branch", "release",
+     f"file://{install['platform']}", str(shallow)],
+    check=True,
+  )
+  _git(shallow, "reset", "-q", "--hard", install["old"])
+  _git(shallow, "branch", "-f", "upstream", install["old"])
+  _git(shallow, "update-ref", "refs/remotes/origin/main", install["new"])
+  monkeypatch.setattr(upgrade, "PLATFORM", shallow)
+
+  assert upgrade.main(["--check"]) == 1
+  assert "shallow history" in capsys.readouterr().err

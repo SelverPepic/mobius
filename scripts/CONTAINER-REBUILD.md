@@ -140,7 +140,11 @@ first, with the helper installed above. From inside the Möbius container, as th
 be installed:
 
 ```sh
-git -C /data/platform fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+if [ "$(git -C /data/platform rev-parse --is-shallow-repository)" = true ]; then
+  git -C /data/platform fetch --no-tags --unshallow origin +refs/heads/main:refs/remotes/origin/main
+else
+  git -C /data/platform fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+fi
 git -C /data/platform show origin/main:scripts/request-container-upgrade.py | python3 -
 ```
 

@@ -6057,3 +6057,23 @@ def test_a_committed_local_package_edit_under_a_local_marker_still_boots(clone_e
   _boot_image(image)
   _record_image_inputs(platform, image_lock)
   assert pu.settle_prepared_update_for_this_image(platform) == "none"
+
+
+def test_a_shallow_clone_judges_packages_by_the_recorded_release(clone_env, monkeypatch):
+  """Absence from shallow history proves nothing, so an input matching the
+  recorded release is refused unless the image's history positively declares
+  it, even under a local marker."""
+  origin, platform = clone_env
+  _with_python_inputs(platform, origin)
+  image = _served_sha(platform)
+  image_lock = (platform / "backend/requirements.lock").read_bytes()
+  local = _local_commit(platform, edits={
+    "backend/requirements.lock": "fastapi==1\nlocally-added==1\n",
+  })
+  pu._set_upstream(platform, local)
+  monkeypatch.setattr(pu, "_is_shallow", lambda repo=None: True)
+
+  _boot_image(image)
+  _record_image_inputs(platform, image_lock)
+  with pytest.raises(pu.BootTransactionError, match="newer release"):
+    pu.settle_prepared_update_for_this_image(platform)
