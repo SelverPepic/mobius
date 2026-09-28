@@ -589,7 +589,9 @@ def test_public_invocation_cannot_spend_on_the_owners_providers(client, auth, db
   assert client.get("/api/app-chats", headers=private).status_code == 200
 
 
-@pytest.mark.parametrize("path", ["tools/log", "/tools/log", "//tools/log"])
+@pytest.mark.parametrize(
+  "path", ["tools/log", "/tools/log", "//tools/log", "./tools/log", "x/../tools/log"],
+)
 def test_http_callers_cannot_reach_the_platforms_tool_lane(client, auth, db, path):
   app = _service_app(db, slug="tool-forge")
   response = client.post(
