@@ -40,7 +40,7 @@ Review the exact changed paths and use the smallest matching action:
 | `frontend/src/` and other frontend build inputs | The watcher rebuilds the served shell, then `shell_apply_now` applies it. A normal save triggers this automatically; source arriving through Git needs a changed frontend file touched. No server restart. |
 | `backend/app/*.py` | After compile checks, tests, and commit, one server restart loads the settled backend revision. |
 | `skill/core.md` | A server restart refreshes the cached constitution for new agent sessions only; existing sessions keep their immutable prompt snapshot. Unless new sessions need the rule immediately, leave it pending for the next separately approved restart. |
-| `backend/scripts/entrypoint.sh`, the exact `/app/scripts/*` bootstrap files it invokes, or `backend/runtime/` | Image-owned. Container replacement installs the official image for the release, which carries no local edit to these files: Finish reports one as a blocker. Batch and test the change, then prepare it as an upstream contribution; it takes effect with the release that contains it. |
+| `backend/scripts/entrypoint.sh`, the exact `/app/scripts/*` bootstrap files it invokes, or `backend/runtime/` | Image-owned. Container replacement installs the official image for the release, which carries no local edit to these files: the edit stays in the checkout, inactive, and the update reports it without waiting on it. Batch and test the change, then prepare it as an upstream contribution; it takes effect with the release that contains it. |
 | `backend/runtime/identity_broker.py` | The one served privileged runtime file: one server restart activates a valid edit; an invalid one falls back to the baked platform for that boot. |
 | `backend/scripts/pm-commit` | One server restart refreshes the installed launcher from the served checkout; no image rebuild. |
 | `backend/scripts/seed-skills/` | One server restart applies the served templates to installed skills; untouched copies advance and edited ones stay for review. No image rebuild once the container runs an image that hands this job to the server. To use an edit immediately, write identical bytes to `/data/shared/skills/<name>.md`. |
@@ -66,8 +66,9 @@ Review the exact changed paths and use the smallest matching action:
    is needed. These declarations are durability metadata, not an activation
    action. Container replacement installs the official image, so a declaration
    becomes durable only through the release that contains it: prepare it as an
-   upstream contribution. Committed only locally, it never reaches an image and
-   blocks Finish.
+   upstream contribution. Committed only locally, it never reaches an image;
+   updates keep it in the checkout, report it as inactive, and never wait on
+   it.
 4. Treat a container rebuild as a last resort, not an ordinary closeout step.
    Require it now only when the change genuinely cannot activate live, or when
    the partner explicitly asks to validate the image.
