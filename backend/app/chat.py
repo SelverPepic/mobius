@@ -5709,7 +5709,7 @@ async def _run_chat_impl_with_db(
       )
       new_session_id = runner_result.get("session_id")
       err = runner_result.get("error")
-      if not err:
+      if not err and runner_result.get("prompt_sent", True):
         await _acknowledge_provider_success(
           chat_id=chat_id,
           run_token=run_token or "",
@@ -5902,7 +5902,7 @@ async def _run_chat_impl_with_db(
         )
       new_session_id = runner_result.get("session_id")
       err = runner_result.get("error")
-      if not err:
+      if not err and runner_result.get("prompt_sent", True):
         await _acknowledge_provider_success(
           chat_id=chat_id,
           run_token=run_token or "",

@@ -15,6 +15,9 @@ class RunnerResult(TypedDict):
   usage_metrics: NotRequired[dict | None]
   terminal_status: NotRequired[str | None]
   final_message_phase: NotRequired[str | None]
+  # False when the turn ended before its provider received the prompt, so
+  # nothing the turn carried (peer notes, Wait results) was delivered.
+  prompt_sent: NotRequired[bool]
 
 
 class ChatEvent(TypedDict):

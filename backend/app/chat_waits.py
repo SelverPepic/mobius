@@ -136,6 +136,7 @@ _OUTPUT_TAIL = 2000
 _OUTPUT_TAIL_BYTES = _OUTPUT_TAIL * 4
 _RESULT_MAX = 3000
 _OUTCOMES = {"met": "met", "expired": "deadline_expired", "failed": "check_failed"}
+_RESUME_RETRY = ".retry"
 
 # Cancellation is synchronous at the API/chat-lifecycle boundary while checks
 # run in the supervisor's event loop. A None PID reserves an admission while
@@ -653,7 +654,7 @@ def safe_startup_writer_orphan(
     or not physical.id.startswith(prefix)
   ):
     return False
-  wait_id = physical.id[len(prefix):]
+  wait_id = physical.id[len(prefix):].removesuffix(_RESUME_RETRY)
   row = db.query(models.ChatWait).filter(
     models.ChatWait.id == wait_id,
     models.ChatWait.chat_id == chat.id,
@@ -685,7 +686,7 @@ def safe_startup_writer_orphan(
     expected_kind = PLATFORM_ACTIVATION_RESULT_MESSAGE_KIND
   else:
     expected_content = _compose_resume_notice(row, outcome)
-    expected_cid = f"wait-result-{row.id}"
+    expected_cid = "wait-result-" + physical.id[len(prefix):]
     expected_kind = WAIT_RESULT_MESSAGE_KIND
   messages = list(chat.messages or [])
   continuation = messages[-1] if messages else None
@@ -756,14 +757,26 @@ async def _deliver_resume(row_id: str) -> bool:
       models.ChatRun.id == resume_run_id,
       models.ChatRun.chat_id == chat_id,
     ).first()
+    if (
+      not activation and existing_resume is not None
+      and existing_resume.status == "failed"
+    ):
+      # A failed resume turn recorded nothing (only a successful provider call
+      # does), so it gets one retry identity, like a helper-result wake. A
+      # failed retry leaves the result to ride the next turn.
+      resume_run_id = f"wait-resume-{row_id}{_RESUME_RETRY}"
+      existing_resume = db.query(models.ChatRun).filter(
+        models.ChatRun.id == resume_run_id,
+        models.ChatRun.chat_id == chat_id,
+      ).first()
     if not activation and existing_resume is not None and not (
       existing_resume.status == "running"
       and existing_resume.provider_execution_admitted is False
       and not is_chat_running(chat_id)
     ):
-      # A Wait gets one resume turn; only its unscheduled orphan is picked up
-      # again. A successful turn carrying the result latches it, and until
-      # then each next turn carries it (owed_wait_results).
+      # Otherwise the resume turn ran (or was stopped or superseded); only
+      # its unscheduled orphan is picked up again. A successful turn carrying
+      # the result latches it; until then each next turn carries it.
       return False
     root_run_id = (
       row.root_run_id if activation else
@@ -780,7 +793,7 @@ async def _deliver_resume(row_id: str) -> bool:
 
   resume_cid = (
     f"activation-result-{row_id}" if activation
-    else f"wait-result-{row_id}"
+    else "wait-result-" + resume_run_id.removeprefix("wait-resume-")
   )
   message_kind = (
     PLATFORM_ACTIVATION_RESULT_MESSAGE_KIND if activation
@@ -1120,7 +1133,7 @@ async def withdraw_delivered_resume_notices(chat_id: str) -> int:
         message.get("kind") == WAIT_RESULT_MESSAGE_KIND
         and isinstance(cid, str) and cid.startswith(prefix)
       ):
-        queued[cid.removeprefix(prefix)] = cid
+        queued[cid.removeprefix(prefix).removesuffix(_RESUME_RETRY)] = cid
     if not queued:
       return 0
     delivered = {
