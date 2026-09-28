@@ -197,7 +197,7 @@ export default function DocumentAttachment({
   }
 
   function continueInChat() {
-    cardRef.current?.closest('.chat__scroll')?.scrollBy({ top: 240, behavior: 'smooth' })
+    cardRef.current?.closest('.chat__scroll')?.scrollBy({ top: 240, behavior: 'auto' })
   }
 
   useEffect(() => {

@@ -3687,7 +3687,6 @@
   height: 34px;
   border-radius: 8px;
   color: var(--text);
-  text-decoration: none;
   border: 0;
   background: transparent;
   cursor: pointer;
@@ -3695,10 +3694,6 @@
 
 .chat__document-card-download:hover {
   background: var(--surface-2);
-}
-
-.chat__document-card-download[aria-disabled="true"] {
-  opacity: .45;
 }
 
 .chat__document-card-toolbar {
@@ -3737,7 +3732,6 @@
   gap: 6px;
 }
 
-.chat__document-card-actions > a,
 .chat__document-card-actions > button,
 .chat__document-card-reader button {
   padding: 7px 10px;
@@ -3748,7 +3742,6 @@
   font: inherit;
   font-size: 12px;
   font-weight: 600;
-  text-decoration: none;
   cursor: pointer;
 }
 
@@ -3791,6 +3784,8 @@
 }
 
 .chat__document-card-continue button {
+  min-height: 40px;
+  padding: 6px 10px;
   border: 0;
   background: transparent;
   color: var(--text);
@@ -3798,6 +3793,10 @@
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
+}
+
+.chat__document-card-continue button:focus-visible {
+  outline: 2px solid var(--accent);
 }
 
 @media (prefers-reduced-motion: no-preference) {
