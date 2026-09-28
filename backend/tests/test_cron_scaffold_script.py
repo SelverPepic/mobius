@@ -228,7 +228,10 @@ def test_durable_replace_failure_cannot_change_live_crontab(tmp_path):
   assert not touched.exists()
 
 
-def test_live_write_failure_leaves_complete_durable_retry_point(tmp_path):
+@pytest.mark.parametrize("zone_cron", ["30 2 * * *", "30 2 * * 1-5"])
+def test_live_write_failure_leaves_complete_durable_retry_point(
+  tmp_path, zone_cron,
+):
   """After the durable commit, a live failure is honest and retryable."""
   app_base = tmp_path / "apps"
   app_dir = app_base / "memory"
@@ -265,7 +268,7 @@ def test_live_write_failure_leaves_complete_durable_retry_point(tmp_path):
   result = subprocess.run(
     [
       str(script), "memory", "* * * * *", "fetch.sh", "57",
-      "Europe/Belgrade", "30 2 * * *",
+      "Europe/Belgrade", zone_cron,
     ],
     text=True, capture_output=True, env=env, check=False,
   )
@@ -274,4 +277,4 @@ def test_live_write_failure_leaves_complete_durable_retry_point(tmp_path):
   assert state.read_text() == "0 9 * * * /data/apps/news/fetch.sh 12\n"
   init_text = init_path.read_text()
   assert 'SCHEDULE_TZ="Europe/Belgrade"' in init_text
-  assert 'SCHEDULE_SOURCE="30 2 * * *"' in init_text
+  assert f'SCHEDULE_SOURCE="{zone_cron}"' in init_text

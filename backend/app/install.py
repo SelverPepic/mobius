@@ -3090,42 +3090,83 @@ def _manifest_default_timezone(
 ) -> str | None:
   """The zone a manifest default is registered in; ``None`` is server time.
 
-  A plain daily default (``M H * * *``) means that wall time for the owner,
-  so it is owned in the owner's timezone once known. Other cadences, and a
-  zone the server already runs in, stay ordinary server cron.
+  A fixed wall-time default (``M H * * *``, ``M H * * 1-5``) means that time
+  for the owner, so it is owned in the owner's timezone once known. Other
+  cadences, and a zone the server already runs in, stay ordinary server cron.
   """
   from app import cron_tz
 
   if (
     owner_zone is None
-    or cron_tz.parse_daily_cron(default) is None
+    or cron_tz.parse_wall_clock_cron(default) is None
     or owner_zone == cron_tz.server_timezone_name()
   ):
     return None
   return owner_zone
 
 
-def _register_app_schedule(
+def _apply_schedule_choice(
   app: models.App,
-  cron: str,
-  job_path: Path,
-  zone: str | None,
+  choice: app_cron.ScheduleChoice,
   scaffold: Path,
 ) -> None:
+  """Record who chose the schedule, then register it.
+
+  Provenance is written first so a failed or interrupted registration can
+  never leave a declaration whose origin a later update must guess.
+  """
   from app import cron_tz
 
-  if zone is None:
-    app_cron.register_cron(app.slug, cron, job_path, app.id, scaffold=scaffold)
+  app_cron.record_schedule_choice(app.id, choice)
+  job_path = Path(app.source_dir) / choice.job
+  if choice.timezone is None:
+    app_cron.register_cron(
+      app.slug, choice.cron, job_path, app.id, scaffold=scaffold,
+    )
     return
   app_cron.register_cron(
     app.slug,
-    cron_tz.materialize_zone_cron(cron, zone),
+    cron_tz.materialize_zone_cron(choice.cron, choice.timezone),
     job_path,
     app.id,
-    timezone=zone,
-    zone_cron=cron,
+    timezone=choice.timezone,
+    zone_cron=choice.cron,
     scaffold=scaffold,
   )
+
+
+async def converge_manifest_schedule_zones(
+  db: Session, owner_zone: str | None,
+) -> None:
+  """Move every manifest-default schedule into the zone it belongs in.
+
+  Runs when the owner's timezone is reported. Owner-chosen schedules keep
+  their own zone; a default already in the right zone is left alone, so
+  repeated reports are no-ops. A failure leaves that app for the next report.
+  """
+  scaffold = app_cron.cron_scaffold(CRON_SCAFFOLD)
+  if not scaffold.exists():
+    return
+  apps = db.query(models.App).filter(models.App.deleted_at.is_(None)).all()
+  for app in apps:
+    try:
+      async with fs_locks.source_dir_lock(app.source_dir):
+        choice = app_cron.read_schedule_choice(app.id)
+        if choice is None or choice.source != "manifest":
+          continue
+        zone = _manifest_default_timezone(choice.cron, owner_zone)
+        if zone == choice.timezone:
+          continue
+        try:
+          await asyncio.to_thread(
+            _apply_schedule_choice,
+            app, dataclasses.replace(choice, timezone=zone), scaffold,
+          )
+        except Exception:
+          app_cron.record_schedule_choice(app.id, choice)
+          raise
+    except Exception:
+      log.exception("schedule zone: app %s could not be moved", app.id)
 
 
 async def _sync_manifest_cron_unlocked(
@@ -3146,7 +3187,7 @@ async def _sync_manifest_cron_unlocked(
 
   A schedule the owner chose survives while the app keeps the same schedule
   contract (``app_cron.owner_schedule_to_keep``); otherwise the manifest
-  default is registered, in ``owner_zone`` when it is a plain daily time.
+  default is registered, in ``owner_zone`` when it is a fixed wall time.
   """
   schedule = manifest.get("schedule")
   job_name = schedule.get("job") if schedule else None
@@ -3165,7 +3206,6 @@ async def _sync_manifest_cron_unlocked(
     await asyncio.to_thread(_drop_app_cron, app_data_dir)
     (app_cron.schedule_state_dir(app.id) / "init-cron.sh").unlink(missing_ok=True)
     app_cron.clear_schedule_choice(app.id)
-  job_path = app_data_dir / cron_job_name
   active_cron_scaffold = app_cron.cron_scaffold(CRON_SCAFFOLD)
   if has_cron and active_cron_scaffold.exists():
     default = schedule["default"]
@@ -3180,10 +3220,8 @@ async def _sync_manifest_cron_unlocked(
         manifest_default=default,
       )
     await asyncio.to_thread(
-      _register_app_schedule,
-      app, choice.cron, job_path, choice.timezone, active_cron_scaffold,
+      _apply_schedule_choice, app, choice, active_cron_scaffold,
     )
-    app_cron.record_schedule_choice(app.id, choice)
   elif has_cron:
     sentinel = app_data_dir / ".cron-pending.json"
     sentinel.write_text(

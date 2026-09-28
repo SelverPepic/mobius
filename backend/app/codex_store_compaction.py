@@ -6,20 +6,21 @@ rollout files Möbius already retired, and never reclaims free pages in its
 thread index. On a metered volume that grew to several gigabytes.
 
 This runs only inside the Codex retention sweep while it holds the exclusive
-side of the cross-process Codex lock, so no Codex process has these databases
-open. It never touches authentication, configuration, rollout files, or any
-path outside CODEX_HOME. Each step checks the schema it expects and skips an
-unfamiliar layout or a busy database, so a Codex upgrade degrades to a no-op
-instead of a guess. Work is batched with WAL checkpoints between batches (so
-the WAL never holds a whole deletion) and stops at a deadline; the next sweep
-resumes where it left off.
+side of the cross-process Codex lock, and Möbius's Codex launches wait on that
+lock, so the deadline is a hard wall-clock bound: SQLite interrupts any
+statement still running when it passes (the statement rolls back), and file
+removal checks it between unlinks. Work is done in small committed steps with
+WAL checkpoints between them, so an interrupted pass loses at most one step
+and the next sweep resumes. It never touches authentication, configuration,
+rollout files, or any path outside CODEX_HOME. Each step checks the schema it
+expects and skips an unfamiliar layout or a busy database, so a Codex upgrade
+degrades to a no-op instead of a guess.
 """
 
 from __future__ import annotations
 
 import os
 import re
-import shutil
 import sqlite3
 import stat
 import time
@@ -31,10 +32,12 @@ LOG_RETENTION_SECONDS = 2 * 86400
 SCRATCH_DIRS = ("tmp", ".tmp", "cache")
 SCRATCH_MIN_AGE_SECONDS = 86400
 
-_DELETE_BATCH_ROWS = 20_000
-_THREADS_PER_COMMIT = 25
-_VACUUM_PAGES_PER_STEP = 16384
+# Each step is a fraction of a second, well inside the sweep's budget.
+_DELETE_BATCH_ROWS = 5_000
+_VACUUM_PAGES_PER_STEP = 4096
 _BUSY_TIMEOUT_MS = 2000
+# SQLite VM instructions between deadline checks inside one statement.
+_INTERRUPT_CHECK_OPS = 1000
 
 
 class _Deadline:
@@ -43,6 +46,11 @@ class _Deadline:
 
   def passed(self) -> bool:
     return self._at is not None and time.monotonic() >= self._at
+
+  def remaining_ms(self, cap: int) -> int:
+    if self._at is None:
+      return cap
+    return max(0, min(cap, int((self._at - time.monotonic()) * 1000)))
 
 
 def _current_generation(home: Path, family: str) -> Path | None:
@@ -71,9 +79,12 @@ def _footprint(path: Path) -> int:
   return total
 
 
-def _connect(path: Path) -> sqlite3.Connection:
-  conn = sqlite3.connect(str(path), timeout=_BUSY_TIMEOUT_MS / 1000, isolation_level=None)
-  conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+def _connect(path: Path, deadline: _Deadline) -> sqlite3.Connection:
+  """Open a store whose statements, and lock waits, end by the deadline."""
+  busy_ms = deadline.remaining_ms(_BUSY_TIMEOUT_MS)
+  conn = sqlite3.connect(str(path), timeout=busy_ms / 1000, isolation_level=None)
+  conn.execute(f"PRAGMA busy_timeout={busy_ms}")
+  conn.set_progress_handler(deadline.passed, _INTERRUPT_CHECK_OPS)
   return conn
 
 
@@ -86,30 +97,15 @@ def _checkpoint(conn: sqlite3.Connection) -> None:
   conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
 
-def _release_free_pages(
-  conn: sqlite3.Connection, path: Path, deadline: _Deadline,
-) -> bool:
+def _release_free_pages(conn: sqlite3.Connection, deadline: _Deadline) -> bool:
   """Return pages to the filesystem; False when the database cannot do it.
 
-  Incremental vacuum visits every trailing page, so its cost follows the file
-  size; a rebuild's cost follows the live data. After a large retention delete
-  (a log that is 97% free pages) the rebuild is an order of magnitude faster,
-  and it needs only live-sized temporary space, which is checked first.
+  Incremental vacuum commits in fixed steps, so a pass can stop at any step
+  and the next one resumes. A full VACUUM cannot be split, and on a
+  multi-gigabyte store it cannot finish inside a budget launches can wait out.
   """
   if conn.execute("PRAGMA auto_vacuum").fetchone()[0] != 2:
     return False
-  free = conn.execute("PRAGMA freelist_count").fetchone()[0]
-  total = conn.execute("PRAGMA page_count").fetchone()[0]
-  page_size = conn.execute("PRAGMA page_size").fetchone()[0]
-  live_bytes = (total - free) * page_size
-  if (
-    not deadline.passed()
-    and free * 2 > total
-    and shutil.disk_usage(path.parent).free > 3 * live_bytes
-  ):
-    conn.execute("VACUUM")
-    _checkpoint(conn)
-    return True
   while conn.execute("PRAGMA freelist_count").fetchone()[0] and not deadline.passed():
     conn.execute(f"PRAGMA incremental_vacuum({_VACUUM_PAGES_PER_STEP})").fetchall()
     _checkpoint(conn)
@@ -119,23 +115,28 @@ def _release_free_pages(
 def _compact(path: Path | None, deadline: _Deadline, work) -> dict:
   if path is None:
     return {"status": "absent"}
+  if deadline.passed():
+    return {"status": "incomplete"}
   started = time.monotonic()
   before = _footprint(path)
   try:
-    conn = _connect(path)
+    conn = _connect(path, deadline)
   except sqlite3.Error as exc:
     return {"status": "unavailable", "error": type(exc).__name__}
   try:
     outcome = work(conn)
     if outcome.get("status") == "completed" and not _release_free_pages(
-      conn, path, deadline,
+      conn, deadline,
     ):
       outcome["vacuum"] = "unavailable"
     _checkpoint(conn)
     if deadline.passed() and outcome.get("status") == "completed":
       outcome["status"] = "incomplete"
   except sqlite3.OperationalError as exc:
-    outcome = {"status": "busy", "error": str(exc)[:120]}
+    if deadline.passed():
+      outcome = {"status": "incomplete"}
+    else:
+      outcome = {"status": "busy", "error": str(exc)[:120]}
   finally:
     conn.close()
   outcome["reclaimed_bytes"] = max(0, before - _footprint(path))
@@ -168,11 +169,13 @@ _THREAD_HISTORY_TABLES = (
 )
 
 
-def _retired_threads(state: Path | None, rollout_cutoff: float) -> list[str] | None:
+def _retired_threads(
+  state: Path | None, rollout_cutoff: float, deadline: _Deadline,
+) -> list[str] | None:
   """Threads Codex can no longer resume: stale and without a rollout file."""
   if state is None:
     return None
-  conn = _connect(state)
+  conn = _connect(state, deadline)
   try:
     if not _has_columns(conn, "threads", {"id", "rollout_path", "updated_at"}):
       return None
@@ -199,40 +202,49 @@ def _drop_retired_history(
   ]
   if "thread_items" not in tables:
     return {"status": "schema_unrecognized"}
-  present = {
-    row[0] for row in conn.execute("SELECT DISTINCT thread_id FROM thread_items")
-  }
-  targets = [thread_id for thread_id in retired if thread_id in present]
   dropped = 0
-  for start in range(0, len(targets), _THREADS_PER_COMMIT):
+  for thread_id in retired:
     if deadline.passed():
       return {"status": "incomplete", "dropped_threads": dropped}
-    batch = targets[start:start + _THREADS_PER_COMMIT]
+    # Codex keys every history table by thread_id, so this is an index probe.
+    if conn.execute(
+      "SELECT 1 FROM thread_items WHERE thread_id = ? LIMIT 1", (thread_id,),
+    ).fetchone() is None:
+      continue
     conn.execute("BEGIN IMMEDIATE")
-    for thread_id in batch:
-      for table in tables:
-        conn.execute(f"DELETE FROM {table} WHERE thread_id = ?", (thread_id,))
+    for table in tables:
+      conn.execute(f"DELETE FROM {table} WHERE thread_id = ?", (thread_id,))
     conn.execute("COMMIT")
     _checkpoint(conn)
-    dropped += len(batch)
+    dropped += 1
   return {"status": "completed", "dropped_threads": dropped}
 
 
-def _tree_bytes(path: Path) -> int:
-  info = path.lstat()
-  if not stat.S_ISDIR(info.st_mode):
-    return info.st_blocks * 512
-  total = 0
-  for base, dirs, files in os.walk(path, followlinks=False):
-    for name in files + dirs:
-      try:
-        total += os.lstat(os.path.join(base, name)).st_blocks * 512
-      except OSError:
-        pass
-  return total
+def _remove_tree(path: Path, deadline: _Deadline) -> tuple[int, bool]:
+  """Unlink ``path`` bottom-up; return bytes freed and whether it is gone."""
+  freed = 0
+
+  def remove(target: Path) -> bool:
+    nonlocal freed
+    if deadline.passed():
+      return False
+    info = target.lstat()
+    if stat.S_ISDIR(info.st_mode):
+      target.rmdir()
+    else:
+      target.unlink()
+    freed += info.st_blocks * 512
+    return True
+
+  if path.is_dir() and not path.is_symlink():
+    for base, dirs, files in os.walk(path, topdown=False, followlinks=False):
+      for name in files + dirs:
+        if not remove(Path(base, name)):
+          return freed, False
+  return freed, remove(path)
 
 
-def _clear_stale_scratch(home: Path, *, now: float) -> dict:
+def _clear_stale_scratch(home: Path, *, now: float, deadline: _Deadline) -> dict:
   removed = reclaimed = errors = 0
   for name in SCRATCH_DIRS:
     root = home / name
@@ -241,16 +253,11 @@ def _clear_stale_scratch(home: Path, *, now: float) -> dict:
     for entry in list(os.scandir(root)):
       path = Path(entry.path)
       try:
-        info = path.lstat()
-        if now - info.st_mtime < SCRATCH_MIN_AGE_SECONDS:
+        if now - path.lstat().st_mtime < SCRATCH_MIN_AGE_SECONDS:
           continue
-        size = _tree_bytes(path)
-        if stat.S_ISDIR(info.st_mode):
-          shutil.rmtree(path)
-        else:
-          path.unlink()
-        removed += 1
-        reclaimed += size
+        freed, gone = _remove_tree(path, deadline)
+        reclaimed += freed
+        removed += gone
       except FileNotFoundError:
         continue
       except OSError:
@@ -267,7 +274,9 @@ def compact_codex_stores(
 ) -> dict:
   """Bound Codex's log, thread history, thread index, and scratch space.
 
-  The caller must hold the exclusive Codex sweep lock. ``rollout_cutoff`` is
+  The caller must hold the exclusive Codex sweep lock; this returns within
+  ``budget_seconds`` (plus one bounded checkpoint) so it releases that lock
+  in time for a waiting launch. ``rollout_cutoff`` is
   the rollout retention boundary: history is dropped only for threads last
   updated before it whose rollout file is already gone.
   """
@@ -275,16 +284,19 @@ def compact_codex_stores(
   deadline = _Deadline(budget_seconds)
   state = _current_generation(home, "state")
   result = {
-    "scratch": _clear_stale_scratch(home, now=now),
+    "scratch": _clear_stale_scratch(home, now=now, deadline=deadline),
     "logs": _compact(
       _current_generation(home, "logs"), deadline,
       lambda conn: _trim_logs(conn, now=now, deadline=deadline),
     ),
   }
   try:
-    retired = _retired_threads(state, rollout_cutoff)
+    retired = _retired_threads(state, rollout_cutoff, deadline)
   except sqlite3.Error as exc:
-    result["thread_history"] = {"status": "busy", "error": str(exc)[:120]}
+    result["thread_history"] = (
+      {"status": "incomplete"} if deadline.passed()
+      else {"status": "busy", "error": str(exc)[:120]}
+    )
   else:
     result["thread_history"] = _compact(
       _current_generation(home, "thread_history"), deadline,

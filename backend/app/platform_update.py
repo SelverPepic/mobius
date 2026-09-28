@@ -3258,37 +3258,73 @@ def release_packages_missing_from_image(
 
   Running an older image under source from a newer release (historical
   image-only rollback) is unsupported: that source declares Python packages
-  the image does not have. The checkout is refused when any package input is
-  exactly its release's yet not installed by this image, and this image is not
-  provably that release or newer. A live update record is settled before
-  this runs; image-first moves (an image newer than the source) and local
-  package declarations stay allowed.
+  the image does not have. Each package input this image does not install
+  (``image_installs_python_input``) is judged on its own:
+
+  - declared somewhere in this image's own history: not newer than the image,
+    so a newer image under older source (a container-only upgrade) is fine;
+  - declared in the official history (``origin/main``) but never in the
+    image's: a newer official release, so the checkout is refused;
+  - declared in neither: a local package declaration, which stays allowed.
+
+  Official history is the proof, not the recorded release marker, which older
+  updaters could set to a local commit. Without complete fetched official
+  history (a shallow clone, or none fetched) the recorded release stands in
+  for it, so an unproven input is refused rather than trusted. A live update record is settled before this runs.
   """
   baked = _build_info().get("image_inputs")
   if not isinstance(baked, dict) or not baked:
     return None
   image = image or frozen_image_sha()
+  # Absence from history proves nothing in a shallow clone (images seed one),
+  # so only a complete clone may call an input local by its absence.
+  official = "" if _is_shallow(repo) else _rev(repo, "refs/remotes/origin/main")
   release = recorded_upstream_sha(repo)
-  if not release:
-    return None
-  # Each input counts on its own: a local declaration exempts only its own
-  # path, never a release's input that the image provably lacks.
-  differs = False
   for path in _PYTHON_DEPENDENCY_INPUTS:
     served = _served_bytes(repo, path)
     if served is None or image_installs_python_input(repo, path, served):
       continue
-    if _git_blob(repo, release, path) == served:
-      differs = True
-  if not differs:
-    return None
-  if image and release and (image == release or _is_ancestor(repo, release, image)):
-    return None
-  return (
-    "the platform source declares Python packages from a newer release than "
-    "this container image; starting an older image under newer source is not "
-    "supported. Replace the container with the release's image."
-  )
+    if image and _declared_in_history(repo, image, path, served):
+      continue
+    if official:
+      newer = _declared_in_history(repo, official, path, served)
+    else:
+      newer = bool(release) and _git_blob(repo, release, path) == served
+    if newer:
+      return (
+        "the platform source declares Python packages from a newer release "
+        "than this container image; starting an older image under newer "
+        "source is not supported. Replace the container with the release's "
+        "image."
+      )
+  return None
+
+
+def _declared_in_history(repo: Path, commit: str, path: str, data: bytes) -> bool:
+  """Whether ``path`` held exactly ``data`` at some commit ``commit`` contains,
+  merge results included."""
+  try:
+    blob = subprocess.run(
+      ["git", "-C", str(repo), "hash-object", "--stdin"],
+      input=data, capture_output=True, check=True, timeout=_GIT_TIMEOUT,
+      env=_scrubbed_git_env(repo),
+    ).stdout.decode().strip()
+    history = subprocess.run(
+      ["git", "-C", str(repo), "log", "-m", "--format=", "--raw", "--no-abbrev",
+       "--no-renames", commit, "--", path],
+      capture_output=True, text=True, check=False, timeout=_GIT_TIMEOUT,
+      env=_scrubbed_git_env(repo),
+    )
+  except (OSError, subprocess.SubprocessError):
+    return False
+  if history.returncode != 0:
+    return False
+  # Raw lines read ":<mode> <mode> <old blob> <new blob> <status>\t<path>".
+  for line in history.stdout.splitlines():
+    fields = line.split("\t", 1)[0].split()
+    if len(fields) >= 4 and blob in fields[2:4]:
+      return True
+  return False
 
 
 def _refuse_source_newer_than_image_packages(repo: Path, image: str | None) -> None:

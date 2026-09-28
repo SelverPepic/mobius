@@ -63,12 +63,10 @@ import {
   isShellListUrl,
   requiresLiveShellList,
   SHELL_DOCUMENT_POLICY_REVISION,
-  isImmutableAppAsset,
-  isPackagedAppAsset,
+  packagedAssetCacheLane,
   packagedAppAssetCacheKey,
   hasOpaqueEmbedSandbox,
   isCacheableOpaqueEmbedDocument,
-  isRangeRequest,
   isStaleRuntimeCache,
   shouldServeCacheFirst,
   shouldFallBackToCacheOnError,
@@ -283,6 +281,8 @@ registerRoute(
 // that under the bare URL truncates the asset for every later consumer —
 // CubeRun's `Range: bytes=0-0` probe blacked out the game this way
 // (2026-06-12); the request side is the only place the case is visible.
+// packagedAssetCacheLane owns the choice. A page navigation to /app-assets
+// takes neither route: it reaches the server's fresh inert response.
 // Bounded-growth trim for APP_ASSETS_CACHE. Neither route below carries a
 // Workbox ExpirationPlugin (it's not a dep on these routes), and a single app
 // can be ~19MB of assets, so without a cap the cache grows unbounded across
@@ -337,11 +337,7 @@ const packagedAssetUpdateGuard = {
 
 registerRoute(
   ({ url, request }) =>
-    url.origin === self.location.origin &&
-    isImmutableAppAsset(url.pathname) &&
-    request.mode !== 'navigate' &&
-    request.destination !== 'document' &&
-    !isRangeRequest(request),
+    packagedAssetCacheLane(url, request, self.location.origin) === 'immutable',
   new CacheFirst({
     cacheName: APP_ASSETS_CACHE,
     plugins: [
@@ -356,12 +352,7 @@ registerRoute(
 )
 registerRoute(
   ({ url, request }) =>
-    url.origin === self.location.origin &&
-    isPackagedAppAsset(url.pathname) &&
-    (!isImmutableAppAsset(url.pathname)
-      || request.mode === 'navigate'
-      || request.destination === 'document') &&
-    !isRangeRequest(request),
+    packagedAssetCacheLane(url, request, self.location.origin) === 'revalidate',
   new StaleWhileRevalidate({
     cacheName: APP_ASSETS_CACHE,
     plugins: [

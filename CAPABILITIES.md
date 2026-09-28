@@ -130,7 +130,10 @@ each request. It sends one JSON object on stdin and accepts one JSON response
 on stdout: `{ "status": 200, "body": ..., "headers": {...} }`. The platform
 owns authentication, immutable source selection, the short-lived app token,
 8 MiB request/response ceilings, timeout, concurrency, and response-header
-safety. Private and public requests use separate serialized lanes so a private
+safety: only `Cache-Control`, `Content-Disposition`, `Content-Language`,
+`ETag`, `Last-Modified`, and `Vary` pass, other headers are dropped, and an
+authenticated response may not opt into shared caching (`public`, `s-maxage`).
+Private and public requests use separate serialized lanes so a private
 request can synchronously receive a public callback without deadlocking. An
 agent-tool call (below) runs on a third lane that is not serialized per app, so
 several can run at once alongside the two request lanes. When lanes that run at
@@ -166,12 +169,20 @@ install-time grants and do not widen the service app token's accepted
 permissions. The generic routes are the whole contract: the platform does not
 carry app-specific path aliases. Services receive the same `APP_ID`, `APP_SLUG`,
 `APP_STORAGE_DIR`, `API_BASE_URL`, and short-lived `APP_TOKEN` environment as
-other reviewed app-owned processes. A service reached only through an
-authenticated caller (`self` or `apps` access) additionally receives the
+other reviewed app-owned processes. The token's authority follows the caller.
+An authenticated invocation's token carries the app's own authority. A public
+invocation acts for an anonymous visitor, so its token has a narrow scope: it
+may read the owner's identity (with the app's `identity_manage` grant) and app
+list and send the owner a notification, and every other route refuses it. In
+particular it cannot start or drive the owner's agents, so an anonymous visitor
+cannot spend on the owner's provider accounts. A service reached only through
+an authenticated caller (`self` or `apps` access) additionally receives the
 provider-credential locations `DATA_DIR`, `CLAUDE_CONFIG_DIR`, and `CODEX_HOME`,
 so it may run a provider CLI as its scheduled job can; a publicly reachable
-(`public`) service never receives them, so an anonymous visitor cannot spend on
-the owner's provider accounts.
+(`public`) service never receives them. None of this is a filesystem sandbox:
+a service is owner-installed reviewed code with the platform's file access.
+Paths under `tools/` are reserved for agent tool calls; HTTP callers get 404
+there.
 
 Project output formats are app-owned too. A `project_templates[].artifact_types`
 declaration names the source extensions, preview kind, output path, and reviewed

@@ -68,7 +68,7 @@ JOB_NAME="${3:-job.sh}"
 # self-contained jobs that hardcode their own id.
 APP_ID="${4:-}"
 # Optional 5th + 6th args are platform-owned and always paired. They preserve
-# a daily IANA wall-clock identity while the live cron expression simply wakes
+# an IANA wall-clock identity (a fixed time, daily or on listed weekdays) while the live cron expression simply wakes
 # the supervised gate every minute.
 SCHEDULE_TZ="${5:-}"
 SCHEDULE_SOURCE="${6:-}"
@@ -122,8 +122,8 @@ if [ -n "$SCHEDULE_TZ" ] || [ -n "$SCHEDULE_SOURCE" ]; then
     echo "ERROR: invalid IANA timezone syntax: $SCHEDULE_TZ" >&2
     exit 2
   fi
-  if [[ ! "$SCHEDULE_SOURCE" =~ ^([0-9]{1,2})[[:blank:]]+([0-9]{1,2})[[:blank:]]+\*[[:blank:]]+\*[[:blank:]]+\*$ ]]; then
-    echo "ERROR: zone-local cron must be a plain daily expression" >&2
+  if [[ ! "$SCHEDULE_SOURCE" =~ ^([0-9]{1,2})[[:blank:]]+([0-9]{1,2})[[:blank:]]+\*[[:blank:]]+\*[[:blank:]]+(\*|[0-7](-[0-7])?(,[0-7](-[0-7])?)*)$ ]]; then
+    echo "ERROR: zone-local cron must be a fixed wall time" >&2
     exit 2
   fi
   if [ "$((10#${BASH_REMATCH[1]}))" -gt 59 ] \

@@ -38,6 +38,7 @@ from app import icon_cache, models
 from app.config import get_settings
 from app.database import get_db
 from app.frontend_assets import resolve_frontend_dir
+from app.response_policy import serves_platform_code
 from app.theme import get_bg_color, theme_data
 
 router = APIRouter(tags=["standalone"])
@@ -675,8 +676,14 @@ def _standalone_index_html(app: models.App, install_pass: str = "") -> str:
   return html
 
 
-@router.get("/apps/{slug}/", response_class=HTMLResponse)
-@router.get("/apps/{slug}", response_class=HTMLResponse)
+@router.get(
+  "/apps/{slug}/", response_class=HTMLResponse,
+  dependencies=[Depends(serves_platform_code)],
+)
+@router.get(
+  "/apps/{slug}", response_class=HTMLResponse,
+  dependencies=[Depends(serves_platform_code)],
+)
 def standalone_shell(
   slug: str, request: Request, db: Session = Depends(get_db)
 ):

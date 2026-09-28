@@ -1844,7 +1844,7 @@ async def _run_codex_sdk_turn(
       current_session_id = thread.id
       if abort_requested():
         log.info("Codex turn aborted before turn setup chat_id=%s", chat_id)
-        return aborted_result()
+        return {**aborted_result(), "prompt_sent": False}
       if session_id is not None and current_session_id != session_id:
         # The requested Codex session is gone (rollout cleaned up, or a phantom
         # id) — Codex returned a fresh thread instead of resuming. Rather than

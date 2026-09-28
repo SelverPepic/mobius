@@ -656,7 +656,7 @@ def test_register_cron_gives_scaffold_the_complete_zone_identity(tmp_path):
   ("Europe/Belgrade", None, 42),
   (None, "30 2 * * *", 42),
   ("Not/AZone", "30 2 * * *", 42),
-  ("Europe/Belgrade", "30 2 * * 1", 42),
+  ("Europe/Belgrade", "30 2 1 * *", 42),
   ("Europe/Belgrade", "30 2 * * *", None),
 ])
 def test_register_cron_rejects_invalid_zone_contract_before_subprocess(
@@ -1343,6 +1343,104 @@ def test_store_schedule_follows_owner_timezone_and_keeps_owner_choice(
   assert len(calls) == registrations
   from app import app_cron
   assert not (app_cron.schedule_state_dir(app_id) / "choice.json").exists()
+
+
+def test_owner_timezone_reported_after_install_moves_only_manifest_defaults(
+  client, auth, bypass_url_validation, recorded_cron,
+):
+  from app import app_cron
+
+  calls, _drop = recorded_cron
+  news = _install_from_store(
+    client, auth, "https://x.test/repo-late-tz/", MANIFEST_NEWS,
+  )["id"]
+  chosen = _install_from_store(client, auth, "https://x.test/repo-chosen/", {
+    **MANIFEST_NEWS, "id": "test-chosen", "name": "Chosen",
+  })["id"]
+  assert client.post(
+    f"/api/apps/{chosen}/schedule",
+    json={"cron": "15 7 * * *", "job": "fetch.sh", "timezone": "Europe/Oslo"},
+    headers=auth,
+  ).status_code == 200
+  assert calls[0] == ("0 10 * * *", "fetch.sh", None, None)
+  before = len(calls)
+
+  def report(zone):
+    assert client.put(
+      "/api/owner/timezone", json={"timezone": zone}, headers=auth,
+    ).status_code == 200
+
+  report("Asia/Tokyo")
+  assert calls[before:] == [
+    ("* * * * *", "fetch.sh", "Asia/Tokyo", "0 10 * * *"),
+  ]
+  assert app_cron.read_schedule_choice(news).timezone == "Asia/Tokyo"
+
+  report("Asia/Tokyo")
+  assert len(calls) == before + 1
+
+  report("Europe/Belgrade")
+  assert calls[-1] == ("* * * * *", "fetch.sh", "Europe/Belgrade", "0 10 * * *")
+  assert len(calls) == before + 2
+  assert app_cron.read_schedule_choice(chosen).timezone == "Europe/Oslo"
+
+
+def test_failed_zone_move_is_retried_by_the_next_report(
+  client, auth, bypass_url_validation, recorded_cron,
+):
+  from app import app_cron
+
+  calls, _drop = recorded_cron
+  app_id = _install_from_store(
+    client, auth, "https://x.test/repo-retry-tz/", MANIFEST_NEWS,
+  )["id"]
+
+  def crontab_down(*args, **kwargs):
+    raise app_cron.CronInfrastructureError(500, "crontab unavailable")
+
+  with patch("app.app_cron.register_cron", crontab_down):
+    assert client.put(
+      "/api/owner/timezone", json={"timezone": "Asia/Tokyo"}, headers=auth,
+    ).status_code == 200
+  assert app_cron.read_schedule_choice(app_id).timezone is None
+
+  assert client.put(
+    "/api/owner/timezone", json={"timezone": "Asia/Tokyo"}, headers=auth,
+  ).status_code == 200
+  assert calls[-1] == ("* * * * *", "fetch.sh", "Asia/Tokyo", "0 10 * * *")
+
+
+def test_weekday_default_follows_owner_timezone(
+  client, auth, bypass_url_validation, recorded_cron,
+):
+  calls, _drop = recorded_cron
+  assert client.put(
+    "/api/owner/timezone", json={"timezone": "Asia/Tokyo"}, headers=auth,
+  ).status_code == 200
+
+  _install_from_store(client, auth, "https://x.test/repo-weekday/", {
+    **MANIFEST_NEWS,
+    "schedule": {"default": "0 9 * * 1-5", "job": "fetch.sh"},
+  })
+
+  assert calls == [("* * * * *", "fetch.sh", "Asia/Tokyo", "0 9 * * 1-5")]
+
+
+def test_schedule_is_never_registered_without_its_recorded_choice(
+  client, auth, bypass_url_validation, recorded_cron,
+):
+  calls, _drop = recorded_cron
+
+  def lost_write(app_id, choice):
+    raise OSError("disk full")
+
+  with patch("app.app_cron.record_schedule_choice", lost_write):
+    body = _install_from_store(
+      client, auth, "https://x.test/repo-lost-choice/", MANIFEST_NEWS,
+    )
+
+  assert calls == []
+  assert any("disk full" in warning for warning in body["warnings"])
 
 
 def test_installed_version_persisted_in_app_list(

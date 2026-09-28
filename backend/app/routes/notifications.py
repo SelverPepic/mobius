@@ -14,7 +14,9 @@ from app.deps import (
   Principal,
   get_current_owner,
   get_principal,
+  get_principal_or_public_service,
   reject_cross_site,
+  require_nondelegated_owner_control,
   require_nondelegated_owner_or_app_control,
 )
 from app.push import notify_owner
@@ -27,7 +29,7 @@ router = APIRouter(prefix="/api/notifications", tags=["notifications"])
 
 def _record_sender_bucket(
   request: Request,
-  principal: Principal = Depends(get_principal),
+  principal: Principal = Depends(get_principal_or_public_service),
 ) -> None:
   """Name the rate-limit bucket after the authenticated sender.
 
@@ -56,7 +58,6 @@ limiter = Limiter(key_func=_sender_bucket)
   "/send",
   dependencies=[
     Depends(reject_cross_site),
-    Depends(require_nondelegated_owner_or_app_control),
     Depends(_record_sender_bucket),
   ],
 )
@@ -69,10 +70,14 @@ limiter = Limiter(key_func=_sender_bucket)
 def send_notification(
   request: Request,
   body: NotificationSendRequest,
-  principal: Principal = Depends(get_principal),
+  principal: Principal = Depends(get_principal_or_public_service),
   db: Session = Depends(get_db),
 ):
-  """Send a push notification to all owner subscriptions."""
+  """Send a push notification to all owner subscriptions.
+
+  A public app service may notify the owner of what a visitor sent it.
+  """
+  require_nondelegated_owner_control(principal)
   actions_list = (
     [a.model_dump(exclude_none=True) for a in body.actions] if body.actions else None
   )

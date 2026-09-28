@@ -15,9 +15,10 @@ idle chat -> a fresh hidden product turn; running chat -> the notice queues
 behind the live turn and the idle-pending sweep promotes it. The
 resume uses IDs derived from the durable wait row. A retry therefore
 reattaches to the exact physical continuation or deduplicates the exact queued
-message. ``resume_delivered_at`` advances only after provider-task admission
-or proven owner adoption; a crash cannot lose the wake or manufacture a second
-model turn.
+message. ``resume_delivered_at`` advances only when a turn carrying the result
+succeeds (or a verified Goal completion takes delivery). A result whose turn
+never reached its provider stays owed and rides along with the chat's next
+turn, so a failed start cannot lose the wake.
 
 Restart immunity is structural: rows are durable, the loop restarts with the
 server, and no part of a wait lives in the turn's process group.
@@ -49,34 +50,32 @@ _LOG = logging.getLogger("moebius.chat_waits")
 
 
 def claim_scheduled_wait_result(chat_id: str, message: object) -> bool:
-  """Latch one exact Wait result only after provider-task admission."""
+  """Latch a restart-activation result once its turn is scheduled.
+
+  The activation barrier owns its own delivery lifecycle. Every other Wait
+  result stays owed until a turn carrying it succeeds (owed_wait_results).
+  """
   if not isinstance(message, dict):
     return False
   cid = message.get("cid")
-  kind = message.get("kind")
-  prefixes = {
-    WAIT_RESULT_MESSAGE_KIND: "wait-result-",
-    PLATFORM_ACTIVATION_RESULT_MESSAGE_KIND: "activation-result-",
-  }
-  prefix = prefixes.get(kind)
-  if not isinstance(cid, str) or prefix is None or not cid.startswith(prefix):
+  prefix = "activation-result-"
+  if (
+    message.get("kind") != PLATFORM_ACTIVATION_RESULT_MESSAGE_KIND
+    or not isinstance(cid, str) or not cid.startswith(prefix)
+  ):
     return False
   row_id = cid.removeprefix(prefix)
   from app.database import SessionLocal
 
   with SessionLocal() as db:
-    query = db.query(models.ChatWait).filter(
+    claimed = db.query(models.ChatWait).filter(
       models.ChatWait.id == row_id,
       models.ChatWait.chat_id == chat_id,
       models.ChatWait.created_by_run_id == message.get("source_work_id"),
+      models.ChatWait.kind == "platform_activation",
       models.ChatWait.status.in_(("met", "expired", "failed")),
       models.ChatWait.resume_delivered_at.is_(None),
-    )
-    if kind == PLATFORM_ACTIVATION_RESULT_MESSAGE_KIND:
-      query = query.filter(models.ChatWait.kind == "platform_activation")
-    else:
-      query = query.filter(models.ChatWait.kind != "platform_activation")
-    claimed = query.update(
+    ).update(
       {models.ChatWait.resume_delivered_at: now_naive_utc()},
       synchronize_session=False,
     )
@@ -84,6 +83,46 @@ def claim_scheduled_wait_result(chat_id: str, message: object) -> bool:
   if claimed:
     _broadcast_changed(chat_id)
   return claimed == 1
+
+
+def owed_wait_results(
+  db: Session, chat_id: str, turn_message: str,
+) -> tuple[str, tuple[str, ...]]:
+  """The fired Wait results a turn carries: (context text, wait ids).
+
+  The ids are recorded delivered only when this turn's provider call succeeds
+  (stage_wait_results_delivered), exactly like its peer notes. A resume turn's
+  own notice is already its message, so the text never repeats it.
+  """
+  rows = db.query(models.ChatWait).filter(
+    models.ChatWait.chat_id == chat_id,
+    models.ChatWait.kind != "platform_activation",
+    _FIRED_UNDELIVERED,
+  ).order_by(models.ChatWait.created_at.asc()).all()
+  notices = [
+    notice for notice in (
+      _compose_resume_notice(row, _OUTCOMES[row.status]) for row in rows
+    )
+    if notice != turn_message
+  ]
+  return "\n\n".join(notices), tuple(row.id for row in rows)
+
+
+def stage_wait_results_delivered(
+  db: Session, chat_id: str, wait_ids: tuple[str, ...],
+) -> int:
+  """Record, in the caller's transaction, that a successful turn got these."""
+  if not wait_ids:
+    return 0
+  return db.query(models.ChatWait).filter(
+    models.ChatWait.chat_id == chat_id,
+    models.ChatWait.id.in_(wait_ids),
+    _FIRED_UNDELIVERED,
+  ).update(
+    {models.ChatWait.resume_delivered_at: now_naive_utc()},
+    synchronize_session=False,
+  )
+
 
 MIN_INTERVAL_SECS = 60
 MAX_INTERVAL_SECS = 24 * 3600
@@ -96,6 +135,8 @@ MAX_CONCURRENT_CHECKS = 4
 _OUTPUT_TAIL = 2000
 _OUTPUT_TAIL_BYTES = _OUTPUT_TAIL * 4
 _RESULT_MAX = 3000
+_OUTCOMES = {"met": "met", "expired": "deadline_expired", "failed": "check_failed"}
+_RESUME_RETRY = ".retry"
 
 # Cancellation is synchronous at the API/chat-lifecycle boundary while checks
 # run in the supervisor's event loop. A None PID reserves an admission while
@@ -613,7 +654,7 @@ def safe_startup_writer_orphan(
     or not physical.id.startswith(prefix)
   ):
     return False
-  wait_id = physical.id[len(prefix):]
+  wait_id = physical.id[len(prefix):].removesuffix(_RESUME_RETRY)
   row = db.query(models.ChatWait).filter(
     models.ChatWait.id == wait_id,
     models.ChatWait.chat_id == chat.id,
@@ -635,11 +676,7 @@ def safe_startup_writer_orphan(
   )
   if (physical.root_run_id or physical.id) != expected_root:
     return False
-  outcome = {
-    "met": "met",
-    "expired": "deadline_expired",
-    "failed": "check_failed",
-  }[row.status]
+  outcome = _OUTCOMES[row.status]
   if activation:
     from app.platform_restart import activation_notice
     expected_content = activation_notice(
@@ -649,7 +686,7 @@ def safe_startup_writer_orphan(
     expected_kind = PLATFORM_ACTIVATION_RESULT_MESSAGE_KIND
   else:
     expected_content = _compose_resume_notice(row, outcome)
-    expected_cid = f"wait-result-{row.id}"
+    expected_cid = "wait-result-" + physical.id[len(prefix):]
     expected_kind = WAIT_RESULT_MESSAGE_KIND
   messages = list(chat.messages or [])
   continuation = messages[-1] if messages else None
@@ -667,85 +704,10 @@ def safe_startup_writer_orphan(
   )
 
 
-def _wait_resume_owned_by_later_owner_turn(
-  db: Session,
-  row: models.ChatWait,
-  physical: models.ChatRun,
-  content: str,
-) -> bool:
-  """Whether an owner turn durably adopted one interrupted Wait result.
-
-  A fresh owner send may win after the deterministic Wait continuation commits
-  but before its provider task is scheduled. StartTurn then interrupts that
-  orphan and includes its already-persisted result in the owner's model
-  history. Once the later owner run has settled, that real turn owns delivery;
-  retry must latch the Wait rather than either starting a duplicate model turn
-  or leaving the wake unresolved forever.
-  """
-  if physical.status not in ("interrupted", "stopped"):
-    return False
-  chat = db.query(models.Chat).filter(
-    models.Chat.id == row.chat_id,
-    models.Chat.deleted_at.is_(None),
-  ).first()
-  if chat is None:
-    return False
-  resume_cid = f"wait-result-{row.id}"
-  matches = [
-    index
-    for index, message in enumerate(list(chat.messages or []))
-    if (
-      isinstance(message, dict)
-      and message.get("role") == "user"
-      and message.get("cid") == resume_cid
-      and message.get("content") == content
-      and message.get("kind") == WAIT_RESULT_MESSAGE_KIND
-      and message.get("source_work_id") == row.created_by_run_id
-      and bool(message.get("hidden"))
-    )
-  ]
-  if len(matches) != 1:
-    return False
-  messages = list(chat.messages or [])
-  if not any(
-    isinstance(message, dict)
-    and message.get("role") == "user"
-    and not bool(message.get("hidden"))
-    and message.get("kind") is None
-    and message.get("_initiated_by_app_id") is None
-    for message in messages[matches[0] + 1:]
-  ):
-    return False
-
-  successor = (
-    db.query(models.ChatRun)
-    .filter(
-      models.ChatRun.chat_id == row.chat_id,
-      models.ChatRun.id != physical.id,
-      models.ChatRun.root_run_id == models.ChatRun.id,
-      models.ChatRun.initiated_by_app_id.is_(None),
-      models.ChatRun.status == "completed",
-    )
-    .order_by(models.ChatRun.started_at.desc(), models.ChatRun.id.desc())
-    .first()
-  )
-  if (
-    successor is None
-    or successor.started_at is None
-    or physical.started_at is None
-    or (successor.started_at, successor.id)
-    <= (physical.started_at, physical.id)
-  ):
-    return False
-  # Only clean completion proves the successor consumed its model history.
-  # Failed, stopped, interrupted, and limit-parked attempts can all end before
-  # the provider owns the prompt, so they must leave the Wait retryable.
-  return True
-
-
 async def _deliver_resume(row_id: str) -> bool:
   """Deliver one met/expired wait's resume to its chat and stamp the latch."""
   import app.chat_queue as chat_queue
+  from app.chat import is_chat_running
   from app.chat_start import start_programmatic_chat_continuation
   from app.chat_writer import AppendPending, await_ack, get_writer
   from app.database import SessionLocal
@@ -770,11 +732,7 @@ async def _deliver_resume(row_id: str) -> bool:
       db.commit()
       return False
     chat_id = row.chat_id
-    outcome = {
-      "met": "met",
-      "expired": "deadline_expired",
-      "failed": "check_failed",
-    }[row.status]
+    outcome = _OUTCOMES[row.status]
     activation = row.kind == "platform_activation"
     if activation:
       from app.platform_restart import activation_notice
@@ -799,6 +757,27 @@ async def _deliver_resume(row_id: str) -> bool:
       models.ChatRun.id == resume_run_id,
       models.ChatRun.chat_id == chat_id,
     ).first()
+    if (
+      not activation and existing_resume is not None
+      and existing_resume.status == "failed"
+    ):
+      # A failed resume turn recorded nothing (only a successful provider call
+      # does), so it gets one retry identity, like a helper-result wake. A
+      # failed retry leaves the result to ride the next turn.
+      resume_run_id = f"wait-resume-{row_id}{_RESUME_RETRY}"
+      existing_resume = db.query(models.ChatRun).filter(
+        models.ChatRun.id == resume_run_id,
+        models.ChatRun.chat_id == chat_id,
+      ).first()
+    if not activation and existing_resume is not None and not (
+      existing_resume.status == "running"
+      and existing_resume.provider_execution_admitted is False
+      and not is_chat_running(chat_id)
+    ):
+      # Otherwise the resume turn ran (or was stopped or superseded); only
+      # its unscheduled orphan is picked up again. A successful turn carrying
+      # the result latches it; until then each next turn carries it.
+      return False
     root_run_id = (
       row.root_run_id if activation else
       (source.root_run_id or source.id)
@@ -814,7 +793,7 @@ async def _deliver_resume(row_id: str) -> bool:
 
   resume_cid = (
     f"activation-result-{row_id}" if activation
-    else f"wait-result-{row_id}"
+    else "wait-result-" + resume_run_id.removeprefix("wait-resume-")
   )
   message_kind = (
     PLATFORM_ACTIVATION_RESULT_MESSAGE_KIND if activation
@@ -848,12 +827,7 @@ async def _deliver_resume(row_id: str) -> bool:
         models.ChatRun.chat_id == chat_id,
       ).first()
       if existing_resume is not None:
-        if _wait_resume_owned_by_later_owner_turn(
-          db, row, existing_resume, content,
-        ):
-          delivered = True
-        else:
-          return False
+        return False
 
   if not delivered and activation:
     # Activation has a writer-authenticated pending/question bypass. Falling
@@ -883,7 +857,7 @@ async def _deliver_resume(row_id: str) -> bool:
           initiated_by_app_id=None,
         )))
         # Queue persistence is not provider delivery. Keep the latch open;
-        # the deterministic promoted run claims it after scheduling, while
+        # the promoted turn latches it when it succeeds, while
         # this stable cid makes supervisor retries idempotent.
         return False
       except Exception:
@@ -1137,9 +1111,10 @@ async def withdraw_delivered_resume_notices(chat_id: str) -> int:
   """Drop queued resume notices for Waits whose delivery is already recorded.
 
   A Wait that fires while its chat is busy queues its resume notice at once
-  and keeps its latch open until that notice starts a turn. A verified Goal
-  completion can take delivery first (stage_consume_fired_goal_waits); the
-  queued notice is then stale and would start a turn for a finished Goal.
+  and keeps its latch open until a turn carrying it succeeds. A verified Goal
+  completion (stage_consume_fired_goal_waits) or the live turn's own context
+  (owed_wait_results) can take delivery first; the queued notice is then
+  stale and would start a duplicate turn.
   """
   from sqlalchemy.orm import load_only
 
@@ -1158,7 +1133,7 @@ async def withdraw_delivered_resume_notices(chat_id: str) -> int:
         message.get("kind") == WAIT_RESULT_MESSAGE_KIND
         and isinstance(cid, str) and cid.startswith(prefix)
       ):
-        queued[cid.removeprefix(prefix)] = cid
+        queued[cid.removeprefix(prefix).removesuffix(_RESUME_RETRY)] = cid
     if not queued:
       return 0
     delivered = {

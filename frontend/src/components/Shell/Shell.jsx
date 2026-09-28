@@ -2124,7 +2124,7 @@ export default function Shell({ onInitialVisualReady }) {
     () => appAttentionIds(apps, newAppIds, visibleAppIds),
     [apps, newAppIds, visibleAppIds],
   )
-  // Report the owner's timezone so plain daily app schedules fire at that
+  // Report the owner's timezone so fixed-time app schedules fire at that
   // wall time for them. Automated browsers (agent screenshots) run on the
   // server's clock and do not speak for the owner, so they never report.
   useEffect(() => {

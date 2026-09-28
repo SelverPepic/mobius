@@ -17,6 +17,9 @@ const dockerfile = readFileSync(
   new URL('../../../../Dockerfile', import.meta.url),
   'utf8',
 )
+const shellHtml = readFileSync(
+  new URL('../../../index.html', import.meta.url), 'utf8',
+)
 const publicLogo = readFileSync(new URL('../../../public/moebius.png', import.meta.url))
 const publicSvgLogo = new URL('../../../public/moebius.svg', import.meta.url)
 const bundledSvgLogo = new URL('../../assets/moebius.svg', import.meta.url)
@@ -65,4 +68,11 @@ test('precache versions match the package graph and the shell has one bitmap log
   assert.equal(existsSync(publicSvgLogo), false)
   assert.equal(existsSync(bundledSvgLogo), false)
   assert.equal(existsSync(bundledPngLogo), false)
+})
+
+test('the shell loads KaTeX CSS through the stable alias, never a pinned version', () => {
+  // The image ships only the current versioned folder plus the alias, so a
+  // version literal here would 404 after the next KaTeX bump.
+  assert.match(shellHtml, /href="\/vendor\/katex\/katex\.min\.css"/)
+  assert.doesNotMatch(shellHtml, /vendor\/katex@/)
 })
