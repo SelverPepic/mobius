@@ -1205,6 +1205,7 @@ async def run_claude_sdk_turn(
   base_env["MOBIUS_GENERATED_DIR"] = str(generated_dir)
 
   # Keep the SDK callback for tool policy and skill-read observability.
+  # The pinned SDK owns input stream lifetime for permission callbacks.
   # Native owner-question tools are disabled on every launch, including resumes.
   async def can_use_tool(
     tool_name: str,
@@ -1242,15 +1243,6 @@ async def run_claude_sdk_turn(
       tool_use_id=getattr(context, "tool_use_id", None),
     )
     return PermissionResultAllow(updated_input=input_data)
-
-  # The SDK requires a PreToolUse hook to keep can_use_tool active.
-  async def keepalive_hook(
-    hook_input: dict[str, Any],
-    tool_use_id: str | None,
-    context: dict[str, Any],
-  ) -> dict[str, Any]:
-    del hook_input, tool_use_id, context
-    return {"continue_": True}
 
   # The Claude SDK fires PreCompact before it auto- or manually compacts the
   # running session. Möbius does not influence that memory-management action;
@@ -1434,9 +1426,6 @@ async def run_claude_sdk_turn(
       "cli_path": _claude_cli_path(),
       "stderr": _capture_stderr,
       "hooks": {
-        "PreToolUse": [
-          HookMatcher(matcher=None, hooks=[keepalive_hook]),
-        ],
         "PostToolUse": [
           HookMatcher(matcher="WebSearch", hooks=[websearch_sources_hook]),
           HookMatcher(matcher=None, hooks=[owner_card_end_hook]),

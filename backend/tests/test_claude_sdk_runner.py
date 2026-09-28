@@ -143,6 +143,65 @@ async def _run_turn(
 
 
 @pytest.mark.asyncio
+async def test_sdk_permission_callback_keeps_input_open_without_dummy_hook():
+  """Exercise the pinned SDK's stream lifetime, not a mocked runner client."""
+  from claude_agent_sdk._internal.query import Query
+
+  writes = []
+  written = asyncio.Event()
+  closed = asyncio.Event()
+
+  async def write(message):
+    assert not closed.is_set()
+    writes.append(json.loads(message))
+    written.set()
+
+  async def end_input():
+    closed.set()
+
+  async def allow(tool, input_data, context):
+    assert tool == "Read"
+    return PermissionResultAllow(updated_input=input_data)
+
+  async def read_messages():
+    yield {"type": "result", "subtype": "success", "is_error": False}
+    await closed.wait()
+
+  query = Query(
+    transport=SimpleNamespace(
+      write=write, end_input=end_input, read_messages=read_messages,
+    ),
+    is_streaming_mode=True, can_use_tool=allow,
+  )
+
+  async def prompt():
+    yield {"type": "user", "message": {"role": "user", "content": "Read"}}
+
+  task = asyncio.create_task(query.stream_input(prompt()))
+  try:
+    await asyncio.wait_for(written.wait(), timeout=1)
+    assert not task.done()
+    assert not closed.is_set()
+    await query._handle_control_request({
+      "type": "control_request", "request_id": "permission-1",
+      "request": {"subtype": "can_use_tool", "tool_name": "Read",
+                  "input": {"file_path": "example.txt"}},
+    })
+    assert writes[-1]["response"]["response"] == {
+      "behavior": "allow", "updatedInput": {"file_path": "example.txt"},
+    }
+    assert not closed.is_set()
+    await asyncio.wait_for(query._read_messages(), timeout=1)
+    await asyncio.wait_for(task, timeout=1)
+    assert closed.is_set()
+  finally:
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    await query._message_send.aclose()
+    await query._message_receive.aclose()
+
+
+@pytest.mark.asyncio
 async def test_claude_collects_fast_generated_file_at_turn_end(monkeypatch, tmp_path):
   """Turn-owned inbox capture does not depend on provider tool-hook timing."""
   class _GeneratedFileBus(_ChatBus):
