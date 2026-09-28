@@ -62,6 +62,8 @@ def install(tmp_path, monkeypatch):
   monkeypatch.setattr(upgrade, "CONTROL", control)
   monkeypatch.setattr(upgrade, "BUILD_INFO", build_info)
   monkeypatch.setattr(upgrade, "RECONCILE_LOCK", data / ".platform-reconcile.lock")
+  # The fixture's first release stands in for the real #1311 floor.
+  monkeypatch.setattr(upgrade, "SERVED_CODE_FLOOR", old)
   return {"data": data, "control": control, "old": old, "new": new, "platform": platform}
 
 
@@ -96,7 +98,7 @@ def test_an_explicit_target_must_be_a_complete_fetched_release(install):
 @pytest.mark.parametrize("case", [
   "same_image", "older_than_source_release", "pending_update", "parked_update",
   "helper_running", "request_queued", "helper_missing", "target_without_bridge",
-  "no_official_history",
+  "no_official_history", "served_code_too_old", "target_packages_differ",
 ])
 def test_refuses_without_touching_the_inbox_when_a_precondition_fails(
   install, case, capsys,
@@ -116,6 +118,15 @@ def test_refuses_without_touching_the_inbox_when_a_precondition_fails(
     bare = _commit(install["platform"], "release-before-bridge", lock="pkg==2\n")
     _git(install["platform"], "reset", "-q", "--hard", install["old"])
     _git(install["platform"], "update-ref", "refs/remotes/origin/main", bare)
+  elif case == "served_code_too_old":
+    upgrade.SERVED_CODE_FLOOR = install["new"]
+  elif case == "target_packages_differ":
+    # An explicit historical target whose packages are not the latest's.
+    first = _commit(install["platform"], "first-bridge", lock="pkg==2\n", bridge=True)
+    latest = _commit(install["platform"], "latest", lock="pkg==4\n", bridge=True)
+    _git(install["platform"], "reset", "-q", "--hard", install["old"])
+    _git(install["platform"], "update-ref", "refs/remotes/origin/main", latest)
+    upgrade_target.append(first)
   elif case == "no_official_history":
     _git(install["platform"], "update-ref", "-d", "refs/remotes/origin/main")
     upgrade_target.append(install["new"])

@@ -158,8 +158,10 @@ package declarations is newer than the image, then probes it, with the image's
 own release as the floor. Install the release from Settings right away:
 its packages are now in the image, so the ordinary update proceeds (served code
 from #1311 on, 23 September 2026, discounts package inputs the running image
-already carries; older served code needs an update to at least that release
-first). Until then,
+already carries; the script refuses older served code, which needs an update
+to at least that release first). An explicit `--target` must carry exactly the
+latest official release's Python packages, since Settings installs that
+release next. Until then,
 older source runs on the newer packages; the probe proves that it imports,
 nothing more. A release that also advances `deployment/self-hosted-helper.required`
 then asks you to reinstall the helper from a current trusted checkout.

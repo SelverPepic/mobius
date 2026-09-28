@@ -48,6 +48,9 @@ ACTIVE_STATES = {"queued", "preparing", "replacing", "verifying"}
 PYTHON_INPUTS = ("backend/requirements.txt", "backend/requirements.lock")
 BRIDGE_FILES = ("backend/runtime/boot-protocol", "scripts/request-container-upgrade.py")
 RECONCILE_LOCK = DATA / ".platform-reconcile.lock"
+# Served code from this release on discounts package inputs the running image
+# already carries (#1311), so after the upgrade it accepts Settings' update.
+SERVED_CODE_FLOOR = "531c08dc98f10dbd4ca0a11b6430c97b0a5e3056"
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 
 
@@ -65,6 +68,11 @@ def git(*args: str) -> subprocess.CompletedProcess:
 
 def resolve(ref: str) -> str:
     out = git("rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
+def resolve_blob(commit: str, path: str) -> str:
+    out = git("rev-parse", "--verify", "--quiet", f"{commit}:{path}")
     return out.stdout.strip() if out.returncode == 0 else ""
 
 
@@ -119,6 +127,21 @@ def check_target(target: str) -> str:
         raise Refused("the target is not part of the fetched official history")
     if not descends(image, target):
         raise Refused("the target is not newer than the running container")
+    # The source's own updater finishes the crossing, so it must be new enough
+    # to count the upgraded image's packages as installed.
+    if not descends(SERVED_CODE_FLOOR, "HEAD"):
+        raise Refused(
+            "the installed platform code predates 23 September 2026 (#1311) and "
+            "could not install the release afterwards; update it first"
+        )
+    # Settings then targets the current official release, so the new image
+    # must carry exactly that release's packages.
+    for path in PYTHON_INPUTS:
+        if resolve_blob(target, path) != resolve_blob(official, path):
+            raise Refused(
+                "the target's Python packages differ from the latest official "
+                "release's; use the latest release"
+            )
     # Only a release that ships this bridge also judges the unchanged source
     # the way these checks do; an older target could not finish the crossing.
     for required in BRIDGE_FILES:
