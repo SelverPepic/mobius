@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 
 import pytest
 
-from app import app_git, install, models
+from app import app_apply, app_git, install, models
 from app.config import get_settings
 from test_app_fixtures import create_local_app
 
@@ -6957,3 +6957,99 @@ def test_update_check_offers_only_bridges_install_can_replace(
   fails and never goes away.
   """
   assert _legacy_bridge_update_check(client, auth, db, "example") is False
+
+
+
+def _code_only_apply(client, auth, source: Path, marker: str):
+  (source / "index.jsx").write_text(
+    f"export default function App() {{ return <div>{marker}</div> }}\n"
+  )
+  return client.post(
+    "/api/apps/apply", headers=auth, json={"source_dir": str(source)},
+  )
+
+
+def _install_git_store_app(client, auth, db, tmp_path, slug):
+  """Install a Store app whose Git repository carries its mobius.json."""
+  base = f"https://raw.githubusercontent.com/acme/{slug}/main/"
+  manifest = {
+    "id": slug, "name": "Git store app", "version": "1.0.0",
+    "description": "Store package with a manifest", "entry": "index.jsx",
+    "permissions": {"cross_app_access": "none", "share_with_apps": "none"},
+  }
+  work, bare, _ = _make_clone_fixture(tmp_path, JSX_MULTI, "")
+  # Author formatting differs from install's own serialization on purpose.
+  (work / "mobius.json").write_text(json.dumps(manifest, indent=4))
+  _fixture_commit(work, "manifest")
+  subprocess.run(
+    ["git", "-C", str(work), "push", "-q", str(bare), "main"],
+    check=True, env=app_git._git_env(work),
+  )
+  installed = _install_clone_fixture(
+    client, auth, base, manifest, JSX_MULTI, "", bare,
+  )
+  assert installed.status_code == 201, installed.text
+  source = Path(db.get(models.App, installed.json()["id"]).source_dir)
+  assert "mobius.json" in app_git.read_ref_tree(source, app_git.LOCAL_BRANCH)
+  return base, manifest, work, bare, source
+
+
+def test_store_install_then_code_only_apply_does_not_warn(
+  client, auth, db, tmp_path, bypass_url_validation,
+):
+  """An untouched Store manifest never reads as a dropped local edit."""
+  *_, source = _install_git_store_app(client, auth, db, tmp_path, "quiet-store")
+
+  applied = _code_only_apply(client, auth, source, "code only")
+
+  assert applied.status_code == 200, applied.text
+  assert applied.json()["warnings"] == []
+
+
+def test_store_install_then_manifest_edit_apply_warns(
+  client, auth, db, tmp_path, bypass_url_validation,
+):
+  """The same install path reports a real dropped manifest edit."""
+  *_, source = _install_git_store_app(client, auth, db, tmp_path, "loud-store")
+  local = json.loads((source / "mobius.json").read_text())
+  (source / "mobius.json").write_text(json.dumps({**local, "version": "9.9.9"}))
+
+  applied = _code_only_apply(client, auth, source, "code and manifest")
+
+  assert applied.status_code == 200, applied.text
+  assert applied.json()["warnings"] == [
+    app_apply._STORE_LOCAL_PACKAGE_DIVERGED
+  ]
+
+
+def test_store_merge_replay_then_code_only_apply_does_not_warn(
+  client, auth, db, tmp_path, bypass_url_validation,
+):
+  """A merged Store update without manifest edits stays quiet on apply."""
+  base, manifest, work, bare, source = _install_git_store_app(
+    client, auth, db, tmp_path, "quiet-merge",
+  )
+  (source / "index.jsx").write_text(
+    JSX_MULTI.replace("ORIGINAL TITLE", "LOCAL TITLE"),
+  )
+  next_manifest = {**manifest, "version": "2.0.0"}
+  jsx_v2 = JSX_MULTI.replace("ORIGINAL FOOTER", "UPSTREAM FOOTER")
+  (work / "mobius.json").write_text(json.dumps(next_manifest, indent=4))
+  _push_clone_fixture(work, bare, jsx_v2, "")
+  updated = _install_clone_fixture(
+    client, auth, base, next_manifest, jsx_v2, "", bare,
+  )
+  assert updated.status_code == 201, updated.text
+  assert updated.json()["divergence"] == "clean_merge"
+  from app.applied_app_runtime import runtime_root
+  row = db.get(models.App, updated.json()["id"])
+  db.refresh(row)
+  accepted = json.loads((runtime_root(row) / "mobius.json").read_text())
+  assert accepted["version"] == "2.0.0"
+
+  applied = client.post(
+    "/api/apps/apply", headers=auth, json={"source_dir": str(source)},
+  )
+
+  assert applied.status_code == 200, applied.text
+  assert applied.json()["warnings"] == []
