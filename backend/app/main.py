@@ -26,7 +26,7 @@ from app.allocator import limit_glibc_arenas
 
 limit_glibc_arenas()
 
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -57,9 +57,11 @@ from app.runtime_provenance import (
 )
 from app.response_policy import (
   chat_embed_csp,
+  PLATFORM_CODE_SCOPE_KEY,
   PUBLISHED_SITE_CSP,
   absolute_csp_origin,
   app_frame_csp,
+  serves_platform_code,
   shell_csp,
   static_embed_csp,
 )
@@ -461,17 +463,6 @@ _APP_FRAME_PATH = re.compile(r"^/api/apps/[^/]+/frame$")
 _ARTIFACT_OUTPUT_PATH = re.compile(
   r"^/api/projects/[^/]+/artifacts/[^/]+/output/"
 )
-# Stored bytes whose content an app, an agent, a chat participant, or a
-# third-party site controls. They are served as subresources, never as shell documents, so a
-# direct navigation to one (a popup that escaped an app sandbox, a link, or a
-# cached proxy response) must not execute on the shell origin, where the owner
-# credential lives.
-_INERT_CONTENT_PATH = re.compile(
-  r"^(?:/app-assets/"
-  r"|/api/proxy(?:/|$)"
-  r"|/api/chats/[^/]+/(?:uploads|generated-files)/"
-  r"|/api/community/publications/github/preview/assets/)"
-)
 # App service responses are app-authored documents. They keep scripts, like a
 # published site, but only inside an opaque origin.
 _APP_SERVICE_PATH = re.compile(r"^/api/(?:(?:app-)?services|apps/[^/]+/service)/")
@@ -598,9 +589,11 @@ _ARTIFACT_OUTPUT_CSP = (
   "frame-ancestors 'self'"
 )
 
-# A sandbox without allow-scripts or allow-same-origin: images, media, and
-# plain documents still display when opened directly, but nothing runs and the
-# document cannot act as the shell origin. Must be enforcing, never Report-Only.
+# The default for every response outside a namespace lane that is not platform
+# code (see serves_platform_code): a sandbox without allow-scripts or
+# allow-same-origin. Images, media, and plain documents still display when
+# opened directly, but nothing runs and the document cannot act as the shell
+# origin. API JSON is unaffected. Must be enforcing, never Report-Only.
 _INERT_CONTENT_CSP = (
   "sandbox; default-src 'none'; img-src 'self' data:; media-src 'self'; "
   "style-src 'unsafe-inline'; frame-ancestors 'self'"
@@ -623,9 +616,10 @@ class _SecurityHeadersMiddleware:
   """Authoritatively sets the platform security headers on every response. Pure
   ASGI so it never buffers a streaming body. It strips any same-named header a
   route may have set first and replaces it with the platform value, so no route
-  can weaken the HSTS/MIME/etc. wall. Document policies are selected by exact
-  origin-owned namespaces. The shared service gateway is the sole exception:
-  its host adapter supplies a topology-specific frame policy."""
+  can weaken the HSTS/MIME/etc. wall. A few origin-owned namespaces carry their
+  own document policy; every other response is inert unless the handler that
+  answered declared it serves platform code. The shared service gateway is the
+  sole exception: its host adapter supplies a topology-specific frame policy."""
 
   def __init__(self, app):
     self.app = app
@@ -650,6 +644,7 @@ class _SecurityHeadersMiddleware:
         (name, value) for name, value in _SECURITY_HEADERS
         if name != _X_FRAME_OPTIONS
       ]
+    csp = None
     if not service_surface:
       if opaque_static_embed:
         csp = _static_embed_csp_for_scope(scope)
@@ -661,16 +656,8 @@ class _SecurityHeadersMiddleware:
         csp = _app_frame_csp_for_scope(scope)
       elif artifact_output:
         csp = _ARTIFACT_OUTPUT_CSP
-      elif _INERT_CONTENT_PATH.match(path):
-        csp = _INERT_CONTENT_CSP
       elif _APP_SERVICE_PATH.match(path):
         csp = _PUBLISHED_SITE_CSP
-      else:
-        csp = _SHELL_CSP
-      response_headers.append((
-        _CONTENT_SECURITY_POLICY,
-        csp.encode("ascii"),
-      ))
       replaced_header_names = replaced_header_names | {
         _CONTENT_SECURITY_POLICY
       }
@@ -686,6 +673,14 @@ class _SecurityHeadersMiddleware:
           if k.lower() not in replaced_header_names
         ]
         headers.extend(response_headers)
+        if not service_surface:
+          # Outside the namespace lanes, the handler that answered decides:
+          # platform code runs as the shell, everything else is inert.
+          policy = csp or (
+            _SHELL_CSP if scope.get(PLATFORM_CODE_SCOPE_KEY)
+            else _INERT_CONTENT_CSP
+          )
+          headers.append((_CONTENT_SECURITY_POLICY, policy.encode("ascii")))
         message["headers"] = headers
       await send(message)
 
@@ -1064,6 +1059,9 @@ def health_strict(response: Response):
   "/api/browser-bootstrap",
   response_class=HTMLResponse,
   include_in_schema=False,
+  # Automation opens this document to write the owner session into the
+  # shell origin's storage, so it must not be an opaque sandbox.
+  dependencies=[Depends(serves_platform_code)],
 )
 def browser_bootstrap():
   """Stable same-origin document for authenticated browser automation setup."""
@@ -1770,7 +1768,8 @@ if _baked_dir.is_dir() or _live_dir.is_dir():
   # module load; this resolves per request, so a post-boot dist and a mid-swap
   # old generation both serve without a restart.
   @app.api_route(
-    "/assets/{asset_path:path}", methods=["GET", "HEAD"], include_in_schema=False
+    "/assets/{asset_path:path}", methods=["GET", "HEAD"], include_in_schema=False,
+    dependencies=[Depends(serves_platform_code)],
   )
   async def serve_asset(request: Request, asset_path: str):
     target = await run_in_threadpool(_resolve_asset_file, asset_path)
@@ -1792,7 +1791,11 @@ if _baked_dir.is_dir() or _live_dir.is_dir():
       },
     )
 
-  @app.get("/{path:path}")
+  # The frontend build is platform code: the shell document, the public app
+  # host, and every worker the shell constructs (sw.js, sw-push.js, pdf.js,
+  # speech) come from here or /assets, and a worker runs under the policy of
+  # its own script response.
+  @app.get("/{path:path}", dependencies=[Depends(serves_platform_code)])
   async def spa_fallback(request: Request, path: str):
     """Serves the SPA index.html for any non-API, non-asset path."""
     if path == _PUSH_WORKER_SCOPE or path.startswith(f"{_PUSH_WORKER_SCOPE}/"):

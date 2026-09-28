@@ -17,8 +17,8 @@ being external attackers reaching the public HTTPS endpoint.
   Railway and self-hosted proxy paths cannot drift. The primary Caddy host
   passes policy through unchanged. Only the distinct service-gateway host keeps
   its topology-specific frame exception and fail-closed routing behavior.
-- **CSP is origin policy, not the app authorization boundary:** ordinary shell
-  documents, the inert chat bootstrap, opaque app frames, packaged embeds, and
+- **CSP is origin policy, not the app authorization boundary:** platform shell
+  documents, inert content (the default), the inert chat bootstrap, opaque app frames, packaged embeds, and
   published sites each receive their policy from the backend. App-frame
   `script-src` includes narrow `'wasm-unsafe-eval'`, never JavaScript
   `'unsafe-eval'`. No global COOP/COEP isolation is enabled; SharedArrayBuffer or
@@ -125,11 +125,14 @@ ancestor problem). `/app-embeds/by-id/` is also frameable, but every response in
 that namespace carries CSP `sandbox` without `allow-same-origin`; the namespace
 exposes only public packaged assets, while protected API access from null
 origins still requires the scoped principal. Ordinary `/app-assets/` remains
-frame-denied. It, `/api/proxy`, chat uploads and Store preview artwork are
-subresources that also carry an inert CSP `sandbox` (no scripts, opaque
-origin), and app-service responses carry the published-site sandbox, so a
-direct navigation to app- or third-party-controlled bytes never runs as the
-shell. A configured shared service-gateway hostname is reserved to
+frame-denied. Outside those namespace lanes, every response carries an inert
+CSP `sandbox` (no scripts, opaque origin) unless its route declares that it
+serves platform code: the shell document and public app host, the frontend
+build and the workers the shell constructs, the standalone host, the
+browser-automation bootstrap and the connector sign-in completion page.
+App-service responses carry the published-site sandbox. A new route is
+therefore inert until classified, so app-, agent-, chat- or
+third-party-controlled bytes never run as the shell. A configured shared service-gateway hostname is reserved to
 explicitly enabled `/services/<slug>` prefixes and frames only through each
 direct, same-origin-readable adapter; shell/API and non-enabled
 service paths return 404 there. The gateway isolates its owner-trusted service

@@ -182,6 +182,11 @@ def test_non_public_service_on_shell_host_still_proxies(
   assert response.status_code == 200
   assert response.content == b"proxied"
   assert "request" in seen
+  # A service without its own gateway origin answers on the shell origin, so
+  # its documents are inert there: its scripts never share the owner's origin.
+  # A service that needs a scripted web UI opts into public_surface.
+  from app.main import _INERT_CONTENT_CSP
+  assert response.headers["content-security-policy"] == _INERT_CONTENT_CSP
 
 
 def test_public_surface_post_redirects_permanently_with_method_preserved(

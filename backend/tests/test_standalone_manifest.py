@@ -444,3 +444,17 @@ def test_screenshot_route_rejects_unknown_asset_names(client, owner_token):
     f"/apps/{app['slug']}/screenshot-huge.png"
   ).status_code == 404
   assert client.get(f"/apps/{app['slug']}/anything.png").status_code == 404
+
+
+def test_standalone_host_is_platform_code_and_its_icons_are_not(client, owner_token):
+  # The host is the signed shell document; app code runs only in its opaque
+  # frame. App-derived bytes beside it (icons) get the inert default.
+  from app.main import _INERT_CONTENT_CSP, _SHELL_CSP
+
+  app = _create_app(client, owner_token, "Lane Host")
+  host = client.get(f"/apps/{app['slug']}/")
+  assert host.status_code == 200
+  assert host.headers["content-security-policy"] == _SHELL_CSP
+  icon = client.get(f"/apps/{app['slug']}/icon-192.png")
+  assert icon.status_code == 200
+  assert icon.headers["content-security-policy"] == _INERT_CONTENT_CSP
