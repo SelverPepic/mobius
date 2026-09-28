@@ -269,11 +269,16 @@ jobs:
     # Existing instances update from the release they run, with that release's
     # own updater. A change it refuses (as the previous updater refused Python
     # package changes, #1469) strands every instance, and tests of the new
-    # code alone cannot see it. Install each candidate from the newest
-    # published main image through the in-product update. Pull requests that
-    # cannot affect updating finish at once, so the job can be required.
+    # code alone cannot see it. Install each candidate from the release owners
+    # run, through the same HTTP calls Settings makes. The host helper is stood
+    # in for (its own code is not exercised here) and the Settings UI is not
+    # driven. Pull requests that cannot affect this path finish at once, so
+    # the job can be required.
     timeout-minutes: 40
     needs: privacy
+    permissions:
+      contents: read
+      actions: read  # read the base's main-image publication
     steps:
       - uses: actions/checkout@v7
         with:
@@ -288,7 +293,7 @@ jobs:
           run=true
           if [ "$EVENT" = pull_request ]; then
             git diff --name-only "$PR_BASE" HEAD \
-              | grep -qE '^(Dockerfile|\.dockerignore|backend/requirements\.(txt|lock)|backend/runtime/|backend/scripts/(entrypoint\.sh|install_platform_release\.py|prepare-container-cutover\.py)|backend/app/(platform_update|platform_boot|platform_activation|deployment_control|restart_util|restart_ledger)\.py|backend/app/routes/(platform|admin|auth)\.py|scripts/(mobius-rebuild-host\.py|test-upgrade-path\.sh)|deployment/|\.github/workflows/test\.yml)' \
+              | grep -qE '^(Dockerfile|\.dockerignore|backend/requirements\.(txt|lock)|backend/runtime/|backend/scripts/(entrypoint\.sh|install_platform_release\.py|prepare-container-cutover\.py)|backend/app/(platform_update|platform_boot|platform_activation|deployment_control|restart_util|restart_ledger|main|startup|auth)\.py|backend/app/routes/(platform|admin|auth)\.py|scripts/(mobius-rebuild-host\.py|test-upgrade-path\.sh)|deployment/|\.github/workflows/test\.yml)' \
               || run=false
           fi
           echo "run=$run" >> "$GITHUB_OUTPUT"
@@ -311,21 +316,31 @@ jobs:
       - name: Verify the previous release can install this one
         if: steps.scope.outputs.run == 'true'
         env:
+          GH_TOKEN: ${{ github.token }}
           BASE_SHA: ${{ github.event.merge_group.base_sha || github.event.pull_request.base.sha || github.event.before }}
         run: |
           git fetch -q origin main
           # The release this change branches from (a manual run has no base).
           base=${BASE_SHA:-$(git merge-base HEAD FETCH_HEAD)}
-          # main-image publishes after each merge, so the base may still be
-          # building: use the newest published image at or before it.
-          previous=""
-          for sha in $(git rev-list --first-parent --max-count=30 "$base"); do
-            if docker manifest inspect "ghcr.io/mobius-os/mobius:sha-$sha" >/dev/null 2>&1; then
-              previous=$sha
-              break
+          # Owners run the base's own image once main-image publishes it, so
+          # wait for a publication that is under way rather than testing an
+          # older updater. A commit merged in a batch never gets an image of
+          # its own; owners run the newest published ancestor instead.
+          image=ghcr.io/mobius-os/mobius
+          published() { docker manifest inspect "$image:sha-$1" >/dev/null 2>&1; }
+          if ! published "$base"; then
+            runs=$(gh api "repos/${{ github.repository }}/actions/workflows/main-image.yml/runs?head_sha=$base" \
+              --jq '[.workflow_runs[] | select(.conclusion != "failure" and .conclusion != "cancelled")] | length')
+            if [ "${runs:-0}" -gt 0 ]; then
+              for _ in $(seq 1 40); do published "$base" && break; sleep 30; done
+              published "$base" || { echo "infrastructure: the image for base $base did not publish within 20 minutes"; exit 1; }
             fi
+          fi
+          previous=""
+          for sha in $(git rev-list --first-parent "$base"); do
+            if published "$sha"; then previous=$sha; break; fi
           done
-          [ -n "$previous" ] || { echo "no published image at or before $base"; exit 1; }
+          [ -n "$previous" ] || { echo "infrastructure: no published image at or before $base"; exit 1; }
           docker pull -q "ghcr.io/mobius-os/mobius:sha-$previous"
           scripts/test-upgrade-path.sh "ghcr.io/mobius-os/mobius:sha-$previous" mobius-test:ci .
 

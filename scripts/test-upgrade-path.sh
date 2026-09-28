@@ -10,8 +10,9 @@
 #
 # 1. Boot the previous image on a fresh volume (production path, like an owner).
 # 2. Offer it the candidate release and create its owner through the setup API.
-# 3. Stand in for a current self-hosted host helper (status only; no Docker in
-#    the container).
+# 3. Stand in for a current self-hosted host helper. This checks the old
+#    updater and the new image's boot against the helper's contract; the
+#    helper's own code (scripts/mobius-rebuild-host.py) is not exercised.
 # 4. Press Update through the same HTTP calls Settings makes. Any refusal
 #    fails the check: that is how a release strands existing instances.
 # 5. Image updates: take the queued request as the helper would, recreate the
@@ -134,14 +135,16 @@ reply=$(api GET /api/platform/update-preview)
 preview=$(body "$reply")
 [ "$(field "$preview" 'd.get("target_sha")')" = "$candidate" ] \
   || fail "the previous release does not offer the candidate: $preview"
-conflicts=$(field "$preview" 'len(d.get("conflict_paths") or [])')
-[ "$conflicts" = 0 ] || fail "a fresh instance reports update conflicts: $preview"
+conflicts=$(field "$preview" 'len(d.get("conflict_paths") or []) + len(d.get("blocking_paths") or [])')
+[ "$conflicts" = 0 ] || fail "a fresh instance reports update conflicts or blockers: $preview"
+[ "$(field "$preview" 'd.get("actionable", True)')" = True ] \
+  || fail "the previous release does not offer the candidate as an actionable update: $preview"
 plan=$(field "$preview" 'json.dumps({k: d.get(k) for k in ("plan_id", "current_sha", "target_sha", "image_digest")})')
 needs_image=$(field "$preview" '"image_rebuild" in ((d.get("activation") or {}).get("required_actions") or [])')
 
 if [ "$needs_image" = True ]; then
   reply=$(api POST /api/platform/rebuild "$plan")
-  [ "$(code "$reply")" = 202 ] \
+  [ "$(code "$reply")" = 202 ] && [ "$(field "$(body "$reply")" 'd.get("state")')" = queued ] \
     || fail "the previous release refused to install the candidate ($(code "$reply")): $(body "$reply")"
   request=$(docker exec "$name" cat /data/mobius-rebuild/inbox/request.json) \
     || fail "Update did not queue a container replacement: $(body "$reply")"
