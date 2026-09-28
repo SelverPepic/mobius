@@ -90,14 +90,17 @@ candidate=$(image_sha "$CANDIDATE")
 [ "$previous" != "$candidate" ] || fail "the previous and candidate images are the same release"
 echo "upgrade path: ${previous:0:12} -> ${candidate:0:12}"
 
-# The seeded checkout already holds the previous commit, so the bundle carries
-# only what the candidate adds (a shallow seed cannot resolve more history).
-# A bundle carries refs, not bare commits: name the candidate for the bundle.
+# The image seeds a shallow checkout, so the candidate travels with its whole
+# history: a bundle that excluded the previous release would need every commit
+# the candidate branched from (a merge of an older branch does), which the seed
+# lacks. A bundle carries refs, not bare commits, so name the candidate.
 bundle_ref=refs/upgrade-path/candidate-$$
 git -C "$REPO" update-ref "$bundle_ref" "$candidate" \
   || fail "the repository does not contain the candidate ${candidate:0:12}"
+git -C "$REPO" merge-base --is-ancestor "$previous" "$candidate" \
+  || fail "the candidate ${candidate:0:12} does not descend from ${previous:0:12}"
 bundled=0
-git -C "$REPO" bundle create "$work/candidate.bundle" "$bundle_ref" "^$previous" \
+git -C "$REPO" bundle create "$work/candidate.bundle" "$bundle_ref" \
   >/dev/null 2>"$work/bundle.err" && bundled=1
 git -C "$REPO" update-ref -d "$bundle_ref"
 [ "$bundled" = 1 ] || fail "could not bundle ${candidate:0:12} on ${previous:0:12}: $(cat "$work/bundle.err")"
