@@ -39,11 +39,14 @@ export function resolveInitialNav({
 } = {}) {
   const homeChatId = storedChatId ?? null
 
-  // Single precedence chain — an explicit destination for THIS load wins over a
-  // cold restore. (Previously activeView/activeAppId/activeChatId were resolved
-  // by three separate `||` chains that could cross-contaminate sources.)
+  // Single precedence chain: a claimed shell reload normally wins, but the
+  // provider callback is a separate top-level navigation and must replace it.
+  // (Previously activeView/activeAppId/activeChatId were resolved by three
+  // separate `||` chains that could cross-contaminate sources.)
   let dest
-  if (shellReload?.activeView) {
+  if (deepLink?.view === 'settings' && deepLink.section === 'ai-providers') {
+    dest = { view: 'settings', appId: null, chatId: null, section: 'ai-providers' }
+  } else if (shellReload?.activeView) {
     dest = {
       view: shellReload.activeView,
       appId: shellReload.activeAppId ?? null,
@@ -80,5 +83,6 @@ export function resolveInitialNav({
     // Back-to-home has a target): the destination's own chat, else the stored one.
     chatId: dest.chatId ?? homeChatId,
     seedHome,
+    ...(dest.section ? { section: dest.section } : {}),
   }
 }

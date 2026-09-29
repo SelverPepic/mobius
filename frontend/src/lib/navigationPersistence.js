@@ -58,7 +58,14 @@ export function parseShellDeepLink(location = globalThis.location) {
   }
   const chatMatch = path.match(/^\/chat\/([^/]+)\/?$/)
   if (chatMatch) return { view: 'chat', chatId: chatMatch[1], intent: null, focusQuestion: false }
-  if (/^\/settings\/?$/.test(path)) return { view: 'settings' }
+  if (/^\/settings\/?$/.test(path)) {
+    // The OAuth callback needs this one section after a cold navigation. Do
+    // not carry arbitrary URL input into SettingsView's focus target.
+    const sections = new URLSearchParams(location?.search || '').getAll('section')
+    return sections.length === 1 && sections[0] === 'ai-providers'
+      ? { view: 'settings', section: 'ai-providers' }
+      : { view: 'settings' }
+  }
   return null
 }
 

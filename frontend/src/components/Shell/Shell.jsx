@@ -282,6 +282,7 @@ export default function Shell({ onInitialVisualReady }) {
   const beforeRestoreRouteRef = useRef(null)
 
   const {
+    initialNav,
     activeView,
     activeAppId,
     activeChatId,
@@ -735,7 +736,10 @@ export default function Shell({ onInitialVisualReady }) {
   // variant: 'info' | 'error'  (see components/ui/Toast.jsx)
   const toastSequenceRef = useRef(0)
   const [toast, setToast] = useState(null)
-  const [settingsFocusTarget, setSettingsFocusTarget] = useState(null)
+  const [settingsFocusTarget, setSettingsFocusTarget] = useState(() =>
+    initialNav.section
+      ? { section: initialNav.section, nonce: Date.now() }
+      : null)
   // Settings stays mounted across workspace transitions. An explicit shell
   // apply can therefore complete a platform-conflict repair without remounting
   // Settings; this token lets that live instance re-read authoritative status
