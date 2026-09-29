@@ -64,6 +64,25 @@ def test_serve_generated_file_by_recorded_name(client, db, auth, chat):
   assert res.headers["x-content-type-options"] == "nosniff"
 
 
+def test_serve_generated_file_from_valid_non_v4_chat(client, db, auth):
+  chat_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "generated-file-test-chat"))
+  created = client.post(
+    "/api/chats", json={"id": chat_id, "title": "Test chat"}, headers=auth,
+  )
+  assert created.status_code == 200
+  chat = db.get(models.Chat, chat_id)
+  stored_name = _stored_file(chat)
+  _write_row(db, chat, name="report.pdf", path=stored_name)
+
+  res = client.get(
+    f"/api/chats/{chat_id}/generated-files/report.pdf",
+    params={"token": _media_token(client, auth, chat_id)},
+  )
+
+  assert res.status_code == 200
+  assert res.content == b"%PDF-1.4 fake"
+
+
 def test_safe_generated_file_preview_opens_inline(client, db, auth, chat):
   stored_name = _stored_file(chat)
   _write_row(db, chat, name="report.pdf", path=stored_name)
