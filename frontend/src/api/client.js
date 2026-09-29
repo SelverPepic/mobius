@@ -1137,9 +1137,6 @@ export const api = {
       `/projects/${encodeURIComponent(projectId)}/file?path=${encodeURIComponent(path)}`,
       { method: 'DELETE' },
     ),
-    downloadUrl: (projectId, path) => (
-      `${BASE}/api/projects/${encodeURIComponent(projectId)}/file?path=${encodeURIComponent(path)}&download=true`
-    ),
     // Rename or move a file/dir within the project tree. The backend confines
     // both paths, rejects symlink escape / dst-exists / into-descendant, and
     // maps an os.replace failure to a 4xx rather than a 500 (see the build spec).
