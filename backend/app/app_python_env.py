@@ -204,17 +204,12 @@ def compatibility_tag() -> str:
   """What a built env's binaries depend on in the running interpreter.
 
   The readable prefix names the ABI and platform; the digest also covers the
-  base executable's location (a venv links to it), the C library and full
-  Python version, and the baked image identity. Thus even a patch interpreter
-  upgrade or an image replacement with the same ABI selects a new env.
+  base executable's location (a venv links to it), the C library and the full
+  Python version, so an image that changes any of them selects a new env. An
+  image replacement that keeps them reuses the env already in /data.
   """
   base = os.path.realpath(getattr(sys, "_base_executable", None) or sys.executable)
   libc = "-".join(platform.libc_ver())
-  build_info = Path(os.environ.get("MOBIUS_BUILD_INFO_PATH", "/app/build-info.json"))
-  try:
-    image_identity = hashlib.sha256(build_info.read_bytes()).hexdigest()
-  except OSError:
-    image_identity = "no-build-info"
   identity = "\0".join((
     sys.implementation.cache_tag or sys.implementation.name,
     sysconfig.get_platform(),
@@ -222,7 +217,6 @@ def compatibility_tag() -> str:
     platform.python_version(),
     base,
     libc,
-    image_identity,
   ))
   readable = re.sub(r"[^A-Za-z0-9_.-]+", "_", (
     f"{sys.implementation.cache_tag}-{sysconfig.get_platform()}"

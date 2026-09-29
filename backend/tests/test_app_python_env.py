@@ -202,23 +202,21 @@ def test_env_key_changes_with_the_lock_and_with_the_interpreter(monkeypatch):
   assert app_python_env.env_key(b"a==1\n") != first
 
 
-def test_env_key_changes_with_python_patch_version_and_image_bytes(tmp_path, monkeypatch):
-  build_info = tmp_path / "build-info.json"
-  build_info.write_bytes(b'{"sha":"first"}')
+def test_env_key_changes_with_the_python_patch_version_only(tmp_path, monkeypatch):
+  """A new image that keeps the interpreter reuses the env in /data."""
   with monkeypatch.context() as patch:
-    patch.setenv("MOBIUS_BUILD_INFO_PATH", str(build_info))
     patch.setattr(app_python_env.platform, "python_version", lambda: "3.13.1")
     app_python_env.compatibility_tag.cache_clear()
     first = app_python_env.env_key(b"a==1\n")
-
     patch.setattr(app_python_env.platform, "python_version", lambda: "3.13.2")
     app_python_env.compatibility_tag.cache_clear()
-    second = app_python_env.env_key(b"a==1\n")
-    assert second != first
-
-    build_info.write_bytes(b'{"sha":"second"}')
+    assert app_python_env.env_key(b"a==1\n") != first
+    build_info = tmp_path / "build-info.json"
+    build_info.write_bytes(b'{"sha":"another-image"}')
+    patch.setenv("MOBIUS_BUILD_INFO_PATH", str(build_info))
+    patch.setattr(app_python_env.platform, "python_version", lambda: "3.13.1")
     app_python_env.compatibility_tag.cache_clear()
-    assert app_python_env.env_key(b"a==1\n") != second
+    assert app_python_env.env_key(b"a==1\n") == first
   app_python_env.compatibility_tag.cache_clear()
 
 

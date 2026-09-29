@@ -175,7 +175,7 @@ source, listed in `source_files`. It must include everything the app imports,
 since nothing is borrowed from the platform, and every package must have a
 wheel. Apply, Store install, and Store update build a virtual environment
 without system site-packages, published at `/data/app-envs/<app id>/<key>`,
-where the key combines the interpreter/ABI, image identity, and lock's SHA-256. The build
+where the key combines the interpreter/ABI and the lock's SHA-256. The build
 installs hash-checked wheels only, so no package build code runs. pip reads no
 configuration file and inherits only index, certificate, and proxy settings,
 and URL credentials are removed from any diagnostics returned. The build then
