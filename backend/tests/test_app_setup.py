@@ -11,10 +11,18 @@ import pytest
 from app import app_setup
 
 
+async def until(predicate):
+  async def poll():
+    while not predicate():
+      await asyncio.sleep(0.01)
+  await asyncio.wait_for(poll(), 3)
+
+
 @pytest.fixture
 def setup(monkeypatch, tmp_path):
   monkeypatch.setattr(app_setup, "get_settings", lambda: SimpleNamespace(data_dir=str(tmp_path)))
   monkeypatch.setattr(app_setup.platform_update, "read_prepared_update", lambda: None)
+  monkeypatch.setattr(app_setup.fs_locks, "_lifecycle_lock", asyncio.Lock())
   return app_setup.Runner()
 
 
@@ -32,12 +40,6 @@ async def test_protocol_and_persistence(setup, codes, state):
 
 @pytest.mark.asyncio
 async def test_script_and_tail(setup, tmp_path):
-  script = tmp_path / "restore.sh"
-  script.write_text('#!/bin/sh\nif [ "$1" = check ]; then test -f done; else touch done; fi\n')
-  async def run(action):
-    return await app_setup.command(["/bin/sh", str(script), action], tmp_path)
-  await setup.step("script", run)
-  assert app_setup.status()["script"]["state"] == "ready"
   code, output = await app_setup.command(["/bin/sh", "-c", "printf 'Inst foo\n%10000s' x"], plan=True)
   assert code == -1 and len(output) == 8192
   code, output = await app_setup.command([sys.executable, "-m", "app.app_python_env", str(tmp_path), "7", str(tmp_path)])
@@ -51,17 +53,22 @@ async def test_apt_combines_constraints_and_refuses_conflict(setup, monkeypatch)
   requirements = ["foo (>= 2)", "foo (<< 2)"]
   await setup.step("apt", lambda action: app_setup.apt(requirements, action))
   assert command.await_count == 3
-  assert command.call_args.args[0] == ["apt-get", "--simulate", "--no-remove", "satisfy", *requirements]
+  assert command.call_args.args[0] == ["sudo", "-n", "apt-get", "--simulate", "--no-remove", "satisfy", *requirements]
   assert app_setup.status()["apt"]["state"] == "conflict"
   command.reset_mock()
   command.side_effect = [(-1, "Inst foo"), (0, "updated"), (-1, "Inst foo"), (0, "installed"), (0, "")]
   await setup.step("apt", lambda action: app_setup.apt(requirements, action))
   assert command.call_args_list[3].args[0] == ["sudo", "-n", "apt-get", "--yes", "--no-remove", "satisfy", *requirements]
   assert app_setup.status()["apt"]["state"] == "ready"
+  command.reset_mock()
+  command.side_effect = [(100, "missing"), (100, "repository unavailable")]
+  await setup.step("apt", lambda action: app_setup.apt(requirements, action))
+  assert command.call_args.args[0] == ["sudo", "-n", "apt-get", "update", "--error-on=any"]
+  assert app_setup.status()["apt"]["state"] == "failed"
 
 
 @pytest.mark.asyncio
-async def test_nonblocking_readiness_settlement_and_rerun(setup, monkeypatch):
+async def test_nonblocking_readiness_and_settlement(setup, monkeypatch):
   import httpx
   ready = False
   record = {"state": "swapped", "operation": {"id": "replacement"}}
@@ -77,15 +84,11 @@ async def test_nonblocking_readiness_settlement_and_rerun(setup, monkeypatch):
   async def reconcile():
     ran.set()
   setup.reconcile = AsyncMock(side_effect=reconcile)
-  monkeypatch.setattr(app_setup, "_runner", setup)
-  setup.record("interrupted", "pending", "previous output")
-  setup.states = {}  # simulate a restarted worker loading its durable status
   task = asyncio.create_task(setup.serve())
   try:
     for _ in range(10):
       await real_sleep(0)
     setup.reconcile.assert_not_awaited()
-    assert setup.states["interrupted"]["output"] == "previous output"
     ready = True
     for _ in range(10):
       await real_sleep(0)
@@ -93,16 +96,12 @@ async def test_nonblocking_readiness_settlement_and_rerun(setup, monkeypatch):
     record = None
     await asyncio.wait_for(ran.wait(), 2)
     assert setup.reconcile.await_count == 1
-    ran.clear()
-    app_setup.request_run()
-    await asyncio.wait_for(ran.wait(), 2)
-    assert setup.reconcile.await_count == 2
   finally:
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
 
 
-def test_authenticated_status_and_rerun(client, auth, setup, monkeypatch):
+def test_authenticated_status_and_rerun(client, auth, setup, monkeypatch, tmp_path):
   setup.record("old", "pending", "interrupted")
   assert client.get("/api/setup").status_code == 401
   assert client.get("/api/setup", headers=auth).json()["old"]["state"] == "pending"
@@ -110,6 +109,9 @@ def test_authenticated_status_and_rerun(client, auth, setup, monkeypatch):
   monkeypatch.setattr(app_setup, "request_run", lambda: calls.append(True))
   assert client.post("/api/setup/rerun", headers=auth).status_code == 202
   assert calls == [True]
+  for corrupt in ["{", "null", "[]"]:
+    (tmp_path / "setup-status.json").write_text(corrupt)
+    assert client.get("/api/setup", headers=auth).json() == {}
 
 
 @pytest.mark.asyncio
@@ -180,14 +182,98 @@ async def test_new_update_binding_prevents_apply(setup, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_shutdown_reaps_running_step(tmp_path):
-  pid_file = tmp_path / "pid"
-  task = asyncio.create_task(app_setup.command(["/bin/sh", "-c", f"echo $$ > {pid_file}; sleep 600"]))
+@pytest.mark.parametrize("escape", [False, True])
+async def test_shutdown_reaps_group_without_waiting_for_pipe_eof(tmp_path, escape):
+  import signal
+  from app.process_groups import _has_exited
+  child, leader = tmp_path / "child", tmp_path / "leader"
+  child_code = f"import os,signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); open({str(child)!r},'w').write(str(os.getpid())); time.sleep(600)"
+  code = f"import subprocess,sys,os,time; subprocess.Popen([sys.executable,'-c',{child_code!r}],start_new_session={escape}); open({str(leader)!r},'w').write(str(os.getpid())); time.sleep(600)"
+  task = asyncio.create_task(app_setup.command([sys.executable, "-c", code]))
   try:
-    while not pid_file.exists():
-      await asyncio.sleep(0.01)
+    await until(lambda: child.exists() and leader.exists())
+    task.cancel()
+    asyncio.get_running_loop().call_later(0.01, task.cancel)  # shutdown during rerun
+    await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 2)
+    assert _has_exited(int(leader.read_text()))
+    if not escape:
+      await until(lambda: _has_exited(int(child.read_text())))
+    else:
+      assert not _has_exited(int(child.read_text()))
   finally:
     task.cancel()
-    await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 12)
-  with pytest.raises(ProcessLookupError):
-    os.kill(int(pid_file.read_text()), 0)
+    await asyncio.gather(task, return_exceptions=True)
+    if child.exists() and not _has_exited(int(child.read_text())):
+      os.kill(int(child.read_text()), signal.SIGKILL)
+
+
+@pytest.mark.asyncio
+async def test_complete_status_and_rerun_cancels_running_step(setup, tmp_path, monkeypatch):
+  import httpx
+  from app.routes.settings import rerun_dependency_setup
+  from app.process_groups import _has_exited
+  monkeypatch.setattr(httpx.AsyncClient, "get", AsyncMock(return_value=SimpleNamespace(status_code=200)))
+  monkeypatch.setattr(app_setup, "_runner", setup)
+  root = tmp_path / "customizations"
+  root.mkdir()
+  (root / "mobius.json").write_text(json.dumps({"setup": {"steps": ["first.sh", "second.sh"]}}))
+  (root / "first.sh").write_text('#!/bin/sh\ntest -f release && exit 0\necho $$ > pid\nsleep 600\n')
+  (root / "second.sh").write_text('#!/bin/sh\nexit 0\n')
+  setup.record("instance:second.sh", "failed", "previous diagnostic")
+  setup.record("removed", "failed")
+  task = asyncio.create_task(setup.serve())
+  try:
+    await until(lambda: (root / "pid").exists())
+    state = app_setup.status()
+    assert set(state) == {"instance:first.sh", "instance:second.sh"}
+    assert state["instance:first.sh"]["running"] is True
+    assert state["instance:second.sh"] == {"state": "pending", "output": "previous diagnostic"}
+    pid = int((root / "pid").read_text())
+    (root / "release").touch()
+    await rerun_dependency_setup(None)
+    await until(lambda: app_setup.status()["instance:second.sh"]["state"] == "ready")
+    assert _has_exited(pid)
+  finally:
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_pointer_is_read_after_pin_and_python_waits_for_apply_rollback(setup, db, tmp_path, monkeypatch):
+  from app import models, fs_locks
+  row = models.App(name="Python", slug="python-restore", source_dir=str(tmp_path), runtime_revision="a" * 64)
+  db.add(row)
+  db.commit()
+  root = tmp_path / "accepted"
+  root.mkdir()
+  (root / "mobius.json").write_text('{"python":{"lock":"requirements.lock"}}')
+  events = []
+  original_pin = app_setup.applied_app_runtime.hold_runtime_async
+  async def pin(app_id):
+    # A pointer changed after the ID snapshot but before the read pin.
+    row.runtime_revision = "b" * 64
+    db.commit()
+    return await original_pin(app_id)
+  def runtime(app):
+    assert app.runtime_revision == "b" * 64
+    return root
+  async def command(*args, **kwargs):
+    assert fs_locks.install_uninstall_lock().locked()
+    events.append("restored")
+    return 0, ""
+  monkeypatch.setattr(app_setup.applied_app_runtime, "hold_runtime_async", pin)
+  monkeypatch.setattr(app_setup.applied_app_runtime, "runtime_root", runtime)
+  execute = AsyncMock(side_effect=command)
+  monkeypatch.setattr(app_setup, "command", execute)
+  original_step = setup.step
+  async def step(key, run):
+    async with fs_locks.install_uninstall_lock():
+      task = asyncio.create_task(original_step(key, run))
+      await asyncio.sleep(0.02)
+      execute.assert_not_awaited()
+      events.append("rollback")  # Apply unpublishes its provisional env
+    await task
+  monkeypatch.setattr(setup, "step", step)
+  await setup.reconcile()
+  assert events == ["rollback", "restored"]
+  assert app_setup.status()[f"app:{row.id}:python"]["state"] == "ready"

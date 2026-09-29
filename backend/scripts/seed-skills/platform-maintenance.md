@@ -68,6 +68,7 @@ Review the exact changed paths and use the smallest matching action:
    `{"setup":{"steps":["restore.sh"],"apt":["poppler-utils (>= 25)"]},"source_files":["restore.sh"]}`.
    Ship app scripts and inputs through `source_files`, then Apply. Instance
    scripts live beside their manifest; after edits, request a re-run.
+   Instance manifests need only `setup`, not `source_files`.
    Scripts need a shebang and receive `check` or `apply` as their only argument,
    with their source directory as cwd. `check` exits 0 when ready, 1 when apply
    is needed, 2 for conflict; other exits fail. `apply` must be idempotent;
@@ -79,8 +80,9 @@ Review the exact changed paths and use the smallest matching action:
    requirements are unmet; extra repository configuration stays explicit.
    Restoration runs sequentially after readiness and update settlement, on
    every boot and accepted declaration. It never holds up boot or updates.
-   Owner-authenticated `GET /api/setup` shows durable per-step state/output;
-   `POST /api/setup/rerun` queues another pass (also after instance edits).
+   Owner-authenticated `GET /api/setup` shows per-step state/output and the
+   running step. `POST /api/setup/rerun` cancels the running step and starts
+   a fresh pass (also after instance edits). Steps have no execution timeout.
    Failed steps wait for a re-run, declaration acceptance, or the next boot.
    There is no UI or automatic capture of ad-hoc installs. A root script can
    still disrupt the platform: this is restoration, not a sandbox.

@@ -217,7 +217,8 @@ Scripts ship through `source_files`, need a shebang, and support `check` (exit
 runner uses accepted source as cwd, runs as `mobius` after readiness/update
 settlement, and combines all APT requirements. It does not gate app launches.
 Instance declarations use `/data/customizations/mobius.json`. Owner-authenticated
-`GET /api/setup` shows status; `POST /api/setup/rerun` queues a pass. See the
+`GET /api/setup` shows status/running steps; `POST /api/setup/rerun` cancels
+the running step and starts a fresh pass. Instance scripts need no `source_files`. See the
 platform-maintenance skill for setup guidance. No UI or ad-hoc install capture.
 
 Same-app calls use `/api/apps/{app_id}/service/{path}`. An app can expose a

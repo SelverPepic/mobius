@@ -155,14 +155,8 @@ def validate_setup(manifest) -> None:
   steps = setup.get("steps", [])
   if not isinstance(steps, list):
     _fail("Manifest `setup.steps` must be an array.")
-  source_files = manifest.get("source_files")
-  declared_sources = {
-    path for path in source_files if isinstance(path, str)
-  } if isinstance(source_files, list) else set()
   for index, path in enumerate(steps):
     validate_repo_relative_path(path, f"setup.steps[{index}]")
-    if path not in declared_sources:
-      _fail(f"Manifest `setup.steps[{index}]` must be listed in `source_files`.")
   apt = setup.get("apt", [])
   if not isinstance(apt, list) or any(
     not isinstance(dependency, str) or not dependency.strip()
@@ -832,6 +826,9 @@ def validate_manifest_contract(manifest) -> None:
         )
 
   validate_setup(manifest)
+  for index, path in enumerate(manifest.get("setup", {}).get("steps", [])):
+    if path not in (source_files or []):
+      _fail(f"Manifest `setup.steps[{index}]` must be listed in `source_files`.")
 
   agent_activities = manifest.get("agent_activities", {})
   if not isinstance(agent_activities, Mapping):
