@@ -20,7 +20,7 @@ from urllib.parse import quote, urlencode, urlparse
 
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
-from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, UploadFile
 from pydantic import BaseModel
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
@@ -806,8 +806,9 @@ async def read_avatar(
   )
 
 
-async def _managed_railway_remote() -> dict:
-  response = await _managed_response("GET", "/api/instance/v1/railway")
+async def _managed_railway_remote(*, include_region_options: bool = False) -> dict:
+  suffix = "?region_options=1" if include_region_options else ""
+  response = await _managed_response("GET", "/api/instance/v1/railway" + suffix)
   if response.status_code != 200:
     raise HTTPException(502, "The Möbius account service could not read Railway state.")
   try:
@@ -817,7 +818,7 @@ async def _managed_railway_remote() -> dict:
 
 
 async def _linked_railway_remote(
-  db: Session, owner_id: int,
+  db: Session, owner_id: int, *, include_region_options: bool = False,
 ) -> tuple[str, dict | None]:
   link = _linked_row(db, owner_id)
   if link is None:
@@ -832,8 +833,9 @@ async def _linked_railway_remote(
     return "signed_out", None
   try:
     async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
+      suffix = "?region_options=1" if include_region_options else ""
       response = await client.get(
-        get_settings().mobius_account_origin + "/api/account/v1/railway",
+        get_settings().mobius_account_origin + "/api/account/v1/railway" + suffix,
         headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
       )
   except httpx.HTTPError:
@@ -854,18 +856,24 @@ async def _linked_railway_remote(
 
 @router.get("/railway")
 async def read_railway(
+  request: Request,
   owner: models.Owner = Depends(get_owner_or_app_with_railway_manage),
   db: Session = Depends(get_db),
 ):
+  include_region_options = request.query_params.get("region_options") == "1"
   if get_settings().mobius_sso_enabled:
     try:
-      payload = await _managed_railway_remote()
+      payload = await _managed_railway_remote(
+        include_region_options=include_region_options,
+      )
     except HTTPException as exc:
       if exc.status_code == 502:
         return {"railway_access": "unavailable", "connection": None, "instances": []}
       raise
     return {"railway_access": "available", **payload}
-  access, payload = await _linked_railway_remote(db, owner.id)
+  access, payload = await _linked_railway_remote(
+    db, owner.id, include_region_options=include_region_options,
+  )
   return {
     "railway_access": access,
     "connection": payload.get("connection") if payload else None,
