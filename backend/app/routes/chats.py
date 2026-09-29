@@ -619,6 +619,39 @@ def _chat_detail_response(
     db=db,
     live_message=live_message,
   )
+  from app.goal_plans import terminal_goal_summaries_by_message_index
+  summaries_by_index = terminal_goal_summaries_by_message_index(
+    db, chat.id, all_msgs, message_start=start, message_end=start + len(page),
+  )
+  # Insert read-side lifecycle blocks before activity compaction. The completion
+  # call then ends its stretch, and later prose/tools cannot drag the card down.
+  # The durable Goal remains the single owner; Chat.messages is untouched.
+  if summaries_by_index:
+    next_page = list(page)
+    for relative_index, message in enumerate(page):
+      summaries = summaries_by_index.get(start + relative_index)
+      if not summaries:
+        continue
+      anchored = {s["completion_tool_use_id"]: s for s in summaries
+                  if s.get("completion_tool_use_id")}
+      blocks = []
+      placed = set()
+      for raw_index, block in enumerate(message.get("blocks") or []):
+        # Compacted disclosures and positioned activity retain the coordinates
+        # of the stored transcript, not these inserted read-side cards.
+        blocks.append({**block, "raw_index": raw_index} if isinstance(block, dict) else block)
+        tool_id = block.get("tool_use_id") if isinstance(block, dict) else None
+        if tool_id in anchored:
+          blocks.append({"type": "goal_history", "summary": anchored[tool_id], "raw_index": None})
+          placed.add(anchored[tool_id]["id"])
+      projected_message = dict(message)
+      if placed:
+        projected_message["blocks"] = blocks
+      unplaced = [s for s in summaries if s["id"] not in placed]
+      if unplaced:
+        projected_message["goal_summaries"] = unplaced
+      next_page[relative_index] = projected_message
+    page = next_page
   candidate_tool_ids = historical_tool_output_ids(
     page,
     live_message=live_message,
@@ -654,22 +687,6 @@ def _chat_detail_response(
     chat_id=chat.id,
     data_dir=get_settings().data_dir,
   )
-  from app.goal_plans import terminal_goal_summaries_by_message_index
-  summaries_by_index = terminal_goal_summaries_by_message_index(
-    db, chat.id, all_msgs,
-    message_start=start,
-    message_end=start + len(page),
-  )
-  if summaries_by_index:
-    next_page = list(page)
-    for relative_index, message in enumerate(page):
-      summaries = summaries_by_index.get(start + relative_index)
-      if not summaries:
-        continue
-      projected_message = dict(message)
-      projected_message["goal_summaries"] = summaries
-      next_page[relative_index] = projected_message
-    page = next_page
   from app.chat_waits import terminal_wait_summaries_by_message_index
   wait_summaries_by_index = terminal_wait_summaries_by_message_index(
     db, chat.id, all_msgs,

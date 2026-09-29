@@ -303,6 +303,9 @@ function MsgContentInner({
     // are folded into an ActivityStretch below; this renders only the `single`
     // nodes — text, question, error, and provider context compaction.
     const renderBlock = (block, i) => {
+      if (block.type === 'goal_history') {
+        return <GoalHistoryCard key={`goal-${block.summary.id}`} summary={block.summary} />
+      }
       if (block.type === 'activity' && Array.isArray(block.entries)) {
         // Cold, very long turns can reach this renderer with their adjacent
         // tools already folded into an activity block. Filter the platform

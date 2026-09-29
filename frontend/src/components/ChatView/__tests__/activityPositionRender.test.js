@@ -29,6 +29,21 @@ test('live and reopened response place the incoming row before later prose', () 
   }
 })
 
+test('a completed Goal splits activity at completion before later prose', () => {
+  const msg = { id: 'goal-answer', role: 'assistant', blocks: [
+    { type: 'text', content: 'Before completion' },
+    { type: 'tool', tool: 'mobius_control:update_goal', input: '{"complete":"Verified"}', tool_use_id: 'complete', status: 'done', output_exit_code: 0 },
+    { type: 'goal_history', summary: { id: 'goal', objective: 'Ship exactly once', status: 'completed' } },
+    { type: 'tool', tool: 'Bash', tool_use_id: 'after', status: 'done' },
+    { type: 'text', content: 'Later prose' },
+  ] }
+  const html = render(Message, { msg, chatId: 'chat', messageKey: msg.id }, { tools: new Map(), positions: new Map() })
+  const card = html.indexOf('aria-label="Completed goal: Ship exactly once"')
+  assert.ok(html.indexOf('Before completion') < card)
+  assert.ok(card < html.indexOf('Later prose'))
+  assert.equal(html.split('aria-label="Completed goal: Ship exactly once"').length, 2)
+})
+
 test('empty active payload still displays anchored activity exactly once', () => {
   const html = render(Message, { msg: { ...message, blocks: [] }, chatId: 'chat', messageKey: 'answer' })
   assert.equal(html.split('aria-label="Received from Colleague"').length, 2)

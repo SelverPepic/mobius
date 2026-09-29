@@ -354,6 +354,21 @@ def test_compact_route_folds_settled_activity_while_live_turn_waits_for_answer(
   assert "settled output" not in response.text
 
 
+def test_inserted_goal_card_does_not_shift_question_twin_matching():
+  blocks = [
+    {"type": "tool", "tool": "Bash", "tool_use_id": "verify", "raw_index": 0},
+    {"type": "goal_history", "summary": {"id": "goal"}, "raw_index": None},
+    {"type": "tool", "tool": "request_user_input", "status": "done", "raw_index": 1},
+    {"type": "question", "question_id": "q1", "questions": [], "raw_index": 2},
+  ]
+  projected = compact_messages_for_detail(
+    [{"role": "assistant", "blocks": blocks}],
+    message_offset=0, binding=EMPTY_RECALL_BINDING,
+  )[0]["blocks"]
+  assert [b["type"] for b in projected] == ["tool", "goal_history", "question"]
+  assert projected[-1]["raw_index"] == 2
+
+
 def test_image_reads_stay_distinctive_and_question_twins_are_not_rendered():
   messages = [{
     "role": "assistant",
