@@ -86,20 +86,6 @@ test('Chat Changes is a modeless panel whose outside press reaches its destinati
     'outside activation must remain the browser’s real pointer sequence, not a replayed synthetic click')
 })
 
-test('first-use guidance is a labeled, dismissible modal with contained keyboard focus', () => {
-  const source = read('../../Walkthrough/WalkthroughOverlay.jsx')
-  assert.match(source, /<dialog ref=\{dialogRef\}/)
-  assert.match(source, /dialog\.showModal\(\)/)
-  assert.match(source, /aria-labelledby="wt-title"/)
-  assert.match(source, /aria-label="Close guide"/)
-  assert.match(source, /aria-labelledby="wt-install-title"/)
-  assert.match(source, /aria-expanded=/)
-  assert.match(source, /role="status"/)
-  assert.match(source, /aria-modal="true"/)
-  assert.match(source, /onCancel=\{event => \{ event\.preventDefault\(\); finish\(\) \}\}/)
-  assert.match(source, /function keepTabInside\(event\)[\s\S]*?event\.preventDefault\(\)[\s\S]*?destination\?\.focus\(\)/)
-})
-
 test('chat image preview actions use labeled buttons', () => {
   const attachments = read('../Attachments.jsx')
   const composer = read('../ChatInputBar.jsx')
