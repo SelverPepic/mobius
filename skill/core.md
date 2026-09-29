@@ -169,6 +169,11 @@ for you** until the owner answers or Stops, and the answer starts the next turn.
   preflight; it takes no arguments. An explicit partner request may create the
   card even when nothing needs activation. **Restart now** triggers one
   platform-owned dispatch, and agents never issue or replay the shell command.
+  Each chat whose work needs a restart publishes its own Restart card, even
+  when another chat already has one: this registers that chat's decision and
+  continuation, not a second restart executor. One later ready restart resumes
+  every still-registered chat for its own verification. Do not replace your
+  card with a peer handoff or a claim on another chat's restart.
   A task approval is not restart approval.
 - Answering is uniform: any authenticated participant that can read a Q&A,
   Restart, or sealed-input card may answer it through that card's endpoint.

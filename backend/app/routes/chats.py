@@ -37,8 +37,8 @@ from app.chat_visibility import (
 from app.chat_event_sink import active_sink_assistant_message_id
 from app.chat_activity import chat_activity_page
 from app.chat_waits import (
-  armed_wait_chat_ids,
-  armed_waits_for_chat,
+  outstanding_wait_chat_ids,
+  outstanding_waits_for_chat,
   serialize_wait,
 )
 from app.config import get_settings
@@ -765,7 +765,7 @@ def _chat_detail_response(
     # an embedded app frame has no business reading (same boundary as
     # session_id).
     "waits": [
-      serialize_wait(row) for row in armed_waits_for_chat(db, chat.id)
+      serialize_wait(row, db=db) for row in outstanding_waits_for_chat(db, chat.id)
     ] if expose_session else [],
     "background_helpers": (
       serialize_background_helpers(db, chat.id)
@@ -867,7 +867,7 @@ def list_chats(
     chats = [c for c in chats if _visible_in_owner_drawer(c)]
   durable_running = running_chat_ids(db, (chat.id for chat in chats))
   durable_waiting = (
-    armed_wait_chat_ids(db)
+    outstanding_wait_chat_ids(db)
     | background_helper_chat_ids(db, (chat.id for chat in chats))
     | usage_limit_waiting_chat_ids(db, (chat.id for chat in chats))
   )
@@ -1744,7 +1744,7 @@ def get_chat_runtime(
     "pending_question_id": _open_question_id_for(chat),
     "updated_at": chat.updated_at.isoformat() if chat.updated_at else None,
     "waits": [
-      serialize_wait(row) for row in armed_waits_for_chat(db, chat.id)
+      serialize_wait(row, db=db) for row in outstanding_waits_for_chat(db, chat.id)
     ] if principal.scope != "chat_embed" else [],
     "background_helpers": (
       serialize_background_helpers(db, chat.id)
