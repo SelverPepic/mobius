@@ -270,6 +270,78 @@ def test_usage_limit_waiting_ignores_non_usage_parks(chat, db):
   assert usage_limit_waiting_chat_ids(db, [chat.id]) == set()
 
 
+@pytest.mark.parametrize("status", ["parked", "resume_pending"])
+@pytest.mark.parametrize("park_reason", ["restart", "model_capacity"])
+@pytest.mark.parametrize("hold,replayed,expected", [
+  (True, None, "restoring_edits"),
+  (True, "restored-sha", "restart_required"),
+  (False, "restored-sha", "restart"),
+])
+def test_continuation_wait_agrees_across_detail_and_runtime(
+  client, auth, chat, db, monkeypatch, status, hold, replayed, expected, park_reason,
+):
+  from app import platform_update
+  monkeypatch.setattr(platform_update, "late_edits_pending", lambda: hold)
+  monkeypatch.setattr(platform_update, "read_prepared_update", lambda: {
+    "replayed": replayed,
+  })
+  base = datetime.now(UTC)
+  db.add(make_goal_run(db,
+    id="restart-wait", chat_id=chat.id, status=status, provider="codex",
+    park_reason=park_reason, started_at=base,
+  ))
+  db.commit()
+
+  def read_wait():
+    detail = client.get(f"/api/chats/{chat.id}", headers=auth).json()
+    runtime = client.get(f"/api/chats/{chat.id}/runtime", headers=auth).json()
+    assert runtime["continuation_wait"] == detail["continuation_wait"]
+    return runtime["continuation_wait"]
+
+  reason = read_wait()
+  if park_reason == "model_capacity" and not hold:
+    expected = None
+  assert reason == expected
+  # Reading presentation must not launch, retire or otherwise mutate the park.
+  db.expire_all()
+  assert db.get(models.ChatRun, "restart-wait").status == status
+  db.add(make_goal_run(db,
+    id="newer-run", chat_id=chat.id, status="completed", provider="codex",
+    started_at=base + timedelta(seconds=1),
+  ))
+  db.commit()
+  reason = read_wait()
+  assert reason is None
+
+
+@pytest.mark.parametrize("status", ["interrupted", "completed", "failed"])
+@pytest.mark.parametrize("park_reason", ["restart", "model_capacity"])
+def test_terminal_recovery_history_never_claims_to_be_waiting(chat, db, status, park_reason):
+  from app.chat import continuation_wait_for_chat
+  db.add(make_goal_run(db,
+    id="old-restart", chat_id=chat.id, status=status, provider="codex",
+    park_reason=park_reason, started_at=datetime.now(UTC),
+  ))
+  db.commit()
+  assert continuation_wait_for_chat(db, chat.id) is None
+
+
+def test_busy_model_wait_clears_when_restored_work_is_loaded(chat, db, monkeypatch):
+  from app import platform_update
+  from app.chat import continuation_wait_for_chat
+  db.add(make_goal_run(db,
+    id="busy-model-wait", chat_id=chat.id, status="parked", provider="codex",
+    park_reason="model_capacity", started_at=datetime.now(UTC),
+  ))
+  db.commit()
+  monkeypatch.setattr(platform_update, "late_edits_pending", lambda: True)
+  monkeypatch.setattr(platform_update, "read_prepared_update", lambda: {"replayed": "restored"})
+  assert continuation_wait_for_chat(db, chat.id) == "restart_required"
+  monkeypatch.setattr(platform_update, "late_edits_pending", lambda: False)
+  assert continuation_wait_for_chat(db, chat.id) is None
+  assert db.get(models.ChatRun, "busy-model-wait").status == "parked"
+
+
 def test_chat_reads_retain_completed_and_paused_goals(client, auth, chat, db):
   completed_at = datetime.now(UTC)
   db.add_all([

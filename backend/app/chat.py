@@ -420,6 +420,26 @@ def usage_limit_waiting_chat_ids(
   return {cid for cid in candidates if _latest_run_is_usage_park(db, cid)}
 
 
+def continuation_wait_for_chat(db: Session, chat_id: str) -> str | None:
+  """Project restart and busy-model holds without changing recovery admission.
+
+  The transcript records why a turn stopped; this live projection explains
+  what it is waiting for now. Never attach a current blocker to a superseded
+  park or a run already retired to manual recovery.
+  """
+  run = _latest_continuation_park(db, chat_id)
+  if run is None or run.park_reason not in {"restart", "model_capacity"}:
+    return None
+  from app.platform_update import late_edits_pending, read_prepared_update
+
+  if late_edits_pending():
+    update = read_prepared_update()
+    if update and update["replayed"]:
+      return "restart_required"
+    return "restoring_edits"
+  return "restart" if run.park_reason == "restart" else None
+
+
 def _restart_manual_hold_for_chat(db: Session, chat_id: str) -> bool:
   """Whether the latest run retired to manual restart recovery.
 

@@ -156,6 +156,7 @@ function MsgContentInner({
   // button. Compared in the memo below, so pass a stable reference.
   onResume,
   resumeState,
+  continuationWait = null,
   onInternalNav,
   autoResumeEnabled,
   autoResumeAvailable,
@@ -515,6 +516,7 @@ function MsgContentInner({
           <ErrorCard
             key={assistantBlockKey(block, i)}
             block={block}
+            continuationWait={recoveryOwner ? continuationWait : null}
             autoResume={automaticContinuation}
             resetElapsed={!!limitResetElapsed}
             recoveryCredit={recoveryCredit}
@@ -703,6 +705,7 @@ export default memo(MsgContentInner, (prev, next) => {
     && prev.onQuestionSubmitCancel === next.onQuestionSubmitCancel
     && prev.onResume === next.onResume
     && prev.resumeState === next.resumeState
+    && prev.continuationWait === next.continuationWait
     && prev.onInternalNav === next.onInternalNav
     && prev.autoResumeEnabled === next.autoResumeEnabled
     && prev.autoResumeAvailable === next.autoResumeAvailable

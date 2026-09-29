@@ -50,6 +50,7 @@ from app.chat import (
   recover_chat_generation,
   stop_chat_for,
   usage_limit_waiting_chat_ids,
+  continuation_wait_for_chat,
 )
 from app.broadcast import get_system_broadcast
 from app.recovery_notifications import (
@@ -738,6 +739,7 @@ def _chat_detail_response(
     "runtime_revision": runtime_revision,
     "active_assistant_message_id": _active_assistant_message_id(chat),
     "recovery_run_id": _recovery_run_id(db, chat.id),
+    "continuation_wait": continuation_wait_for_chat(db, chat.id),
     "active_goal_objective": active_goal_objective,
     "goal": goal,
     "pending_question_id": _open_question_id_for(chat),
@@ -1738,6 +1740,7 @@ def get_chat_runtime(
     "runtime_revision": runtime_revision,
     "active_assistant_message_id": _active_assistant_message_id(chat),
     "recovery_run_id": _recovery_run_id(db, chat.id),
+    "continuation_wait": continuation_wait_for_chat(db, chat.id),
     "active_goal_objective": running_goal_objective(db, chat.id),
     "goal": presented_goal(db, chat.id),
     "pending_messages": list(chat.pending_messages or []),
