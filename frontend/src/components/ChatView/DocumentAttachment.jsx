@@ -56,7 +56,6 @@ function PdfThumbnail({ chatId, file, visible }) {
 
   useEffect(() => {
     if (!visible) return undefined
-    const controller = new AbortController()
     let active = true
     let loadingTask = null
     let renderTask = null
@@ -64,14 +63,17 @@ function PdfThumbnail({ chatId, file, visible }) {
     setStatus('loading')
 
     async function renderFirstPage() {
-      const response = await apiFetch(filePath(chatId, file.name), { signal: controller.signal })
-      if (!response.ok) throw new Error(`HTTP ${response.status}`)
-      const bytes = new Uint8Array(await response.arrayBuffer())
+      const src = await freshFileUrl(chatId, file.name, true)
       if (!active) return
       const pdfjs = await import('pdfjs-dist')
       if (!active) return
       pdfjs.GlobalWorkerOptions.workerSrc = '/vendor/pdfjs/pdf.worker.mjs'
-      loadingTask = pdfjs.getDocument({ data: bytes })
+      // A collapsed card needs one page, not a copy of the whole PDF.
+      loadingTask = pdfjs.getDocument({
+        url: src,
+        disableStream: true,
+        disableAutoFetch: true,
+      })
       const pdf = await loadingTask.promise
       if (!active) return
       page = await pdf.getPage(1)
@@ -103,7 +105,6 @@ function PdfThumbnail({ chatId, file, visible }) {
     })
     return () => {
       active = false
-      controller.abort()
       renderTask?.cancel?.()
       page?.cleanup?.()
       void loadingTask?.destroy?.()
@@ -126,6 +127,7 @@ export default function DocumentAttachment({
   const visible = useCardVisibility(cardRef)
   const isMarkdown = file.mime_type === 'text/markdown'
   const [retry, setRetry] = useState(0)
+  const [excerpt, setExcerpt] = useState({ status: 'loading', text: '' })
   const [report, setReport] = useState({ status: 'loading', text: '' })
   const [pdfPreview, setPdfPreview] = useState({ status: 'loading', src: '' })
   const [downloadError, setDownloadError] = useState(false)
@@ -159,7 +161,24 @@ export default function DocumentAttachment({
   useEffect(() => {
     if (!isMarkdown || !visible) return undefined
     const controller = new AbortController()
-    setReport({ status: 'loading', text: '' })
+    apiFetch(filePath(chatId, file.name), {
+      signal: controller.signal,
+      headers: { Range: 'bytes=0-8191' },
+    })
+      .then(response => {
+        if (!response.ok) throw new Error(`HTTP ${response.status}`)
+        return response.text()
+      })
+      .then(text => setExcerpt({ status: 'ready', text }))
+      .catch(error => {
+        if (error.name !== 'AbortError') setExcerpt({ status: 'error', text: '' })
+      })
+    return () => controller.abort()
+  }, [chatId, file.name, isMarkdown, retry, visible])
+
+  useEffect(() => {
+    if (!isMarkdown || !expanded || report.status !== 'loading') return undefined
+    const controller = new AbortController()
     apiFetch(filePath(chatId, file.name), { signal: controller.signal })
       .then(response => {
         if (!response.ok) throw new Error(`HTTP ${response.status}`)
@@ -170,10 +189,10 @@ export default function DocumentAttachment({
         if (error.name !== 'AbortError') setReport({ status: 'error', text: '' })
       })
     return () => controller.abort()
-  }, [chatId, file.name, isMarkdown, retry, visible])
+  }, [chatId, expanded, file.name, isMarkdown, report.status, retry])
 
-  const excerpt = isMarkdown && report.status === 'ready'
-    ? markdownCardExcerpt(report.text)
+  const cardExcerpt = isMarkdown && excerpt.status === 'ready'
+    ? markdownCardExcerpt(excerpt.text)
     : null
   const kind = isMarkdown ? 'Markdown' : 'PDF'
   const size = `${Math.max(1, Math.round(file.size / 1024))} KB`
@@ -206,10 +225,10 @@ export default function DocumentAttachment({
       >
         <div className="chat__document-card-visual" aria-hidden="true">
           {isMarkdown ? <div className="chat__document-card-paper">
-            {excerpt ? <>
-              <strong>{excerpt.title || 'Markdown report'}</strong>
-              <p>{excerpt.body || 'Open to read this report.'}</p>
-            </> : <span>{report.status === 'error' ? 'Preview unavailable' : 'Preparing preview…'}</span>}
+            {cardExcerpt ? <>
+              <strong>{cardExcerpt.title || 'Markdown report'}</strong>
+              <p>{cardExcerpt.body || 'Open to read this report.'}</p>
+            </> : <span>{excerpt.status === 'error' ? 'Preview unavailable' : 'Preparing preview…'}</span>}
           </div> : <PdfThumbnail chatId={chatId} file={file} visible={visible} />}
         </div>
         <span className="chat__document-card-caption">
@@ -237,7 +256,10 @@ export default function DocumentAttachment({
         {report.status === 'loading' && <p role="status">Loading Markdown preview…</p>}
         {report.status === 'error' && <div role="alert">
           <p>Couldn’t load the preview. You can try again or download the file.</p>
-          <button type="button" onClick={() => setRetry(value => value + 1)}>Try again</button>
+          <button type="button" onClick={() => {
+            setReport({ status: 'loading', text: '' })
+            setRetry(value => value + 1)
+          }}>Try again</button>
         </div>}
         {report.status === 'ready' && <StandardMarkdown text={report.text} />}
       </div> : pdfPreview.status === 'ready'
