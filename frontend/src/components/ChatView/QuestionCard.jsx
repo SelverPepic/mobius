@@ -340,6 +340,11 @@ export default function QuestionCard({
         {questions.map((q, qi) => {
         const selected = answers[q.question]
         const isMulti = q.multiSelect
+        const options = q.options || []
+        const visibleOptions = writtenRestartAction
+          ? options.filter(opt => opt.id === platformAction.restart_option_id)
+          : options
+        const hasOptions = visibleOptions.length > 0
         const selectedArr = isMulti
           ? (Array.isArray(selected) ? selected : [])
           : []
@@ -355,8 +360,8 @@ export default function QuestionCard({
           : []
         const unmatchedAnswers = selectionLocked
           ? (isMulti
-              ? answeredArr.filter(v => !q.options?.some(o => o.label === v))
-              : (answeredValue && !q.options?.some(o => o.label === answeredValue)
+              ? answeredArr.filter(v => !options.some(o => o.label === v))
+              : (answeredValue && !options.some(o => o.label === answeredValue)
                   ? [answeredValue]
                   : []))
           : []
@@ -365,7 +370,7 @@ export default function QuestionCard({
           && submittedOptions
           && Object.keys(submittedOptions).length === 0
         )
-        const writtenAnswer = writtenRestartResponse
+        const writtenAnswer = writtenRestartResponse || !hasOptions
           ? answeredValue
           : unmatchedAnswers.join(', ')
         const answeredWithOther = writtenAnswer.length > 0
@@ -383,7 +388,7 @@ export default function QuestionCard({
                 and watched whether a prior pick cleared. Surface it up front:
                 a caption (with a live count for multi) plus a per-option glyph
                 (□ checkbox for multi, ○ radio for single). */}
-            {!completedAction && (!disabled || answered) && q.options?.length > 0 && (
+            {!completedAction && (!disabled || answered) && hasOptions && (
               <div className="qcard__hint">
                 {writtenRestartAction
                   ? 'Restart now, or reply below'
@@ -395,70 +400,65 @@ export default function QuestionCard({
             {/* Selection state was conveyed only by a CSS class — silent to
                 screen readers. Expose it as a radiogroup (single) / group of
                 checkboxes (multi) with per-option aria-checked. */}
-            {!completedAction && q.options?.length > 0 && <div
+            {!completedAction && hasOptions && <div
               className="qcard__opts"
               role={isMulti ? 'group' : 'radiogroup'}
               aria-label={q.question}
             >
               {/* For multi-select answered state, the comma-joined value is
                   parsed above so each chosen option highlights correctly. */}
-              {(() => {
-                const visibleOptions = writtenRestartAction
-                  ? q.options?.filter(opt => opt.id === platformAction.restart_option_id)
-                  : q.options
-                return visibleOptions?.map((opt, oi) => {
-                  const isChosen = selectionLocked
-                    ? (isMulti ? answeredArr.includes(opt.label) : answeredValue === opt.label)
-                    : false
-                  const isActive = selectionLocked
-                    ? isChosen
-                    : (isMulti ? selectedArr.includes(opt.label) : selected === opt.label)
-                  const dimmed = answered && !isChosen
-                  const OptionSurface = inactive ? 'div' : 'button'
-                  return (
-                    <OptionSurface
-                      key={oi}
-                      type={inactive ? undefined : 'button'}
-                      role={isMulti ? 'checkbox' : 'radio'}
-                      aria-checked={isActive}
-                      aria-disabled={inactive || undefined}
-                      className={`qcard__opt${isActive ? ' qcard__opt--on' : ''}${dimmed ? ' qcard__opt--dim' : ''}${inactive ? ' qcard__opt--static' : ''}`}
-                      onPointerDown={inactive ? undefined : () => {
-                        pointerSelectionRef.current = textSelectionSnapshot()
-                      }}
-                      onClick={inactive ? undefined : (event) => {
-                        const selectionBeforePointer = pointerSelectionRef.current
-                        pointerSelectionRef.current = null
-                        if (
-                          event.detail !== 0
-                          && pointerSelectionChangedWithin(
-                            selectionBeforePointer,
-                            event.currentTarget,
-                          )
-                        ) return
-                        selectOption(q.question, opt.label)
-                      }}
-                      title={opt.description || ''}
-                    >
-                      <span
-                        className={`qcard__mark qcard__mark--${isMulti ? 'box' : 'radio'}`}
-                        aria-hidden="true"
-                      />
-                      {/* Description renders inline, not only as title= — a
-                          title tooltip is invisible on touch, and this is a
-                          phone-first surface. */}
-                      {opt.description ? (
-                        <span className="qcard__opt-body">
-                          <span className="qcard__opt-label">{opt.label}</span>
-                          <span className="qcard__opt-desc">{opt.description}</span>
-                        </span>
-                      ) : (
-                        opt.label
-                      )}
-                    </OptionSurface>
-                  )
-                })
-              })()}
+              {visibleOptions.map((opt, oi) => {
+                const isChosen = selectionLocked
+                  ? (isMulti ? answeredArr.includes(opt.label) : answeredValue === opt.label)
+                  : false
+                const isActive = selectionLocked
+                  ? isChosen
+                  : (isMulti ? selectedArr.includes(opt.label) : selected === opt.label)
+                const dimmed = answered && !isChosen
+                const OptionSurface = inactive ? 'div' : 'button'
+                return (
+                  <OptionSurface
+                    key={oi}
+                    type={inactive ? undefined : 'button'}
+                    role={isMulti ? 'checkbox' : 'radio'}
+                    aria-checked={isActive}
+                    aria-disabled={inactive || undefined}
+                    className={`qcard__opt${isActive ? ' qcard__opt--on' : ''}${dimmed ? ' qcard__opt--dim' : ''}${inactive ? ' qcard__opt--static' : ''}`}
+                    onPointerDown={inactive ? undefined : () => {
+                      pointerSelectionRef.current = textSelectionSnapshot()
+                    }}
+                    onClick={inactive ? undefined : (event) => {
+                      const selectionBeforePointer = pointerSelectionRef.current
+                      pointerSelectionRef.current = null
+                      if (
+                        event.detail !== 0
+                        && pointerSelectionChangedWithin(
+                          selectionBeforePointer,
+                          event.currentTarget,
+                        )
+                      ) return
+                      selectOption(q.question, opt.label)
+                    }}
+                    title={opt.description || ''}
+                  >
+                    <span
+                      className={`qcard__mark qcard__mark--${isMulti ? 'box' : 'radio'}`}
+                      aria-hidden="true"
+                    />
+                    {/* Description renders inline, not only as title= — a
+                        title tooltip is invisible on touch, and this is a
+                        phone-first surface. */}
+                    {opt.description ? (
+                      <span className="qcard__opt-body">
+                        <span className="qcard__opt-label">{opt.label}</span>
+                        <span className="qcard__opt-desc">{opt.description}</span>
+                      </span>
+                    ) : (
+                      opt.label
+                    )}
+                  </OptionSurface>
+                )
+              })}
             </div>}
             {(!completedAction || respondedRestartAction)
               && (!restartAction || writtenRestartAction) && (
@@ -469,7 +469,7 @@ export default function QuestionCard({
                 disabled={inactive}
                 placeholder={writtenRestartAction
                   ? 'Or tell me what you’d like to do instead…'
-                  : q.options?.length ? undefined : 'Type your answer…'}
+                  : hasOptions ? undefined : 'Type your answer…'}
                 onChange={text => setOtherText(q.question, text)}
                 onSubmitShortcut={(questionCard) => {
                   if (allAnswered) handleSubmit(questionCard, null)
