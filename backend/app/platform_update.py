@@ -132,7 +132,6 @@ _LATE_REF = "refs/mobius/update-late"
 # need the rolled-back image's packages, so they are never merged back
 # automatically.
 _SET_ASIDE_PREFIX = "refs/mobius/platform-set-aside"
-_SET_ASIDE_KEEP = 5
 # Written by the image entrypoint once this boot's own boot transaction
 # (``app.platform_boot``) succeeded; it holds that transaction's protocol.
 BOOT_TRANSACTION_MARKER = Path("/tmp/platform-boot-transaction")
@@ -3547,12 +3546,6 @@ def _keep_set_aside(repo: Path, commit: str) -> str:
   stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
   ref = f"{_SET_ASIDE_PREFIX}/{stamp}"
   _git("update-ref", ref, commit, repo=repo)
-  kept = _git(
-    "for-each-ref", "--sort=-refname", "--format=%(refname)", _SET_ASIDE_PREFIX,
-    repo=repo, check=False,
-  ).stdout.split()
-  for old in kept[_SET_ASIDE_KEEP:]:
-    _git("update-ref", "-d", old, repo=repo, check=False)
   return ref
 
 
