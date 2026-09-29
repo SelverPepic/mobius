@@ -1327,6 +1327,138 @@ test('a hidden chat performs no scroll work and returns to its saved hold', () =
   }
 })
 
+// Model the real scroll box and row rects: a hidden prefix can clamp the
+// physical viewport while the controller retains its semantic reading hold.
+function mountHeldRefreshController(chatId) {
+  const mounted = mountTailController(chatId)
+  const { scroll, list, assistant, listeners } = mounted
+  scroll.getBoundingClientRect = () => ({ top: 0, bottom: 500, height: 500 })
+  assistant.getBoundingClientRect = () => ({
+    top: assistant.offsetTop - scroll.scrollTop,
+    bottom: assistant.offsetTop + assistant.offsetHeight - scroll.scrollTop,
+    height: assistant.offsetHeight,
+  })
+  assistant.offsetHeight = 1000
+  list.offsetHeight = 1100
+  scroll.scrollHeight = 1600
+  listeners.get('wheel')({ type: 'wheel', deltaY: -100, target: scroll })
+  scroll.scrollTop = 500
+  listeners.get('scroll')()
+  listeners.get('scrollend')()
+  return mounted
+}
+
+for (const phase of ['preparing', 'cache-validating']) {
+  test(`a retained reading hold is repaired before refreshed ${phase} contents reveal`, (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    const observers = []
+    const restoreBrowser = installBrowserEnvironment({ observers })
+    let mounted
+    try {
+      mounted = mountHeldRefreshController(`refresh-${phase}`)
+      const { hook, scroll, list, assistant, args } = mounted
+      t.mock.timers.tick(50)
+      assert.equal(hook.result.current.revealed, true)
+      hook.rerender({ ...args, initialEntryPhase: phase })
+      // The hidden replacement shrank the scroll range. Its complete commit
+      // then moves the same addressed row without changing message count.
+      scroll.scrollTop = 0
+      assistant.offsetTop = 600
+      list.offsetHeight = 1600
+      scroll.scrollHeight = 2100
+      hook.rerender({ ...args, initialEntryPhase: 'ready' })
+      assert.equal(scroll.scrollTop, 1000,
+        'ready must repair the retained hold in the layout commit, not after a visible frame')
+      assert.equal(scroll.dataset.scrollMode, 'ANCHOR_AT',
+        'refresh must preserve reading intent rather than creating follow or pin authority')
+      const activeObserver = observers.filter(observer => !observer.disconnected).at(-1)
+      activeObserver.callback([])
+      assert.equal(scroll.scrollTop, 1000,
+        'the later resize delivery must be an idempotent verification')
+    } finally {
+      mounted?.hook.unmount()
+      restoreBrowser()
+    }
+  })
+}
+
+test('a temporarily missing nested refresh target does not retarget the reading hold', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const observers = []
+  const restoreBrowser = installBrowserEnvironment({ observers })
+  let mounted
+  try {
+    mounted = mountHeldRefreshController('refresh-missing-part')
+    const { hook, scroll, assistant, args, listeners } = mounted
+    const part = fakeElement({ offsetTop: 100, offsetHeight: 1000 })
+    part.getBoundingClientRect = () => ({
+      top: part.offsetTop - scroll.scrollTop,
+      bottom: part.offsetTop + part.offsetHeight - scroll.scrollTop,
+    })
+    assistant.children = [part]
+    listeners.get('wheel')({ type: 'wheel', deltaY: -100, target: scroll })
+    listeners.get('scroll')()
+    listeners.get('scrollend')()
+    t.mock.timers.tick(50)
+    const saved = JSON.parse(localStorage.getItem('chat-reading-position'))['refresh-missing-part']
+    assert.deepEqual(saved.part, [0])
+    hook.rerender({ ...args, initialEntryPhase: 'preparing' })
+    assistant.children = []
+    scroll.scrollTop = 0
+    hook.rerender({ ...args, initialEntryPhase: 'ready' })
+    assert.equal(scroll.scrollTop, 0,
+      'an absent part must not silently resolve against the enormous parent row')
+    const retained = JSON.parse(localStorage.getItem('chat-reading-position'))['refresh-missing-part']
+    assert.deepEqual(retained.part, [0], 'temporary absence must not destroy the saved location')
+    assistant.children = [part]
+    observers.filter(observer => !observer.disconnected).at(-1).callback([])
+    assert.equal(scroll.scrollTop, 500, 'the same hold resumes once its part returns')
+  } finally {
+    mounted?.hook.unmount()
+    restoreBrowser()
+  }
+})
+
+test('refresh anchor repair yields to newer reader input', () => {
+  const restoreBrowser = installBrowserEnvironment()
+  let mounted
+  try {
+    mounted = mountHeldRefreshController('refresh-reader-owns')
+    const { hook, scroll, assistant, args, listeners } = mounted
+    listeners.get('wheel')({ type: 'wheel', deltaY: -100, target: scroll })
+    assistant.offsetTop = 600
+    hook.rerender({ ...args, initialEntryPhase: 'cached' })
+    assert.equal(scroll.scrollTop, 500,
+      'a pending wheel gesture owns the viewport even when the retained anchor moved')
+  } finally {
+    mounted?.hook.unmount()
+    restoreBrowser()
+  }
+})
+
+test('refreshing unchanged anchored geometry adds no scroll writes', () => {
+  const restoreBrowser = installBrowserEnvironment()
+  let mounted
+  try {
+    mounted = mountHeldRefreshController('refresh-no-write')
+    const { hook, scroll, args } = mounted
+    // Commit the gesture's new semantic mode before measuring steady refresh.
+    hook.rerender({ ...args, initialEntryPhase: 'cached' })
+    let top = scroll.scrollTop
+    let writes = 0
+    Object.defineProperty(scroll, 'scrollTop', {
+      get: () => top,
+      set(value) { writes += 1; top = value },
+    })
+    hook.rerender({ ...args, initialEntryPhase: 'cached' })
+    hook.rerender({ ...args, initialEntryPhase: 'ready' })
+    assert.equal(writes, 0, 'a refresh is not a second automatic scroll authority')
+  } finally {
+    mounted?.hook.unmount()
+    restoreBrowser()
+  }
+})
+
 test('an empty chat keeps its first-send pin when the transcript mounts', () => {
   const observers = []
   const restoreBrowser = installBrowserEnvironment({ observers })
@@ -1497,4 +1629,61 @@ test('stream and row churn cannot restart the absolute reveal deadline', () => {
     globalThis.clearTimeout = previousClearTimeout
     restoreBrowser()
   }
+})
+
+test('restored-open activity blocks quiet and safety-cap reveal, then wakes on its readiness marker', t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const restoreBrowser = installBrowserEnvironment()
+  const mutations = []
+  globalThis.MutationObserver = class {
+    constructor(callback) { this.callback = callback; mutations.push(this) }
+    observe(target, options) { this.options = options }
+    disconnect() { this.disconnected = true }
+  }
+  try {
+    let pending = true
+    // Hold data loading so the pending layout can exist before first restore.
+    const { hook, scroll, args } = mountTailController('restore-expanded-ready', {
+      initialEntryPhase: 'preparing',
+    })
+    const query = scroll.querySelector.bind(scroll)
+    scroll.querySelector = selector => selector === '[data-reading-layout-pending="true"]'
+      ? (pending ? {} : null) : query(selector)
+    hook.rerender({ ...args, initialEntryPhase: 'ready' })
+    t.mock.timers.tick(2000)
+    assert.equal(hook.result.current.revealed, false, 'deadline cannot expose incomplete reading layout')
+    assert.equal(scroll.dataset.scrollMode, 'INITIAL')
+    const observer = mutations.filter(o => !o.disconnected).at(-1)
+    assert.deepEqual(observer.options.attributeFilter, ['data-reading-layout-pending'])
+    pending = false
+    observer.callback([{ type: 'attributes', attributeName: 'data-reading-layout-pending' }])
+    t.mock.timers.tick(50)
+    assert.equal(hook.result.current.revealed, true, 'settled or failed detail releases the existing gate')
+    assert.equal(scroll.dataset.scrollMode, 'ANCHOR_AT')
+    hook.unmount()
+  } finally { restoreBrowser() }
+})
+
+test('late peer projection repairs the same reading coordinate before an observer can reveal its shift', t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const restoreBrowser = installBrowserEnvironment()
+  try {
+    const { hook, scroll, assistant, list } = mountHeldRefreshController('peer-projection-hold')
+    t.mock.timers.tick(50)
+    const before = scroll.scrollTop
+    assistant.offsetTop += 32
+    list.offsetHeight += 32
+    scroll.scrollHeight += 32
+    hook.result.current.reapplyActiveMode()
+    assert.equal(scroll.scrollTop, before + 32)
+    assert.equal(scroll.dataset.scrollMode, 'ANCHOR_AT')
+    let writes = 0
+    let top = scroll.scrollTop
+    Object.defineProperty(scroll, 'scrollTop', {
+      configurable: true, get: () => top, set: value => { writes++; top = value },
+    })
+    hook.result.current.reapplyActiveMode()
+    assert.equal(writes, 0, 'unchanged projection does not write during ordinary render churn')
+    hook.unmount()
+  } finally { restoreBrowser() }
 })

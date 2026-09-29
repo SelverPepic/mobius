@@ -2857,7 +2857,11 @@ export default function ChatView({
       // ~90ms on-device reflow). This keeps switching responsive at the layer that
       // owns the transcript, without deferring the shell's nav dispatch — which
       // raced chat bootstrap/materialization and double-created starter chats.
-      if (activationCacheReusable && cacheCoversSavedAnchor && !anchorRetired) {
+      // Nested-coordinate validation does not make a complete mounted window
+      // cold. Slicing its replacement would destroy retained expanded details
+      // and clamp the reader through each prefix. Runtime reuse/fallback still
+      // requires the stronger activationCacheReusable proof above.
+      if (activationCacheEntryState !== 'missing' && !anchorRetired) {
         startTransition(() => {
           applyMessagesToView(refreshed.messages, refreshed.offset)
           settleRuntime(runtime, refreshed.messages)
@@ -5094,16 +5098,6 @@ export default function ChatView({
     }
   }, [freezeForegroundReturn, turnActive])
 
-  // Reconnect catch-up and authoritative compact reads are the two atomic
-  // transcript-source handoffs. Either can re-settle row geometry without
-  // changing the message count. Re-apply the mode already owned by the scroll
-  // controller in the same pre-paint commit; before reveal, hide-then-reveal
-  // already owns the position and reapplyActiveMode deliberately no-ops.
-  useLayoutEffect(() => {
-    if (catchUpCommitSeq === 0 && transcriptReconcileSeq === 0) return
-    reapplyActiveMode()
-  }, [catchUpCommitSeq, transcriptReconcileSeq, reapplyActiveMode])
-
   // Promotion and this sequence update share one React batch, so the terminal
   // pin decision runs after the settled assistant DOM is committed and before
   // paint. This avoids racing a concurrent commit from the stream callback.
@@ -5837,6 +5831,12 @@ export default function ChatView({
     streamItems,
     showActiveAssistantSurface ? activeMirrorMsgIdx : -1,
   )
+  // Activity projection is a transcript-source commit too: peer rows may
+  // arrive after the first reveal without changing message count. Keep all
+  // source handoffs in the controller's same pre-paint transaction.
+  useLayoutEffect(() => {
+    reapplyActiveMode()
+  }, [catchUpCommitSeq, transcriptReconcileSeq, peerTimeline.activityEvents, reapplyActiveMode])
   const projectedActiveMirrorMsg = activeMirrorMsg?.id
     ? peerTimeline.messages.find(message => message.id === activeMirrorMsg.id)
       || activeMirrorMsg
