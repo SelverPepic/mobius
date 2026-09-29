@@ -489,6 +489,58 @@ def test_build_smoke_runs_the_service_setup_and_names_a_missing_import(
     app_python_env.prepare_env(tmp_path, 7, root)
 
 
+@pytest.mark.parametrize("reused", [False, True], ids=["new-env", "reused-env"])
+def test_candidate_smokes_both_service_and_python_job(monkeypatch, tmp_path, reused):
+  lock = "a==1\n"
+  root = _runtime_tree(
+    tmp_path / "rev", lock=lock, service=b"import json\n",
+    job=b"#!/usr/bin/env python3\nimport pathlib\n",
+  )
+  builds = _fake_builds(monkeypatch)
+  if reused:
+    _fake_env(_keyed(tmp_path, 7, lock))
+  actual_run = app_python_env._run
+  checked = []
+
+  def observe(command, **kwargs):
+    if kwargs["step"].startswith("Starting the app's"):
+      checked.append((command[-2], Path(command[-1]).name))
+    return actual_run(command, **kwargs)
+
+  monkeypatch.setattr(app_python_env, "_run", observe)
+  staged = app_python_env.prepare_env(tmp_path, 7, root)
+  assert staged.reused is reused
+  assert builds == ([] if reused else [lock])
+  assert checked == [("service", "service.py"), ("job", "job.py")]
+  app_python_env.discard_env(staged)
+
+
+@pytest.mark.parametrize("entry", ["service", "job"])
+@pytest.mark.parametrize("reused", [False, True], ids=["new-env", "reused-env"])
+def test_candidate_rejects_changed_python_entry_even_with_same_lock(
+  monkeypatch, tmp_path, entry, reused,
+):
+  lock = "a==1\n"
+  root = _runtime_tree(
+    tmp_path / "rev", lock=lock, service=b"import json\n",
+    job=b"#!/usr/bin/env python3\nimport pathlib\n",
+  )
+  _fake_builds(monkeypatch)
+  if reused:
+    _fake_env(_keyed(tmp_path, 7, lock))
+  missing = f"not_locked_for_{entry}"
+  shebang = "#!/usr/bin/env python3\n" if entry == "job" else ""
+  (root / f"{entry}.py").write_text(f"{shebang}import {missing}\n")
+
+  with pytest.raises(app_python_env.PythonEnvBuildError, match=missing):
+    app_python_env.prepare_env(tmp_path, 7, root)
+
+  if reused:
+    assert _keyed(tmp_path, 7, lock).exists()
+  else:
+    assert list((tmp_path / "app-envs" / "builds").iterdir()) == []
+
+
 def test_build_step_timeout_kills_the_whole_process_group(monkeypatch, tmp_path):
   marker = tmp_path / "survivor"
   child = f"import time; time.sleep(2); open({str(marker)!r}, 'w')"
@@ -593,7 +645,7 @@ def test_publication_replaces_only_a_link_whose_build_is_gone(tmp_path):
 
 # --- Apply -----------------------------------------------------------------
 
-def _source(lock: str | None, job: bytes | None = None) -> Path:
+def _source(lock: str | None, job: bytes | None = None, service: bytes | None = None) -> Path:
   root = _data_dir() / "apps" / "deps-demo"
   root.mkdir(parents=True, exist_ok=True)
   extra = {"source_files": []}
@@ -603,6 +655,10 @@ def _source(lock: str | None, job: bytes | None = None) -> Path:
   if job is not None:
     (root / "job.py").write_bytes(job)
     extra["schedule"] = {"job": "job.py"}
+  if service is not None:
+    (root / "service.py").write_bytes(service)
+    extra["service"] = {"entry": "service.py"}
+    extra["source_files"].append("service.py")
   (root / "mobius.json").write_text(json.dumps(_manifest(**extra)))
   (root / "index.jsx").write_text("export default function App() { return <div>x</div> }\n")
   return root
@@ -633,6 +689,27 @@ def test_apply_build_failure_keeps_the_previous_revision_live(
   db.expire_all()
   assert db.get(models.App, app_id).runtime_revision == previous
   assert not app_python_env.envs_parent(_data_dir(), app_id).exists()
+
+
+def test_apply_rejects_changed_service_with_reused_lock_and_keeps_previous_revision(
+  client, auth, db, monkeypatch,
+):
+  builds = _fake_builds(monkeypatch)
+  source = _source(lock="a==1\n", service=b"import json\n")
+  first = _apply(client, auth, source)
+  assert first.status_code == 200, first.text
+  app_id = first.json()["app"]["id"]
+  previous = db.get(models.App, app_id).runtime_revision
+
+  (source / "service.py").write_bytes(b"import missing_from_same_lock\n")
+  failed = _apply(client, auth, source)
+  assert failed.status_code == 422, failed.text
+  assert failed.json()["detail"]["code"] == "python_env_failed"
+  assert "missing_from_same_lock" in failed.json()["detail"]["message"]
+  db.expire_all()
+  assert db.get(models.App, app_id).runtime_revision == previous
+  assert builds == ["a==1\n"]
+  assert _keyed(_data_dir(), app_id, "a==1\n").exists()
 
 
 def test_apply_rejects_an_unredirectable_python_job_in_a_declaring_app(
@@ -728,7 +805,8 @@ def store(monkeypatch):
   monkeypatch.setattr("app.install.CRON_SCAFFOLD", Path("/nonexistent/scaffold.sh"))
   base = "https://deps.test/repo/"
 
-  def install(client, auth, *, lock: str, version: str):
+  def install(client, auth, *, lock: str, version: str,
+              service: bytes = b"import json, sys\n"):
     manifest = _manifest(
       version=version, python={"lock": "requirements.lock"},
       service={"entry": "service.py"},
@@ -737,7 +815,7 @@ def store(monkeypatch):
     responses = {
       base + "mobius.json": (200, json.dumps(manifest).encode()),
       base + "index.jsx": (200, b"export default function App() { return <div>x</div> }"),
-      base + "service.py": (200, b"import json, sys\n"),
+      base + "service.py": (200, service),
       base + "requirements.lock": (200, lock.encode()),
     }
     with patch("app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses)):
@@ -800,6 +878,28 @@ def test_store_update_rebuilds_for_a_new_lock_and_a_failed_build_keeps_the_old_o
   assert db.get(models.App, app_id).runtime_revision == live
   assert _keyed(_data_dir(), app_id, "a==2\n").exists()
   assert not _keyed(_data_dir(), app_id, "brokenpkg==1\n").exists()
+
+
+def test_store_update_rejects_changed_service_with_reused_lock(
+  client, auth, db, monkeypatch, store,
+):
+  builds = _fake_builds(monkeypatch)
+  first = store(client, auth, lock="a==1\n", version="1.0.0")
+  assert first.status_code == 201, first.text
+  app_id = first.json()["id"]
+  previous = db.get(models.App, app_id).runtime_revision
+
+  failed = store(
+    client, auth, lock="a==1\n", version="1.1.0",
+    service=b"import missing_from_store_update\n",
+  )
+  assert failed.status_code == 422, failed.text
+  assert failed.json()["detail"]["code"] == "python_env_failed"
+  assert "missing_from_store_update" in failed.json()["detail"]["message"]
+  db.expire_all()
+  assert db.get(models.App, app_id).runtime_revision == previous
+  assert builds == ["a==1\n"]
+  assert _keyed(_data_dir(), app_id, "a==1\n").exists()
 
 
 def test_store_update_whose_merged_lock_diverges_is_refused_and_leaves_no_build(
