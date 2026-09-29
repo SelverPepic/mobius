@@ -143,6 +143,36 @@ def python_lock(manifest) -> str | None:
   return python["lock"]
 
 
+def validate_setup(manifest) -> None:
+  """Validate optional setup steps and native Debian dependency strings."""
+  if not isinstance(manifest, Mapping):
+    _fail("Manifest must be an object.")
+  if "setup" not in manifest:
+    return
+  setup = manifest["setup"]
+  if not isinstance(setup, Mapping) or set(setup) - {"steps", "apt"}:
+    _fail("Manifest `setup` must be an object with only `steps` and `apt`.")
+  steps = setup.get("steps", [])
+  if not isinstance(steps, list):
+    _fail("Manifest `setup.steps` must be an array.")
+  source_files = manifest.get("source_files")
+  declared_sources = {
+    path for path in source_files if isinstance(path, str)
+  } if isinstance(source_files, list) else set()
+  for index, path in enumerate(steps):
+    validate_repo_relative_path(path, f"setup.steps[{index}]")
+    if path not in declared_sources:
+      _fail(f"Manifest `setup.steps[{index}]` must be listed in `source_files`.")
+  apt = setup.get("apt", [])
+  if not isinstance(apt, list) or any(
+    not isinstance(dependency, str) or not dependency.strip()
+    or dependency.startswith("-") or "\x00" in dependency
+    or "\n" in dependency or "\r" in dependency
+    for dependency in apt
+  ):
+    _fail("Manifest `setup.apt` must be an array of Debian dependency strings.")
+
+
 def python_job_arguments(interpreter: tuple[str, ...]) -> tuple[str, ...] | None:
   """The interpreter arguments of a Python job shebang, or None for another program.
 
@@ -800,6 +830,8 @@ def validate_manifest_contract(manifest) -> None:
           "node_modules/, the cron/job scripts, .bak snapshots, or the "
           "numeric-id storage tree)."
         )
+
+  validate_setup(manifest)
 
   agent_activities = manifest.get("agent_activities", {})
   if not isinstance(agent_activities, Mapping):

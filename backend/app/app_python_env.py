@@ -32,14 +32,18 @@ Lifecycle:
   smoke run checks the fetched service. When local edits are merged into the
   update, the locally merged service is not what was smoke-tested; only a
   changed lock is detected (and refused).
+- Restore (``rebuild_accepted_env``): after an image replacement, rebuild a
+  missing env from the frozen accepted runtime tree, never editable source.
+  Restoration uses the same validation and atomic publication as Apply. A
+  failure leaves the app's Python unavailable rather than falling back to the
+  platform interpreter.
 - Use (``resolve_env``): a declaring revision gets its env or
   ``PythonEnvUnavailable``, never the platform interpreter. A revision with no
   mobius.json is deliberately undeclared: accepted revisions may legitimately
   lack one (Store sources without a runtime manifest, legacy baselines). A
   manifest that exists but cannot be read fails closed instead. An image
-  replacement that changes the interpreter changes the key, so the process
-  fails with a message telling the owner to Apply the app again, which
-  rebuilds it (with network). ``activated_environment`` puts the env's
+  replacement changes the key, so processes fail closed while background
+  restoration is pending or if it fails. ``activated_environment`` puts the env's
   ``bin`` first on PATH so a subprocess ``python3`` is the env's too.
 - GC (``prune_envs``): ``applied_app_runtime.prune_runtime`` calls it under the
   runtime reader/job locks with the runtime trees it keeps, so an env lives
@@ -200,17 +204,25 @@ def compatibility_tag() -> str:
   """What a built env's binaries depend on in the running interpreter.
 
   The readable prefix names the ABI and platform; the digest also covers the
-  base executable's location (a venv links to it) and the C library version,
-  so moving or upgrading either in a new image selects a new env.
+  base executable's location (a venv links to it), the C library and full
+  Python version, and the baked image identity. Thus even a patch interpreter
+  upgrade or an image replacement with the same ABI selects a new env.
   """
   base = os.path.realpath(getattr(sys, "_base_executable", None) or sys.executable)
   libc = "-".join(platform.libc_ver())
+  build_info = Path(os.environ.get("MOBIUS_BUILD_INFO_PATH", "/app/build-info.json"))
+  try:
+    image_identity = hashlib.sha256(build_info.read_bytes()).hexdigest()
+  except OSError:
+    image_identity = "no-build-info"
   identity = "\0".join((
     sys.implementation.cache_tag or sys.implementation.name,
     sysconfig.get_platform(),
     sysconfig.get_config_var("SOABI") or "",
+    platform.python_version(),
     base,
     libc,
+    image_identity,
   ))
   readable = re.sub(r"[^A-Za-z0-9_.-]+", "_", (
     f"{sys.implementation.cache_tag}-{sysconfig.get_platform()}"
@@ -253,9 +265,9 @@ def resolve_env(data_dir: Path | str, app_id: int, runtime_root: Path) -> Path |
   env = envs_parent(data_dir, app_id) / key
   if not _usable(env):
     raise PythonEnvUnavailable(
-      "This app's Python environment is not built for the current platform "
-      "interpreter. Apply the app again to rebuild it (this needs network "
-      "access to download its locked packages)."
+      "This app's Python environment is unavailable for the current platform "
+      "interpreter. Automatic restoration runs after boot; inspect GET /api/setup "
+      "and retry with POST /api/setup/rerun if it fails."
     )
   return env
 
@@ -453,6 +465,19 @@ def prepare_env(
   return StagedEnv(key=key, root=build, reused=False)
 
 
+def rebuild_accepted_env(data_dir: Path | str, app_id: int, root: Path) -> Path | None:
+  """Restore the pinned accepted tree with the ordinary build/publication path."""
+  staged = prepare_env(data_dir, app_id, root)
+  if staged is None:
+    return None
+  try:
+    publish_env(data_dir, app_id, staged)
+  except BaseException:
+    discard_env(staged)
+    raise
+  return resolve_env(data_dir, app_id, root)
+
+
 def publish_env(data_dir: Path | str, app_id: int, staged: StagedEnv) -> PublishedEnv | None:
   """Link a validated build at its keyed location, never replacing a link.
 
@@ -564,3 +589,12 @@ def prune_envs(data_dir: Path | str, app_id: int, kept_runtimes) -> int:
       _remove_env(env, _builds(data_dir))
       removed += 1
   return removed
+
+
+if __name__ == "__main__":
+  # A separate process lets shutdown interrupt the existing synchronous pip
+  # builder without leaving an executor thread holding up a platform restart.
+  def stop_build(_signal, _frame):
+    raise SystemExit(1)  # _run/prepare_env already clean up on BaseException
+  signal.signal(signal.SIGTERM, stop_build)
+  rebuild_accepted_env(sys.argv[1], int(sys.argv[2]), Path(sys.argv[3]))

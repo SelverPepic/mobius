@@ -175,7 +175,7 @@ source, listed in `source_files`. It must include everything the app imports,
 since nothing is borrowed from the platform, and every package must have a
 wheel. Apply, Store install, and Store update build a virtual environment
 without system site-packages, published at `/data/app-envs/<app id>/<key>`,
-where the key combines the interpreter/ABI with the lock's SHA-256. The build
+where the key combines the interpreter/ABI, image identity, and lock's SHA-256. The build
 installs hash-checked wheels only, so no package build code runs. pip reads no
 configuration file and inherits only index, certificate, and proxy settings,
 and URL credentials are removed from any diagnostics returned. The build then
@@ -206,9 +206,19 @@ that changes the interpreter, the key no longer matches, and an accepted
 revision whose manifest cannot be read is treated the same way. A revision
 with no `mobius.json` at all is deliberately undeclared, because accepted
 revisions may legitimately lack one. Service calls
-answer 503 and the app's jobs log a failure until Apply rebuilds the
-environment, which needs network. Environments that no retained runtime
+answer 503 and the app's jobs log a failure until the background setup runner
+rebuilds from the accepted lock after boot and update settlement. This may
+need network; failures and explicit retries are available at `/api/setup`. Environments that no retained runtime
 revision references are removed with those revisions.
+
+Apps may also declare `"setup": {"steps": ["restore.sh"], "apt": ["foo (>= 2)"]}`.
+Scripts ship through `source_files`, need a shebang, and support `check` (exit
+0 ready, 1 needs apply, 2 conflict) and idempotent `apply`. The background
+runner uses accepted source as cwd, runs as `mobius` after readiness/update
+settlement, and combines all APT requirements. It does not gate app launches.
+Instance declarations use `/data/customizations/mobius.json`. Owner-authenticated
+`GET /api/setup` shows status; `POST /api/setup/rerun` queues a pass. See the
+platform-maintenance skill for setup guidance. No UI or ad-hoc install capture.
 
 Same-app calls use `/api/apps/{app_id}/service/{path}`. An app can expose a
 reviewed service to other installed apps at `/api/services/{service_id}/{path}`

@@ -61,14 +61,29 @@ Review the exact changed paths and use the smallest matching action:
    version. New processes can use the install immediately. A long-running
    backend needs one approved server restart only when it must load the new
    package itself.
-3. If shipped behavior depends on the package, record the same resolution in
-   the owning manifest and lockfile, plus the Dockerfile only when image wiring
-   is needed. These declarations are durability metadata, not an activation
-   action. Container replacement installs the official image, so a declaration
-   becomes durable only through the release that contains it: prepare it as an
-   upstream contribution. Committed only locally, it never reaches an image;
-   updates keep it in the checkout, report it as inactive, and never wait on
-   it.
+3. Install freely. To survive container replacement, declare setup rather
+   than relying on local image-file edits. Apps use `setup` in their accepted
+   `mobius.json`; instance-wide declarations use
+   `/data/customizations/mobius.json`. Both use this small shape:
+   `{"setup":{"steps":["restore.sh"],"apt":["poppler-utils (>= 25)"]},"source_files":["restore.sh"]}`.
+   Ship app scripts and inputs through `source_files`, then Apply. Instance
+   scripts live beside their manifest; after edits, request a re-run.
+   Scripts need a shebang and receive `check` or `apply` as their only argument,
+   with their source directory as cwd. `check` exits 0 when ready, 1 when apply
+   is needed, 2 for conflict; other exits fail. `apply` must be idempotent;
+   successful apply is checked again. Run as `mobius`, using existing sudo
+   where needed. Write persistent outputs under `/data`, not accepted source.
+   Version/lock syntax belongs to the underlying manager (`npm ci`, pip, etc.).
+   All `setup.apt` requirements are solved together with `apt-get satisfy`;
+   conflicts do not force removal or downgrades. Package lists refresh when
+   requirements are unmet; extra repository configuration stays explicit.
+   Restoration runs sequentially after readiness and update settlement, on
+   every boot and accepted declaration. It never holds up boot or updates.
+   Owner-authenticated `GET /api/setup` shows durable per-step state/output;
+   `POST /api/setup/rerun` queues another pass (also after instance edits).
+   Failed steps wait for a re-run, declaration acceptance, or the next boot.
+   There is no UI or automatic capture of ad-hoc installs. A root script can
+   still disrupt the platform: this is restoration, not a sandbox.
 4. Treat a container rebuild as a last resort, not an ordinary closeout step.
    Require it now only when the change genuinely cannot activate live, or when
    the partner explicitly asks to validate the image.

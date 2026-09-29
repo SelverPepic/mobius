@@ -202,6 +202,26 @@ def test_env_key_changes_with_the_lock_and_with_the_interpreter(monkeypatch):
   assert app_python_env.env_key(b"a==1\n") != first
 
 
+def test_env_key_changes_with_python_patch_version_and_image_bytes(tmp_path, monkeypatch):
+  build_info = tmp_path / "build-info.json"
+  build_info.write_bytes(b'{"sha":"first"}')
+  with monkeypatch.context() as patch:
+    patch.setenv("MOBIUS_BUILD_INFO_PATH", str(build_info))
+    patch.setattr(app_python_env.platform, "python_version", lambda: "3.13.1")
+    app_python_env.compatibility_tag.cache_clear()
+    first = app_python_env.env_key(b"a==1\n")
+
+    patch.setattr(app_python_env.platform, "python_version", lambda: "3.13.2")
+    app_python_env.compatibility_tag.cache_clear()
+    second = app_python_env.env_key(b"a==1\n")
+    assert second != first
+
+    build_info.write_bytes(b'{"sha":"second"}')
+    app_python_env.compatibility_tag.cache_clear()
+    assert app_python_env.env_key(b"a==1\n") != second
+  app_python_env.compatibility_tag.cache_clear()
+
+
 def test_undeclared_app_keeps_the_platform_interpreter_and_environment(tmp_path):
   root = _runtime_tree(tmp_path / "rev", lock=None)
   assert app_python_env.resolve_env(tmp_path, 7, root) is None
@@ -242,7 +262,7 @@ def test_malformed_accepted_python_declaration_fails_closed(tmp_path):
 
 def test_declared_app_never_falls_back_to_the_platform_interpreter(tmp_path, monkeypatch):
   root = _runtime_tree(tmp_path / "rev", lock="a==1\n")
-  with pytest.raises(app_python_env.PythonEnvUnavailable, match="Apply the app again"):
+  with pytest.raises(app_python_env.PythonEnvUnavailable, match="Automatic restoration"):
     app_python_env.resolve_env(tmp_path, 7, root)
 
   env = _keyed(tmp_path, 7, "a==1\n")
@@ -330,7 +350,7 @@ def test_job_runner_fails_a_declaring_apps_job_without_its_env(tmp_path, monkeyp
     run_lock_fd=0,
   )
   assert code == 4 and launched == []
-  assert "Apply the app again" in (tmp_path / "app-jobs.log").read_text()
+  assert "Automatic restoration" in (tmp_path / "app-jobs.log").read_text()
 
 
 # --- Services and preload hosts ----------------------------------------------
@@ -340,7 +360,7 @@ def test_service_without_its_env_fails_visibly_instead_of_borrowing(tmp_path):
   with pytest.raises(HTTPException) as caught:
     app_services.service_python_env(models.App(id=7, slug="deps-demo"), root / "service.py")
   assert caught.value.status_code == 503
-  assert "Apply the app again" in caught.value.detail
+  assert "Automatic restoration" in caught.value.detail
 
 
 @pytest.mark.asyncio
@@ -645,7 +665,7 @@ def test_apply_publishes_the_env_before_the_runtime_and_rebuilds_after_image_cha
   assert again.status_code == 200, again.text
   assert builds == ["a==1\n"]  # a matching env is reused
 
-  # A new image's interpreter: the env is reported missing until Apply rebuilds it.
+  # A new image's interpreter: the env is unavailable until restoration rebuilds it.
   monkeypatch.setattr(app_python_env, "compatibility_tag", lambda: "cpython-399-other")
   app_python_env.declared_key.cache_clear()
   with pytest.raises(app_python_env.PythonEnvUnavailable):
@@ -654,6 +674,29 @@ def test_apply_publishes_the_env_before_the_runtime_and_rebuilds_after_image_cha
   assert rebuilt.status_code == 200, rebuilt.text
   assert len(builds) == 2
   assert app_python_env.resolve_env(_data_dir(), row.id, root).name.startswith("cpython-399-other")
+
+
+def test_rebuild_accepted_env_uses_frozen_lock_after_image_change(
+  client, auth, db, monkeypatch,
+):
+  builds = _fake_builds(monkeypatch)
+  source = _source(lock="accepted==1\n")
+  created = _apply(client, auth, source)
+  assert created.status_code == 200, created.text
+  row = db.get(models.App, created.json()["app"]["id"])
+  accepted_root = applied_app_runtime.runtime_root(row)
+  assert builds == ["accepted==1\n"]
+
+  # The editable tree is not accepted input, even if it declares another lock.
+  (source / "requirements.lock").write_text("dirty==2\n")
+  monkeypatch.setattr(app_python_env, "compatibility_tag", lambda: "new-image")
+  app_python_env.declared_key.cache_clear()
+  rebuilt = app_python_env.rebuild_accepted_env(_data_dir(), row.id, applied_app_runtime.runtime_root(row))
+  assert rebuilt == app_python_env.resolve_env(_data_dir(), row.id, accepted_root)
+  assert rebuilt.name.startswith("new-image-")
+  assert builds == ["accepted==1\n", "accepted==1\n"]
+  assert app_python_env.rebuild_accepted_env(_data_dir(), row.id, applied_app_runtime.runtime_root(row)) == rebuilt
+  assert len(builds) == 2
 
 
 def test_apply_failure_after_env_publication_removes_the_new_env(
