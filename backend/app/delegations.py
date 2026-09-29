@@ -1947,8 +1947,11 @@ def _wake_recovery_groups(
       models.Delegation.parent_chat_id,
       models.Delegation.parent_root_run_id,
     )
+    .join(models.Chat, models.Chat.id == models.Delegation.parent_chat_id)
     .join(models.ChatRun, models.ChatRun.id == _latest_child_run_id())
     .filter(
+      # Leave results owed during the recovery window, but do not poll deleted parents.
+      models.Chat.deleted_at.is_(None),
       models.Delegation.notify_parent_on_complete.is_(True),
       models.Delegation.cancelled_at.is_(None),
       current_result_undelivered(),
@@ -2623,7 +2626,7 @@ async def _deliver_parent_wake_once(
         .filter(models.Chat.id == parent_chat_id)
         .first()
       )
-      if parent_chat is None:
+      if parent_chat is None or parent_chat.deleted_at is not None:
         return False
       repair_completed_activity_deliveries(db, parent_chat_id)
 
