@@ -979,6 +979,8 @@ def _process_tool_event(event: dict, assistant_blocks: list) -> bool:
       "mime_type": event.get("mime_type"),
       "previewable": event.get("previewable") is True,
     }
+    if isinstance(event.get("sha256"), str):
+      entry["sha256"] = event["sha256"]
     target = next((
       block for block in reversed(assistant_blocks)
       if block.get("type") == "generated_files"

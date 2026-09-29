@@ -75,21 +75,51 @@ test('a viewed /tmp image resolves through the owning chat only', () => {
   assert.equal(temporaryImageReference('/var/tmp/visual.png', 'chat-123'), null)
 })
 
-test('a viewed generated image uses its completed tool identity, not an open inbox URL', () => {
-  const path = '/data/chats/chat-123/deliverables/inbox/format comparison.png'
-  assert.deepEqual(generatedImageReference(path, 'chat-123', 'tool-7'), {
-    kind: 'generated-view',
-    chatId: 'chat-123',
-    toolUseId: 'tool-7',
-    filename: 'format comparison.png',
+test('a viewed generated image resolves only to matching final attachment bytes', () => {
+  const path = '/data/chats/chat-123/deliverables/inbox/image.png'
+  const digest = 'a'.repeat(64)
+  const files = [
+    { name: 'image.png', mime_type: 'image/png', previewable: true, sha256: 'b'.repeat(64) },
+    { name: 'image_1.png', mime_type: 'image/png', previewable: true, sha256: digest },
+  ]
+  const options = { files, viewedDigest: digest, completed: true }
+  const expected = {
+    kind: 'generated', chatId: 'chat-123', collection: 'generated-files',
+    filename: 'image_1.png', expectedSha256: digest,
+  }
+  assert.deepEqual(generatedImageReference(path, 'chat-123', options), expected)
+  assert.equal(generatedImageReference(path, 'chat-123', { files, viewedDigest: digest }), null)
+  assert.deepEqual(servedImageReference(path, 'chat-123', options), expected)
+  assert.equal(generatedImageReference(path, 'chat-123', { files, viewedDigest: 'c'.repeat(64), completed: true }), null)
+  assert.equal(generatedImageReference(path, 'chat-123', { files, viewedDigest: '', legacyName: true, completed: true }), null)
+  assert.equal(generatedImageReference(path, 'chat-123', { files }), null)
+  assert.equal(generatedImageReference(path, 'another-chat', options), null)
+  assert.equal(generatedImageReference('/data/chats/chat-123/deliverables/files/secret.png', 'chat-123', options), null)
+  assert.equal(generatedImageReference('/data/chats/chat-123/deliverables/inbox/nested/x.png', 'chat-123', options), null)
+  assert.equal(generatedImageReference('/other/chats/chat-123/deliverables/inbox/image.png', 'chat-123', options), null)
+})
+
+test('a saved view with no file fingerprint still requires a serve-time byte match', () => {
+  const digest = 'a'.repeat(64)
+  const path = '/data/chats/chat-123/deliverables/inbox/image.png'
+  const files = [{ name: 'image.png', mime_type: 'image/png', previewable: true }]
+  assert.deepEqual(generatedImageReference(path, 'chat-123', { files, viewedDigest: digest, completed: true }), {
+    kind: 'generated', chatId: 'chat-123', collection: 'generated-files',
+    filename: 'image.png', expectedSha256: digest,
   })
-  assert.deepEqual(servedImageReference(path, 'chat-123', 'tool-7'),
-    generatedImageReference(path, 'chat-123', 'tool-7'))
-  assert.equal(generatedImageReference(path, 'another-chat', 'tool-7'), null)
-  assert.equal(generatedImageReference(path, 'chat-123', ''), null)
-  assert.equal(generatedImageReference('/data/chats/chat-123/deliverables/files/secret.png', 'chat-123', 'tool-7'), null)
-  assert.equal(generatedImageReference('/data/chats/chat-123/deliverables/inbox/nested/x.png', 'chat-123', 'tool-7'), null)
-  assert.equal(generatedImageReference('/other/chats/chat-123/deliverables/inbox/image.png', 'chat-123', 'tool-7'), null)
+  assert.equal(generatedImageReference(path, 'chat-123', {
+    files: [{ ...files[0], sha256: 'b'.repeat(64) }], viewedDigest: digest, completed: true,
+  }), null)
+})
+
+test('a historical ViewImage can use only a same-turn final attachment by name', () => {
+  const path = '/data/chats/chat-123/deliverables/inbox/image.png'
+  const files = [{ name: 'image.png', mime_type: 'image/png', previewable: true }]
+  assert.deepEqual(generatedImageReference(path, 'chat-123', { files, legacyName: true, completed: true }), {
+    kind: 'generated', chatId: 'chat-123', collection: 'generated-files', filename: 'image.png',
+  })
+  assert.equal(generatedImageReference(path, 'chat-123', { files }), null)
+  assert.equal(generatedImageReference(path, 'chat-123', { files: [], legacyName: true, completed: true }), null)
 })
 
 test('a base64 image result is an explicit fallback for non-chat paths', () => {

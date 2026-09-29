@@ -29,6 +29,9 @@ INLINE_PREVIEW_MIME_TYPES = frozenset({
   "image/gif",
   "image/jpeg",
   "image/png",
+  "image/webp",
+  "image/avif",
+  "image/bmp",
   "video/mp4",
 })
 
@@ -172,11 +175,13 @@ def _freeze_file(data_dir: str, chat_id: str, name: str) -> dict | None:
       destination_fd, "wb", closefd=False,
     ) as dst:
       remaining = MAX_RECORDED_BYTES + 1
+      digest = hashlib.sha256()
       while remaining > 0:
         chunk = src.read(min(1024 * 1024, remaining))
         if not chunk:
           break
         dst.write(chunk)
+        digest.update(chunk)
         remaining -= len(chunk)
     final = os.fstat(source_fd)
     copied = os.fstat(destination_fd)
@@ -197,6 +202,7 @@ def _freeze_file(data_dir: str, chat_id: str, name: str) -> dict | None:
       "path": stored_name,
       "size": final.st_size,
       "mime_type": mimetypes.guess_type(name)[0] or "application/octet-stream",
+      "sha256": digest.hexdigest(),
       "_source_identity": (final.st_dev, final.st_ino, final.st_mtime_ns, final.st_size),
     }
   except OSError:

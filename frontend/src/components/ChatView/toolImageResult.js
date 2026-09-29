@@ -57,22 +57,45 @@ export function temporaryImageReference(input, chatId) {
   }
 }
 
-/** A viewed deliverable is still in its inbox while the agent runs. The
- * tool-specific route checks that exact completed view before serving it. */
-export function generatedImageReference(input, chatId, toolUseId) {
-  if (!chatId || !toolUseId) return null
-  const path = imagePathFromInput(input)
-  const match = path.match(GENERATED_IMAGE_PATH)
-  if (!match || match[1] !== chatId) return null
-  return { kind: 'generated-view', chatId, toolUseId, filename: match[2] }
+/** A viewed deliverable previews through its final same-turn attachment.
+ * New views match captured bytes. Older saved entries without a file digest
+ * may supply a same-name candidate, but the route still checks a view digest.
+ * Pre-fingerprint ViewImage rows have only a best-effort name match. */
+export function generatedInboxImageName(input, chatId) {
+  if (!chatId) return null
+  const match = imagePathFromInput(input).match(GENERATED_IMAGE_PATH)
+  return match?.[1] === chatId ? match[2] : null
+}
+
+export function generatedImageReference(input, chatId, {
+  files = [], viewedDigest, legacyName = false, completed = false,
+} = {}) {
+  if (!completed) return null
+  const name = generatedInboxImageName(input, chatId)
+  if (!name) return null
+  const digestValid = typeof viewedDigest === 'string'
+    && /^[a-f0-9]{64}$/.test(viewedDigest)
+  const file = files.find(candidate => (
+    candidate?.previewable === true
+    && INLINE_IMAGE_TYPES.has(candidate.mime_type)
+    && (digestValid
+      ? candidate.sha256 === viewedDigest
+        || (candidate.sha256 == null && candidate.name === name)
+      : viewedDigest == null && legacyName && candidate.name === name)
+  ))
+  if (!file) return null
+  return {
+    kind: 'generated', chatId, collection: 'generated-files', filename: file.name,
+    ...(digestValid ? { expectedSha256: viewedDigest } : {}),
+  }
 }
 
 /** References that can render through an existing protected route without
  * loading the image tool's much larger base64 sidecar. */
-export function servedImageReference(input, chatId, toolUseId) {
+export function servedImageReference(input, chatId, generated = {}) {
   return chatImageReference(input)
     || temporaryImageReference(input, chatId)
-    || generatedImageReference(input, chatId, toolUseId)
+    || generatedImageReference(input, chatId, generated)
 }
 
 /** Fallback for image tools that viewed a path outside chat media. This work
@@ -102,6 +125,6 @@ export function inlineImageReference(output) {
   }
 }
 
-export function toolImageReference(input, output, chatId, toolUseId) {
-  return servedImageReference(input, chatId, toolUseId) || inlineImageReference(output)
+export function toolImageReference(input, output, chatId, generated = {}) {
+  return servedImageReference(input, chatId, generated) || inlineImageReference(output)
 }

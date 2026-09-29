@@ -13,7 +13,6 @@ from app import generated_files as gf
 from app import chat_writer
 from app import chat_event_sink
 from app import models
-from app.routes import generated_files as generated_routes
 from app.broadcast import ChatBroadcast
 from app.chat_event_sink import ChatEventSink
 from app.chat_media import fix_forward_chat_media
@@ -66,104 +65,28 @@ def test_serve_generated_file_by_recorded_name(client, db, auth, chat):
   assert res.headers["x-content-type-options"] == "nosniff"
 
 
-def test_viewed_generated_image_requires_exact_completed_chat_tool(tmp_path):
-  from types import SimpleNamespace
-
-  chat = SimpleNamespace(id="chat-123", messages=[], live_assistant={
-    "blocks": [{
-      "type": "tool", "tool": "ViewImage", "status": "done",
-      "tool_use_id": "view-1",
-      "input": f"{tmp_path}/chats/chat-123/deliverables/inbox/image.png",
-    }, {"type": "generated_files", "files": [{"name": "image.png"}]}],
-  })
-  assert generated_routes._viewed_inbox_name(chat, "view-1", str(tmp_path)) == ("image.png", True, None)
-  chat.live_assistant["blocks"].pop()
-  assert generated_routes._viewed_inbox_name(chat, "view-1", str(tmp_path)) is None
-  chat.live_assistant["blocks"][0]["viewed_image_sha256"] = "a" * 64
-  assert generated_routes._viewed_inbox_name(chat, "view-1", str(tmp_path)) == ("image.png", True, "a" * 64)
-  del chat.live_assistant["blocks"][0]["viewed_image_sha256"]
-  chat.live_assistant["blocks"].append({"type": "generated_files", "files": [{"name": "image.png"}]})
-  assert generated_routes._viewed_inbox_name(chat, "view-2", str(tmp_path)) is None
-  chat.live_assistant["blocks"][0]["status"] = "running"
-  assert generated_routes._viewed_inbox_name(chat, "view-1", str(tmp_path)) is None
-  chat.live_assistant["blocks"][0]["status"] = "done"
-  chat.live_assistant["blocks"][0]["input"] = str(tmp_path / "chats/other/deliverables/inbox/image.png")
-  assert generated_routes._viewed_inbox_name(chat, "view-1", str(tmp_path)) is None
-
-
-def test_viewed_generated_image_serves_live_inbox_then_frozen_file(
-  client, db, auth, chat, monkeypatch,
-):
-  name = "comparison.png"
-  data_dir = get_settings().data_dir
-  inbox = gf.output_dir(data_dir, chat.id, create=True)
-  source = inbox / name
-  source.write_bytes(b"live-image")
-  digest = hashlib.sha256(b"live-image").hexdigest()
-  monkeypatch.setattr(generated_routes, "_viewed_inbox_name", lambda *_: (name, True, digest))
-  url = f"/api/chats/{chat.id}/viewed-generated-images/view-1"
+def test_final_generated_image_preview_checks_content_on_existing_route(client, db, auth, chat):
+  content = b"viewed-image"
+  stored = _stored_file(chat, name="frozen", content=content)
+  _write_row(db, chat, name="image_1.png", path=stored, mime_type="image/png")
+  url = f"/api/chats/{chat.id}/generated-files/image_1.png"
   token = _media_token(client, auth, chat.id)
+  digest = hashlib.sha256(content).hexdigest()
+  matched = client.get(url, params={"token": token, "preview": True, "expected_sha256": digest})
+  assert matched.status_code == 200
+  assert matched.content == content
+  assert matched.headers["content-disposition"] == 'inline; filename="image_1.png"'
+  assert matched.headers["cache-control"] == "private, no-store"
 
-  live = client.get(url, params={"token": token})
-  assert live.status_code == 200
-  assert live.content == b"live-image"
-  assert live.headers["content-type"] == "image/png"
-  assert live.headers["x-content-type-options"] == "nosniff"
-
-  source.unlink()
-  stored = _stored_file(chat, name="frozen", content=b"live-image")
-  _write_row(db, chat, name=name, path=stored, mime_type="image/png")
-  monkeypatch.setattr(generated_routes, "_viewed_inbox_name", lambda *_: (name, False, digest))
-  frozen = client.get(url, params={"token": token})
-  assert frozen.status_code == 200
-  assert frozen.content == b"live-image"
-
-
-def test_viewed_generated_image_route_uses_persisted_tool_digest(
-  client, db, auth, chat,
-):
-  name = "comparison.png"
-  path = gf.output_dir(get_settings().data_dir, chat.id, create=True) / name
-  path.write_bytes(b"the-viewed-bytes")
-  digest = gf.viewed_inbox_sha256(get_settings().data_dir, chat.id, str(path))
-  chat.live_assistant = {"blocks": [{
-    "type": "tool", "tool": "ViewImage", "status": "done",
-    "tool_use_id": "view-1", "input": str(path),
-    "viewed_image_sha256": digest,
-  }]}
-  db.commit()
-  url = f"/api/chats/{chat.id}/viewed-generated-images/view-1"
-  token = _media_token(client, auth, chat.id)
-  assert client.get(url, params={"token": token}).content == b"the-viewed-bytes"
-  path.write_bytes(b"the-replacement")
-  assert client.get(url, params={"token": token}).status_code == 404
-
-
-def test_viewed_generated_image_never_substitutes_changed_bytes(
-  client, db, auth, chat, monkeypatch,
-):
-  name = "comparison.png"
-  inbox = gf.output_dir(get_settings().data_dir, chat.id, create=True)
-  (inbox / name).write_bytes(b"new-image")
-  stored = _stored_file(chat, name="old-frozen", content=b"other-image")
-  _write_row(db, chat, name=name, path=stored, mime_type="image/png")
-  digest = hashlib.sha256(b"viewed-image").hexdigest()
-  monkeypatch.setattr(generated_routes, "_viewed_inbox_name", lambda *_: (name, True, digest))
-  url = f"/api/chats/{chat.id}/viewed-generated-images/view-1"
-  assert client.get(url, params={"token": _media_token(client, auth, chat.id)}).status_code == 404
-
-
-def test_legacy_view_uses_only_frozen_attachment(client, db, auth, chat, monkeypatch):
-  name = "comparison.png"
-  inbox = gf.output_dir(get_settings().data_dir, chat.id, create=True)
-  (inbox / name).write_bytes(b"unrelated-live-image")
-  monkeypatch.setattr(generated_routes, "_viewed_inbox_name", lambda *_: (name, True, None))
-  url = f"/api/chats/{chat.id}/viewed-generated-images/view-1"
-  token = _media_token(client, auth, chat.id)
-  assert client.get(url, params={"token": token}).status_code == 404
-  stored = _stored_file(chat, name="frozen", content=b"original")
-  _write_row(db, chat, name=name, path=stored, mime_type="image/png")
-  assert client.get(url, params={"token": token}).content == b"original"
+  changed = client.get(url, params={"token": token, "preview": True, "expected_sha256": "0" * 64})
+  assert changed.status_code == 404
+  (gf.stored_dir(get_settings().data_dir, chat.id) / stored).write_bytes(b"replacement")
+  assert client.get(
+    url, params={"token": token, "preview": True, "expected_sha256": digest},
+  ).status_code == 404
+  malformed = client.get(url, params={"token": token, "preview": True, "expected_sha256": "wrong"})
+  assert malformed.status_code == 400
+  assert client.get(f"/api/chats/{chat.id}/viewed-generated-images/old-tool", params={"token": token}).status_code == 404
 
 
 def test_viewed_image_digest_is_bound_to_exact_chat_inbox(tmp_path):
@@ -180,19 +103,6 @@ def test_viewed_image_digest_is_bound_to_exact_chat_inbox(tmp_path):
   image.unlink()
   image.symlink_to(tmp_path / "outside.png")
   assert gf.viewed_inbox_sha256(str(tmp_path), chat_id, str(image)) is None
-
-
-def test_viewed_generated_image_rejects_unviewed_and_symlinked_file(
-  client, auth, chat, tmp_path, monkeypatch,
-):
-  url = f"/api/chats/{chat.id}/viewed-generated-images/view-1"
-  token = _media_token(client, auth, chat.id)
-  assert client.get(url, params={"token": token}).status_code == 404
-
-  inbox = gf.output_dir(get_settings().data_dir, chat.id, create=True)
-  (inbox / "image.png").symlink_to(tmp_path / "outside.png")
-  monkeypatch.setattr(generated_routes, "_viewed_inbox_name", lambda *_: ("image.png", True, "0" * 64))
-  assert client.get(url, params={"token": token}).status_code == 404
 
 
 def test_safe_generated_file_preview_opens_inline(client, db, auth, chat):
@@ -408,6 +318,10 @@ def test_inbox_capture_is_immutable_across_same_name_regeneration(db, chat):
     "report.pdf", "report_1.pdf",
   ]
   assert all(file["previewable"] is True for file in block["files"])
+  assert [file["sha256"] for file in block["files"]] == [
+    hashlib.sha256(content).hexdigest()
+    for content in (b"first report", b"second report")
+  ]
   rows = db.query(models.GeneratedFile).filter_by(chat_id=chat.id).all()
   assert len(rows) == 2
   assert rows[0].path != rows[1].path
@@ -422,6 +336,10 @@ def test_inbox_capture_is_immutable_across_same_name_regeneration(db, chat):
   ]
   assert [file["name"] for file in file_blocks[0]["files"]] == [
     "report.pdf", "report_1.pdf",
+  ]
+  assert [file["sha256"] for file in file_blocks[0]["files"]] == [
+    hashlib.sha256(content).hexdigest()
+    for content in (b"first report", b"second report")
   ]
 
 
