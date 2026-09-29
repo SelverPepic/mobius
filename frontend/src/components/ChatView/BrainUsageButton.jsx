@@ -1,5 +1,3 @@
-import { useEffect, useRef } from 'react'
-import { useQueryClient } from '@tanstack/react-query'
 import { chatQueries, modelQueries, settingsQueries } from '../../hooks/queries.js'
 import BrainUsageIcon from './BrainUsageIcon.jsx'
 import {
@@ -28,15 +26,6 @@ export default function BrainUsageButton({
   model = null,
   liveContext = null,
 }) {
-  const queryClient = useQueryClient()
-  const previousChatId = useRef(chatId)
-  useEffect(() => {
-    if (previousChatId.current !== chatId && usageEnabled && provider) {
-      // The same Brain stays mounted while a pane moves between chats.
-      void settingsQueries.providerUsage.invalidate(queryClient, provider)
-    }
-    previousChatId.current = chatId
-  }, [chatId, provider, queryClient, usageEnabled])
   const providerUsageQuery = settingsQueries.providerUsage.useQuery(provider, {
     enabled: usageEnabled && Boolean(provider),
   })

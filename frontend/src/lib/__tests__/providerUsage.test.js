@@ -30,8 +30,12 @@ const shellSource = readFileSync(
   new URL('../../components/Shell/Shell.jsx', import.meta.url),
   'utf8',
 )
-const brainSource = readFileSync(
-  new URL('../../components/ChatView/BrainUsageButton.jsx', import.meta.url),
+const paneChatSource = readFileSync(
+  new URL('../../components/Shell/PaneChatView.jsx', import.meta.url),
+  'utf8',
+)
+const embeddedChatSource = readFileSync(
+  new URL('../../components/ChatEmbed/ChatEmbed.jsx', import.meta.url),
   'utf8',
 )
 
@@ -52,8 +56,9 @@ test('account change clears only that provider reading before refetch', async ()
   assert.match(shellSource, /model_providers_changed[\s\S]*providerUsage\.reset\(queryClient, ev\.provider\)/)
 })
 
-test('Brain refreshes usage on chat entry and when returning to the window', () => {
-  assert.match(brainSource, /previousChatId\.current !== chatId[\s\S]*providerUsage\.invalidate\(queryClient, provider\)/)
+test('Brain usage refetches when a chat mounts and on window focus', () => {
+  assert.match(paneChatSource, /<ChatView\s+key=\{chatId\}/)
+  assert.match(embeddedChatSource, /<ChatView\s+key=\{chatId\}/)
   const querySource = readFileSync(new URL('../../hooks/queries.js', import.meta.url), 'utf8')
   assert.match(querySource, /function useProviderUsageQuery[\s\S]*staleTime: 0,[\s\S]*refetchOnWindowFocus: true/)
 })
