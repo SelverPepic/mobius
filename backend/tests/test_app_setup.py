@@ -106,9 +106,9 @@ def test_authenticated_status_and_rerun(client, auth, setup, monkeypatch, tmp_pa
   assert client.get("/api/setup").status_code == 401
   assert client.get("/api/setup", headers=auth).json()["old"]["state"] == "pending"
   calls = []
-  monkeypatch.setattr(app_setup, "request_run", lambda: calls.append(True))
+  monkeypatch.setattr(app_setup, "request_run", lambda **kwargs: calls.append(kwargs))
   assert client.post("/api/setup/rerun", headers=auth).status_code == 202
-  assert calls == [True]
+  assert calls == [{"cancel": True}]
   for corrupt in ["{", "null", "[]"]:
     (tmp_path / "setup-status.json").write_text(corrupt)
     assert client.get("/api/setup", headers=auth).json() == {}
@@ -229,6 +229,11 @@ async def test_complete_status_and_rerun_cancels_running_step(setup, tmp_path, m
     assert state["instance:first.sh"]["running"] is True
     assert state["instance:second.sh"] == {"state": "pending", "output": "previous diagnostic"}
     pid = int((root / "pid").read_text())
+    # Accepting a declaration only queues a pass: it never interrupts a
+    # running step (an apt install must not be cut off midway).
+    app_setup.request_run()
+    await asyncio.sleep(0.3)
+    assert not _has_exited(pid)
     (root / "release").touch()
     await rerun_dependency_setup(None)
     await until(lambda: app_setup.status()["instance:second.sh"]["state"] == "ready")

@@ -20,10 +20,12 @@ log = logging.getLogger(__name__)
 _runner = None
 
 
-def request_run() -> None:
+def request_run(*, cancel: bool = False) -> None:
+  """Queue another pass. Only an explicit rerun (``cancel``) interrupts the
+  running one: an accepted declaration must never cut off an apt install."""
   if _runner is not None:
     _runner.wake.set()
-    if _runner.active is not None and not _runner.active.cancelling():
+    if cancel and _runner.active is not None and not _runner.active.cancelling():
       _runner.active.cancel()
 
 
@@ -187,6 +189,9 @@ class Runner:
             # The same boundary covers Apply publication AND rollback. Never
             # reuse an env that Apply could still unpublish on failure.
             async with fs_locks.install_uninstall_lock():
+              # The lock can wait out a long Apply; an update may have
+              # started meanwhile.
+              await self.wait_settled()
               code, output = await command([
                 sys.executable, "-m", "app.app_python_env", str(data), str(app_id), str(root),
               ])

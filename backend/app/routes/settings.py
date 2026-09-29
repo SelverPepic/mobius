@@ -590,5 +590,5 @@ def dependency_setup_status(_: models.Owner = Depends(get_current_owner)):
 @router.post("/api/setup/rerun", status_code=202, dependencies=[Depends(reject_cross_site)])
 async def rerun_dependency_setup(_: models.Owner = Depends(get_current_owner)):
   from app import app_setup
-  app_setup.request_run()
+  app_setup.request_run(cancel=True)
   return {"status": "pending"}
