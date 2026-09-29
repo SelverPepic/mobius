@@ -12,7 +12,7 @@ import {
   waitForGithubSignIn,
 } from '../../lib/githubConnection.js'
 
-function SignInCode({ attempt, retrying, onCancel }) {
+function SignInCode({ attempt, retrying, cancelling, unconfirmed, message, onCancel }) {
   const [copied, setCopied] = useState(false)
   const copy = () => navigator.clipboard?.writeText(attempt.userCode).then(() => setCopied(true), () => {})
   return (
@@ -28,11 +28,12 @@ function SignInCode({ attempt, retrying, onCancel }) {
       </div>
       <div className="codex-auth__pending-actions">
         <p className="pa__muted codex-auth__waiting" role="status" aria-live="polite">
-          {retrying ? 'GitHub is not responding. Retrying…' : 'Waiting for sign-in to complete…'}
+          {cancelling ? 'Cancelling GitHub sign-in…' : unconfirmed ? 'Sign-in status is unknown. Retry Cancel to check again.' : retrying ? 'GitHub is not responding. Retrying…' : 'Waiting for sign-in to complete…'}
         </p>
         <a className="pa__btn pa__btn--sm" href={attempt.verificationUri} target="_blank" rel="noopener noreferrer">Open GitHub</a>
-        <button type="button" className="pa__btn pa__btn--sm" onClick={onCancel}>Cancel</button>
+        <button type="button" className="pa__btn pa__btn--sm" disabled={cancelling} onClick={onCancel}>Cancel</button>
       </div>
+      {message ? <p className="pa__error" role="status">{message}</p> : null}
     </div>
   )
 }
@@ -49,17 +50,17 @@ export default function GithubConnection({ active = true, focusRef, attention = 
   const [busy, setBusy] = useState(false)
   const waitRef = useRef(null)
 
-  const refresh = useCallback(async () => {
-    const next = await fetchGithubStatus()
-    setConn(next)
+  const refresh = useCallback(async (options = {}) => {
+    const next = await fetchGithubStatus(options)
+    if (!options.signal?.aborted) setConn(next)
     return next
   }, [])
 
   useEffect(() => () => waitRef.current?.abort(), [])
 
-  const waitFor = useCallback(async (attempt) => {
-    waitRef.current?.abort()
-    const controller = new AbortController()
+  const waitFor = useCallback(async (attempt, controller = new AbortController()) => {
+    if (controller.signal.aborted) return
+    if (waitRef.current !== controller) waitRef.current?.abort()
     waitRef.current = controller
     setSignIn(attempt)
     setExpanded(true)
@@ -74,11 +75,17 @@ export default function GithubConnection({ active = true, focusRef, attention = 
   }, [refresh])
 
   const start = useCallback(async (privateRepos) => {
+    waitRef.current?.abort()
+    const controller = new AbortController()
+    waitRef.current = controller
     setMessage('')
     setSignIn('starting')
     try {
-      await waitFor(await startGithubSignIn({ privateRepos }))
+      const attempt = await startGithubSignIn({ privateRepos, signal: controller.signal })
+      await waitFor(attempt, controller)
     } catch (error) {
+      if (controller.signal.aborted) return
+      waitRef.current = null
       setSignIn(null)
       setMessage(error.message)
     }
@@ -97,12 +104,27 @@ export default function GithubConnection({ active = true, focusRef, attention = 
   const cancel = useCallback(async () => {
     const attemptId = signIn?.attemptId
     waitRef.current?.abort()
-    waitRef.current = null
-    setSignIn(null)
+    const controller = new AbortController()
+    waitRef.current = controller
+    setBusy(true)
     setRetrying(false)
-    if (attemptId) await cancelGithubSignIn(attemptId).catch(() => {})
-    await refresh()
-  }, [signIn, refresh])
+    setMessage('')
+    try {
+      if (attemptId) await cancelGithubSignIn(attemptId, { signal: controller.signal })
+    } catch (error) {
+      if (controller.signal.aborted) return
+      setMessage(error.message)
+    }
+    const next = await refresh({ signal: controller.signal })
+    if (controller.signal.aborted) return
+    setBusy(false)
+    if (next.attempt) {
+      void waitFor(next.attempt, controller)
+    } else {
+      waitRef.current = null
+      if (next.state !== 'unknown') setSignIn(null)
+    }
+  }, [signIn, refresh, waitFor])
 
   const disconnect = useCallback(async () => {
     setBusy(true)
@@ -139,7 +161,7 @@ export default function GithubConnection({ active = true, focusRef, attention = 
   if (signIn === 'starting') {
     panel = <p className="pa__muted" role="status">Starting GitHub sign-in…</p>
   } else if (signIn) {
-    panel = <SignInCode attempt={signIn} retrying={retrying} onCancel={cancel} />
+    panel = <SignInCode attempt={signIn} retrying={retrying} cancelling={busy} unconfirmed={conn.state === 'unknown'} message={message} onCancel={cancel} />
   } else if (conn.state === 'unknown') {
     panel = (
       <div className="provider-connection">

@@ -38,9 +38,9 @@ function attemptFrom(body) {
     : null
 }
 
-export async function fetchGithubStatus() {
+export async function fetchGithubStatus({ signal } = {}) {
   try {
-    const s = await call(options => api.github.status(options), 'Could not check GitHub.')
+    const s = await call(options => api.github.status({ ...options, signal }), 'Could not check GitHub.')
     return {
       state: s.connected ? 'connected' : 'disconnected',
       login: s.login || '',
@@ -54,8 +54,8 @@ export async function fetchGithubStatus() {
   }
 }
 
-export async function startGithubSignIn({ privateRepos = false } = {}) {
-  const body = await call(options => api.github.connectStart(privateRepos, options), 'Could not start GitHub sign-in.')
+export async function startGithubSignIn({ privateRepos = false, signal } = {}) {
+  const body = await call(options => api.github.connectStart(privateRepos, { ...options, signal }), 'Could not start GitHub sign-in.')
   const attempt = attemptFrom(body)
   if (!attempt) throw new Error('GitHub sign-in started without a code. Please try again.')
   return attempt
@@ -111,8 +111,8 @@ export async function waitForGithubSignIn(attemptId, { signal, onRetrying = () =
   return { status: 'cancelled' }
 }
 
-export function cancelGithubSignIn(attemptId) {
-  return call(options => api.github.connectCancel(attemptId, options), 'Could not cancel GitHub sign-in.')
+export function cancelGithubSignIn(attemptId, { signal } = {}) {
+  return call(options => api.github.connectCancel(attemptId, { ...options, signal }), 'Could not cancel GitHub sign-in.')
 }
 
 export function disconnectGithub() {

@@ -1082,11 +1082,6 @@ export default function SettingsView({
                     onToggleExpand={openMobiusYou}
                   />
                 )}
-                <GithubConnection
-                  active={active}
-                  focusRef={(node) => setSetupFocusRef('github', node)}
-                  attention={attentionSection === 'github'}
-                />
               </div>
             </>
           ) : providerError ? (
@@ -1115,6 +1110,13 @@ export default function SettingsView({
               Loading providers…
             </div>
           )}
+          <div className="settings__providers">
+            <GithubConnection
+              active={active}
+              focusRef={(node) => setSetupFocusRef('github', node)}
+              attention={attentionSection === 'github'}
+            />
+          </div>
         </section>
 
         {providerReady && (
