@@ -3,6 +3,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
+import { QueryClient } from '@tanstack/react-query'
+import { settingsQueries } from '../../hooks/queries.js'
 import {
   clampUsagePercent,
   formatPlanStatus,
@@ -24,6 +26,37 @@ const providerCss = readFileSync(
   new URL('../../components/ProviderAuth/ProviderAuth.css', import.meta.url),
   'utf8',
 )
+const shellSource = readFileSync(
+  new URL('../../components/Shell/Shell.jsx', import.meta.url),
+  'utf8',
+)
+const brainSource = readFileSync(
+  new URL('../../components/ChatView/BrainUsageButton.jsx', import.meta.url),
+  'utf8',
+)
+
+test('account change clears only that provider reading before refetch', async () => {
+  const client = new QueryClient()
+  client.setQueryData(settingsQueries.providerUsage.keyFor('codex'), {
+    state: 'ready', windows: [{ used_percent: 100 }],
+  })
+  client.setQueryData(settingsQueries.providerUsage.keyFor('claude'), {
+    state: 'ready', windows: [{ used_percent: 80 }],
+  })
+  await settingsQueries.providerUsage.reset(client, 'codex')
+  assert.equal(client.getQueryData(settingsQueries.providerUsage.keyFor('codex')), undefined)
+  assert.equal(
+    client.getQueryData(settingsQueries.providerUsage.keyFor('claude')).windows[0].used_percent,
+    80,
+  )
+  assert.match(shellSource, /model_providers_changed[\s\S]*providerUsage\.reset\(queryClient, ev\.provider\)/)
+})
+
+test('Brain refreshes usage on chat entry and when returning to the window', () => {
+  assert.match(brainSource, /previousChatId\.current !== chatId[\s\S]*providerUsage\.invalidate\(queryClient, provider\)/)
+  const querySource = readFileSync(new URL('../../hooks/queries.js', import.meta.url), 'utf8')
+  assert.match(querySource, /function useProviderUsageQuery[\s\S]*staleTime: 0,[\s\S]*refetchOnWindowFocus: true/)
+})
 
 test('connected plan status uses the compact green-disclosure copy', () => {
   assert.equal(formatPlanStatus('Max plan'), 'Plan: Max')
