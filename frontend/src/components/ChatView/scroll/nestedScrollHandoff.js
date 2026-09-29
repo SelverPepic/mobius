@@ -3,6 +3,7 @@ import { nestedScrollRange } from './policy.js'
 const PIXEL_DELTA = 0
 const LINE_DELTA = 1
 const PAGE_DELTA = 2
+const WHEEL_GESTURE_IDLE_MS = 280
 
 function lineHeightInPixels(element, readStyle) {
   const style = readStyle?.(element)
@@ -33,20 +34,18 @@ export function wheelDeltaPixels(event, nested, readStyle) {
     : 0
 }
 
-/** Move only the part of a gesture that the nested surface cannot consume.
- * Native scrolling remains untouched until a delta crosses an edge. */
-function handoffNestedScroll(range, scrollEl, delta, beforeApply = null) {
-  if (!range || !Number.isFinite(delta) || delta === 0) return false
+/** Consume the reader's remaining range and return only the excess. Native
+ * scrolling remains untouched until a delta crosses an edge. */
+function consumeNestedEdge(range, delta) {
+  if (!range || !Number.isFinite(delta) || delta === 0) return null
   const available = delta > 0
     ? Math.max(0, range.maxScrollTop - range.scrollTop)
     : Math.max(0, range.scrollTop)
-  if (Math.abs(delta) <= available) return false
+  if (Math.abs(delta) <= available) return null
 
   const consumed = Math.sign(delta) * available
-  beforeApply?.()
   range.nested.scrollTop += consumed
-  scrollEl.scrollTop += delta - consumed
-  return true
+  return delta - consumed
 }
 
 function preventNativeScroll(event) {
@@ -62,8 +61,8 @@ function touchWithIdentifier(touches, identifier) {
 }
 
 /** Install one delegated handoff for every capped transcript surface marked
- * with data-chat-scroll-region. WebKit does not reliably chain a nested
- * scroller at its edge, so the transcript consumes only the residual delta. */
+ * with data-chat-scroll-region. A wheel burst stays inside its reader even
+ * when it reaches an edge; a new gesture at that edge may enter the chat. */
 export function createNestedScrollHandoff(scrollEl, {
   readStyle = typeof globalThis.getComputedStyle === 'function'
     ? globalThis.getComputedStyle.bind(globalThis)
@@ -72,6 +71,7 @@ export function createNestedScrollHandoff(scrollEl, {
 } = {}) {
   let active = true
   let touch = null
+  let wheel = { nested: null, lastTime: -Infinity, edge: 0, transferring: false }
 
   const onWheel = (event) => {
     if (!active) return false
@@ -81,12 +81,32 @@ export function createNestedScrollHandoff(scrollEl, {
     const range = nestedScrollRange(event?.target, scrollEl)
     if (!range) return false
     const delta = wheelDeltaPixels(event, range.nested, readStyle)
-    if (!handoffNestedScroll(
-      range,
-      scrollEl,
-      delta,
-      () => onHandoff?.({ delta, type: 'wheel' }),
-    )) return false
+    const direction = Math.sign(delta)
+    if (!direction) return false
+    const available = direction > 0
+      ? Math.max(0, range.maxScrollTop - range.scrollTop)
+      : Math.max(0, range.scrollTop)
+    const time = Number.isFinite(event?.timeStamp) ? event.timeStamp : performance.now()
+    const crossesEdge = Math.abs(delta) > available
+    const canTransfer = crossesEdge && wheel.nested === range.nested
+      && wheel.edge === direction
+      && (wheel.transferring || time - wheel.lastTime > WHEEL_GESTURE_IDLE_MS)
+    wheel = {
+      nested: range.nested,
+      lastTime: time,
+      edge: Math.abs(delta) >= available ? direction : 0,
+      transferring: canTransfer,
+    }
+    if (!crossesEdge) return false
+    // Native containment still owns a non-cancelable wheel event. Do not let
+    // the outer input policy mistake it for a chat gesture.
+    if (event?.cancelable === false) return true
+    const residual = consumeNestedEdge(range, delta)
+    if (residual == null) return false
+    if (canTransfer) {
+      onHandoff?.({ delta, type: 'wheel' })
+      scrollEl.scrollTop += residual
+    }
     preventNativeScroll(event)
     return true
   }
@@ -116,12 +136,10 @@ export function createNestedScrollHandoff(scrollEl, {
     const delta = touch.y - point.clientY
     touch.y = point.clientY
     const range = nestedScrollRange(touch.target, scrollEl)
-    if (!handoffNestedScroll(
-      range,
-      scrollEl,
-      delta,
-      () => onHandoff?.({ delta, type: 'touchmove' }),
-    )) return false
+    const residual = consumeNestedEdge(range, delta)
+    if (residual == null) return false
+    onHandoff?.({ delta, type: 'touchmove' })
+    scrollEl.scrollTop += residual
     preventNativeScroll(event)
     return true
   }
@@ -140,6 +158,7 @@ export function createNestedScrollHandoff(scrollEl, {
     dispose() {
       active = false
       touch = null
+      wheel = { nested: null, lastTime: -Infinity, edge: 0, transferring: false }
     },
   }
 }

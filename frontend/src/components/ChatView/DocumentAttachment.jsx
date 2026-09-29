@@ -14,34 +14,6 @@ async function freshFileUrl(chatId, name, preview = false) {
   return `${BASE}/api${filePath(chatId, name)}${token}${preview ? '&preview=true' : ''}`
 }
 
-const WHEEL_GESTURE_IDLE_MS = 280
-
-export function transferReaderWheel(event, gesture) {
-  const reader = event.currentTarget
-  const direction = Math.sign(event.deltaY)
-  if (!direction) return
-  const atEdge = direction > 0
-    ? reader.scrollTop + reader.clientHeight >= reader.scrollHeight - 1
-    : reader.scrollTop <= 1
-  const time = event.timeStamp
-  const newGesture = time - gesture.lastTime > WHEEL_GESTURE_IDLE_MS
-  const canTransfer = atEdge && gesture.edge === direction &&
-    (gesture.transferring || newGesture)
-  gesture.lastTime = time
-  gesture.edge = atEdge ? direction : 0
-  gesture.transferring = canTransfer
-  if (!atEdge) return
-
-  // The reader contains momentum. A new gesture made after arriving at its
-  // edge can continue in the chat, but the first gesture cannot spill over.
-  event.preventDefault()
-  if (canTransfer) {
-    const chat = reader.closest('.chat__scroll')
-    const distance = event.deltaY * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? reader.clientHeight : 1)
-    chat?.scrollBy({ top: distance, behavior: 'auto' })
-  }
-}
-
 function useCardVisibility(ref) {
   const [visible, setVisible] = useState(false)
   useEffect(() => {
@@ -151,8 +123,6 @@ export default function DocumentAttachment({
   const previewButtonRef = useRef(null)
   const collapseButtonRef = useRef(null)
   const focusAfterToggleRef = useRef(false)
-  const readerRef = useRef(null)
-  const wheelGestureRef = useRef({ lastTime: 0, edge: 0, transferring: false })
   const visible = useCardVisibility(cardRef)
   const isMarkdown = file.mime_type === 'text/markdown'
   const [retry, setRetry] = useState(0)
@@ -170,16 +140,6 @@ export default function DocumentAttachment({
     return () => { active = false }
   }, [chatId, expanded, file.name, isMarkdown, retry])
 
-  useEffect(() => {
-    if (!expanded || !isMarkdown) return undefined
-    const reader = readerRef.current
-    if (!reader) return undefined
-    const gesture = wheelGestureRef.current
-    const onWheel = event => transferReaderWheel(event, gesture)
-    reader.addEventListener('wheel', onWheel, { passive: false })
-    return () => reader.removeEventListener('wheel', onWheel)
-  }, [expanded, isMarkdown])
-
   async function download() {
     setDownloadError(false)
     try {
@@ -194,10 +154,6 @@ export default function DocumentAttachment({
     } catch {
       setDownloadError(true)
     }
-  }
-
-  function continueInChat() {
-    cardRef.current?.closest('.chat__scroll')?.scrollBy({ top: 240, behavior: 'auto' })
   }
 
   useEffect(() => {
@@ -227,8 +183,7 @@ export default function DocumentAttachment({
     onToggle()
   }
 
-  // When another card opens, this card may collapse too. Only the card the
-  // person clicked should claim focus during that shared state update.
+  // Keep focus on the control for this card when its own state changes.
   useLayoutEffect(() => {
     if (!focusAfterToggleRef.current) return
     focusAfterToggleRef.current = false
@@ -278,7 +233,7 @@ export default function DocumentAttachment({
           <button ref={collapseButtonRef} type="button" onClick={toggle}>Collapse</button>
         </div>
       </header>
-      {isMarkdown ? <div ref={readerRef} className="chat__document-card-reader">
+      {isMarkdown ? <div className="chat__document-card-reader" data-chat-scroll-region>
         {report.status === 'loading' && <p role="status">Loading Markdown preview…</p>}
         {report.status === 'error' && <div role="alert">
           <p>Couldn’t load the preview. You can try again or download the file.</p>
@@ -297,9 +252,6 @@ export default function DocumentAttachment({
             Couldn’t load the PDF preview. <button type="button" onClick={() => setRetry(value => value + 1)}>Try again</button>
           </> : 'Loading PDF preview…'}
         </p>}
-      {!isMarkdown && <div className="chat__document-card-continue">
-        <button type="button" onClick={continueInChat}>Continue in chat</button>
-      </div>}
     </>}
   </article>
 }

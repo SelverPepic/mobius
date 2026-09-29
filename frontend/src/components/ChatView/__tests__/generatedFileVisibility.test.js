@@ -22,7 +22,7 @@ const {
 } = await vite.ssrLoadModule(
   '/src/components/ChatView/Attachments.jsx',
 )
-const { default: DocumentAttachment, markdownCardExcerpt, transferReaderWheel } = await vite.ssrLoadModule(
+const { default: DocumentAttachment, markdownCardExcerpt } = await vite.ssrLoadModule(
   '/src/components/ChatView/DocumentAttachment.jsx',
 )
 
@@ -180,39 +180,16 @@ test('document cards enlarge in chat without losing the original download', () =
   assert.match(open, /chat__document-card--expanded/)
   assert.match(open, />Collapse<\/button>/)
   assert.match(open, /Loading PDF preview/)
-  assert.match(open, /Continue in chat/)
+  assert.doesNotMatch(open, /Continue in chat/)
   assert.match(open, />Download<\/button>/)
 })
 
-test('reader contains the momentum gesture, then transfers a deliberate new one to chat', () => {
-  const moves = []
-  const gesture = { lastTime: 0, edge: 0, transferring: false }
-  const chat = { scrollBy: move => moves.push(move) }
-  const reader = {
-    scrollTop: 600, clientHeight: 400, scrollHeight: 1000,
-    closest: () => chat,
-  }
-  const wheel = (timeStamp, deltaY) => {
-    let prevented = false
-    transferReaderWheel({
-      currentTarget: reader, timeStamp, deltaY, deltaMode: 0,
-      preventDefault: () => { prevented = true },
-    }, gesture)
-    return prevented
-  }
-  assert.equal(wheel(1000, 80), true)
-  assert.equal(wheel(1050, 30), true)
-  assert.equal(wheel(1170, 8), true)
-  assert.deepEqual(moves, [], 'inertia after reaching the edge stays inside the reader')
-  assert.equal(wheel(1600, 50), true)
-  assert.deepEqual(moves, [{ top: 50, behavior: 'auto' }])
-  assert.equal(wheel(1640, 20), true)
-  assert.equal(moves.length, 2, 'the deliberate second gesture continues in the chat')
-  reader.scrollTop = 300
-  assert.equal(wheel(1700, 40), false)
-  reader.scrollTop = 600
-  assert.equal(wheel(2000, 40), true)
-  assert.equal(moves.length, 2, 'moving back into the reader resets the handoff')
+test('expanded Markdown joins the shared nested-scroll reader', () => {
+  const file = { name: 'review.md', size: 700, mime_type: 'text/markdown' }
+  const html = renderToStaticMarkup(createElement(DocumentAttachment, {
+    file, chatId: 'chat-generated-file', expanded: true, onToggle() {},
+  }))
+  assert.match(html, /class="chat__document-card-reader" data-chat-scroll-region/)
 })
 
 test('Markdown card shows a readable excerpt of the actual report', () => {

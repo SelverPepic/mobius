@@ -44,7 +44,7 @@ function wheel(target, properties = {}) {
   }
 }
 
-test('wheel handoff preserves native scrolling until a pixel delta crosses the edge', () => {
+test('wheel burst stays in its reader; a new edge gesture transfers only residual motion', () => {
   const ownership = []
   const { child, handlers, nested, outer } = fixture({
     onHandoff: input => ownership.push({ input, outerTop: outer.scrollTop }),
@@ -56,40 +56,62 @@ test('wheel handoff preserves native scrolling until a pixel delta crosses the e
   assert.equal(within.prevented(), false)
 
   nested.scrollTop = 190
-  const crossing = wheel(child, { deltaY: 25 })
+  const crossing = wheel(child, { deltaY: 25, timeStamp: 1000 })
   handlers.onWheel(crossing)
   assert.equal(nested.scrollTop, 200, 'nested surface consumes its remaining range')
-  assert.equal(outer.scrollTop, 415, 'only the residual reaches the transcript')
+  assert.equal(outer.scrollTop, 400, 'the first crossing cannot spill into chat')
   assert.equal(crossing.prevented(), true)
+
+  handlers.onWheel(wheel(child, { deltaY: 30, timeStamp: 1080 }))
+  assert.equal(outer.scrollTop, 400, 'momentum from the same burst stays contained')
+  const deliberate = wheel(child, { deltaY: 15, timeStamp: 1450 })
+  handlers.onWheel(deliberate)
+  assert.equal(outer.scrollTop, 415, 'a fresh edge gesture reaches the transcript')
+  assert.equal(deliberate.prevented(), true)
   assert.deepEqual(ownership, [{
-    input: { delta: 25, type: 'wheel' },
+    input: { delta: 15, type: 'wheel' },
     outerTop: 400,
   }], 'reader ownership is claimed before the outer scroll mutates')
   handlers.dispose()
 })
 
-test('line and page wheel handlers hand off in CSS pixels without scale factors', () => {
+test('line and page wheel handoff uses CSS pixels after a deliberate new gesture', () => {
   const { child, handlers, nested, outer } = fixture({ nestedTop: 200 })
-  const lines = wheel(child, { deltaY: 3, deltaMode: 1 })
+  handlers.onWheel(wheel(child, { deltaY: 1, deltaMode: 1, timeStamp: 1000 }))
+  assert.equal(outer.scrollTop, 400)
+  const lines = wheel(child, { deltaY: 3, deltaMode: 1, timeStamp: 1400 })
   handlers.onWheel(lines)
   assert.equal(outer.scrollTop, 460, 'three computed 20px lines stay in CSS pixels')
   assert.equal(lines.prevented(), true)
 
   outer.scrollTop = 400
   nested.scrollTop = 0
-  const page = wheel(child, { deltaY: -1, deltaMode: 2 })
+  handlers.onWheel(wheel(child, { deltaY: -1, deltaMode: 2, timeStamp: 1500 }))
+  assert.equal(outer.scrollTop, 400)
+  const page = wheel(child, { deltaY: -1, deltaMode: 2, timeStamp: 1900 })
   handlers.onWheel(page)
   assert.equal(outer.scrollTop, 300, 'one page is the nested 100px client height')
   assert.equal(page.prevented(), true)
   handlers.dispose()
 })
 
-test('delegation covers descendant targets in every marked nested region', () => {
+test('delegation keeps each marked nested region independent', () => {
   const { child, handlers, nested, outer } = fixture({ nestedTop: 200 })
-  const event = wheel(child, { deltaY: 30 })
+  handlers.onWheel(wheel(child, { deltaY: 30, timeStamp: 1000 }))
+  const event = wheel(child, { deltaY: 30, timeStamp: 1400 })
   handlers.onWheel(event)
   assert.equal(outer.scrollTop, 430)
   assert.equal(event.prevented(), true)
+
+  const second = {
+    scrollTop: 200, scrollHeight: 300, clientHeight: 100,
+    closest: selector => selector === '[data-chat-scroll-region], .chat__scroll'
+      ? second
+      : null,
+  }
+  outer.contains = node => node === nested || node === second
+  handlers.onWheel(wheel(second, { deltaY: 30, timeStamp: 1800 }))
+  assert.equal(outer.scrollTop, 430, 'a different reader cannot inherit the first reader’s handoff')
 
   const unrelated = { closest: () => null }
   const outside = wheel(unrelated, { deltaY: 30 })
@@ -97,6 +119,17 @@ test('delegation covers descendant targets in every marked nested region', () =>
   assert.equal(outer.scrollTop, 430)
   assert.equal(outside.prevented(), false)
   nested.scrollTop = 0
+  handlers.dispose()
+})
+
+test('reaching the edge exactly arms the next gesture without handing off the first', () => {
+  const { child, handlers, nested, outer } = fixture({ nestedTop: 190 })
+  const exact = wheel(child, { deltaY: 10, timeStamp: 1000 })
+  handlers.onWheel(exact)
+  assert.equal(exact.prevented(), false, 'native scrolling consumes the whole delta')
+  nested.scrollTop = 200 // browser applies the native movement after the event
+  handlers.onWheel(wheel(child, { deltaY: 20, timeStamp: 1400 }))
+  assert.equal(outer.scrollTop, 420)
   handlers.dispose()
 })
 
@@ -112,6 +145,15 @@ test('ctrl-wheel zoom and scrollable room retain native browser behavior', () =>
   handlers.onWheel(native)
   assert.equal(outer.scrollTop, 400)
   assert.equal(native.prevented(), false)
+  handlers.dispose()
+})
+
+test('non-cancelable edge momentum stays owned by the nested reader', () => {
+  const { child, handlers, outer } = fixture({ nestedTop: 200 })
+  const event = wheel(child, { deltaY: 30, timeStamp: 1000, cancelable: false })
+  assert.equal(handlers.onWheel(event), true)
+  assert.equal(event.prevented(), false)
+  assert.equal(outer.scrollTop, 400)
   handlers.dispose()
 })
 

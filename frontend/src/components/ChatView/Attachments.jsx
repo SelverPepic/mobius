@@ -29,7 +29,7 @@ export default function Attachments({ attachments, chatId }) {
   // Fetch a short-lived media token for this chat. Owner JWTs must not appear
   // in ?token= query params (they leak into access logs/history/Referer).
   const [tokenParam, setTokenParam] = useState(null)
-  const [expandedName, setExpandedName] = useState(null)
+  const [expandedNames, setExpandedNames] = useState(() => new Set())
   useEffect(() => {
     if (!hasAttachments) return undefined
     setTokenParam(null)
@@ -68,7 +68,7 @@ export default function Attachments({ attachments, chatId }) {
         const isGenerated = f.kind === 'generated'
         const isMarkdown = generatedFileIsMarkdown(f)
         const hasChatPreview = isMarkdown || generatedFileIsPdf(f)
-        const previewOpen = expandedName === f.name
+        const previewOpen = expandedNames.has(f.name)
         const canPreview = generatedFileCanPreview(f)
         const href = tokenParam ? `${BASE}/api/chats/${encodeURIComponent(chatId)}/${
           isGenerated ? 'generated-files' : 'uploads'
@@ -85,7 +85,12 @@ export default function Attachments({ attachments, chatId }) {
           file={f}
           chatId={chatId}
           expanded={previewOpen}
-          onToggle={() => setExpandedName(previewOpen ? null : f.name)}
+          onToggle={() => setExpandedNames(current => {
+            const next = new Set(current)
+            if (next.has(f.name)) next.delete(f.name)
+            else next.add(f.name)
+            return next
+          })}
         />
         if (!tokenParam) return isGenerated ? (
           <span key={i} className="chat__attach-file" aria-disabled="true">

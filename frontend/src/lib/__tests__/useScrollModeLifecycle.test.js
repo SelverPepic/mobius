@@ -225,17 +225,22 @@ test('nested controls cannot relatch the transcript while they own the input', (
       },
     }
     listeners.get('wheel')({
-      type: 'wheel', deltaY: 80, shiftKey: false, target: nested,
+      type: 'wheel', deltaY: 80, shiftKey: false, target: nested, timeStamp: 1000,
     })
     assert.equal(scroll.dataset.scrollMode, 'ANCHOR_AT',
       'a nested vertical surface keeps the wheel while it can move')
 
     nested.scrollTop = 120
     listeners.get('wheel')({
-      type: 'wheel', deltaY: 80, shiftKey: false, target: nested,
+      type: 'wheel', deltaY: 80, shiftKey: false, target: nested, timeStamp: 1050,
+    })
+    assert.equal(scroll.dataset.scrollMode, 'ANCHOR_AT',
+      'momentum reaching the nested edge cannot relatch the transcript')
+    listeners.get('wheel')({
+      type: 'wheel', deltaY: 80, shiftKey: false, target: nested, timeStamp: 1450,
     })
     assert.equal(scroll.dataset.scrollMode, 'FOLLOW_BOTTOM',
-      'the same gesture may chain to the transcript at the nested edge')
+      'a deliberate new gesture at the nested edge may enter the transcript')
     hook.unmount()
   } finally {
     restoreBrowser()

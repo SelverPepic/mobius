@@ -36,6 +36,16 @@ test('.chat__scroll contains its overscroll and is a positioning context', () =>
   assert.match(body, /position:\s*relative/)
 })
 
+test('nested chat readers contain native overscroll until the shared handoff allows it', () => {
+  for (const selector of [
+    '.chat__tool-detail', '.chat__marker-body', '.chat__document-card-reader',
+  ]) {
+    assert.match(ruleBody(selector), /overscroll-behavior(?:-y)?:\s*contain/)
+  }
+  const questionCss = readFileSync(join(dir, '..', 'QuestionCard.css'), 'utf8')
+  assert.match(questionCss, /\.qcard__input\s*\{[^}]*overscroll-behavior-y:\s*contain/)
+})
+
 test('the composer and transcript both reserve the full device safe area', () => {
   const foot = ruleBody('.chat__foot')
   const list = ruleBody('.chat__list')
