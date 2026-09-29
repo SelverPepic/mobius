@@ -646,6 +646,7 @@ def test_linked_railway_mutations_use_the_scoped_server_bridge(
       "memory_mb": None,
       "volume_mb": None,
       "update_policy": "manual",
+      "region": "europe-west4-drams3a",
     },
     headers=granted,
   )
@@ -667,10 +668,16 @@ def test_linked_railway_mutations_use_the_scoped_server_bridge(
     json={"update_policy": "manual"},
     headers=granted,
   )
+  invalid_region = client.post(
+    "/api/identity/railway/deployments",
+    json={"name": "Wrong region", "region": "unknown"},
+    headers=granted,
+  )
 
   assert connect.status_code == 200
   assert connect.json()["authorization_url"].startswith("https://www.mobius.you/")
   assert created.status_code == 202
+  assert invalid_region.status_code == 422
   assert renamed.status_code == 200
   assert deleted.status_code == 202
   assert storage.status_code == 200
@@ -686,6 +693,7 @@ def test_linked_railway_mutations_use_the_scoped_server_bridge(
         "memory_mb": None,
         "volume_mb": None,
         "update_policy": "manual",
+        "region": "europe-west4-drams3a",
       },
     ),
     (

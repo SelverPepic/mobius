@@ -94,6 +94,9 @@ class RailwayCreate(BaseModel):
   memory_mb: int | None = None
   volume_mb: int | None = None
   update_policy: Literal["automatic", "manual"] | None = None
+  region: Literal[
+    "us-west2", "us-east4-eqdc4a", "europe-west4-drams3a", "asia-southeast1-eqsg3a"
+  ] | None = None
 
 
 class RailwayCompute(BaseModel):
@@ -1120,6 +1123,10 @@ async def create_railway_deployment(
   # only sends it after the inventory advertises update-policy support.
   if body.update_policy is not None:
     settings["update_policy"] = body.update_policy
+  # The account service advertises region support in its inventory. Older
+  # hosts still receive the original request when the app omits this field.
+  if body.region is not None:
+    settings["region"] = body.region
   return await _railway_mutation(
     db,
     owner.id,
