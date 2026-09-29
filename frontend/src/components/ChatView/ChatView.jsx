@@ -2000,9 +2000,10 @@ export default function ChatView({
       // including when Stop is pressed with a queued message): the backend has
       // sealed the assistant text streamed up to the split, persisted the user
       // message after it, and reset for the continuation. Mirror that exact
-      // shape locally: first promote the current live stream segment into
-      // `messages`, then append the steered user row, then let future text
-      // deltas build a fresh streaming assistant block.
+      // shape locally in one transcript commit: seal the current assistant
+      // segment directly before the steered row, then let future text deltas
+      // build a fresh streaming assistant block. Separate commits can briefly
+      // paint the row ahead of the paragraph that was already visible.
       //
       // The split is owned by the live provider handle through the sink, so
       // this event always arrives AFTER the last block belonging to the sealed
@@ -2043,6 +2044,7 @@ export default function ChatView({
         keepTurnOpen: true,
         items: sealedItems,
         assistantMessageId,
+        followingMessages: steeredMessages,
         authoritativeCut: true,
       })
       // The sealed segment was promoted under the previous owner above. The
@@ -2071,11 +2073,6 @@ export default function ChatView({
         // applied its pin/hold, before allowing keyboard geometry to change.
         setCommittedSteerKeyboardDismiss(keyboardDismissRequest)
       }
-      // Dedup by ts so a reconnect's catch-up replay of the same event
-      // can't double-insert the steered user message. Insert by transcript ts
-      // instead of blindly appending: if a fetch/replay already committed the
-      // post-steer assistant row, the steered user still belongs before it.
-      commitMessages(prev => insertMessageBatchByTs(prev, steeredMessages))
       // The rows have now genuinely left `chat.pending_messages`, so retire the
       // tray entries the deferred-cut window kept durably queued but hidden.
       // The cut is the one place that owns the hand-off for both providers.
@@ -2368,6 +2365,11 @@ export default function ChatView({
     // REAL token ("I ") is renderable and still seals — we only skip when there
     // is nothing worth keeping.
     if (keepTurnOpen && !streamItemsHaveRenderableContent(items)) {
+      // Even an empty assistant segment has a real owner-message boundary.
+      // Commit that row here, not in a second render after stream retirement.
+      if (following.length > 0) {
+        commitMessages(prev => insertMessageBatchByTs(prev, following))
+      }
       clearStreamItems?.()
       return
     }
