@@ -26,17 +26,22 @@ export function sealedAssistantBeforeSteer(messages, continuationIndex) {
 }
 
 
-function soleTextBlockContent(message) {
+function terminalTextBlockContent(message) {
   if (!message) return ''
   if (!Array.isArray(message.blocks) || message.blocks.length === 0) {
     return typeof message.content === 'string' ? message.content : ''
   }
-  const textBlocks = message.blocks.filter(block => (
-    block?.type === 'text' && typeof block.content === 'string' && block.content
-  ))
-  // Joining several text blocks would invent separators and could cross tool,
-  // question, or activity boundaries. Exactness is more important than reach.
-  return textBlocks.length === 1 ? textBlocks[0].content : ''
+  // A repeated steer can replay the current text section, not the whole reply.
+  // Never join sections or reach back past a tool/question boundary. Thinking
+  // is neutral activity, just as it is before the continuation's first text.
+  for (let index = message.blocks.length - 1; index >= 0; index -= 1) {
+    const block = message.blocks[index]
+    if (block?.type === 'thinking') continue
+    return block?.type === 'text' && typeof block.content === 'string'
+      ? block.content
+      : ''
+  }
+  return ''
 }
 
 
@@ -80,7 +85,7 @@ export function projectSteerContinuationMessage(
   if (!sealedMessage || continuationMessage?.role !== 'assistant') {
     return continuationMessage
   }
-  const prefix = soleTextBlockContent(sealedMessage)
+  const prefix = terminalTextBlockContent(sealedMessage)
   if (!prefix) return continuationMessage
 
   const blocks = continuationMessage.blocks

@@ -5863,6 +5863,54 @@ export default function ChatView({
     pendingQueue.steerReservedMessages,
   )
 
+  // A DB refresh may commit the steer before its cut reaches this socket.
+  // Keep the identity-owned active row in its transcript slot through that
+  // handoff; moving it to the tail would paint the owner message above it.
+  const activeAssistantSurface = showActiveAssistantSurface ? (
+    <ActiveAssistantSurface
+      key={streamingDataKey}
+      activeMirrorMsg={projectedActiveMirrorMsg}
+      activityMessageId={activeAssistantMessageId}
+      activitySourceBlocks={activeMirrorMsg?.blocks}
+      useDbActivePayload={useDbActivePayload}
+      hasLivePayload={hasLiveAssistantPayload}
+      streamItems={streamItems}
+      dataKey={streamingDataKey}
+      chatId={chatId}
+      onAnswer={doSendSilent}
+      onPrepareAnswer={prepareQuestionSubmission}
+      onCancelAnswer={cancelQuestionSubmission}
+      onResume={activeAssistantIsStreaming ? undefined : handleResume}
+      resumeState={resumeState}
+      onInternalNav={internalNav}
+      autoResumeEnabled={autoResumeEnabled}
+      autoResumeAvailable={showAutoResumeControl}
+      autoResumeSaving={autoResumeSaving}
+      autoResumeError={
+        autoResumeErrorSource === 'card' ? autoResumeError : ''
+      }
+      onAutoResumeChange={handleAutoResumeChange}
+      limitResetElapsed={limitResetElapsed}
+      recoveryCredit={pendingLimitRecoveryCredit}
+      submissionBlocked={providerSwitching}
+      liveQuestionId={answerableQuestionId}
+      // Same publication channel as the durable rows above: while the
+      // turn is live THIS surface owns the pending question card, so
+      // the offscreen observer follows the handoff automatically.
+      pendingQuestionRef={pendingQuestionRef}
+      resumeCardRef={resumeCardRef}
+      // Liveness for the ACTIVE surface follows the TURN, not the
+      // payload source: when a richer DB partial wins source selection
+      // (useDbActivePayload, e.g. through the reconnect catch-up
+      // window) the turn is still running, and its trailing activity
+      // must keep the in-progress face — shimmer, progressive tense,
+      // ", in progress" — instead of settling early. Source selection
+      // still gates resume/question routing above (review 2026-07-17).
+      isStreaming={activeAssistantIsStreaming || turnActive}
+      sealedSteerAssistant={sealedSteerAssistant}
+    />
+  ) : null
+
   return (
     <div
       ref={chatRef}
@@ -6033,13 +6081,12 @@ export default function ChatView({
             const continuationMarker = isContinuationMessage(msg)
             const renderedEndIndex = ownerBatch?.end ?? i
             const isLastMsg = renderedEndIndex === lastVisibleMessageIndex
-            // The mirrored DB row is rendered below by the SAME active
-            // MsgContent instance that consumes live payloads. Suppress only
-            // that row; unrelated assistant history remains in this map.
+            // DB and stream payloads occupy the same identity-owned row,
+            // including when a committed steer already follows that row.
             if (i === activeMirrorMsgIdx
                 && msg.role === 'assistant'
                 && showActiveAssistantSurface) {
-              return [peerRows]
+              return [peerRows, activeAssistantSurface]
             }
             // A question is answerable while the runner is parked on it,
             // waiting for the answer. The runner BLOCKS the turn on the
@@ -6139,52 +6186,9 @@ export default function ChatView({
               />
             </li>
           )]
-          })}
-
-          {showActiveAssistantSurface && (
-            <ActiveAssistantSurface
-              key={streamingDataKey}
-              activeMirrorMsg={projectedActiveMirrorMsg}
-              activityMessageId={activeAssistantMessageId}
-              activitySourceBlocks={activeMirrorMsg?.blocks}
-              useDbActivePayload={useDbActivePayload}
-              hasLivePayload={hasLiveAssistantPayload}
-              streamItems={streamItems}
-              dataKey={streamingDataKey}
-              chatId={chatId}
-              onAnswer={doSendSilent}
-              onPrepareAnswer={prepareQuestionSubmission}
-              onCancelAnswer={cancelQuestionSubmission}
-              onResume={activeAssistantIsStreaming ? undefined : handleResume}
-              resumeState={resumeState}
-              onInternalNav={internalNav}
-              autoResumeEnabled={autoResumeEnabled}
-              autoResumeAvailable={showAutoResumeControl}
-              autoResumeSaving={autoResumeSaving}
-              autoResumeError={
-                autoResumeErrorSource === 'card' ? autoResumeError : ''
-              }
-              onAutoResumeChange={handleAutoResumeChange}
-              limitResetElapsed={limitResetElapsed}
-              recoveryCredit={pendingLimitRecoveryCredit}
-              submissionBlocked={providerSwitching}
-              liveQuestionId={answerableQuestionId}
-              // Same publication channel as the durable rows above: while the
-              // turn is live THIS surface owns the pending question card, so
-              // the offscreen observer follows the handoff automatically.
-              pendingQuestionRef={pendingQuestionRef}
-              resumeCardRef={resumeCardRef}
-              // Liveness for the ACTIVE surface follows the TURN, not the
-              // payload source: when a richer DB partial wins source selection
-              // (useDbActivePayload, e.g. through the reconnect catch-up
-              // window) the turn is still running, and its trailing activity
-              // must keep the in-progress face — shimmer, progressive tense,
-              // ", in progress" — instead of settling early. Source selection
-              // still gates resume/question routing above (review 2026-07-17).
-              isStreaming={activeAssistantIsStreaming || turnActive}
-              sealedSteerAssistant={sealedSteerAssistant}
-            />
-          )}
+          }).concat(activeMirrorMsgIdx < 0 && activeAssistantSurface
+            ? [activeAssistantSurface]
+            : [])}
 
           {turnActive && streamItems.length === 0 && !loading && !showActiveAssistantSurface && (
             <li className="chat__msg chat__msg--assistant">
