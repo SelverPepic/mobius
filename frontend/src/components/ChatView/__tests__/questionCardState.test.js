@@ -10,6 +10,34 @@ const component = readFileSync(new URL('../QuestionCard.jsx', import.meta.url), 
 const chatView = readFileSync(new URL('../ChatView.jsx', import.meta.url), 'utf8')
 const css = readFileSync(new URL('../QuestionCard.css', import.meta.url), 'utf8')
 
+test('text-only questions never offer choice instructions or empty choice groups', () => {
+  for (const options of [undefined, []]) {
+    for (const multiSelect of [false, true]) {
+      for (const answeredMap of [undefined, { 'Which chat?': 'Example chat title' }]) {
+        const html = renderToStaticMarkup(createElement(QuestionCard, {
+          chatId: 'text-only', questionId: 'text-only-q', answeredMap,
+          questions: [{ question: 'Which chat?', options, multiSelect }],
+        }))
+        assert.doesNotMatch(html, /Choose one|Select all that apply|qcard__hint|qcard__opts|radiogroup/)
+        if (answeredMap) assert.match(html, /Example chat title/)
+        else assert.match(html, /placeholder="Type your answer…"/)
+      }
+    }
+  }
+})
+
+test('questions with choices retain single and multi-select instructions', () => {
+  for (const [multiSelect, hint, role] of [[false, 'Choose one', 'radio'], [true, 'Select all that apply', 'checkbox']]) {
+    const html = renderToStaticMarkup(createElement(QuestionCard, {
+      chatId: 'choices', questionId: 'choices-q',
+      questions: [{ question: 'Which?', options: [{ label: 'A' }, { label: 'B' }], multiSelect }],
+    }))
+    assert.ok(html.includes(hint))
+    assert.ok(html.includes(`role="${role}"`))
+    assert.match(html, /placeholder="Or type your own answer…"/)
+  }
+})
+
 test('question option explanations remain selectable without choosing them', () => {
   const optionRule = css.match(/\.qcard__opt\s*\{[^}]*\}/s)?.[0] || ''
 
@@ -36,8 +64,8 @@ test('unanswered question cards do not have a stale gray state', () => {
     'submit button should remain in place after an answer is submitted')
   assert.match(component, /let submitLabel = writtenRestartAction \? 'Continue' : 'Submit'[\s\S]*if \(answered\) submitLabel = 'Submitted'[\s\S]*if \(submitting\) submitLabel = 'Submitting…'/,
     'the retained submit button should explain pending and answered states without rewriting legacy Restart cards')
-  assert.match(component, /\{!completedAction && \(!disabled \|\| answered\) && \(\s*<div className="qcard__hint"/,
-    'selection hints should stay in place after the answer is submitted')
+  assert.match(component, /\{!completedAction && \(!disabled \|\| answered\) && q\.options\?\.length > 0 && \(\s*<div className="qcard__hint"/,
+    'selection hints should stay in place after submission only when there are choices')
   assert.doesNotMatch(component, /qcard__opt--other/,
     'a custom answer should be a direct writing surface, not an Other option')
   assert.match(component, /const writtenAnswer = writtenRestartResponse[\s\S]*?unmatchedAnswers\.join\(', '\)[\s\S]*?<CustomAnswerArea[\s\S]*?answered=\{selectionLocked\}[\s\S]*?value=\{selectionLocked[\s\S]*?writtenAnswer/,
@@ -106,7 +134,7 @@ test('multiple questions read as one compact decision panel', () => {
   assert.match(component, /const grouped = questions\.length > 1/)
   assert.match(component, /className=\{`qcard\$\{grouped \? ' qcard--grouped'/)
   assert.match(component, /\{questions\.length\} decisions/)
-  assert.match(component, /Choose each one, then submit them together\./)
+  assert.match(component, /Answer each question, then submit them together\./)
   assert.match(css, /\.qcard\s*\{[\s\S]*?width:\s*min\(100%, 640px\);[\s\S]*?margin:\s*10px auto;/)
   assert.match(css, /\.qcard--grouped\s*\{[\s\S]*?overflow:\s*hidden;/)
   assert.match(css, /\.qcard--grouped \.qcard__q \+ \.qcard__q\s*\{[\s\S]*?margin-top:\s*0;/)

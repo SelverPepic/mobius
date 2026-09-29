@@ -330,7 +330,7 @@ export default function QuestionCard({
           <div>
             <div className="qcard__group-title">{questions.length} decisions</div>
             <div className="qcard__group-copy">
-              Choose each one, then submit them together.
+              Answer each question, then submit them together.
             </div>
           </div>
           <span className="qcard__group-count">{questions.length}</span>
@@ -383,7 +383,7 @@ export default function QuestionCard({
                 and watched whether a prior pick cleared. Surface it up front:
                 a caption (with a live count for multi) plus a per-option glyph
                 (□ checkbox for multi, ○ radio for single). */}
-            {!completedAction && (!disabled || answered) && (
+            {!completedAction && (!disabled || answered) && q.options?.length > 0 && (
               <div className="qcard__hint">
                 {writtenRestartAction
                   ? 'Restart now, or reply below'
@@ -395,7 +395,7 @@ export default function QuestionCard({
             {/* Selection state was conveyed only by a CSS class — silent to
                 screen readers. Expose it as a radiogroup (single) / group of
                 checkboxes (multi) with per-option aria-checked. */}
-            {!completedAction && <div
+            {!completedAction && q.options?.length > 0 && <div
               className="qcard__opts"
               role={isMulti ? 'group' : 'radiogroup'}
               aria-label={q.question}
@@ -469,7 +469,7 @@ export default function QuestionCard({
                 disabled={inactive}
                 placeholder={writtenRestartAction
                   ? 'Or tell me what you’d like to do instead…'
-                  : undefined}
+                  : q.options?.length ? undefined : 'Type your answer…'}
                 onChange={text => setOtherText(q.question, text)}
                 onSubmitShortcut={(questionCard) => {
                   if (allAnswered) handleSubmit(questionCard, null)
