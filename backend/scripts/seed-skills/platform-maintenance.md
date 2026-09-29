@@ -61,32 +61,27 @@ Review the exact changed paths and use the smallest matching action:
    version. New processes can use the install immediately. A long-running
    backend needs one approved server restart only when it must load the new
    package itself.
-3. Install freely. To survive container replacement, declare setup rather
-   than relying on local image-file edits. Apps use `setup` in their accepted
-   `mobius.json`; instance-wide declarations use
-   `/data/customizations/mobius.json`. Both use this small shape:
-   `{"setup":{"steps":["restore.sh"],"apt":["poppler-utils (>= 25)"]},"source_files":["restore.sh"]}`.
-   Ship app scripts and inputs through `source_files`, then Apply. Instance
-   scripts live beside their manifest; after edits, request a re-run.
-   Instance manifests need only `setup`, not `source_files`.
-   Scripts need a shebang and receive `check` or `apply` as their only argument,
-   with their source directory as cwd. `check` exits 0 when ready, 1 when apply
-   is needed, 2 for conflict; other exits fail. `apply` must be idempotent;
-   successful apply is checked again. Run as `mobius`, using existing sudo
-   where needed. Write persistent outputs under `/data`, not accepted source.
-   Version/lock syntax belongs to the underlying manager (`npm ci`, pip, etc.).
-   All `setup.apt` requirements are solved together with `apt-get satisfy`;
-   conflicts do not force removal or downgrades. Package lists refresh when
-   requirements are unmet; extra repository configuration stays explicit.
-   Restoration runs sequentially after readiness and update settlement, on
-   every boot and accepted declaration. It never holds up boot or updates.
-   Owner-authenticated `GET /api/setup` shows per-step state/output and the
-   running step. `POST /api/setup/rerun` cancels the running step and starts
-   a fresh pass (also after instance edits). Steps have no execution timeout.
-   Failed steps wait for a re-run, declaration acceptance, or the next boot.
-   There is no UI or automatic capture of ad-hoc installs. A root script can
-   still disrupt the platform: this is restoration, not a sandbox.
-4. Treat a container rebuild as a last resort, not an ordinary closeout step.
+3. If shipped platform behavior depends on the package, record the same
+   resolution in the owning manifest and lockfile, plus the Dockerfile only
+   when image wiring is needed, and contribute it upstream. These declarations
+   are durability metadata, not an activation action: they reach installations
+   through the release that contains them. Committed only locally, they never
+   reach an image and never block updates.
+4. To keep a local or app install across container replacements, declare a
+   setup step: `{"setup":{"steps":["restore.sh"],"apt":["poppler-utils (>= 25)"]}}`
+   in the app's accepted `mobius.json` (ship scripts through `source_files`,
+   then Apply) or in `/data/customizations/mobius.json` for the instance. A
+   step script gets `check` (exit 0 ready, 1 needs apply, 2 conflict) or an
+   idempotent `apply`, runs as `mobius` from its directory (sudo as needed),
+   and writes persistent output under `/data`. Version syntax belongs to the
+   underlying manager; all `apt` entries are solved together by
+   `apt-get satisfy`, never forcing removals. Restoration runs after readiness
+   and update settlement on every boot and accepted declaration, and never
+   holds up boot or updates. `GET /api/setup` shows each step's state and the
+   running one; `POST /api/setup/rerun` cancels it and starts a fresh pass.
+   A root script can still disrupt the platform: this is restoration, not a
+   sandbox.
+5. Treat a container rebuild as a last resort, not an ordinary closeout step.
    Require it now only when the change genuinely cannot activate live, or when
    the partner explicitly asks to validate the image.
 

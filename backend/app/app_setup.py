@@ -214,17 +214,8 @@ class Runner:
       await asyncio.sleep(1)
 
   async def serve(self):
-    import httpx
-    # A real HTTP probe proves lifespan has yielded AND the server is serving.
-    async with httpx.AsyncClient(trust_env=False) as client:
-      while True:
-        try:
-          response = await client.get(f"http://127.0.0.1:{os.environ.get('PORT', '8000')}/api/ready")
-          if response.status_code == 200:
-            break
-        except httpx.HTTPError:
-          pass
-        await asyncio.sleep(1)
+    # Started as lifespan completes: restoration only ever follows startup,
+    # and waits for update settlement before each mutation.
     while True:
       await self.wake.wait()
       await self.wait_settled()

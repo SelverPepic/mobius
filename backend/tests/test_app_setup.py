@@ -68,13 +68,8 @@ async def test_apt_combines_constraints_and_refuses_conflict(setup, monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_nonblocking_readiness_and_settlement(setup, monkeypatch):
-  import httpx
-  ready = False
+async def test_restoration_waits_for_update_settlement(setup, monkeypatch):
   record = {"state": "swapped", "operation": {"id": "replacement"}}
-  async def get(*args, **kwargs):
-    return SimpleNamespace(status_code=200 if ready else 503)
-  monkeypatch.setattr(httpx.AsyncClient, "get", get)
   monkeypatch.setattr(app_setup.platform_update, "read_prepared_update", lambda: record)
   real_sleep = asyncio.sleep
   async def tick(_):
@@ -86,10 +81,6 @@ async def test_nonblocking_readiness_and_settlement(setup, monkeypatch):
   setup.reconcile = AsyncMock(side_effect=reconcile)
   task = asyncio.create_task(setup.serve())
   try:
-    for _ in range(10):
-      await real_sleep(0)
-    setup.reconcile.assert_not_awaited()
-    ready = True
     for _ in range(10):
       await real_sleep(0)
     setup.reconcile.assert_not_awaited()
@@ -209,10 +200,8 @@ async def test_shutdown_reaps_group_without_waiting_for_pipe_eof(tmp_path, escap
 
 @pytest.mark.asyncio
 async def test_complete_status_and_rerun_cancels_running_step(setup, tmp_path, monkeypatch):
-  import httpx
   from app.routes.settings import rerun_dependency_setup
   from app.process_groups import _has_exited
-  monkeypatch.setattr(httpx.AsyncClient, "get", AsyncMock(return_value=SimpleNamespace(status_code=200)))
   monkeypatch.setattr(app_setup, "_runner", setup)
   root = tmp_path / "customizations"
   root.mkdir()
