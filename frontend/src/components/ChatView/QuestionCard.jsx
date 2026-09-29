@@ -150,7 +150,11 @@ export default function QuestionCard({
   ))
   const actionStatusLabel = restartCardStatusLabel(platformAction)
   const actionStatusDetail = restartCardStatusDetail(platformAction)
+  // A ready-boot receipt is independent of the offered action. Keep an
+  // unanswered button and written reply available without manufacturing an
+  // owner answer or bypassing the server's continuation hold.
   const completedAction = Boolean(actionStatusLabel)
+    && platformAction?.status !== 'awaiting_owner'
   const answered = submitted || !!answeredMap || completedAction
   const locallyQueued = !answered && Boolean(localAnswer)
   const selectionLocked = answered || locallyQueued
@@ -386,7 +390,9 @@ export default function QuestionCard({
             {!completedAction && (!disabled || answered) && (
               <div className="qcard__hint">
                 {writtenRestartAction
-                  ? 'Restart now, or reply below'
+                  ? platformAction.observation?.observed_at
+                    ? 'Restart again, or reply below'
+                    : 'Restart now, or reply below'
                   : isMulti
                   ? `Select all that apply${selectionCount ? ` · ${selectionCount} selected` : ''}`
                   : 'Choose one'}
