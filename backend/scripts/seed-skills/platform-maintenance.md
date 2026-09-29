@@ -72,7 +72,7 @@ Review the exact changed paths and use the smallest matching action:
    in the app's accepted `mobius.json` (ship scripts through `source_files`,
    then Apply) or in `/data/customizations/mobius.json` for the instance. A
    step script gets `check` (exit 0 ready, 1 needs apply, 2 conflict) or an
-   idempotent `apply`, runs as `mobius` from its directory (sudo as needed),
+   idempotent `apply`, runs as `mobius` from its manifest's directory (sudo as needed),
    and writes persistent output under `/data`. Version syntax belongs to the
    underlying manager; all `apt` entries are solved together by
    `apt-get satisfy`, never forcing removals. Restoration runs after readiness

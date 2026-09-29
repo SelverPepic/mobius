@@ -318,8 +318,9 @@ async def lifespan(app):
     record_memory_checkpoint("startup_ready")
     supervisors.reclaim_boot_file_cache()
   from app import app_setup
-  # Like cron mutation, restoration never runs inside the test runtime; its
-  # own tests drive the runner directly.
+  # Like cron mutation, restoration never runs inside the test runtime (its
+  # readiness probe would reach other tests' HTTP doubles); its own tests
+  # drive the runner directly.
   setup_task = app_setup.start() if (
     database_boot.serviceable and os.environ.get("MOBIUS_TEST_RUNTIME") != "1"
   ) else None
