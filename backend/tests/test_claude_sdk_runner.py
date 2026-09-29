@@ -1963,6 +1963,7 @@ async def test_run_claude_sdk_turn_requests_summarized_thinking(monkeypatch):
     claude_sdk_runner._system_prompt_with_register("system")
   )
   assert "$MOBIUS_GENERATED_DIR" in options.system_prompt
+  assert "Create downloadable deliverables only when the owner explicitly requests" in options.system_prompt
   assert options.system_prompt.startswith("system")
   assert "# Concise register" in options.system_prompt
   assert "# Execution lifetimes in Möbius" in options.system_prompt

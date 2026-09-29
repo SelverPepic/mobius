@@ -20,6 +20,20 @@ from app.config import get_settings
 from app.agent_activity import EMPTY_AGENT_ACTIVITY_BINDING
 
 
+def test_delivery_instruction_keeps_reports_in_chat_unless_a_file_is_requested(tmp_path):
+  directory = tmp_path / "deliverables" / "inbox"
+
+  instruction = gf.delivery_instruction(directory)
+
+  assert "Respond in chat by default, including reports, reviews, plans, and summaries." in instruction
+  assert "Create downloadable deliverables only when the owner explicitly requests" in instruction
+  assert "A request for a report or plan alone is not a request for an attachment" in instruction
+  assert "Do not also create a Markdown document or other downloadable copy" in instruction
+  assert f"When a deliverable is requested, save the finished file directly in {directory}." in instruction
+  assert "$MOBIUS_GENERATED_DIR" in instruction
+  assert "Keep temporary and source files outside it." in instruction
+
+
 def _write_row(db, chat, *, name, path, size=11, mime_type="application/pdf"):
   row = models.GeneratedFile(
     chat_id=chat.id, name=name, path=path, size=size, mime_type=mime_type,
