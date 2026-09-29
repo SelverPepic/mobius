@@ -20,7 +20,7 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 _BACKEND_DIR = _SCRIPT_DIR.parent
 if str(_BACKEND_DIR) not in sys.path:
   sys.path.insert(0, str(_BACKEND_DIR))
-from app import cron_tz
+from app import app_python_env, cron_tz
 from app.manifest_contract import (
   ManifestContractError,
   job_interpreter,
@@ -303,16 +303,33 @@ def _job_env(app_token: str) -> dict[str, str]:
   return env
 
 
-def _job_command(job: Path, app_id: int) -> list[str]:
+def _job_command(job: Path, app_id: int, python_env: Path | None) -> list[str]:
   """Build the command declared by a job's shebang.
 
   Job packages own their runtime choice. The platform only validates that
   declaration and passes the app id; it does not guess an interpreter from a
-  filename, executable bit, or historical Bash convention.
+  filename, executable bit, or historical Bash convention. A Python shebang in
+  an app that declares a Python lock runs with that app's own environment.
   """
   with job.open("rb") as script:
     interpreter = job_interpreter(script.read(257))
+  interpreter = app_python_env.job_command_interpreter(interpreter, python_env)
   return [*interpreter, str(job), str(app_id)]
+
+
+def _reclaim_job_file_cache(app_id: int) -> None:
+  """Release file pages the finished job left cached.
+
+  Jobs run git, gh, and provider tools outside any chat turn, so the
+  settled-turn cleanup never sees them, and on a metered host their cached
+  pages stay billable memory. Optional work: a failure is logged and never
+  changes the job's exit status.
+  """
+  try:
+    from app.file_cache import reclaim_background_work_cache
+    reclaim_background_work_cache(DATA_DIR)
+  except Exception as exc:
+    _log(app_id, f"file cache advice failed: {exc!r}")
 
 
 def _execute_job(
@@ -377,7 +394,15 @@ def _execute_job(
     job_state.mkdir(parents=True, exist_ok=True)
     child_env["APP_JOB_STATE_DIR"] = str(job_state)
     try:
-      command = _job_command(runtime_job, app_id)
+      # Every job of a declaring app needs its env: a Bash job's `python3`
+      # resolves to it through PATH.
+      python_env = app_python_env.resolve_env(DATA_DIR, app_id, runtime_job.parent)
+    except app_python_env.PythonEnvUnavailable as exc:
+      _log(app_id, f"failed: {runtime_job.name}: {exc}")
+      return 4
+    child_env = app_python_env.activated_environment(child_env, python_env)
+    try:
+      command = _job_command(runtime_job, app_id, python_env)
     except (OSError, ManifestContractError) as exc:
       _log(app_id, f"rejected: invalid job declaration {runtime_job}: {exc}")
       return 4
@@ -403,6 +428,7 @@ def _execute_job(
       _emit_cron_outcome(app_id, resolved, rc, duration_ms)
     if rc != 0:
       _log(app_id, f"job exited rc={rc}: {resolved}")
+    _reclaim_job_file_cache(app_id)
     return rc
   finally:
     lease.unlink(missing_ok=True)

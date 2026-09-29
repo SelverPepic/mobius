@@ -6,6 +6,8 @@ import ipaddress
 import re
 from urllib.parse import urlparse
 
+from starlette.requests import Request
+
 
 def absolute_csp_origin(value: str) -> str | None:
   """Return one origin-only HTTP(S) CSP source or fail closed."""
@@ -91,8 +93,23 @@ def app_frame_csp(
   )
 
 
+# Every response without an explicit namespace lane is inert: sandboxed, no
+# scripts. Only a handler that serves code the platform itself authored (the
+# shell document, its workers, and a few platform pages) opts into the shell
+# policy, by declaring this dependency. A new route therefore cannot run bytes
+# an app, an agent, a chat, or a third party controls on the owner's origin by
+# being forgotten. The marker lives in the ASGI scope, which response headers
+# relayed from an upstream or an app cannot reach.
+PLATFORM_CODE_SCOPE_KEY = "mobius.platform_code"
+
+
+def serves_platform_code(request: Request) -> None:
+  """Route dependency: this handler's responses may run as the shell."""
+  request.scope[PLATFORM_CODE_SCOPE_KEY] = True
+
+
 def shell_csp(gateway_origin: str = "") -> str:
-  """Policy for ordinary shell/API documents, independent of proxy syntax.
+  """Policy for platform-code responses, independent of proxy syntax.
 
   ``'wasm-unsafe-eval'`` permits WebAssembly and nothing else, rather than the
   general ``'unsafe-eval'``. On-device Pocket TTS runs as Wasm in a same-origin

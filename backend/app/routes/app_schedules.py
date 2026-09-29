@@ -585,7 +585,8 @@ def update_app_schedule(
   counterpart to run-job: a mini-app settings screen can tune its own
   recurring job, but an app token cannot rewrite a sibling's crontab.
   The scaffold writes both the live crontab and durable init-cron.sh so
-  the change survives container restarts.
+  the change survives container restarts, and the recorded owner provenance
+  keeps it across app updates that leave the schedule contract unchanged.
   """
   require_nondelegated_owner_control(principal)
   if principal.app_id is not None and principal.app_id != app_id:
@@ -601,18 +602,18 @@ def update_app_schedule(
     raise HTTPException(status_code=400, detail=str(exc)) from exc
   timezone = (body.timezone or "").strip() or None
   if timezone is not None:
-    # A zone-owned schedule is durable data: body.cron is the daily wall time
+    # A zone-owned schedule is durable data: body.cron is the wall time
     # in that zone, and the crontab entry is an every-minute materialization
     # whose supervised gate decides the real due instant.
     if not cron_tz.valid_timezone(timezone):
       raise HTTPException(
         status_code=400, detail=f"Unknown IANA timezone: {timezone!r}",
       )
-    if cron_tz.parse_daily_cron(body.cron) is None:
+    if cron_tz.parse_wall_clock_cron(body.cron) is None:
       raise HTTPException(
         status_code=400,
-        detail="A timezone-owned schedule must be a plain daily cron "
-               "('m h * * *').",
+        detail="A timezone-owned schedule must be a fixed wall time "
+               "('m h * * *' or 'm h * * 1-5').",
       )
   source_dir = Path(app.source_dir)
   job_name = body.job or "fetch.sh"
@@ -627,6 +628,17 @@ def update_app_schedule(
   if not (accepted_root / job_name).is_file():
     raise HTTPException(status_code=400, detail="Job script not found in the applied revision.")
   slug = app.slug
+  manifest_schedule = _manifest_schedule(accepted_root)
+  # Provenance lets accepted updates keep this choice instead of resetting it
+  # to the manifest default (see app_cron.owner_schedule_to_keep). It is
+  # recorded before registering, so no declaration exists without it.
+  app_cron.record_schedule_choice(app_id, app_cron.ScheduleChoice(
+    source="owner",
+    cron=body.cron,
+    job=job_name,
+    timezone=timezone,
+    manifest_default=manifest_schedule[0] if manifest_schedule else None,
+  ))
   if timezone is not None:
     materialized = cron_tz.materialize_zone_cron(body.cron, timezone)
     app_cron.register_cron(

@@ -5,7 +5,8 @@
  * cannot move the card before the continuation actually renders.
  */
 import { test, expect, serveRecoveryBuild } from './_recoveryBrowser.mjs'
-import { testChatAgentSettings, installMockAgentProvider } from './_chatTestPrerequisites.mjs'
+import { testChatAgentSettings, installMockAgentProvider, runtimeSnapshot, mockDeliveryReady } from './_chatTestPrerequisites.mjs'
+import { waitForComposerSendable } from './_chatSession.mjs'
 
 const BASE = process.env.MOBIUS_URL || 'http://localhost:8001'
 
@@ -127,10 +128,7 @@ for (const scenario of [...questionFollowScenarios, coldQuestionScenario]) test(
   const readyGate = scenario.queuedUntilReady
     ? new Promise(resolve => { releaseReadiness = resolve }) : Promise.resolve()
   try {
-    await page.route('**/api/ready', async route => {
-      await readyGate
-      return route.fulfill({ json: { ready: true, boot_id: 'question-follow-boot' } })
-    })
+    await mockDeliveryReady(page, { until: readyGate })
     await page.route(/\/api\/chats(?:\?.*)?$/, route => route.request().method() === 'GET'
       ? route.fulfill({ json: [{ id: chat.id, title: 'Question follow fixture', has_messages: true, running: false }] })
       : route.fallback())
@@ -165,7 +163,9 @@ for (const scenario of [...questionFollowScenarios, coldQuestionScenario]) test(
         return route.fulfill({
           status: 202,
           contentType: 'application/json',
-          body: JSON.stringify({ status: 'started' }),
+          // Echo the accepted message so the send intent retires; otherwise the
+          // outbox re-sends the turn.
+          body: JSON.stringify({ status: 'started', message: acceptedMessage }),
         })
       }
       pendingQuestionId = null
@@ -193,10 +193,8 @@ for (const scenario of [...questionFollowScenarios, coldQuestionScenario]) test(
       height: scenario.viewport.initialHeight,
     })
     const runtimeState = () => ({
-      running: turnStarted,
+      ...runtimeSnapshot({ running: turnStarted, pending_question_id: pendingQuestionId }),
       active_goal_objective: null,
-      pending_messages: [],
-      pending_question_id: pendingQuestionId,
       updated_at: null,
     })
     await page.route(new RegExp(`/api/chats/${chat.id}/runtime(?:\\?.*)?$`), route => {
@@ -235,6 +233,7 @@ for (const scenario of [...questionFollowScenarios, coldQuestionScenario]) test(
     const surface = page.locator('[data-chat-surface="painted"]')
     const input = surface.getByRole('textbox', { name: 'Message Möbius…' })
     await input.fill('Ask while I follow')
+    await waitForComposerSendable(surface)
     await page.keyboard.press('Enter')
     if (releaseReadiness) {
       await expect(surface.locator('.queued__row').filter({ hasText: 'Ask while I follow' })).toBeVisible()

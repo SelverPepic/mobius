@@ -796,3 +796,14 @@ def test_callback_rejects_issuer_mismatch(client, auth, db, provider):
                    params={"code": "c1", "state": state, "iss": "https://evil.test"})
   assert "failed" in bad.text
   assert provider.issued == 0
+
+
+def test_oauth_completion_page_may_run_its_platform_script(client):
+  # The popup posts its result to the opener and closes itself, so it is a
+  # platform document, not inert content.
+  from app.main import _SHELL_CSP
+
+  page = client.get("/api/connectors/oauth/callback")
+  assert page.status_code == 200
+  assert "window.opener" in page.text
+  assert page.headers["content-security-policy"] == _SHELL_CSP

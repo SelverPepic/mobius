@@ -218,21 +218,19 @@ def test_drop_platform_restart_executions_is_idempotent(tmp_path):
   assert "platform_restart_executions" not in inspect(eng).get_table_names()
 
 
-def test_goal_plan_admission_revision_upgrade_is_nullable_and_idempotent(tmp_path):
+def test_retired_goal_admission_revision_migration_stays_idempotent(tmp_path):
+  # Goals no longer earn automatic turns from plan progress. The ledger entry
+  # still runs on fresh and upgraded databases; it only adds the retired
+  # nullable column, which no model maps any more.
   eng = create_engine(f"sqlite:///{tmp_path / 'goal-admission-revision.db'}")
   models.Base.metadata.create_all(eng)
-  with eng.begin() as conn:
-    conn.execute(text(
-      "ALTER TABLE chat_runs DROP COLUMN goal_plan_revision_at_admission"
-    ))
-
   migrations._add_goal_plan_admission_revision(eng)
   migrations._add_goal_plan_admission_revision(eng)
-
-  columns = {
-    column["name"]: column for column in inspect(eng).get_columns("chat_runs")
-  }
-  assert columns["goal_plan_revision_at_admission"]["nullable"] is True
+  cols = {c["name"]: c for c in inspect(eng).get_columns("chat_runs")}
+  assert cols["goal_plan_revision_at_admission"]["nullable"] is True
+  assert (
+    "goal_plan_revision_at_admission" not in models.ChatRun.__table__.columns
+  )
 
 
 def test_retired_progress_lease_migration_stays_idempotent(tmp_path):
@@ -1392,6 +1390,32 @@ def test_run_migrations_adds_owner_auto_resume_default(tmp_path):
   assert value in (False, 0)
 
 
+def test_run_migrations_adds_nullable_owner_timezone(tmp_path):
+  eng = create_engine(f"sqlite:///{tmp_path / 'owner-timezone.db'}")
+  with eng.begin() as conn:
+    conn.execute(text(
+      "CREATE TABLE apps (id INTEGER PRIMARY KEY, name VARCHAR(255))"
+    ))
+    conn.execute(text(
+      "CREATE TABLE owner (id INTEGER PRIMARY KEY, username VARCHAR(64), "
+      "hashed_password VARCHAR(255))"
+    ))
+    conn.execute(text(
+      "INSERT INTO owner (id, username, hashed_password) "
+      "VALUES (1, 'owner', 'hash')"
+    ))
+
+  run_migrations(eng)
+  run_migrations(eng)
+
+  cols = {c["name"]: c for c in inspect(eng).get_columns("owner")}
+  assert cols["timezone"]["nullable"] is True
+  with eng.connect() as conn:
+    assert conn.execute(text(
+      "SELECT timezone FROM owner WHERE id = 1"
+    )).scalar_one() is None
+
+
 def test_retire_restart_resume_toggle_lifts_stranded_chats(tmp_path):
   """The one-time retirement drops the owner seed column and lifts every chat a
   prior toggle latched off, while preserving a cancelled delegation child's
@@ -1730,6 +1754,8 @@ def test_run_migrations_records_an_inspectable_append_only_history(tmp_path):
     "0069_chat_pending_queue_index",
     "0070_delegation_goal_task",
     "0071_delegation_result_identity",
+    "0072_owner_timezone",
+    "0073_schedule_provenance",
   ]
   assert second == first
 

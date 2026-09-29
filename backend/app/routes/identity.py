@@ -20,7 +20,7 @@ from urllib.parse import quote, urlencode, urlparse
 
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
-from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, UploadFile
 from pydantic import BaseModel
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
@@ -30,6 +30,7 @@ from app import models
 from app.config import get_settings
 from app.database import get_db
 from app.deps import (
+  get_identity_reader,
   get_owner_or_app_with_identity_manage,
   get_owner_or_app_with_railway_manage,
   require_nondelegated_owner_or_app_control,
@@ -93,6 +94,9 @@ class RailwayCreate(BaseModel):
   memory_mb: int | None = None
   volume_mb: int | None = None
   update_policy: Literal["automatic", "manual"] | None = None
+  region: Literal[
+    "us-west2", "us-east4-eqdc4a", "europe-west4-drams3a", "asia-southeast1-eqsg3a"
+  ] | None = None
 
 
 class RailwayCompute(BaseModel):
@@ -587,7 +591,7 @@ async def resolve_handle_hosts(
 @router.get("/handles/{handle}")
 async def read_handle_hosts(
   handle: str,
-  owner: models.Owner = Depends(get_owner_or_app_with_identity_manage),
+  owner: models.Owner = Depends(get_identity_reader),
   db: Session = Depends(get_db),
 ):
   """Resolve an account handle for a reviewed app without exposing credentials."""
@@ -652,7 +656,7 @@ def _with_member_since(payload: dict, owner: models.Owner) -> dict:
 
 @router.get("")
 async def read_identity(
-  owner: models.Owner = Depends(get_owner_or_app_with_identity_manage),
+  owner: models.Owner = Depends(get_identity_reader),
   db: Session = Depends(get_db),
 ):
   local = _local_payload()
@@ -802,8 +806,9 @@ async def read_avatar(
   )
 
 
-async def _managed_railway_remote() -> dict:
-  response = await _managed_response("GET", "/api/instance/v1/railway")
+async def _managed_railway_remote(*, include_region_options: bool = False) -> dict:
+  suffix = "?region_options=1" if include_region_options else ""
+  response = await _managed_response("GET", "/api/instance/v1/railway" + suffix)
   if response.status_code != 200:
     raise HTTPException(502, "The Möbius account service could not read Railway state.")
   try:
@@ -813,7 +818,7 @@ async def _managed_railway_remote() -> dict:
 
 
 async def _linked_railway_remote(
-  db: Session, owner_id: int,
+  db: Session, owner_id: int, *, include_region_options: bool = False,
 ) -> tuple[str, dict | None]:
   link = _linked_row(db, owner_id)
   if link is None:
@@ -828,8 +833,9 @@ async def _linked_railway_remote(
     return "signed_out", None
   try:
     async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
+      suffix = "?region_options=1" if include_region_options else ""
       response = await client.get(
-        get_settings().mobius_account_origin + "/api/account/v1/railway",
+        get_settings().mobius_account_origin + "/api/account/v1/railway" + suffix,
         headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
       )
   except httpx.HTTPError:
@@ -850,18 +856,24 @@ async def _linked_railway_remote(
 
 @router.get("/railway")
 async def read_railway(
+  request: Request,
   owner: models.Owner = Depends(get_owner_or_app_with_railway_manage),
   db: Session = Depends(get_db),
 ):
+  include_region_options = request.query_params.get("region_options") == "1"
   if get_settings().mobius_sso_enabled:
     try:
-      payload = await _managed_railway_remote()
+      payload = await _managed_railway_remote(
+        include_region_options=include_region_options,
+      )
     except HTTPException as exc:
       if exc.status_code == 502:
         return {"railway_access": "unavailable", "connection": None, "instances": []}
       raise
     return {"railway_access": "available", **payload}
-  access, payload = await _linked_railway_remote(db, owner.id)
+  access, payload = await _linked_railway_remote(
+    db, owner.id, include_region_options=include_region_options,
+  )
   return {
     "railway_access": access,
     "connection": payload.get("connection") if payload else None,
@@ -1119,6 +1131,10 @@ async def create_railway_deployment(
   # only sends it after the inventory advertises update-policy support.
   if body.update_policy is not None:
     settings["update_policy"] = body.update_policy
+  # The account service advertises region support in its inventory. Older
+  # hosts still receive the original request when the app omits this field.
+  if body.region is not None:
+    settings["region"] = body.region
   return await _railway_mutation(
     db,
     owner.id,
@@ -1242,7 +1258,10 @@ async def read_railway_deletion_state(
   )
 
 
-@router.post("/railway/deployments/{instance_id}/confirm-absent")
+@router.post(
+  "/railway/deployments/{instance_id}/confirm-absent",
+  dependencies=[Depends(require_nondelegated_owner_or_app_control)],
+)
 async def confirm_railway_deletion_absent(
   instance_id: str,
   body: RailwayConfirmAbsent,
@@ -1260,7 +1279,10 @@ async def confirm_railway_deletion_absent(
   )
 
 
-@router.post("/railway/deployments/{instance_id}/recovery", status_code=202)
+@router.post(
+  "/railway/deployments/{instance_id}/recovery", status_code=202,
+  dependencies=[Depends(require_nondelegated_owner_or_app_control)],
+)
 async def open_railway_recovery(
   instance_id: str,
   owner: models.Owner = Depends(get_owner_or_app_with_railway_manage),

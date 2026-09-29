@@ -15,6 +15,8 @@ import {
   appCodeStoreAction,
   entriesToTrim,
   isAppCodeRoute,
+  isCacheableProxyRequest,
+  packagedAssetCacheLane,
   isCacheableAppAssetResponse,
   hasOpaqueEmbedSandbox,
   isCacheableOpaqueEmbedDocument,
@@ -381,4 +383,37 @@ test('scoped chat row reads never enter the offline shell-list cache', async () 
   const scoped = 'https://mobius.test/api/chats?ids=a&ids=b'
   assert.equal(isShellListUrl(new URL(scoped)), false)
   assert.equal(requiresLiveShellList(new Request(scoped, { cache: 'no-store' })), false)
+})
+
+test('proxied third-party assets are cached for subresources but never answer a navigation', () => {
+  const origin = 'https://mobius.example'
+  const svg = new URL(`${origin}/api/proxy?url=${encodeURIComponent('https://evil.example/x.svg')}`)
+  const favicon = new URL(`${origin}/api/proxy/favicon?url=https%3A%2F%2Fevil.example%2F`)
+  const json = new URL(`${origin}/api/proxy?url=${encodeURIComponent('https://api.example/data')}`)
+  assert.equal(isCacheableProxyRequest(svg, { mode: 'no-cors' }, origin), true)
+  assert.equal(isCacheableProxyRequest(favicon, { mode: 'cors' }, origin), true)
+  assert.equal(isCacheableProxyRequest(json, { mode: 'cors' }, origin), false)
+  assert.equal(isCacheableProxyRequest(svg, { mode: 'navigate' }, origin), false)
+  assert.equal(isCacheableProxyRequest(favicon, { mode: 'navigate' }, origin), false)
+  assert.equal(isCacheableProxyRequest(svg, { mode: 'no-cors' }, 'https://other.example'), false)
+})
+
+test('packaged-asset navigations are served from cache only for sandboxed /app-embeds documents', () => {
+  // /app-assets bytes are inert subresources. A navigation must reach the
+  // server's fresh inert response, never a copy stored under an older policy.
+  const origin = 'https://mobius.example'
+  const lane = (path, request) => packagedAssetCacheLane(new URL(`${origin}${path}`), request, origin)
+  const navigate = { mode: 'navigate', destination: 'document', headers: new Headers() }
+  const frame = { mode: 'navigate', destination: 'iframe', headers: new Headers() }
+  const image = { mode: 'no-cors', destination: 'image', headers: new Headers() }
+  assert.equal(lane('/app-assets/app/x.html', navigate), null)
+  assert.equal(lane('/app-assets/app/x.svg', frame), null)
+  assert.equal(lane('/app-assets/app/main.8f3a2b1c.js', navigate), null)
+  assert.equal(lane('/app-assets/app/x.svg', image), 'revalidate')
+  assert.equal(lane('/app-assets/app/main.8f3a2b1c.js', image), 'immutable')
+  assert.equal(lane('/app-embeds/by-id/1/index.html', frame), 'revalidate')
+  assert.equal(lane('/app-embeds/by-id/1/main.8f3a2b1c.js', frame), 'revalidate')
+  assert.equal(lane('/app-embeds/by-id/1/main.8f3a2b1c.js', image), 'immutable')
+  assert.equal(lane('/app-assets/app/x.svg', { ...image, headers: new Headers({ range: 'bytes=0-0' }) }), null)
+  assert.equal(packagedAssetCacheLane(new URL('https://other.example/app-assets/app/x.svg'), image, origin), null)
 })

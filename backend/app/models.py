@@ -84,6 +84,11 @@ class Owner(Base):
   # than a boolean flag) so we can correlate first-completion against
   # other onboarding signals later — same shape as a SCD type 1 row.
   walkthrough_completed_at = Column(DateTime, nullable=True, default=None)
+  # The owner's IANA timezone as last reported by the shell's browser. Plain
+  # daily app schedules (manifest defaults such as "30 5 * * *") are owned in
+  # this zone so they fire at that wall time for the owner. Null until a
+  # shell has reported it; server time applies meanwhile.
+  timezone = Column(String(64), nullable=True, default=None)
   # Monotonic JWT-validity generation. Every owner-derived token (the
   # 30-day login token, the 8h app token, the run-bound agent token, the
   # 90-day service token) is stamped with the owner's token_epoch at
@@ -423,13 +428,6 @@ class ChatRun(Base):
   goal_plan_json = Column(JSON, nullable=True, default=None)
   goal_plan_revision = Column(
     Integer, nullable=False, default=0, server_default="0"
-  )
-  # Exact plan revision visible when this physical Goal turn was admitted.
-  # Settlement compares this checkpoint with the root's current revision;
-  # unfinished work may schedule another provider turn only after the durable
-  # plan advances. NULL is legacy/ordinary work and never proves progress.
-  goal_plan_revision_at_admission = Column(
-    Integer, nullable=True, default=None
   )
   # App that initiated this turn under the app-attributed-chat contract
   # (077 §1). NULL = an ordinary owner-driven turn. Reserved now so the

@@ -35,10 +35,11 @@
     <!-- Preloading the primary text face avoids a FOUT on first paint without
          blocking secondary weights until they're needed. -->
     <link rel="preload" href="/vendor/fonts/inter-400.woff2" as="font" type="font/woff2" crossorigin />
-    <!-- KaTeX CSS is self-hosted under /vendor/katex@0.18.7/ (built into the
-         image by the Dockerfile). Its JS is an on-demand application chunk,
-         loaded only when a chat actually contains mathematical content. -->
-    <link rel="stylesheet" href="/vendor/katex@0.18.7/katex.min.css" />
+    <!-- KaTeX CSS is self-hosted under the stable /vendor/katex/ alias (built
+         into the image by the Dockerfile), so a KaTeX bump never edits this
+         file. Its JS is an on-demand application chunk, loaded only when a
+         chat actually contains mathematical content. -->
+    <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
     <title>Möbius</title>
     <link rel="manifest" href="/manifest.webmanifest" />
     <!-- The exact embedded-chat route is intentionally frameable below an
@@ -328,7 +329,12 @@
         // apply-on-idle, and reload. Keeping lifecycle policy out of this boot
         // document prevents an older cached page and the mounted shell from
         // racing two partial update mechanisms.
-        navigator.serviceWorker.register('/sw.js', { updateViaCache: 'none' }).catch(() => {})
+        // `in` only proves the property EXISTS. A sandboxed frame without
+        // allow-same-origin still throws from its getter, so the read itself
+        // needs guarding for any framed route, not just the embed path above.
+        try {
+          navigator.serviceWorker.register('/sw.js', { updateViaCache: 'none' }).catch(() => {})
+        } catch { /* sandboxed: no worker is possible or wanted here */ }
       }
       // Request persistent storage so cached app modules and offline
       // state aren't evicted under storage pressure. Best-effort —

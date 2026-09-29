@@ -70,7 +70,7 @@ build swap.
 
 Möbius is meant to be self-hosted on a user-provisioned host — a managed platform (Railway/Render/Fly/PikaPods) or a raw VPS — so "apply a security update" splits into three tiers by who can even act:
 
-- **Image userspace** — the Python wheels, npm globals, apt packages, and vendored mini-app libs baked into the image. The agent owns these end-to-end: change the declared constraint (`Dockerfile` / `backend/requirements.txt` / `frontend/package.json`), regenerate the hashed Python lock, rebuild, recreate. Never `apt upgrade` / `pip install -U` a *running* container — that mutation is ephemeral and drifts the live container away from the reproducible image. `deploy-prod.sh` is the apply path. Full root is an honest default instance capability: the root entrypoint creates `mobius ALL=(root) NOPASSWD: ALL` before dropping privileges. `MOBIUS_AGENT_SUDO=0` is the coarse operator kill switch and ships with no sudoers rule. Changing either direction requires a clean recreation because an already-root agent could have installed persistent-in-container privilege paths.
+- **Image userspace** — the Python wheels, npm globals, apt packages, and vendored mini-app libs baked into the image. They change through the declared constraint (`Dockerfile` / `backend/requirements.txt` / `frontend/package.json`) and the hashed Python lock in an upstream release; official container replacement installs that release's image, so a local-only edit to these inputs is kept in the checkout but never reaches an official image; updates report it and never wait on it. A live install in a running container serves the current task and lasts until the container is replaced; never `apt upgrade` / `pip install -U` a running container, which drifts it away from the reproducible image. An owner building their own image applies it with `deploy-prod.sh`. Full root is an honest default instance capability: the root entrypoint creates `mobius ALL=(root) NOPASSWD: ALL` before dropping privileges. `MOBIUS_AGENT_SUDO=0` is the coarse operator kill switch and ships with no sudoers rule. Changing either direction requires a clean recreation because an already-root agent could have installed persistent-in-container privilege paths.
 - **Host OS userspace + the Docker engine** — outside every container; patched on the host (`unattended-upgrades` covers the OS packages; the engine is a separate host upgrade).
 - **Host kernel** — *not in the container*; it shares the host's and cannot be patched from inside. On a managed platform the operator patches+reboots the kernel underneath you (the safe default for non-devops owners); on a raw VPS it's the owner's job, via `unattended-upgrades` + livepatch + a scheduled reboot window.
 
@@ -138,8 +138,8 @@ stays in an isolated worktree while the old checkout remains served. Working
 edits are carried through as a transient commit and returned uncommitted.
 
 **Prepared updates swap at shutdown, or on their own image's boot.** An update
-an agent resolves on the isolated copy (a committed conflict, or blockers
-handed over with **Fix with an agent**) and every combined source-and-container
+an agent resolves on the isolated copy (a committed conflict, or a predicted
+overlap handed over with **Fix with an agent**) and every combined source-and-container
 update are *prepared*, not applied: the answer is committed on the reviewed
 release and recorded in `.platform-prepared-update.json`. The live checkout
 keeps serving its snapshot, and nothing edited afterwards enters the update.
@@ -520,7 +520,7 @@ The chat is large and self-contained; its hooks live beside it, not in `src/hook
 |------|------|
 | `frontend/public/mobius-runtime.js` | The `window.mobius` runtime injected into mini-apps inside the shared opaque frame used by both workspace and standalone hosts. Offline outbox + read-through cache live here |
 | `frontend/public/app-frame.html` | The opaque mini-app frame: error UI, parent module broker, runtime bootstrap, and postMessage isolation |
-| `frontend/src/sw.js` | Service worker: precache + cache strategy, incl. the offline-capable-app handler |
+| `frontend/src/sw.js` | Service worker: precache + mini-app code and standalone cache strategies |
 | `frontend/src/sw-cache-policy.js` | Authoritative cache-route policy (see *Service worker + offline* below) |
 | `frontend/src/lib/` | Cross-cutting helpers: `appToken.js`, `chatEmbed.js`, `themeService.js`, `connectivityStore.js`, `navHistory.js`, `errorLog.js`, etc. |
 
@@ -1173,7 +1173,7 @@ recovery prompt reconstructed from that exact control. A stable client control
 id makes manual retries idempotent without inventing owner speech. Existing
 transcript-backed recoveries remain readable for safe replay across upgrades;
 generic coordinator continuations retain their exact supplied content and
-replay contract. Goal rollover remains owned by its existing plan/FIFO path.
+replay contract.
 
 The sweep is cheap: one indexed due-row query immediately at boot, on
 `chat_run_finished`, and on a 60-second fallback. Startup captures the boot
@@ -1191,7 +1191,7 @@ column remains only as an internal latch: it defaults on and is cleared solely
 by `delegations.mark_cancelled`, so a cancelled delegated child cannot
 resurrect itself when the boot sweep claims restart parks.
 
-### Goal handoff ownership is exact and singular
+### A Goal is a note, a checklist, and Done
 
 `ChatGoal` owns the stable objective, revision-checked plan, checkpoint, next
 step, and explicit outcome. `ChatRun.goal_id` attaches each execution attempt
@@ -1201,35 +1201,26 @@ can reopen stopped work but stale deliveries cannot. Migration 0063 copies
 historical plans without deleting run snapshots and leaves uncertain work open.
 
 The writer admits Goal identity and the attempt in the same transaction.
-Execution turns are not a budget, but unfinished intent alone cannot authorize
-another provider invocation. Every Goal-bound run checkpoints the `ChatGoal`
-revision at provider admission. At clean settlement, a new exact durable owner
-gets the next move; otherwise automatic rollover requires that revision to have
-advanced beyond the checkpoint. A legacy or unknown checkpoint proves nothing.
-Stop, completion, provider failures and usage-limit handling keep their existing
-boundaries. The legacy `automatic_remaining` column is inert historical schema,
-never read or updated by admission.
+Execution turns are not a budget, and an unfinished Goal never schedules its
+own next turn. Goal work moves only through what already wakes a chat: owner
+input, a Wait result, a helper result, peer or activation delivery, and
+restart or usage-limit recovery. A turn that ends cleanly needs no Goal
+handoff: nothing checks it, and an idle unfinished Goal is simply the owner's
+turn. The Goal record reports only its own lifecycle (`active` while a turn
+runs, `paused` while idle or stopped, `completed`); who moves next is derived
+from chat state the client already holds — an open card, armed Waits, running
+helpers — never from a per-Goal ownership query. Retired automatic-continuation
+bookkeeping (`goal_plan_revision_at_admission`, the `automatic_remaining`
+column) is inert historical schema.
 
 Persisted plans use the same task validation as plan writes. An unreadable
-plan keeps its Goal open, cannot authorize automatic handoff or completion,
-and can be repaired through a fully validated, revision-checked replacement.
+plan keeps its Goal open, cannot authorize completion, and can be repaired
+through a fully validated, revision-checked replacement. Identical normalized
+plan writes are revision no-ops.
 
-`goal_plans.goal_handoff_owner_kind` is the shared exact-identity query for
-both Goal presentation and turn settlement. It recognizes an owner question,
-Wait (including a settled result awaiting delivery), or wake-enabled helper only when that actor belongs to the same
-`goal_id`; an unrelated question or background operation in the chat cannot
-hide an orphaned Goal. The writer's terminal promotion checks ownership after
-question persistence. Identical normalized plan writes are revision no-ops, so
-rewriting unchanged state cannot manufacture permission to continue. Without
-durable plan progress, the terminal path saves an owner reconciliation question
-instead of starting another turn. Automatic Goal controls keep their causal
-place in the existing pending FIFO, but the writer translates them into an
-ephemeral provider prompt and never appends them as owner transcript rows.
-
-A result retains ownership until delivery. Provider-native Goal execution is
-disabled: one Möbius attempt starts one ordinary provider turn. Legacy native
-controllers are retired before resuming their conversation, not recreated in
-parallel.
+Provider-native Goal execution is disabled: one Möbius attempt starts one
+ordinary provider turn. Legacy native controllers are retired before resuming
+their conversation, not recreated in parallel.
 
 Every Goal attempt receives a deterministic hierarchical view even with no
 provider history: original objective, checkpoint, current task, ancestor
@@ -1242,7 +1233,9 @@ No model summarizer, delta cache, extra focus record,
 or duplicate copy of the incoming message is involved. Agents continue working
 in their current run rather than ending turns to refresh context. Task additions and updates operate on the existing record. Completion
 is an explicit revision-checked operation with verification evidence and no
-unfinished tasks or outstanding handoff. A green plan alone is not completion.
+unfinished tasks or running helpers. It takes delivery of the Goal's fired
+Waits so they do not wake a finished Goal; an open card or armed Wait does not
+block it. A green plan alone is not completion.
 
 Workspace `AgentWorkClaim` rows are narrower: they serialize one shared action
 across otherwise independent chats. They do not replace a chat's Goal, a
@@ -1271,6 +1264,18 @@ owner message, Wait result, or other product continuation already in the chat
 queue. If the bounded window overflows, the explicit overflow marker and its
 cursor form one cut: omitted older notes remain owner-visible history but never
 surface later behind newer notes and invert causal order.
+
+A helper result that settles while a Codex parent's turn runs travels as a
+queued hidden carrier, steered by its cid and recorded delivered in the steer
+cut's own commit. Claude leaves routine helper results in their existing durable
+Delegation rows rather than interrupting its current command or putting a
+carrier ahead of an owner's immediate message. After the Claude turn settles,
+the ordinary activity continuation delivers the result; a stopped turn leaves
+it owed for the next owner turn. A Codex turn that ends before the steer runs
+the carrier as its next turn, whose completed Finalize records it. Until a cut
+or completed Finalize, the result is owed. Stop drops a queued carrier, because
+the Delegation row still owes the result and the next owner turn's context
+carries it.
 
 An idle recipient is woken only when it has an unfinished Goal. An armed
 external Wait remains active but no longer suppresses an explicitly
@@ -1461,7 +1466,8 @@ Three frontend gates must stay aligned. `StreamingMessage.jsx` renders live ques
 Ordinary choices use `mobius_control.request_question` and
 `POST /api/chats/{id}/question`; approvals use `mobius_control.request_approval`
 and `POST /api/chats/{id}/approval`. Both tools share
-`backend/scripts/owner_approval.py` and `save_owner_question`.
+the control server's `owner_approval.py` library and `save_owner_question`
+(`mobius_control_mcp.py call <tool>` is the command-line fallback).
 This is an application decision, not the provider's sandbox-permission or
 clarifying-question protocol. The route uses the active `ChatEventSink` and
 `QuestionCommit` to save an ordinary question with
@@ -1497,9 +1503,9 @@ exact retries acknowledge it without clearing a newer card. Existing queued
 follow-ups use ordinary idle admission or the publisher's terminal drain.
 Stop remains authoritative and quiet closure cannot revive stopped work.
 
-Quiet closure cannot remove the sole next owner of an unfinished Goal: it
-requires completed work or an exact-Goal wait, helper, or queued continuation.
-An unrelated follow-up does not count; conflicts preserve the card and choice.
+Quiet closure cannot strand an approval's exact work claim: a card whose
+`action_key` still names an active claim needs a reply so its agent can
+complete or release the claim; conflicts preserve the card and choice.
 Legacy save-only answers cannot bypass typed-card semantics: the writer checks
 its actual matched card, including unkeyed requests racing a newly saved card.
 The frontend settles quiet replies without replacing the stream, touching the
@@ -1584,11 +1590,7 @@ message. Repeated steps are bounded by activity variety rather than raw call
 count. Only an explicit disclosure resolves that exact range through
 `GET /api/chats/{id}/activity-detail`; the live assistant stays self-contained.
 Mounted runtime reconciliation uses `GET /api/chats/{id}/runtime`, whose ORM
-projection raiseloads every unrequested field. Goal handoff classification
-reads only the pending-question identity in the ordinary no-question case;
-an open continuation card explicitly resolves its author from the transcript
-so an unrelated question cannot own that Goal. It must not reload the full
-Chat for each Goal status check. Both projections carry `updated_at` as the
+projection raiseloads every unrequested field. Both projections carry `updated_at` as the
 detail-snapshot version. On activation, a retained ChatView reads the runtime
 projection first and reuses its painted transcript only when those explicit
 versions match; a missing or changed version fails closed to the compact detail
@@ -1743,7 +1745,7 @@ protected lane. No recursive crawler is implied: a future offline-capable packag
 needs an explicit manifest/static-assets warm contract. The controlled-page
 regression pins the cached entry as packaged content rather than shell HTML.
 
-Install-time precache includes the Vite shell plus the D3/Pixi classic scripts Memory loads by URL. Package imports are already inside each compiled app artifact and must not be duplicated in the shell precache. Runtime `/vendor/` remains `CacheFirst` for explicit public assets. `setCatchHandler()` returns precached `index.html` outside `/apps/` and `offline.html` for standalone/app-asset failures, avoiding native offline chrome. Two anti-patterns: do NOT reintroduce a `mobius-shell-nav` HTML cache (navigations bind to the precached `index.html` so HTML and hashed bundles advance together), and do NOT gate in-shell frame/module reads on `offline_capable` (that flag gates standalone offline opens + write semantics, while frame/module speed + warmup are universal). There is no hand-edited `VERSION` constant: `activate` deletes stale runtime caches via `isStaleRuntimeCache`, and Workbox handles content-versioned precache cleanup separately.
+Install-time precache includes the Vite shell plus the D3/Pixi classic scripts Memory loads by URL. Package imports are already inside each compiled app artifact and must not be duplicated in the shell precache. Runtime `/vendor/` remains `CacheFirst` for explicit public assets. `setCatchHandler()` returns precached `index.html` outside `/apps/` and `offline.html` for standalone/app-asset failures, avoiding native offline chrome. Two anti-patterns: do NOT reintroduce a `mobius-shell-nav` HTML cache (navigations bind to the precached `index.html` so HTML and hashed bundles advance together), and do NOT gate in-shell frame/module reads on `offline_capable` (that flag gates standalone offline opens, while in-shell code warm-up and storage behavior are universal). There is no hand-edited `VERSION` constant: `activate` deletes stale runtime caches via `isStaleRuntimeCache`, and Workbox handles content-versioned precache cleanup separately.
 
 Shell rebuilds never own document navigation. `shell_rebuilt`, agent-authored
 `shell_apply_now`, and resume-time worker discovery collapse into one

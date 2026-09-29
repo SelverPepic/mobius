@@ -84,7 +84,7 @@ const CSS = `
 }
 
 .aci__close:hover {
-  background: var(--surface2);
+  background: var(--surface-2);
   color: var(--text);
 }
 

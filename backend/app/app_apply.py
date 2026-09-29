@@ -22,7 +22,10 @@ from urllib.parse import parse_qs, urlsplit
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
-from app import app_git, chat_app_artifacts, icon_assets, managed_paths, models, timeutil
+from app import (
+  app_git, app_python_env, chat_app_artifacts, icon_assets, managed_paths, models,
+  service_preload, timeutil,
+)
 from app.app_capabilities import (
   contract_from_app_state,
   contract_from_manifest,
@@ -35,16 +38,17 @@ from app.compiler import (
   publish_staged_bundle,
   unlink_app_bundle,
 )
+from app.config import get_settings
 from app.manifest_contract import (
   ICON_MAX_BYTES,
   MANIFEST_MAX_BYTES,
   STATIC_ASSET_MAX_BYTES,
   STATIC_ASSETS_TOTAL_MAX,
   ManifestContractError,
-  job_interpreter,
   static_asset_entries,
   validate_manifest_contract,
   validate_repo_relative_path,
+  validate_schedule_job,
 )
 
 
@@ -66,6 +70,13 @@ _STATIC_ASSETS_BACKUP_METADATA_PREFIX = "metadata"
 _LOCAL_PACKAGE_WARNING = (
   "Local package declarations are active, including permissions, schedules, "
   "and skills; a future reviewed Store update may replace them."
+)
+
+_STORE_LOCAL_PACKAGE_DIVERGED = (
+  "This app is Store-managed, so its live package comes from the accepted "
+  "manifest. Your local mobius.json changes were NOT applied by this "
+  "ordinary apply. Re-apply with --accept-local-package to make the local "
+  "manifest authoritative."
 )
 
 
@@ -312,10 +323,13 @@ async def _sync_accepted_app_side_effects(
         drop_prior_cron=drop_prior_cron,
         bundled_job=bool(schedule and schedule.get("job")),
         warnings=warnings,
+        owner_zone=install.owner_timezone(db),
       )
     except Exception as exc:
       log.exception("app apply: cron sync failed post-commit")
       warnings.append(f"cron: registration failed — {exc!r}")
+  from app import app_setup
+  app_setup.request_run()
   warnings.extend(await _sync_accepted_app_skills(db, app, manifest))
   return tuple(warnings)
 
@@ -372,6 +386,26 @@ def _read_manifest(snapshot_dir: Path) -> dict:
   except ManifestContractError as exc:
     raise AppApplyError("manifest_invalid", str(exc)) from exc
   return dict(manifest)
+
+
+def _store_local_package_divergence(app: models.App, snapshot_dir: Path) -> str | None:
+  """Warn when ordinary Store apply drops local mobius.json edits.
+
+  Ordinary apply of a Store-managed app publishes code but keeps the accepted
+  package manifest, the runtime root's mobius.json. Any local manifest that
+  differs from it was not applied. Best-effort: a read or parse problem
+  returns None so a valid apply is never blocked by the check.
+  """
+  from app import applied_app_runtime
+
+  try:
+    local = json.loads((snapshot_dir / "mobius.json").read_bytes())
+    accepted = json.loads(
+      (applied_app_runtime.runtime_root(app) / "mobius.json").read_bytes()
+    )
+  except (OSError, ValueError, applied_app_runtime.AppliedRuntimeUnavailable):
+    return None
+  return _STORE_LOCAL_PACKAGE_DIVERGED if local != accepted else None
 
 
 def _entry_source(snapshot_dir: Path, relative: str) -> str:
@@ -584,6 +618,7 @@ def _apply_local_manifest_runtime(
     contract_permissions=manifest.get("permissions") or {},
     service=service,
     tools=list(manifest.get("tools") or []),
+    model_provider=manifest.get("model_provider"),
   )
 
 
@@ -685,6 +720,8 @@ async def apply_source_revision(
   published = None
   staged = None
   runtime_staged = None
+  python_env = None
+  published_env = None
   static_created: list[Path] = []
   static_rollback: list = []
   static_commit: list = []
@@ -707,13 +744,29 @@ async def apply_source_revision(
         if not store_managed or accept_local_package
         else None
       )
+      store_divergence_warning = (
+        _store_local_package_divergence(app, snapshot_dir)
+        if store_managed and not accept_local_package and app is not None
+        else None
+      )
       if manifest is not None:
         _validate_local_identity(source_path, manifest, app)
+        provider = manifest.get("model_provider")
+        if (not store_managed and isinstance(provider, dict)
+            and provider.get("transport") == "identity_broker"):
+          # The broker signs with the owner's Möbius account, so only the
+          # reviewed Möbius · You package may route turns through it. Local
+          # apps declare their own HTTPS endpoint and app-secret key.
+          raise AppApplyError(
+            "local_model_broker",
+            "Local apps may declare an HTTPS model provider with their own "
+            "app secret, not the protected Möbius broker transport.",
+          )
         schedule = manifest.get("schedule")
         job_name = schedule.get("job") if isinstance(schedule, dict) else None
         if job_name:
           try:
-            job_interpreter((snapshot_dir / job_name).read_bytes())
+            validate_schedule_job(manifest, (snapshot_dir / job_name).read_bytes())
           except (OSError, ManifestContractError) as exc:
             raise AppApplyError(
               "invalid_schedule_job", str(exc), status_code=422,
@@ -868,6 +921,20 @@ async def apply_source_revision(
         static_assets=runtime_assets,
         **runtime_options,
       )
+      # Build the declared Python environment from the accepted tree before
+      # its pointer is published: a failure leaves the previous revision live.
+      try:
+        python_env = await asyncio.to_thread(
+          app_python_env.prepare_env,
+          get_settings().data_dir, None if created else app.id,
+          runtime_staged.root,
+        )
+      except app_python_env.PythonEnvBuildError as exc:
+        raise AppApplyError(
+          "python_env_failed",
+          f"Could not build the app's Python environment. {exc}",
+          status_code=422,
+        ) from exc
       if created:
         # A new App has no numeric id until SQLite inserts it. Compiling after
         # that insert used to hold the database write lock for the entire
@@ -877,6 +944,11 @@ async def apply_source_revision(
         # only when the accepted Git tree and compiled bytes are ready.
         db.add(app)
         db.flush()
+      if python_env is not None:
+        published_env = app_python_env.publish_env(
+          get_settings().data_dir, app.id, python_env,
+        )
+        python_env = None
       applied_app_runtime.publish_runtime(app, runtime_staged)
       runtime_staged = None
       app_staged = _compiled_dir() / f"app-{app.id}.js.staging"
@@ -900,6 +972,8 @@ async def apply_source_revision(
         static_materialized = False
         if store_managed and accept_local_package:
           warnings = (*warnings, _LOCAL_PACKAGE_WARNING)
+        elif store_divergence_warning:
+          warnings = (*warnings, store_divergence_warning)
         return ApplyResult(app=app, mode="unchanged", warnings=warnings)
 
       app.jsx_source = source
@@ -925,6 +999,8 @@ async def apply_source_revision(
       if previous_bundle != published:
         unlink_app_bundle(app.id, previous_bundle)
       db.refresh(app)
+      # A preloaded service host pins the runtime it imported.
+      service_preload.retire(app.id, keep_revision=app.runtime_revision)
       try:
         await asyncio.to_thread(
           applied_app_runtime.prune_runtime, app,
@@ -937,6 +1013,8 @@ async def apply_source_revision(
       )
       if store_managed and accept_local_package:
         warnings = (*warnings, _LOCAL_PACKAGE_WARNING)
+      elif store_divergence_warning:
+        warnings = (*warnings, store_divergence_warning)
       return ApplyResult(
         app=app,
         mode="created" if created else "updated",
@@ -946,6 +1024,10 @@ async def apply_source_revision(
     db.rollback()
     if runtime_staged is not None:
       shutil.rmtree(runtime_staged.root)
+    app_python_env.discard_env(python_env)
+    if not durable_commit:
+      # No row may reference it; a rolled-back new app has none to drive GC.
+      app_python_env.unpublish_env(published_env)
     if not durable_commit and static_materialized:
       _rollback_static_assets(static_created, static_rollback)
     if staged is not None:

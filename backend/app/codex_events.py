@@ -370,7 +370,7 @@ def _public_task_event(
         (description or agent_type)[:_COLLAB_DESCRIPTION_MAX]
         or "Background helper"
       ),
-      "task_type": agent_type or None,
+      "task_type": "codex_agent",
       "tool_use_id": tool_use_id,
     }
   if event_type == "agent_terminal":
@@ -738,7 +738,12 @@ def _tool_start_event(item: Any, sdk: dict[str, Any]) -> dict[str, Any] | None:
   return None
 
 
-def _tool_completed_events(item: Any, sdk: dict[str, Any]) -> list[dict[str, Any]]:
+def _tool_completed_events(
+  item: Any,
+  sdk: dict[str, Any],
+  *,
+  streamed_command_output: str | None = None,
+) -> list[dict[str, Any]]:
   """Builds Möbius tool-end events from a completed typed item."""
   image_view_cls = sdk.get("ImageViewThreadItem")
   if image_view_cls is not None and isinstance(item, image_view_cls):
@@ -765,7 +770,14 @@ def _tool_completed_events(item: Any, sdk: dict[str, Any]) -> list[dict[str, Any
     return []
 
   if isinstance(item, sdk["CommandExecutionThreadItem"]):
-    output = (item.aggregated_output or "").strip()
+    # Codex normally repeats the complete command output on the completed
+    # ThreadItem. Some dynamic-tool command paths emit every delta but leave
+    # `aggregated_output` empty. The runner joins those exact deltas and passes
+    # them here so the terminal event remains authoritative for transcript
+    # persistence, generic output stashing, and protocol receipts.
+    output = (
+      item.aggregated_output or streamed_command_output or ""
+    ).strip()
     exit_code = getattr(item, "exit_code", None)
     events: list[dict[str, Any]] = [{
       "type": "tool_output",
@@ -865,6 +877,17 @@ def _enum_wire_value(value: Any) -> str | None:
   return raw if isinstance(raw, str) else str(raw)
 
 
+# The Möbius gateway refuses a request it can't pay for with this code (HTTP
+# 402), whether the trial was never activated, is used up, or a top-up ran out.
+_MOBIUS_NO_CREDIT_RE = re.compile(
+  r"insufficient_credits|not enough credits for the maximum request cost",
+)
+MOBIUS_NO_CREDIT_MESSAGE = (
+  "M\u00f6bius models need credit. "
+  "[Open M\u00f6bius \u00b7 You](/shell/?app=identity) to activate your trial "
+  "or see your options."
+)
+
 _CHATGPT_MODEL_UNAVAILABLE_RE = re.compile(
   r"[\"'](?P<model>[^\"']+)[\"'] model is not supported when using Codex "
   r"with a ChatGPT account",
@@ -905,6 +928,8 @@ def _codex_user_error(error_text: str | None) -> str | None:
     return error_text
   if _STREAM_STALL_RE.search(error_text):
     return _stream_stall_message(error_text)
+  if _MOBIUS_NO_CREDIT_RE.search(error_text):
+    return MOBIUS_NO_CREDIT_MESSAGE
   match = _CHATGPT_MODEL_UNAVAILABLE_RE.search(error_text)
   if match is None:
     return error_text

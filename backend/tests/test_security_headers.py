@@ -2,14 +2,16 @@
 
 from pathlib import Path
 
-from fastapi import Response
+from fastapi import Depends, FastAPI, Response
+from fastapi.responses import HTMLResponse
 from fastapi.testclient import TestClient
 
 from app import main
 from app.main import (
-  _PUBLISHED_SITE_CSP, _SHELL_CSP, _STATIC_EMBED_CSP, _CHAT_EMBED_CSP, app,
+  _INERT_CONTENT_CSP, _PUBLISHED_SITE_CSP, _SHELL_CSP, _STATIC_EMBED_CSP,
+  _CHAT_EMBED_CSP, app,
 )
-from app.response_policy import chat_embed_csp, app_frame_csp
+from app.response_policy import app_frame_csp, chat_embed_csp, serves_platform_code
 
 
 def _headers(path="/api/health"):
@@ -149,7 +151,7 @@ def test_standard_security_headers_present():
 
 
 def test_direct_shell_response_receives_the_origin_owned_policy():
-  policy = _headers().get("content-security-policy")
+  policy = _headers("/shell/").get("content-security-policy")
   assert policy == _SHELL_CSP
   assert "https://esm.sh" in policy
   assert "img-src 'self' data: blob:" in policy
@@ -430,3 +432,86 @@ def test_chat_embed_loopback_delivery_is_exact_and_not_host_header_trusted():
   assert client.get("/shell/embed/chat", headers={"Host": "evil.example"}).headers["content-security-policy"] == _CHAT_EMBED_CSP
   remote = TestClient(app, base_url="http://127.0.0.1:8000", client=("203.0.113.4", 50000))
   assert remote.get("/shell/embed/chat").headers["content-security-policy"] == _CHAT_EMBED_CSP
+
+
+def test_a_response_no_route_declared_as_platform_code_is_inert():
+  # Safe by default: a route nobody classified (a new one, an API error, a
+  # file download) must never run as the shell, whatever bytes it returns.
+  # Only a handler that serves platform-authored code opts into the shell.
+  probe = FastAPI()
+
+  @probe.get("/new-route")
+  def new_route():
+    return HTMLResponse("<script>parent.stolen = localStorage</script>")
+
+  @probe.get("/platform-page", dependencies=[Depends(serves_platform_code)])
+  def platform_page():
+    return HTMLResponse("<script>boot()</script>")
+
+  probe.add_middleware(main._SecurityHeadersMiddleware)
+  client = TestClient(probe)
+  assert client.get("/new-route").headers["content-security-policy"] == _INERT_CONTENT_CSP
+  assert client.get("/platform-page").headers["content-security-policy"] == _SHELL_CSP
+  assert client.get("/missing").headers["content-security-policy"] == _INERT_CONTENT_CSP
+  assert _INERT_CONTENT_CSP.startswith("sandbox;")
+  assert "allow-scripts" not in _INERT_CONTENT_CSP
+  assert "allow-same-origin" not in _INERT_CONTENT_CSP
+
+
+def test_app_agent_chat_and_third_party_bytes_never_run_as_the_shell():
+  # No path list names these any more; each is inert because its route is not
+  # platform code. The API JSON routes are inert too, which changes nothing a
+  # fetch() caller can observe.
+  for path in (
+    "/api/health",
+    "/app-assets/some-app/x.html",
+    "/app-assets/by-id/1/x.svg",
+    "/api/proxy",
+    "/api/proxy/favicon",
+    "/api/chats/c1/uploads/page.html",
+    "/api/chats/c1/generated-files/page.html",
+    "/api/chats/c1/tmp-images/x.svg",
+    "/api/community/publications/github/preview/assets/1/abc/x.svg",
+    "/api/fs/read?path=/tmp/x.html",
+    "/api/storage/apps/1/x.html",
+    "/api/apps/7/module",
+    "/api/apps/7/source/file?path=x.html",
+    "/api/shared-apps/1/output/index.html",
+    "/api/projects/p1/file?path=x.html",
+  ):
+    assert _headers(path).get("content-security-policy") == _INERT_CONTENT_CSP, path
+
+
+def test_shell_document_and_platform_workers_run_under_the_shell_policy(
+  monkeypatch, tmp_path,
+):
+  # A worker runs under the CSP of its own script response, so every worker
+  # the shell constructs must come from a platform-code handler.
+  (tmp_path / "index.html").write_text(
+    '<script type="application/json" id="__mobius-theme__"></script>',
+    encoding="utf-8",
+  )
+  for rel in (
+    "sw.js", "sw-push.js", "vendor/pdfjs/pdf.worker.mjs",
+    "speech/pocket-tts-worker.js", "speech/soundtouch-processor.js",
+    "assets/worker-3f2a9c1b.js",
+  ):
+    (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / rel).write_text("// platform worker\n", encoding="utf-8")
+  monkeypatch.setattr(main, "_resolve_static_dir", lambda: tmp_path)
+  for path in (
+    "/", "/shell/", "/shell/?chat=c1", "/sw.js", "/sw-push.js",
+    "/vendor/pdfjs/pdf.worker.mjs", "/speech/pocket-tts-worker.js",
+    "/speech/soundtouch-processor.js", "/assets/worker-3f2a9c1b.js",
+    "/api/browser-bootstrap",
+  ):
+    response = TestClient(app).get(path)
+    assert response.status_code == 200, path
+    assert response.headers["content-security-policy"] == _SHELL_CSP, path
+
+
+def test_app_service_documents_run_only_at_an_opaque_origin():
+  for path in (
+    "/api/app-services/svc/page", "/api/services/svc/page", "/api/apps/7/service/page",
+  ):
+    assert _headers(path).get("content-security-policy") == _PUBLISHED_SITE_CSP

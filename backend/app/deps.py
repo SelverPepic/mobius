@@ -88,9 +88,9 @@ class Principal:
   that gate on cross-app access (storage, app-attributed chats) read `app_id`
   to decide whether the caller is the app itself, a different app, or the owner.
 
-  `app_is_service` is set only for a token minted by app_services for the
-  app's own server-side service subprocess (the `service` JWT claim) — never
-  for the app's ordinary browser-frame bearer. It lets a route trust that the
+  `app_is_service` is set only for a token minted by app_services for an
+  authenticated invocation of the app's own server-side service (the `service`
+  JWT claim), never for the app's browser-frame bearer or a public invocation. It lets a route trust that the
   caller is the app's reviewed backend code, not its untrusted frame, without
   granting it anything beyond `app_id`'s existing app-scoped authority.
   """
@@ -106,6 +106,8 @@ class Principal:
   operations: frozenset[str] = frozenset()
   delegation_id: str | None = None
   app_is_service: bool = False
+  # Signed supervised-job identity/grant; never copied into frame bearers.
+  app_job_secrets: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -712,7 +714,10 @@ def get_principal(
   valid exact-chat bearer from accidentally inheriting storage, app-management,
   GitHub, notification, logging, or future app-token powers.
   """
-  owner, payload = _resolve_owner(token, db)
+  return _generic_principal(*_resolve_owner(token, db), db)
+
+
+def _generic_principal(owner: models.Owner, payload: dict, db: Session) -> Principal:
   if payload.get("scope") not in (None, "app"):
     raise HTTPException(status_code=403, detail="Token scope is not valid here.")
   app_id = _enforce_app_scope(payload, db)
@@ -725,7 +730,27 @@ def get_principal(
     run_id=payload.get("agent_run"),
     delegation_id=payload.get("delegation_id"),
     app_is_service=app_id is not None and payload.get("service") is True,
+    app_job_secrets=frozenset(payload.get("job_secrets", [])) if app_id is not None else frozenset(),
   )
+
+
+def get_principal_or_public_service(
+  token: str = Depends(_oauth2),
+  db: Session = Depends(get_db),
+) -> Principal:
+  """``get_principal``, also admitting an app service's public invocation.
+
+  A service answering an anonymous visitor holds a token of its own scope
+  (auth.PUBLIC_SERVICE_SCOPE) that every other resolver refuses, so it can
+  never start or drive the owner's chats and agents, read secrets, or act on
+  the owner's accounts. Only the few routes a public service is reviewed to
+  use (reading the owner's public identity and app list, notifying the owner)
+  resolve through here, where it is an ordinary app caller.
+  """
+  owner, payload = _resolve_owner(token, db)
+  if payload.get("scope") == auth.PUBLIC_SERVICE_SCOPE:
+    payload = {**payload, "scope": "app"}
+  return _generic_principal(owner, payload, db)
 
 
 def require_nondelegated_owner_control(principal: Principal) -> None:
@@ -1222,6 +1247,18 @@ def get_owner_or_app_with_identity_manage(
   principal: Principal = Depends(get_principal),
   db: Session = Depends(get_db),
 ) -> models.Owner:
+  return _identity_manager(principal, db)
+
+
+def get_identity_reader(
+  principal: Principal = Depends(get_principal_or_public_service),
+  db: Session = Depends(get_db),
+) -> models.Owner:
+  """``get_owner_or_app_with_identity_manage`` for reads a public service makes."""
+  return _identity_manager(principal, db)
+
+
+def _identity_manager(principal: Principal, db: Session) -> models.Owner:
   """Owner JWT, or an app with the reviewed identity-management grant.
 
   This grant lives in the accepted capability contract rather than a second

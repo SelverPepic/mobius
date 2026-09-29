@@ -399,14 +399,15 @@ class AcknowledgeProviderSuccess(_Command):
   Provider admission is intentionally earlier: it prevents ambiguous replay
   of an execution attempt. It is not proof that the provider accepted the
   prompt. This later acknowledgement both heals an older provider-limit signal
-  and, when peer context was delivered, advances that delivery cursor in the
-  same writer-owned transaction.
+  and records what the provider received — the peer-note cursor and the Wait
+  results the turn carried — in the same writer-owned transaction.
   """
 
   chat_id: str = ""
   run_token: str = ""
   peer_message_through_created_at: datetime | None = None
   peer_message_through_id: str | None = None
+  wait_results: tuple[str, ...] = ()
 
 
 @dataclass
@@ -906,7 +907,6 @@ class AppendPending(_Command):
   selected_options: dict | None = None
   question_id: str | None = None
   initiated_by_app_id: int | None = None
-  owner_authored: bool = False
   front: bool = False
   require_answer_match: bool = False
 
@@ -970,9 +970,6 @@ class PromotePending(_Command):
   valid history instead RAISES `_PersistFailed` — the turn-end drain maps that
   to FAILED_LEAVE_MARKER (leave the marker for reconciliation) rather than
   confusing it with an empty queue and clearing the marker on stranded work.
-  A clean terminal may also materialize and immediately promote one exact Goal
-  continuation when no durable next owner exists; stale-pending callers must
-  opt out through the default ``allow_goal_continuation=False``.
   """
 
   chat_id: str = ""
@@ -981,10 +978,6 @@ class PromotePending(_Command):
   # not turn-end handoffs and keep the clean default; drain_and_release passes
   # "failed" when the provider returned an error before queued work continues.
   ending_status: str = "completed"
-  # Exact physical run handing off at a terminal boundary. Empty for ordinary
-  # stale-pending promotion, which must never manufacture Goal execution.
-  ending_run_token: str = ""
-  allow_goal_continuation: bool = False
 
 
 @dataclass
@@ -1016,7 +1009,6 @@ class UpdatePending(_Command):
   run_token: str = ""
   cid: str = ""
   content: str = ""
-  owner_authored: bool = False
 
 
 @dataclass
@@ -2355,8 +2347,10 @@ class ChatWriterActor:
       if cmd.selected_options is not None else None
     )
     if cmd.close_without_reply:
-      from app.questions import AnswerConflict, accepts_saved_answer, closes_without_reply, saved_question
-      from app.goal_plans import require_quiet_answer_handoff
+      from app.questions import (
+        AnswerConflict, accepts_saved_answer, closes_without_reply,
+        require_quiet_close_holds_no_claim, saved_question,
+      )
       card = saved_question(chat, cmd.question_id)
       if card is None or not closes_without_reply(card, cmd.answers, cmd.selected_options):
         raise AnswerConflict("This answer cannot close the question without a reply.")
@@ -2367,7 +2361,7 @@ class ChatWriterActor:
         raise AnswerConflict("This question already has a different answer.")
       if not accepts_saved_answer(chat, cmd.question_id):
         raise AnswerConflict("This question is no longer open.")
-      require_quiet_answer_handoff(db, chat, cmd.question_id)
+      require_quiet_close_holds_no_claim(db, chat, cmd.question_id)
       metadata = {"answer_turn": "none", "selected_options": cmd.selected_options}
     applied = apply_answers_to_last_question(
       chat, cmd.answers, cmd.question_id, metadata=metadata,
@@ -2628,11 +2622,6 @@ class ChatWriterActor:
           "AdmitProviderExecution: activity delivery is no longer available"
         )
     run.provider_execution_admitted = True
-    if run.goal_id is not None:
-      from app.goal_plans import goal_plan_revision
-      run.goal_plan_revision_at_admission = goal_plan_revision(
-        db, cmd.chat_id, run.goal_id,
-      )
     run.peer_message_delivery_pending = bool(cmd.has_peer_context_delivery)
     delivery_envelope = (
       {
@@ -2655,7 +2644,7 @@ class ChatWriterActor:
   def _acknowledge_provider_success(
     self, db, cmd: AcknowledgeProviderSuccess,
   ) -> None:
-    """Heal availability and optionally advance peer delivery after success."""
+    """Heal availability and record what the provider received."""
     from app.models import ChatRun
 
     delivered_at = cmd.peer_message_through_created_at
@@ -2697,6 +2686,8 @@ class ChatWriterActor:
     clear_provider_availability_after_success(
       db, run.provider, run.started_at,
     )
+    from app.chat_waits import stage_wait_results_delivered
+    stage_wait_results_delivered(db, cmd.chat_id, cmd.wait_results)
     if not _commit_or_rollback(db):
       raise _PersistFailed("AcknowledgeProviderSuccess did not persist")
 
@@ -3839,6 +3830,7 @@ class ChatWriterActor:
       _parent_wake_continuation_root,
       current_result_undelivered,
       derived_status,
+      parent_wake_blocker,
     )
     from app.models import ChatRun
 
@@ -3928,26 +3920,14 @@ class ChatWriterActor:
       db.rollback()
       return StartContinuationBlocked("active_run")
 
-    latest = db.query(ChatRun).filter(
-      ChatRun.chat_id == cmd.chat_id,
-    ).order_by(ChatRun.started_at.desc(), ChatRun.id.desc()).first()
-    latest_source = (
-      (latest.goal_id or latest.root_run_id or latest.id)
-      if latest is not None else None
+    blocker, source = parent_wake_blocker(
+      db, cmd.chat_id, cmd.source_work_id, cmd.root_run_id,
     )
-    if (
-      latest is None
-      or latest.status != "completed"
-      or latest_source != cmd.source_work_id
-    ):
+    if blocker is not None:
       db.rollback()
-      return StartContinuationBlocked("parent_not_waiting")
-
-    if latest.goal_id:
-      from app.run_state import _recoverable_result_goal
-      if _recoverable_result_goal(db, cmd.chat_id, latest)[0] is None:
-        db.rollback()
-        return StartContinuationBlocked("goal_closed")
+      return StartContinuationBlocked(blocker)
+    goal_id = source.goal_id if source is not None else None
+    goal_objective = source.goal_objective if goal_id else None
 
     existing = list(chat.messages or [])
     try:
@@ -3973,7 +3953,7 @@ class ChatWriterActor:
     chat.active_assistant_message_id = cmd.run_token
     chat.updated_at = started_at
     provider = chat.provider or "claude"
-    admit_goal(db, cmd.chat_id, latest.goal_id, latest.goal_objective)
+    admit_goal(db, cmd.chat_id, goal_id, goal_objective)
     db.add(ChatRun(
       id=cmd.run_token,
       chat_id=cmd.chat_id,
@@ -3982,8 +3962,8 @@ class ChatWriterActor:
       provider=provider,
       started_at=started_at,
       initiated_by_app_id=None,
-      goal_objective=latest.goal_objective,
-      goal_id=latest.goal_id,
+      goal_objective=goal_objective,
+      goal_id=goal_id,
       activity_delivery_json={
         "delegation_ids": [trigger.id],
         "source_work_id": cmd.source_work_id,
@@ -4060,18 +4040,9 @@ class ChatWriterActor:
     )
     run.goal_objective = cmd.objective
     run.goal_id = goal_id
-    checkpoint_changed = run.goal_plan_revision_at_admission is None
-    if checkpoint_changed:
-      from app.goal_plans import goal_plan_revision
-      run.goal_plan_revision_at_admission = goal_plan_revision(
-        db, cmd.chat_id, goal_id,
-      )
-    if (
-      (identity_changed or checkpoint_changed or goal_was_missing)
-      and not _commit_or_rollback(db)
-    ):
+    if (identity_changed or goal_was_missing) and not _commit_or_rollback(db):
       raise _PersistFailed("PromoteRunToGoal did not persist")
-    if not identity_changed and not checkpoint_changed and not goal_was_missing:
+    if not identity_changed and not goal_was_missing:
       db.rollback()
     return {
       "objective": cmd.objective,
@@ -4219,8 +4190,6 @@ class ChatWriterActor:
       raise _PersistFailed("AppendPending: no matching question block")
     if cmd.initiated_by_app_id is not None:
       new_msg["_initiated_by_app_id"] = cmd.initiated_by_app_id
-    if cmd.owner_authored:
-      new_msg["_owner_authored"] = True
     # Idempotent append: `cid` is untrusted client input, and a retried POST
     # (flaky network, double-tap) carries the SAME cid. If that cid already
     # names a durable row — queued OR already promoted into the transcript —
@@ -4330,10 +4299,9 @@ class ChatWriterActor:
       cid_of(m) for m in msgs if m.get("role") == "user"
     }
     stored_messages: list[dict] = []
-    owner_steer_committed = False
     for raw_msg in raw_user_msgs:
       new_msg = dict(raw_msg)
-      owner_authored = new_msg.pop("_owner_authored", False) is True
+      new_msg.pop("_owner_authored", None)
       # This provenance is part of the durable transcript contract, not a UI
       # hint.  A normal Q1/A1/Q2/A2 exchange is indistinguishable from a
       # mid-turn steer after reload unless the committed Q2 row names the
@@ -4353,13 +4321,16 @@ class ChatWriterActor:
       msgs.append(new_msg)
       used_messages.append(new_msg)
       stored_messages.append(new_msg)
-      owner_steer_committed |= (
-        owner_authored
-        and new_msg.get("role") == "user"
-        and not new_msg.get("hidden")
-      )
     _stamp_provider_batch(stored_messages)
     chat.messages = msgs
+    # The steer cut is where a steered helper result reaches its provider, so
+    # its delivery is recorded in this same commit.
+    from app.delegations import carrier_results, mark_results_delivered
+    for stored in stored_messages:
+      mark_results_delivered(
+        db, carrier_results(db, stored),
+        filters=(models.Delegation.parent_chat_id == cmd.chat_id,),
+      )
     if cmd.consume_pending_cids:
       consumed = set(cmd.consume_pending_cids)
       chat.pending_messages = [
@@ -4372,7 +4343,6 @@ class ChatWriterActor:
     return {
       "stored": stored_messages[-1] if stored_messages else None,
       "stored_messages": stored_messages,
-      "owner_steer_committed": owner_steer_committed,
       "pending": list(chat.pending_messages or []),
     }
 
@@ -4571,70 +4541,19 @@ class ChatWriterActor:
       db.rollback()
       return PromotePendingBlocked("activation", wait_id=activation_wait_id)
     pending = list(chat.pending_messages or [])
-    # `/goal clear` is no longer a runnable message. An automatic Goal
-    # continuation is likewise retired once its Goal settles, stops, or gains
-    # another exact owner. This writer-owned admission point prevents a saved
-    # question/monitor/manual continuation from racing a second executor.
+    # `/goal clear` and a retired automatic-Goal control are never runnable.
+    from app.continuations import is_retired_goal_handoff
     from app.goal_commands import goal_clear_requested
-    from app.continuations import continuation_reason
-    from app.run_state import GOAL_HANDOFF_REASON, goal_identity_for_run_start
-    from app.goal_plans import (
-      goal_handoff_owner_kind,
-      goal_plan_is_unfinished,
-      goal_terminal_handoff,
-    )
 
-    seen_goal_continuations: set[str] = set()
-
-    def runnable_pending(row: dict) -> bool:
-      if goal_clear_requested(str(row.get("content") or "")):
-        return False
-      if continuation_reason(row) != GOAL_HANDOFF_REASON:
-        return True
-      _objective, goal_id = goal_identity_for_run_start(
-        db, cmd.chat_id, row,
-      )
-      if goal_id is None or not goal_plan_is_unfinished(
-        db, cmd.chat_id, goal_id,
-      ):
-        return False
-      if goal_id in seen_goal_continuations or goal_handoff_owner_kind(
-        db,
-        cmd.chat_id,
-        goal_id,
-        include_queued_execution=True,
-        excluding_automatic_continuations=True,
-      ) is not None:
-        return False
-      seen_goal_continuations.add(goal_id)
-      return True
-
-    runnable = [row for row in pending if runnable_pending(row)]
+    runnable = [
+      row for row in pending
+      if not goal_clear_requested(str(row.get("content") or ""))
+      and not is_retired_goal_handoff(row)
+    ]
     retired_control = len(runnable) != len(pending)
     if retired_control:
       pending = runnable
       chat.pending_messages = pending
-    if cmd.allow_goal_continuation and cmd.ending_status == "completed":
-      handoff = goal_terminal_handoff(
-        db, cmd.chat_id, cmd.ending_run_token,
-      )
-      if handoff is not None:
-        pending.append({
-          "role": "user",
-          "content": (
-            "Continue the unfinished Goal from its saved plan and current "
-            "state. Reconcile the durable plan against verified current "
-            "state before claiming completion or that no work remains."
-          ),
-          "kind": "continuation",
-          "continuation_reason": GOAL_HANDOFF_REASON,
-          "goal_id": handoff.goal_id,
-          "goal_plan_revision": handoff.plan_revision,
-          "hidden": True,
-          "cid": f"goal-handoff-{cmd.ending_run_token}",
-          "ts": next_message_ts(list(chat.messages or []) + pending),
-        })
-        chat.pending_messages = pending
     if not pending:
       if retired_control and not _commit_or_rollback(db):
         raise _PersistFailed("PromotePending could not retire stale control")
@@ -4733,6 +4652,7 @@ class ChatWriterActor:
     from app.models import ChatRun
     from app.continuations import continues_logical_root
     from app.run_state import (
+      goal_identity_for_run_start,
       product_result_continuation_root,
     )
     goal_objective, goal_id = goal_identity_for_run_start(
@@ -4836,12 +4756,7 @@ class ChatWriterActor:
         if message.get("content") == cmd.content:
           next_pending.append(message)
         else:
-          replacement = {**message, "content": cmd.content}
-          if cmd.owner_authored:
-            replacement["_owner_authored"] = True
-          else:
-            replacement.pop("_owner_authored", None)
-          next_pending.append(replacement)
+          next_pending.append({**message, "content": cmd.content})
           changed = True
       else:
         next_pending.append(message)
@@ -4864,18 +4779,19 @@ class ChatWriterActor:
     guard in ChatView.handleStop.
 
     A ``hidden`` queued row is never owner speech: it is usually a machine-owned
-    carrier (wait/delegation/activation result, a peer-message wake, or a
-    secure-input answer continuation) parked behind the owner-input barrier,
-    each with its own idempotent delivery latch. The Stop "collapse queued
-    text into one fresh follow-up turn" contract — and the terminal
-    setup-error cleanup that shares this command — must leave those carriers
-    queued so they deliver at their legitimate boundary (the owner answering
-    the open card), and must never report their cids for re-send. Re-sending
-    one as owner text was the phantom-queued-message bug: a wait result that
-    fired while a question card was open got re-sent as if the owner typed it
-    the moment they hit Stop. The one exception is an automatic Goal control:
-    Stop/setup cleanup retires it because it is merely scheduled execution,
-    while still omitting its cid from the owner-resend contract.
+    carrier (wait/activation result, a peer-message wake, or a secure-input
+    answer continuation) parked behind the owner-input barrier, each with its
+    own idempotent delivery latch. The Stop "collapse queued text into one
+    fresh follow-up turn" contract — and the terminal setup-error cleanup that
+    shares this command — must leave those carriers queued so they deliver at
+    their legitimate boundary (the owner answering the open card), and must
+    never report their cids for re-send. Re-sending one as owner text was the
+    phantom-queued-message bug: a wait result that fired while a question card
+    was open got re-sent as if the owner typed it the moment they hit Stop.
+
+    A queued helper-result carrier is the exception: it only transports a
+    result its Delegation row still owes. Stop drops it silently, so stopped
+    work stays quiet and the owner's next turn carries the result instead.
     """
     from app.models import Chat
 
@@ -4883,20 +4799,22 @@ class ChatWriterActor:
     if chat is None:
       raise _PersistFailed("ClearPending: chat not found")
     pending = list(chat.pending_messages or [])
-    from app.continuations import continuation_reason
-    from app.run_state import GOAL_HANDOFF_REASON
+    from app.continuations import (
+      DELEGATION_RESULT_MESSAGE_KIND,
+      is_retired_goal_handoff,
+    )
 
     def preserved_carrier(message: object) -> bool:
       return bool(
         isinstance(message, dict)
         and message.get("hidden")
-        and continuation_reason(message) != GOAL_HANDOFF_REASON
+        and message.get("kind") != DELEGATION_RESULT_MESSAGE_KIND
+        and not is_retired_goal_handoff(message)
       )
 
     preserved = [m for m in pending if preserved_carrier(m)]
     removed = [m for m in pending if not preserved_carrier(m)]
-    # Machine-owned Goal controls retire with Stop/setup cleanup but are never
-    # reported as owner text to re-send. Other hidden result carriers remain.
+    # A retired Goal control goes with Stop but is never owner text to re-send.
     cleared_cids = [
       cid_of(m) for m in removed
       if not (isinstance(m, dict) and m.get("hidden"))
@@ -5984,23 +5902,17 @@ def _pending_messages_for_transcript(
   existing: list[dict],
 ) -> list[dict]:
   """Return separate visible transcript rows for promoted pending messages."""
-  from app.continuations import continuation_reason
-  from app.run_state import GOAL_HANDOFF_REASON
-
   stored: list[dict] = []
   used = list(existing)
   for pending_msg in pending:
-    if continuation_reason(pending_msg) == GOAL_HANDOFF_REASON:
-      # This is a scheduler control carried by the one existing FIFO, not
-      # owner speech. Its provider prompt is ephemeral and its identity lives
-      # on the admitted ChatRun; the transcript records only actual messages.
-      continue
     msg = dict(pending_msg)
     msg["role"] = "user"
     msg.pop("queued", None)
     msg.pop("serverTs", None)
     msg.pop("position", None)
     msg.pop("_initiated_by_app_id", None)
+    # Queue rows written before 2026-09-27 may still carry this retired
+    # owner-steer marker; strip it so it never reaches the transcript.
     msg.pop("_owner_authored", None)
     # Preserve an explicit cid, or stamp the legacy fallback before changing
     # ts so queue identity stays byte-identical across promotion.

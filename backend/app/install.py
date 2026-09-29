@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import hashlib
 import json
 import logging
@@ -32,6 +33,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -46,6 +48,7 @@ from sqlalchemy.orm import Session
 from app import (
   activity,
   app_git,
+  app_python_env,
   data_git,
   drawer_pins,
   fs_locks,
@@ -79,10 +82,11 @@ from app.manifest_contract import (
   SYSTEM_PROMPT_MAX_BYTES as _CONTRACT_SYSTEM_PROMPT_MAX_BYTES,
   REQUIRED_STRING_FIELDS,
   ManifestContractError,
-  job_interpreter,
+  python_lock,
   skill_member_paths,
   static_asset_entries,
   validate_manifest_contract,
+  validate_schedule_job,
   validate_storage_destination,
 )
 # Keep the underscore alias: install._http_get calls _validate_url_safe, and
@@ -491,22 +495,45 @@ def _trusted_origin_catalog_identity_matches(
   """Whether a local identity-free row has the catalog package's Git origin."""
   if app.manifest_url is not None or app.slug != manifest_id:
     return False
-  return _trusted_catalog_origin_matches(app, source_url)
+  return _trusted_catalog_origin_matches(app.source_dir, source_url)
 
 
 def _trusted_catalog_origin_matches(
-  app: models.App,
+  source_dir: str | Path,
   source_url: str,
 ) -> bool:
   """Whether an app checkout has the canonical catalog repository origin."""
   expected_origin = _trusted_catalog_origin_url(source_url)
   if expected_origin is None:
     return False
-  actual_origin = app_git.origin_url(app.source_dir)
+  actual_origin = app_git.origin_url(source_dir)
   return bool(
     actual_origin
     and actual_origin.rstrip("/") == expected_origin.rstrip("/")
   )
+
+
+def trusted_catalog_checkout(
+  identity: str | None,
+  source_dir: str | Path,
+  source_url: str,
+  manifest_id: str,
+) -> bool:
+  """Whether an installed package's checkout is its trusted catalog repo."""
+  return _catalog_identity_matches(
+    identity, source_url, manifest_id,
+  ) and _trusted_catalog_origin_matches(source_dir, source_url)
+
+
+def replaces_migration_bridge(upstream_tree: dict, *, trusted_origin: bool) -> bool:
+  """Whether install replaces the recorded upstream instead of continuing it.
+
+  The one-time migration bridge records code but no manifest and shares no
+  history with the real repository. Only a trusted origin may replace it
+  outright; the Store's update check asks this same question so it never
+  offers an update install cannot apply.
+  """
+  return trusted_origin and "mobius.json" not in upstream_tree
 
 
 def _find_ref_independent_catalog_row(
@@ -1478,7 +1505,7 @@ def package_content_digest_from_tree(
   bundled_job = required_bytes(job_name, "schedule job") if job_name else None
   if bundled_job is not None:
     try:
-      job_interpreter(bundled_job)
+      validate_schedule_job(manifest, bundled_job)
     except ManifestContractError as exc:
       raise PackageContentError(str(exc)) from exc
 
@@ -2451,7 +2478,7 @@ def read_git_install_candidate(
   bundled_job = required(job_name, "schedule job") if job_name else None
   if bundled_job is not None:
     try:
-      job_interpreter(bundled_job)
+      validate_schedule_job(manifest, bundled_job)
     except ManifestContractError as exc:
       raise ValueError(str(exc)) from exc
 
@@ -2594,6 +2621,10 @@ class InstallTarget:
   source_identity: str | None
   source_handoff_required: bool
 
+  @property
+  def trusted_origin(self) -> bool:
+    return self.adopting_trusted_origin or self.trusted_catalog_origin
+
 
 @dataclass
 class InstallJournal:
@@ -2720,7 +2751,7 @@ async def _fetch_install_candidate(
         cli, raw_base + schedule["job"], _ENTRY_MAX_BYTES,
       )
       try:
-        job_interpreter(bundled_job)
+        validate_schedule_job(manifest, bundled_job)
       except ManifestContractError as exc:
         raise HTTPException(400, str(exc)) from exc
 
@@ -3062,10 +3093,10 @@ def _select_install_target(
     ),
     trusted_catalog_origin=bool(
       existing is not None
-      and _catalog_identity_matches(
-        existing.manifest_url, source_for_key, manifest_id,
+      and trusted_catalog_checkout(
+        existing.manifest_url, existing.source_dir, source_for_key,
+        manifest_id,
       )
-      and _trusted_catalog_origin_matches(existing, source_for_key)
     ),
     canonical_manifest_url=canonical_manifest_url,
     origin_migration=origin_migration,
@@ -3075,6 +3106,99 @@ def _select_install_target(
   )
 
 
+def owner_timezone(db: Session) -> str | None:
+  """The owner's recorded IANA timezone, when the shell has reported one."""
+  from app import cron_tz
+
+  owner = db.query(models.Owner).order_by(models.Owner.id).first()
+  zone = owner.timezone if owner else None
+  return zone if zone and cron_tz.valid_timezone(zone) else None
+
+
+def _manifest_default_timezone(
+  default: str, owner_zone: str | None,
+) -> str | None:
+  """The zone a manifest default is registered in; ``None`` is server time.
+
+  A fixed wall-time default (``M H * * *``, ``M H * * 1-5``) means that time
+  for the owner, so it is owned in the owner's timezone once known. Other
+  cadences, and a zone the server already runs in, stay ordinary server cron.
+  """
+  from app import cron_tz
+
+  if (
+    owner_zone is None
+    or cron_tz.parse_wall_clock_cron(default) is None
+    or owner_zone == cron_tz.server_timezone_name()
+  ):
+    return None
+  return owner_zone
+
+
+def _apply_schedule_choice(
+  app: models.App,
+  choice: app_cron.ScheduleChoice,
+  scaffold: Path,
+) -> None:
+  """Record who chose the schedule, then register it.
+
+  Provenance is written first so a failed or interrupted registration can
+  never leave a declaration whose origin a later update must guess.
+  """
+  from app import cron_tz
+
+  app_cron.record_schedule_choice(app.id, choice)
+  job_path = Path(app.source_dir) / choice.job
+  if choice.timezone is None:
+    app_cron.register_cron(
+      app.slug, choice.cron, job_path, app.id, scaffold=scaffold,
+    )
+    return
+  app_cron.register_cron(
+    app.slug,
+    cron_tz.materialize_zone_cron(choice.cron, choice.timezone),
+    job_path,
+    app.id,
+    timezone=choice.timezone,
+    zone_cron=choice.cron,
+    scaffold=scaffold,
+  )
+
+
+async def converge_manifest_schedule_zones(
+  db: Session, owner_zone: str | None,
+) -> None:
+  """Move every manifest-default schedule into the zone it belongs in.
+
+  Runs when the owner's timezone is reported. Owner-chosen schedules keep
+  their own zone; a default already in the right zone is left alone, so
+  repeated reports are no-ops. A failure leaves that app for the next report.
+  """
+  scaffold = app_cron.cron_scaffold(CRON_SCAFFOLD)
+  if not scaffold.exists():
+    return
+  apps = db.query(models.App).filter(models.App.deleted_at.is_(None)).all()
+  for app in apps:
+    try:
+      async with fs_locks.source_dir_lock(app.source_dir):
+        choice = app_cron.read_schedule_choice(app.id)
+        if choice is None or choice.source != "manifest":
+          continue
+        zone = _manifest_default_timezone(choice.cron, owner_zone)
+        if zone == choice.timezone:
+          continue
+        try:
+          await asyncio.to_thread(
+            _apply_schedule_choice,
+            app, dataclasses.replace(choice, timezone=zone), scaffold,
+          )
+        except Exception:
+          app_cron.record_schedule_choice(app.id, choice)
+          raise
+    except Exception:
+      log.exception("schedule zone: app %s could not be moved", app.id)
+
+
 async def _sync_manifest_cron_unlocked(
   *,
   app: models.App,
@@ -3082,6 +3206,7 @@ async def _sync_manifest_cron_unlocked(
   drop_prior_cron: bool,
   bundled_job: bool,
   warnings: list[str],
+  owner_zone: str | None,
 ) -> None:
   """Converge one accepted manifest's cron while its source lock is held.
 
@@ -3089,6 +3214,10 @@ async def _sync_manifest_cron_unlocked(
   the same manifest contract. Keeping cron convergence here prevents either
   path from becoming add-only: an accepted update that drops its schedule must
   retire both the live entry and its replayable declaration.
+
+  A schedule the owner chose survives while the app keeps the same schedule
+  contract (``app_cron.owner_schedule_to_keep``); otherwise the manifest
+  default is registered, in ``owner_zone`` when it is a fixed wall time.
   """
   schedule = manifest.get("schedule")
   job_name = schedule.get("job") if schedule else None
@@ -3099,19 +3228,29 @@ async def _sync_manifest_cron_unlocked(
 
   app_data_dir = Path(app.source_dir)
   app_data_dir.mkdir(parents=True, exist_ok=True)
-  if drop_prior_cron:
+  kept = (
+    app_cron.owner_schedule_to_keep(app.id, schedule["default"], cron_job_name)
+    if has_cron else None
+  )
+  if drop_prior_cron and kept is None:
     await asyncio.to_thread(_drop_app_cron, app_data_dir)
     (app_cron.schedule_state_dir(app.id) / "init-cron.sh").unlink(missing_ok=True)
-  job_path = app_data_dir / cron_job_name
+    app_cron.clear_schedule_choice(app.id)
   active_cron_scaffold = app_cron.cron_scaffold(CRON_SCAFFOLD)
   if has_cron and active_cron_scaffold.exists():
+    default = schedule["default"]
+    if kept is not None:
+      choice = dataclasses.replace(kept, manifest_default=default)
+    else:
+      choice = app_cron.ScheduleChoice(
+        source="manifest",
+        cron=default,
+        job=cron_job_name,
+        timezone=_manifest_default_timezone(default, owner_zone),
+        manifest_default=default,
+      )
     await asyncio.to_thread(
-      app_cron.register_cron,
-      app.slug,
-      schedule["default"],
-      job_path,
-      app.id,
-      scaffold=active_cron_scaffold,
+      _apply_schedule_choice, app, choice, active_cron_scaffold,
     )
   elif has_cron:
     sentinel = app_data_dir / ".cron-pending.json"
@@ -3141,6 +3280,8 @@ async def _run_post_commit_effects(
   Every failure here becomes a warning. The app row and selected bundle are
   already durable, so this phase must never enter the pre-commit rollback path.
   """
+  from app import app_setup
+  app_setup.request_run()
   manifest = candidate.manifest
   schedule = manifest.get("schedule")
   job_name = schedule.get("job") if schedule else None
@@ -3158,6 +3299,7 @@ async def _run_post_commit_effects(
           drop_prior_cron=drop_prior_cron,
           bundled_job=bool(candidate.bundled_job),
           warnings=warnings,
+          owner_zone=owner_timezone(db),
         )
     except HTTPException as exc:
       log.warning(
@@ -3397,6 +3539,74 @@ class ActivationPlan:
   capability_contract: dict
   package_id: str | None
   source_identity: str | None
+  # Built from the fetched package before the row's write transaction.
+  python_env: app_python_env.StagedEnv | None = None
+
+
+async def _stage_install_python_env(
+  data_dir: Path,
+  manifest: dict,
+  package_tree: dict[str, bytes],
+  app_id: int | None,
+  journal: InstallJournal,
+) -> app_python_env.StagedEnv | None:
+  """Build the package's declared Python env before any row is written.
+
+  A build takes minutes at worst, so it must not run inside the install's
+  SQLite write transaction. The reconciled tree exists only inside that
+  transaction, so this builds from the fetched package (its lock and service)
+  and ``_publish_install_python_env`` requires the reconciled lock to match.
+  """
+  if python_lock(manifest) is None:
+    return None
+
+  def build():
+    with tempfile.TemporaryDirectory(prefix="mobius-install-env-") as tmp:
+      root = Path(tmp)
+      for relative, content in package_tree.items():
+        (root / relative).parent.mkdir(parents=True, exist_ok=True)
+        (root / relative).write_bytes(content)
+      (root / "mobius.json").write_text(json.dumps(manifest, sort_keys=True))
+      return app_python_env.prepare_env(data_dir, app_id, root)
+
+  try:
+    staged = await asyncio.to_thread(build)
+  except app_python_env.PythonEnvBuildError as exc:
+    raise HTTPException(422, detail={
+      "code": "python_env_failed",
+      "message": f"Could not build the app's Python environment. {exc}",
+    }) from exc
+  journal.rollback_actions.append(lambda: app_python_env.discard_env(staged))
+  return staged
+
+
+def _publish_install_python_env(
+  app: models.App,
+  staged: app_python_env.StagedEnv | None,
+  runtime_root: Path,
+  journal: InstallJournal,
+  data_dir: Path,
+) -> None:
+  """Link the staged env for the reconciled tree, before its pointer is published."""
+  try:
+    key = app_python_env.declared_key(runtime_root)
+  except app_python_env.PythonEnvUnavailable as exc:
+    raise HTTPException(422, detail={
+      "code": "python_env_failed", "message": str(exc),
+    }) from exc
+  if key != (staged.key if staged is not None else None):
+    # Only a local edit to the lock merged into the update can differ here.
+    raise HTTPException(409, detail={
+      "code": "python_lock_diverged",
+      "message": (
+        "This app's local source changes its Python lock, so the environment "
+        "built for the update does not match it. The update was not "
+        "installed; reconcile the lock in the app source, Apply it, and retry."
+      ),
+    })
+  if staged is not None:
+    published = app_python_env.publish_env(data_dir, app.id, staged)
+    journal.rollback_actions.append(lambda: app_python_env.unpublish_env(published))
 
 
 def _apply_manifest_metadata(
@@ -3585,6 +3795,13 @@ async def _activate_install_source(
     static_assets=plan.static_assets,
     runtime_manifest=json.dumps(manifest, sort_keys=True).encode(),
   )
+  try:
+    _publish_install_python_env(
+      app, plan.python_env, runtime_staged.root, journal, data_dir,
+    )
+  except BaseException:
+    shutil.rmtree(runtime_staged.root)
+    raise
   applied_app_runtime.publish_runtime(app, runtime_staged)
   return equivalence_target
 
@@ -3901,6 +4118,10 @@ async def install_from_manifest(
   data_dir = Path(get_settings().data_dir)
 
   try:
+    python_env = await _stage_install_python_env(
+      data_dir, manifest, published_source_tree,
+      existing.id if existing is not None else None, journal,
+    )
     app = await _prepare_app_row(
       db,
       candidate=candidate,
@@ -4039,13 +4260,10 @@ async def install_from_manifest(
               git_source_dir,
               app_git.UPSTREAM_BRANCH,
             )
-            synthetic_baseline = (
-              bool(prev_upstream_commit)
-              and "mobius.json" not in previous_tree
-              and (
-                target.trusted_catalog_origin
-                or target.adopting_trusted_origin
-              )
+            synthetic_baseline = bool(
+              prev_upstream_commit
+            ) and replaces_migration_bridge(
+              previous_tree, trusted_origin=target.trusted_origin,
             )
             if synthetic_baseline:
               await asyncio.to_thread(
@@ -4064,10 +4282,7 @@ async def install_from_manifest(
                 app_git.promote_upstream,
                 git_source_dir,
                 reviewed_upstream_commit,
-                trusted_origin_adoption=(
-                  target.adopting_trusted_origin
-                  or target.trusted_catalog_origin
-                ),
+                trusted_origin_adoption=target.trusted_origin,
               )
           except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
             raise HTTPException(
@@ -4095,13 +4310,10 @@ async def install_from_manifest(
             git_source_dir,
             app_git.UPSTREAM_BRANCH,
           )
-          synthetic_baseline = (
-            bool(prev_upstream_commit)
-            and "mobius.json" not in previous_tree
-            and (
-              target.trusted_catalog_origin
-              or target.adopting_trusted_origin
-            )
+          synthetic_baseline = bool(
+            prev_upstream_commit
+          ) and replaces_migration_bridge(
+            previous_tree, trusted_origin=target.trusted_origin,
           )
           if synthetic_baseline:
             try:
@@ -4138,10 +4350,7 @@ async def install_from_manifest(
                 app_git.fetch_upstream,
                 git_source_dir,
                 ref,
-                trusted_origin_adoption=(
-                  target.adopting_trusted_origin
-                  or target.trusted_catalog_origin
-                ),
+                trusted_origin_adoption=target.trusted_origin,
                 verify=lambda commit: _verify_git_install_candidate(
                   git_source_dir, commit, candidate,
                 ),
@@ -4473,10 +4682,14 @@ async def install_from_manifest(
             capability_contract=capability_contract,
             package_id=target.package_id,
             source_identity=target.source_identity,
+            python_env=python_env,
           ),
           journal=journal,
           data_dir=data_dir,
         )
+      else:
+        # A conflict activates nothing, so its build is never linked.
+        journal.commit_actions.append(lambda: app_python_env.discard_env(python_env))
     finally:
       # Release the per-source-dir lock (held across the merge + write for the
       # git path) BEFORE the seeds block takes app_storage_lock, preserving the
@@ -4610,7 +4823,10 @@ async def install_from_manifest(
       500, "Install failed due to an unexpected server error.",
     )
 
+  from app import service_preload
   from app.applied_app_runtime import prune_runtime
+  # A preloaded service host pins the runtime it imported.
+  service_preload.retire(app.id, keep_revision=app.runtime_revision)
   try:
     await asyncio.to_thread(prune_runtime, app)
   except OSError:

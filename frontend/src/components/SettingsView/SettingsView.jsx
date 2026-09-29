@@ -10,6 +10,7 @@ import { clearExplicitOwnerSession } from '../../lib/explicitLogout.js'
 import { stopShellInstallPassPreparation } from '../../lib/shellInstallPass.js'
 import { captureLayoutSpace, clientLengthToLayout } from '../../lib/layoutSpace.js'
 import {
+  mobiusOutOfCredit,
   PROVIDER_AVAILABILITY_PHASE,
   resolveProviderAvailability,
 } from '../../lib/providerAvailability.js'
@@ -325,6 +326,7 @@ export default function SettingsView({
   const mobiusExpiryTime = Date.parse(mobiusExpiryRaw || '')
   const mobiusHasExpiry = Number.isFinite(mobiusExpiryTime)
   const mobiusExpired = mobiusHasExpiry && mobiusExpiryTime <= Date.now()
+  const mobiusNoCredit = mobiusOutOfCredit(providerStatusQuery.data?.mobius)
   // Live-probed CLI versions (null when the CLI isn't installed or
   // didn't respond). Read-only — updates happen via the agent, not here.
   const claudeVersion = settingsQuery.data?.claude_version
@@ -415,9 +417,9 @@ export default function SettingsView({
   const mobiusAllowance = providerAllowance('mobius', mobiusUsageQuery.data)
   const mobiusTrialSubtitle = mobiusAuthenticated
     ? (
-        mobiusExpired
-          ? 'Trial expired'
-          : (
+        mobiusNoCredit
+          ? 'No credit. Activate your trial or see your options in Möbius · You.'
+          : mobiusExpired ? 'Trial expired' : (
               typeof mobiusAllowance.usedPercent === 'number'
                 ? providerAllowanceSummary('mobius', mobiusAllowance)
                 : formatTrialTimeLeft(mobiusExpiryRaw) || 'Trial usage unavailable'
@@ -1070,9 +1072,9 @@ export default function SettingsView({
                     connected={mobiusAuthenticated}
                     subtitle={mobiusTrialSubtitle}
                     statusNode={(
-                      <StatusDot color={mobiusAuthenticated && !mobiusExpired ? '--green' : '--muted'}>
+                      <StatusDot color={mobiusAuthenticated && !mobiusExpired && !mobiusNoCredit ? '--green' : '--muted'}>
                         {mobiusAuthenticated
-                          ? (mobiusExpired ? 'Trial expired' : 'Trial active')
+                          ? (mobiusNoCredit ? 'No credit' : mobiusExpired ? 'Trial expired' : 'Trial active')
                           : 'Sign in from Möbius · You'}
                       </StatusDot>
                     )}

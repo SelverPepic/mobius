@@ -83,15 +83,32 @@ _GIT_BLOB_READ_MAX = 8 * 1024 * 1024
 _LEVELS = {"none": 0, "read": 1, "write": 2}
 
 
-def _require_shared_memory_read(
+# The only /data/shared entries an app token may read. Agents write arbitrary
+# files (credentials included) under /data/shared, so apps get an allowlist,
+# never a denylist. Shared writes and deletes are owner-only regardless.
+_APP_SHARED_READ_ROOTS = frozenset({"skills", "memory", "self-reminders.jsonl"})
+
+
+def _require_shared_read(
   path: str,
   principal: Principal,
   db: Session,
 ) -> None:
-  """Gate the optional Memory app's shared graph by its live contract."""
-  if path != "memory" and not path.startswith("memory/"):
-    return
+  """Confine app reads to the allowlisted shared entries.
+
+  Decide on the normalized first segment, the same one ``_resolve`` serves:
+  ``./memory/x`` and ``memory/x`` name the same file. ``memory`` additionally
+  needs the app's live ``shared_memory`` read contract.
+  """
   if principal.app_id is None:
+    return
+  parts = Path(path).parts
+  top = parts[0] if parts else ""
+  if top not in _APP_SHARED_READ_ROOTS:
+    raise HTTPException(
+      status_code=403, detail="Apps cannot read this shared path.",
+    )
+  if top != "memory":
     return
   app = (
     db.query(models.App)
@@ -477,22 +494,30 @@ def _list_directory_page(
   return entries, next_cursor
 
 
-def _include_json_listing_content(
-  entries: list[dict], base: Path,
-) -> None:
-  """Adds parsed ``content`` to eligible JSON file entries in place.
+def _with_json_listing_content(
+  entries: list[dict], next_cursor: str | None, base: Path,
+) -> tuple[list[dict], str | None]:
+  """Adds parsed ``content`` to eligible JSON entries; returns the page.
 
   Every candidate is resolved again through the storage path guard, so a
-  listing can never make a symlink readable. Invalid JSON, files that changed
-  type/size after the directory scan, and files outside the strict per-file or
-  aggregate byte budgets simply remain metadata-only; callers can fall back to
-  an ordinary ``get`` for those exceptional entries.
+  listing can never make a symlink readable. Oversized files, invalid JSON,
+  and files that changed type/size after the directory scan remain
+  metadata-only; callers can fall back to an ordinary ``get`` for those
+  exceptional entries.
+
+  The aggregate byte budget ENDS the page instead of silently stripping
+  content from later eligible entries: when the next small JSON file would
+  not fit, the page stops before it and ``next_cursor`` resumes there. So a
+  caller may ask for a full-size page and still receive every eligible body
+  — a large collection costs a handful of budget-sized requests rather than
+  many tiny ones, each of which rescans the directory. Every page reads at
+  least one candidate, so pagination always advances.
   """
   # This is an I/O budget, not merely a response-size budget. Invalid JSON
   # must consume it too; otherwise a page of 500 malformed 64 KiB files could
   # still force ~32 MiB of reads before returning no content at all.
   read_bytes = 0
-  for entry in entries:
+  for index, entry in enumerate(entries):
     if (
       entry.get("type") != "file"
       or not str(entry.get("name", "")).endswith(".json")
@@ -505,11 +530,12 @@ def _include_json_listing_content(
       if not file_path.is_file():
         continue
       size = file_path.stat().st_size
-      remaining = _LIST_CONTENT_PAGE_MAX - read_bytes
-      if remaining <= 0:
-        break
-      if size > _LIST_CONTENT_FILE_MAX or size > remaining:
+      if size > _LIST_CONTENT_FILE_MAX:
         continue
+      remaining = _LIST_CONTENT_PAGE_MAX - read_bytes
+      if size > remaining and index > 0:
+        # Budget spent: this body belongs to the next page.
+        return entries[:index], _encode_cursor(entries[index - 1]["name"])
       # Read one byte beyond the stat'd size when the page budget permits, so
       # a file that grows during the scan is detected without an unbounded
       # read_bytes() allocation. The page budget remains a strict ceiling.
@@ -525,6 +551,7 @@ def _include_json_listing_content(
       # RecursionError (deeply nested content) is a RuntimeError, so without it
       # a list-with-content read would 500 instead of just skipping the entry.
       continue
+  return entries, next_cursor
 
 
 def _serve_file(file_path: Path, stored_mime: str | None = None):
@@ -757,7 +784,11 @@ async def move_app_file(
       raise HTTPException(status_code=404, detail="Source not found.")
     if dst.exists():
       raise HTTPException(status_code=409, detail="Destination already exists.")
-    dst.parent.mkdir(parents=True, exist_ok=True)
+    if src in dst.parents:
+      raise HTTPException(
+        status_code=400, detail="Cannot move a folder into itself.",
+      )
+    storage_io.make_parent_folders(dst)
     shutil.move(str(src), str(dst))
     # Carry the MIME sidecar(s) to the new path so the moved bytes keep their
     # stored type, and the old path keeps no stale sidecar.
@@ -933,7 +964,7 @@ def read_shared_git_file(
   reachable from ``refs/heads/main``; symlinks, submodules, replacement refs,
   hooks and external Git configuration are never consulted.
   """
-  _require_shared_memory_read(f"{repo}/{file}", principal, db)
+  _require_shared_read(f"{repo}/{file}", principal, db)
   if not _GIT_COMMIT_RE.fullmatch(revision):
     raise HTTPException(status_code=400, detail="Invalid Git revision.")
   if (
@@ -1013,7 +1044,7 @@ def read_shared_file(
   db: Session = Depends(get_db),
 ):
   """Returns a file from the shared data directory."""
-  _require_shared_memory_read(path, principal, db)
+  _require_shared_read(path, principal, db)
   base = Path(get_settings().data_dir) / "shared"
   file_path = _resolve(base, path)
   # is_file() so a directory path 404s instead of 500-ing in _serve_file
@@ -1189,7 +1220,9 @@ def list_app_dir(
     mime_override=lambda rel: read_content_type(data_dir, scope, rel),
   )
   if include_content:
-    _include_json_listing_content(entries, base)
+    entries, next_cursor = _with_json_listing_content(
+      entries, next_cursor, base,
+    )
   return {"entries": entries, "next_cursor": next_cursor}
 
 
@@ -1211,7 +1244,7 @@ def list_shared_dir(
   listing rather than 404, matching `apps-list` (enumerating a not-yet-
   created directory is a normal call).
   """
-  _require_shared_memory_read(path, principal, db)
+  _require_shared_read(path, principal, db)
   base = Path(get_settings().data_dir) / "shared"
   dir_path = base if path == "" else _resolve(base, path)
   if not dir_path.is_dir():

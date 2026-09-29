@@ -236,14 +236,6 @@ class AppOut(BaseModel):
 
   @computed_field
   @property
-  def agent_tools(self) -> list[dict]:
-    """Reviewed agent tools this app contributes to every agent run."""
-    from app.app_capabilities import agent_tools_from_contract
-
-    return agent_tools_from_contract(self.capability_contract)
-
-  @computed_field
-  @property
   def icon_url(self) -> str | None:
     """Versioned public reference to the effective accepted icon asset."""
     if not self.has_icon:
@@ -445,8 +437,8 @@ class AppInstallOut(AppOut):
 class AppScheduleUpdate(BaseModel):
   """Body for updating one installed app's cron schedule.
 
-  When ``timezone`` (an IANA identifier) is set, ``cron`` is a plain daily
-  expression owned in that zone; the platform stores that identity durably
+  When ``timezone`` (an IANA identifier) is set, ``cron`` is a fixed wall
+  time (daily or on listed weekdays) owned in that zone; the platform stores that identity durably
   and materializes an every-minute gate that resolves the real wall-clock
   occurrence. Ambiguous times run once at their first occurrence; nonexistent
   times run at the first valid minute after the gap. Without ``timezone``,
@@ -780,6 +772,15 @@ class PushKeys(BaseModel):
 class PushSubscribeRequest(BaseModel):
   endpoint: str
   keys: PushKeys
+
+  @field_validator("endpoint")
+  @classmethod
+  def _https_push_service(cls, value: str) -> str:
+    """Browser push services are always HTTPS URLs."""
+    parsed = urlsplit(value)
+    if parsed.scheme != "https" or not parsed.hostname:
+      raise ValueError("Push endpoint must be an https URL.")
+    return value
 
 
 class PushUnsubscribeRequest(BaseModel):

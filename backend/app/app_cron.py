@@ -1,9 +1,11 @@
 """Shared cron declaration and parsing primitives for installed apps."""
 
+import json
 import os
 import re
 import shlex
 import subprocess
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from fastapi import HTTPException
@@ -45,6 +47,84 @@ def cron_mutation_blocked_in_test_runtime() -> bool:
 def schedule_state_dir(app_id: int) -> Path:
   """Owner schedule declarations live with app data, not editable source."""
   return Path(get_settings().data_dir) / "apps" / str(int(app_id)) / "schedule"
+
+
+_SCHEDULE_CHOICE_FILE = "choice.json"
+
+
+@dataclass(frozen=True)
+class ScheduleChoice:
+  """Who chose an app's current schedule, and what they chose.
+
+  ``source`` is ``"owner"`` for a schedule set through the schedule route
+  (by the owner or the app's own settings screen) and ``"manifest"`` for the
+  default the platform registered from the app's manifest. ``cron`` is the
+  chosen cadence, zone-local when ``timezone`` is set. ``manifest_default`` is
+  the manifest default in force when the choice was recorded; it tells a later
+  update whether the app has changed its schedule contract since.
+  """
+
+  source: str
+  cron: str
+  job: str
+  timezone: str | None = None
+  manifest_default: str | None = None
+
+
+def record_schedule_choice(app_id: int, choice: ScheduleChoice) -> None:
+  """Atomically record provenance beside the durable schedule declaration."""
+  state_dir = schedule_state_dir(app_id)
+  state_dir.mkdir(parents=True, exist_ok=True)
+  target = state_dir / _SCHEDULE_CHOICE_FILE
+  tmp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+  tmp.write_text(json.dumps(asdict(choice), sort_keys=True), encoding="utf-8")
+  os.replace(tmp, target)
+
+
+def clear_schedule_choice(app_id: int) -> None:
+  (schedule_state_dir(app_id) / _SCHEDULE_CHOICE_FILE).unlink(missing_ok=True)
+
+
+def read_schedule_choice(app_id: int) -> ScheduleChoice | None:
+  try:
+    raw = json.loads(
+      (schedule_state_dir(app_id) / _SCHEDULE_CHOICE_FILE).read_text(),
+    )
+    return ScheduleChoice(
+      source=str(raw["source"]),
+      cron=str(raw["cron"]),
+      job=str(raw["job"]),
+      timezone=raw.get("timezone") or None,
+      manifest_default=raw.get("manifest_default") or None,
+    )
+  except (OSError, ValueError, TypeError, KeyError):
+    return None
+
+
+def owner_schedule_to_keep(
+  app_id: int, default: str, job: str,
+) -> ScheduleChoice | None:
+  """The owner's schedule choice that survives an accepted manifest.
+
+  An update or local apply keeps the owner's choice while the app's schedule
+  contract is unchanged: the same scheduled job, and either the same manifest
+  default as when the owner chose, or a wall-time default on the same weekdays
+  as the owner's wall time (an app retiming its daily default does not override
+  the owner's daily time). A different job or cadence kind returns ``None`` so
+  the new default applies.
+  """
+  from app import cron_tz
+
+  choice = read_schedule_choice(app_id)
+  if choice is None or choice.source != "owner" or choice.job != job:
+    return None
+  if choice.manifest_default == default:
+    return choice
+  chosen = cron_tz.parse_wall_clock_cron(choice.cron)
+  offered = cron_tz.parse_wall_clock_cron(default)
+  if chosen and offered and chosen[2] == offered[2]:
+    return choice
+  return None
 
 
 def register_cron(
@@ -91,9 +171,9 @@ def register_cron(
       raise CronDeclarationError(
         500, f"Unknown IANA timezone: {timezone!r}",
       )
-    if cron_tz.parse_daily_cron(zone_cron) is None:
+    if cron_tz.parse_wall_clock_cron(zone_cron) is None:
       raise CronDeclarationError(
-        500, f"Zone-owned schedule must be a plain daily cron: {zone_cron!r}",
+        500, f"Zone-owned schedule must be a fixed wall time: {zone_cron!r}",
       )
   active_scaffold = scaffold or cron_scaffold()
   if not active_scaffold.exists():

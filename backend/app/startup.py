@@ -199,6 +199,12 @@ def _sweep_codex_provider_sessions(context: StartupContext) -> None:
       "provider session retention reclaimed %d bytes from %d Codex files",
       codex["reclaimed_bytes"], codex["removed_files"],
     )
+  stores = codex.get("stores") or {}
+  if codex.get("store_reclaimed_bytes") or not stores.get("complete", True):
+    context.logger.info(
+      "Codex store compaction reclaimed %d bytes (complete=%s)",
+      codex.get("store_reclaimed_bytes", 0), stores.get("complete"),
+    )
   if codex["errors"]:
     context.logger.warning(
       "provider session retention skipped %d Codex file(s)", codex["errors"],
@@ -212,6 +218,20 @@ def _configure_claude_settings_defaults(context: StartupContext) -> None:
   added = ensure_claude_settings_defaults(context.settings.data_dir)
   if added:
     context.logger.info("set Claude settings defaults: %s", ", ".join(added))
+
+
+def _migrate_theme_surface_token(context: StartupContext) -> None:
+  """Rewrite a saved theme.css's legacy --surface2 token to --surface-2.
+
+  Fix-forward for the secondary-surface token rename (no alias). This is the
+  only code that knows the legacy name, so it must run before the theme is
+  served or an owner's saved value is lost. Idempotent and missing-file-safe;
+  runs before the database phase because it only touches shared/theme.css.
+  """
+  from app.theme import migrate_theme_surface2_token
+
+  if migrate_theme_surface2_token(context.settings.data_dir):
+    context.logger.info("migrated saved theme.css --surface2 -> --surface-2")
 
 
 _SKILL_RECONCILER = Path(__file__).resolve().parents[1] / "scripts" / "init_skills.py"
@@ -334,7 +354,9 @@ def _freeze_legacy_app_runtimes(context: StartupContext) -> None:
     migrate_legacy_job_declarations,
     prune_runtime,
   )
-  from app import models
+  from app import app_python_env, models
+  # No Apply can run yet, so every staged env build is an interrupted one.
+  app_python_env.discard_interrupted_builds(context.settings.data_dir)
   with SessionLocal() as db:
     count, warnings = bootstrap_legacy_runtimes(db)
     service_count, service_warnings = migrate_accepted_service_contracts(db)
@@ -588,6 +610,10 @@ def _route_diagnostics_to_chat_log(_context: StartupContext) -> None:
   for name, level in (
     ("app.providers.models", logging.WARNING),
     ("moebius.memory", logging.INFO),
+    # Shared helper hosts: starts, exits with stderr, reseeds, and dispatches
+    # that never start a helper are otherwise lost with the process output.
+    ("app.helper_hosts", logging.INFO),
+    ("app.claude_helper_host", logging.INFO),
   ):
     logger = logging.getLogger(name)
     if handler not in logger.handlers:
@@ -629,6 +655,7 @@ PROCESS_STARTUP_TASKS = (
     _configure_claude_settings_defaults,
   ),
   StartupTask("reconcile platform skills", _reconcile_platform_skills),
+  StartupTask("migrate theme surface token", _migrate_theme_surface_token),
   StartupTask(
     "initialize database",
     _initialize_database,

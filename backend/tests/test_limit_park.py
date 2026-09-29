@@ -667,7 +667,6 @@ def test_owner_message_queues_behind_future_limit_park(
     "content": "also check the weekly limit",
     "ts": response.json()["ts"],
     "cid": "queued-owner",
-    "_owner_authored": True,
   }]
 
 
@@ -849,15 +848,10 @@ def test_manual_resume_defers_product_receipt_until_original_turn_finishes(
     setup_db.commit()
   expected_run = product_result_run_token(cid, result)
   claimed_waits = []
-  claimed_wakes = []
 
   monkeypatch.setattr(
     "app.chat_waits.claim_scheduled_wait_result",
     lambda chat_id, next_user: claimed_waits.append((chat_id, next_user)),
-  )
-  monkeypatch.setattr(
-    "app.delegations.claim_scheduled_parent_wake",
-    lambda chat_id, next_user: claimed_wakes.append((chat_id, next_user)),
   )
 
   async def capture(*args, **kwargs):
@@ -881,11 +875,10 @@ def test_manual_resume_defers_product_receipt_until_original_turn_finishes(
   with SessionLocal() as check_db:
     assert check_db.get(models.ChatRun, expected_run) is None
   assert claimed_waits == []
-  assert claimed_wakes == []
   assert _chat_row(cid)["pending"] == [result]
 
   # The existing ordinary turn-end admission retains the receipt's exact
-  # identity and scheduling latch; Resume never claims it early.
+  # identity; Resume never claims it early.
   promoted = get_writer().submit(PromotePending(
     chat_id=cid, run_token="provisional-next-turn",
   )).result(timeout=5)["promoted"]
@@ -902,11 +895,10 @@ def test_manual_resume_defers_product_receipt_until_original_turn_finishes(
     await asyncio.sleep(0)
 
   asyncio.run(schedule_result())
-  for claimed in (claimed_waits, claimed_wakes):
-    assert len(claimed) == 1
-    assert claimed[0][0] == cid
-    assert claimed[0][1]["kind"] == kind
-    assert claimed[0][1]["_run_token"] == expected_run
+  assert len(claimed_waits) == 1
+  assert claimed_waits[0][0] == cid
+  assert claimed_waits[0][1]["kind"] == kind
+  assert claimed_waits[0][1]["_run_token"] == expected_run
   chat_mod.discard_starting(cid)
   remove_broadcast(cid)
 

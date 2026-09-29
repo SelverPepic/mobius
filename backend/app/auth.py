@@ -159,6 +159,11 @@ def create_agent_token(
   )
 
 
+# The JWT scope of a token minted for an app service answering an anonymous
+# public request (create_app_token(service="public")).
+PUBLIC_SERVICE_SCOPE = "public_service"
+
+
 def create_app_token(
   app_id: int,
   owner_username: str,
@@ -168,7 +173,8 @@ def create_app_token(
   expires_delta: timedelta = timedelta(hours=8),
   delegation_id: str | None = None,
   delegation_chat: str | None = None,
-  is_service: bool = False,
+  service: str | None = None,
+  job_secrets: list[str] | None = None,
 ) -> str:
   """Creates a short-lived JWT scoped to a specific mini-app.
 
@@ -183,18 +189,31 @@ def create_app_token(
   only by callers without the row; the resolver then falls back to
   row-existence.
 
-  `is_service` marks a token minted only for the app's own server-side
-  service subprocess (see app_services.service_environment) — never the
-  browser frame. It is the one thing that lets deps.Principal distinguish
-  a request the app's reviewed backend code made from one the untrusted
-  frame made, which is what allows a service to read back its own secrets
-  (routes/secrets.get_secret) without opening that read to the frame.
+  `job_secrets` is set only by the owner-authorized job-token endpoint. It
+  records the reviewed names at mint time, not a blanket service credential.
+  Every secret read also intersects the current accepted permission.
+
+  `service` marks a token minted only for one invocation of the app's own
+  server-side service (see app_services.service_environment), never for the
+  browser frame. `"private"` is an invocation by an authenticated caller: the
+  token keeps the app's authority and additionally lets deps.Principal tell the
+  app's reviewed backend from its untrusted frame, which is what allows a
+  service to read back its own secrets (routes/secrets.get_secret). `"public"`
+  is an invocation by an anonymous visitor: the token gets its own scope, which
+  every principal resolver refuses except
+  deps.get_principal_or_public_service, so it can reach only the few routes a
+  public service needs and never the owner's chats, agents, or accounts.
   """
-  claims = {"sub": owner_username, "scope": "app", "app_id": app_id}
+  scope = PUBLIC_SERVICE_SCOPE if service == "public" else "app"
+  claims = {"sub": owner_username, "scope": scope, "app_id": app_id}
   if app_nonce is not None:
     claims["app_nonce"] = app_nonce
-  if is_service:
+  if service == "private":
     claims["service"] = True
+  if job_secrets is not None:
+    # Only the owner-authorized supervised-job mint sets this distinct claim.
+    # Snapshot names prevent a running older job gaining newly approved access.
+    claims["job_secrets"] = job_secrets
   if (delegation_id is None) != (delegation_chat is None):
     raise ValueError("delegation identity and chat must be supplied together")
   if delegation_id is not None:

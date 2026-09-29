@@ -22,7 +22,9 @@ CONTRACT_SCHEMA = 6
 
 _PUBLIC_NETWORK_RULE_LIMIT = 16
 _PUBLIC_QUERY_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
-_PRESERVE_SERVICE = object()
+# Keyword default for local-contract projections whose absence (None) is a
+# meaningful removal: omit the argument to keep the currently accepted value.
+_PRESERVE_ACCEPTED = object()
 
 
 def _normalize_public_query(value: Any, *, rule_index: int) -> dict[str, Any]:
@@ -574,6 +576,8 @@ def contract_from_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     "runtime": normalize_runtime_capabilities(manifest),
     "public": normalize_public_access(manifest),
   }
+  if perms.get("job_secret_read"):
+    contract["data"]["job_secret_read"] = sorted(perms["job_secret_read"])
   service = manifest.get("service")
   if isinstance(manifest.get("model_provider"), dict):
     # Freeze the reviewed declaration; editable source is never consulted by
@@ -635,15 +639,18 @@ def contract_from_app_state(
   capabilities: dict[str, Any] | None = None,
   public_access: dict[str, Any] | None = None,
   contract_permissions: dict[str, Any] | None = None,
-  service: dict[str, Any] | None | object = _PRESERVE_SERVICE,
+  service: dict[str, Any] | None | object = _PRESERVE_ACCEPTED,
   tools: list[dict[str, Any]] | None = None,
+  model_provider: dict[str, Any] | None | object = _PRESERVE_ACCEPTED,
 ) -> dict[str, Any]:
   """Build an accurate contract for an owner-authored local app.
 
   Store installs derive their complete contract from the reviewed manifest.
   Local apps are created and edited directly by their owner, so their durable
   database state is authoritative for server permissions while ``mobius.json``
-  is authoritative for host-mediated runtime capabilities.
+  is authoritative for host-mediated runtime capabilities — including an
+  app-secret model provider, which reaches no turn until the owner saves its
+  key in the app.
   """
   if capabilities is None:
     capabilities = runtime_declaration_from_contract(
@@ -669,9 +676,13 @@ def contract_from_app_state(
       "github_connect": bool(getattr(app, "github_connect", False)),
       "connections_manage": bool(getattr(app, "connections_manage", False)),
       "connect_manage": bool(getattr(app, "connect_manage", False)),
-      # Contract-only grants are declared by a local package on every apply.
-      # Store installs build straight from their manifest and never enter this
-      # projection. Do not inherit an older accepted value: omission revokes.
+      # Manifest apply passes an explicit mapping: omission revokes. An
+      # unrelated row projection (no mapping) retains reviewed job access.
+      "job_secret_read": (
+        contract_permissions if contract_permissions is not None else
+        (getattr(app, "capability_contract", None) or {}).get("data", {})
+      ).get("job_secret_read", []),
+      # These contract-only grants must be declared on every local apply.
       "identity_manage": bool(
         (contract_permissions or {}).get("identity_manage", False)
       ),
@@ -685,7 +696,7 @@ def contract_from_app_state(
     "public_access": public_access,
     "tools": tools,
   }
-  if service is _PRESERVE_SERVICE and isinstance(
+  if service is _PRESERVE_ACCEPTED and isinstance(
     getattr(app, "capability_contract", None), dict,
   ):
     accepted_service = app.capability_contract.get("service")
@@ -699,6 +710,11 @@ def contract_from_app_state(
         service["aliases"] = list(accepted_service["aliases"])
   if isinstance(service, dict):
     manifest["service"] = service
+  if model_provider is _PRESERVE_ACCEPTED:
+    accepted = getattr(app, "capability_contract", None)
+    model_provider = accepted.get("model_provider") if isinstance(accepted, dict) else None
+  if isinstance(model_provider, dict):
+    manifest["model_provider"] = model_provider
   return contract_from_manifest(manifest)
 
 
@@ -775,6 +791,13 @@ def _semantic_contract(contract: dict[str, Any]) -> dict[str, Any]:
   """
   normalized = deepcopy(contract)
   normalized.pop("schema", None)
+  normalized.pop("offline", None)
+
+  data = normalized.get("data")
+  chat_logs = data.get("chat_logs") if isinstance(data, dict) else None
+  if isinstance(chat_logs, dict):
+    # Redaction is derived from effective access, not an independent grant.
+    chat_logs.pop("redaction", None)
 
   provider = normalized.get("model_provider")
   if isinstance(provider, dict):
@@ -813,14 +836,13 @@ def diff_contracts(
   """Return stable changed capability paths for update review.
 
   Values are compared at leaf paths.  The UI owns copy; the backend reports
-  precise semantic changes, whether the prior contract was unavailable
-  (legacy install), and which changed paths widen access (``widened``) so
-  the owner is asked only when an update grants more than before.
+  precise semantic changes and a fail-closed ``widens`` decision for the
+  update-review gate, including when the prior contract is unavailable.
   """
   if not isinstance(installed, dict):
     return {
-      "unknown_previous": True,
-      "added": [], "removed": [], "changed": [], "widened": [],
+      "unknown_previous": True, "widens": True,
+      "added": [], "removed": [], "changed": [],
     }
 
   def leaves(value: Any, prefix: str = "") -> dict[str, Any]:
@@ -839,24 +861,40 @@ def diff_contracts(
   added = sorted(k for k in after.keys() - before.keys())
   removed = sorted(k for k in before.keys() - after.keys())
   changed = sorted(k for k in before.keys() & after.keys() if before[k] != after[k])
-  widened = sorted(
-    path for path in [*added, *removed, *changed]
-    if _widens(path, before.get(path), after.get(path), after)
+  widens = any(
+    _widens(path, before.get(path), after.get(path), after)
+    for path in [*added, *removed, *changed]
   )
   return {
     "unknown_previous": False,
+    "widens": widens,
     "added": added,
     "removed": removed,
     "changed": changed,
-    "widened": widened,
   }
 
 
-# Ordered grant levels for enumerated access values; a higher rank grants more.
-_ACCESS_RANKS = (
-  ("none", "read", "write"),
-  ("none", "summary", "summary_with_deleted"),
-)
+# Only these known contract paths have ordered grants. An unfamiliar field is
+# reviewable even if it happens to reuse one of the same string values.
+_ACCESS_RANKS = {
+  "data.cross_app_access": ("none", "read", "write"),
+  "data.share_with_apps": ("none", "read", "write"),
+  "data.shared_memory": ("none", "read", "write"),
+  "data.chat_logs.requested": ("none", "summary", "summary_with_deleted"),
+  "data.chat_logs.effective": ("none", "summary", "summary_with_deleted"),
+}
+
+_BOOLEAN_GRANTS = {
+  "agent.embeds_agent", "data.filesystem_api", "data.manage_apps",
+  "data.manage_skills", "data.github_access", "data.github_connect",
+  "data.connections_manage", "data.connect_manage", "data.identity_manage",
+  "data.railway_manage", "public.storage.read",
+}
+
+_LIST_GRANTS = {
+  "agent.skills", "agent.tools", "data.job_secret_read",
+  "public.network",
+}
 
 
 def _widens(path: str, before: Any, after: Any, after_leaves: dict) -> bool:
@@ -867,28 +905,40 @@ def _widens(path: str, before: Any, after: Any, after_leaves: dict) -> bool:
   missing leaf means "no grant" — except a limit, where a missing leaf means
   "no ceiling" while its capability is still granted.
   """
-  parts = path.split(".")
-  if parts[0] == "offline":
-    return False  # Offline behaviour describes the app; it grants nothing.
-  if "limits" in parts:
-    if after is None:  # Removed ceiling: wider unless the grant went too.
-      grant = ".".join(parts[:parts.index("limits")]) + "."
-      return any(
-        key.startswith(grant) and not key[len(grant):].startswith("limits.")
-        for key in after_leaves
-      )
+  ranks = _ACCESS_RANKS.get(path)
+  if ranks:
+    old = "none" if before is None else before
+    new = "none" if after is None else after
+    return old not in ranks or new not in ranks or ranks.index(new) > ranks.index(old)
+  if path in _BOOLEAN_GRANTS:
+    return not (before is True and after is None)
+  if path in _LIST_GRANTS:
+    if after is None:
+      return not isinstance(before, list)
     if before is None:
-      return False  # A new ceiling only restricts.
-    if isinstance(before, (int, float)) and isinstance(after, (int, float)):
-      return after > before
+      return True
+    return not isinstance(before, list) or not isinstance(after, list) or any(
+      item not in before for item in after
+    )
+  for capability_id, definition in RUNTIME_CAPABILITY_DEFINITIONS.items():
+    prefix = f"runtime.{capability_id}."
+    if not path.startswith(prefix):
+      continue
+    if not any(key.startswith(prefix) for key in after_leaves):
+      return False  # The entire capability was revoked.
+    suffix = path.removeprefix(prefix)
+    limit_key = suffix.removeprefix("limits.")
+    if suffix.startswith("limits.") and limit_key in definition["hard_limits"]:
+      if after is None:
+        return True  # Removed ceiling on a still-granted capability.
+      if before is None:
+        return False  # New ceiling.
+      if type(before) in (int, float) and type(after) in (int, float):
+        return after > before
     return True
-  if after is None:
-    return False  # Removed grant.
-  if before is None:
-    return True  # New grant.
-  if isinstance(before, list) and isinstance(after, list):
-    return any(item not in before for item in after)
-  for ranks in _ACCESS_RANKS:
-    if before in ranks and after in ranks:
-      return ranks.index(after) > ranks.index(before)
+  if path == "public.storage.write_prefix" and after is None:
+    return False
+  if after is None and path.startswith(("background.", "service.")):
+    group = path.split(".", 1)[0]
+    return any(key.startswith(f"{group}.") for key in after_leaves)
   return True

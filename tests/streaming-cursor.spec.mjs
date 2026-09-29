@@ -4,6 +4,7 @@
  */
 import { test, expect } from '@playwright/test'
 import { createTaggedChat, attachCleanup } from './_chatTracker.mjs'
+import { runtimeSnapshot } from './_chatTestPrerequisites.mjs'
 
 const BASE = process.env.MOBIUS_URL || 'http://localhost:8001'
 
@@ -76,10 +77,8 @@ test('terminal cursor removal keeps followed geometry unchanged', async ({ page 
       status: 200,
       contentType: 'application/json',
       body: JSON.stringify({
-        running: true,
+        ...runtimeSnapshot({ running: true }),
         active_goal_objective: null,
-        pending_messages: [],
-        pending_question_id: null,
       }),
     })
   })
@@ -93,9 +92,7 @@ test('terminal cursor removal keeps followed geometry unchanged', async ({ page 
         messages: [userMessage],
         total: 1,
         offset: 0,
-        running: true,
-        pending_messages: [],
-        pending_question_id: null,
+        ...runtimeSnapshot({ running: true }),
         provider: 'claude',
       }),
     })
@@ -178,7 +175,10 @@ test('terminal cursor removal keeps followed geometry unchanged', async ({ page 
   )))
   const settled = await measure()
 
+  // Settling removes the cursor and mounts the turn's metadata row; neither
+  // may move the followed transcript. scrollTop derives from fractional
+  // layout, hence its sub-pixel allowance.
   expect(Math.abs(settled.scrollHeight - live.scrollHeight)).toBeLessThanOrEqual(1)
-  expect(Math.abs(settled.scrollTop - live.scrollTop)).toBeLessThanOrEqual(1)
+  expect(Math.abs(settled.scrollTop - live.scrollTop)).toBeLessThanOrEqual(1.5)
   expect(Math.abs(settled.paragraphTop - live.paragraphTop)).toBeLessThanOrEqual(1)
 })

@@ -65,7 +65,7 @@ def test_legacy_closed_defaults_do_not_manufacture_capability_changes():
     "added": [],
     "removed": [],
     "changed": [],
-    "widened": [],
+    "widens": False,
   }
 
 
@@ -93,7 +93,7 @@ def test_legacy_public_storage_closed_shapes_equal_current_default(legacy_public
     "added": [],
     "removed": [],
     "changed": [],
-    "widened": [],
+    "widens": False,
   }
 
 
@@ -137,7 +137,7 @@ def test_future_closed_default_does_not_manufacture_a_permission_change():
     "added": [],
     "removed": [],
     "changed": [],
-    "widened": [],
+    "widens": False,
   }
 
 
@@ -689,7 +689,7 @@ def test_model_catalog_changes_are_not_access_changes():
   ))
   assert renamed == {
     "unknown_previous": False, "added": [], "removed": [], "changed": [],
-    "widened": [],
+    "widens": False,
   }
   moved = diff_contracts(contract(), contract(base_url="https://other.example/v1"))
   assert moved["changed"] == ["model_provider.base_url"]
@@ -708,11 +708,11 @@ def test_update_review_asks_only_when_access_widens():
   reader = _contract(permissions={"cross_app_access": "read"})
   writer = _contract(permissions={"cross_app_access": "write"})
 
-  assert diff_contracts(plain, github)["widened"] == ["data.github_access"]
+  assert diff_contracts(plain, github)["widens"] is True
   assert diff_contracts(github, plain)["removed"] == ["data.github_access"]
-  assert diff_contracts(github, plain)["widened"] == []
-  assert diff_contracts(reader, writer)["widened"] == ["data.cross_app_access"]
-  assert diff_contracts(writer, reader)["widened"] == []
+  assert diff_contracts(github, plain)["widens"] is False
+  assert diff_contracts(reader, writer)["widens"] is True
+  assert diff_contracts(writer, reader)["widens"] is False
 
 
 def test_shrinking_a_list_narrows_and_growing_it_widens():
@@ -720,9 +720,9 @@ def test_shrinking_a_list_narrows_and_growing_it_widens():
   two = _contract(skills=["alpha", "beta"])
   other = _contract(skills=["gamma"])
 
-  assert diff_contracts(two, one)["widened"] == []
-  assert diff_contracts(one, two)["widened"] == ["agent.skills"]
-  assert diff_contracts(one, other)["widened"] == ["agent.skills"]
+  assert diff_contracts(two, one)["widens"] is False
+  assert diff_contracts(one, two)["widens"] is True
+  assert diff_contracts(one, other)["widens"] is True
 
 
 def _speech(**limits):
@@ -733,12 +733,10 @@ def test_removing_or_raising_a_limit_widens_but_adding_or_lowering_one_does_not(
   capped = _contract(capabilities=_speech(max_text_chars=1000))
   lower = _contract(capabilities=_speech(max_text_chars=500))
   uncapped = _contract(capabilities=_speech())
-  path = "runtime.media.speech.limits.max_text_chars"
-
-  assert diff_contracts(capped, uncapped)["widened"] == [path]
-  assert diff_contracts(lower, capped)["widened"] == [path]
-  assert diff_contracts(capped, lower)["widened"] == []
-  assert diff_contracts(uncapped, capped)["widened"] == []
+  assert diff_contracts(capped, uncapped)["widens"] is True
+  assert diff_contracts(lower, capped)["widens"] is True
+  assert diff_contracts(capped, lower)["widens"] is False
+  assert diff_contracts(uncapped, capped)["widens"] is False
 
 
 def test_dropping_a_whole_capability_with_its_limit_narrows():
@@ -747,11 +745,77 @@ def test_dropping_a_whole_capability_with_its_limit_narrows():
   report = diff_contracts(capped, _contract())
 
   assert report["removed"]
-  assert report["widened"] == []
+  assert report["widens"] is False
 
 
 def test_offline_contract_changes_never_ask_for_access():
   online = _contract()
   offline = _contract(offline_capable=True, offline={"reads": True, "writes": "none"})
 
-  assert diff_contracts(online, offline)["widened"] == []
+  report = diff_contracts(online, offline)
+  assert report["added"] == report["removed"] == report["changed"] == []
+  assert report["widens"] is False
+
+
+def test_legacy_contract_requires_review_even_without_changed_paths():
+  report = diff_contracts(None, _contract())
+  assert report["unknown_previous"] is True
+  assert report["widens"] is True
+
+
+@pytest.mark.parametrize(("field", "old", "new"), [
+  ("future_access", "write", "read"),
+  ("future_limits", {"ceiling": 5}, None),
+  ("future_denylist", ["private"], None),
+])
+def test_unrecognized_access_values_and_paths_fail_closed(field, old, new):
+  before = _contract()
+  after = json.loads(json.dumps(before))
+  before["data"][field] = old
+  if new is not None:
+    after["data"][field] = new
+
+  assert diff_contracts(before, after)["widens"] is True
+
+
+def test_revoking_chat_logs_and_job_secrets_does_not_widen_access():
+  before = _contract(permissions={"chat_log_access": "summary_with_deleted",
+                                  "job_secret_read": ["one", "two"]})
+  after = _contract(permissions={"chat_log_access": "none",
+                                 "job_secret_read": ["one"]})
+  report = diff_contracts(before, after)
+  assert report["widens"] is False
+  assert "data.chat_logs.redaction" not in report["changed"]
+
+
+def test_provider_destination_change_requires_review():
+  before = _contract(model_provider={"base_url": "https://a.example/v1"})
+  after = _contract(model_provider={"base_url": "https://b.example/v1"})
+  assert diff_contracts(before, after)["widens"] is True
+
+
+@pytest.mark.parametrize('names', [True, 'bot-token', ['../secret'], ['a', 'a'],
+                                  ['a'] * 17, [None], ['a b'], ['a' * 65]])
+def test_job_secret_permission_rejects_invalid_names(names):
+  with pytest.raises(ManifestContractError, match='job_secret_read'):
+    validate_manifest_contract(_manifest(permissions={'job_secret_read': names}))
+
+
+def test_job_secret_permission_is_reviewed_normalized_and_omission_revokes():
+  from types import SimpleNamespace
+  from app.app_capabilities import contract_from_app_state
+  base, base_hash = contract_and_digest(_manifest(permissions={}))
+  empty, empty_hash = contract_and_digest(_manifest(permissions={'job_secret_read': []}))
+  assert base == empty and base_hash == empty_hash
+  manifest = _manifest(permissions={'job_secret_read': ['tg-2', 'tg-1']})
+  validate_manifest_contract(manifest)
+  granted, digest = contract_and_digest(manifest)
+  assert digest != base_hash
+  assert granted['data']['job_secret_read'] == ['tg-1', 'tg-2']
+  assert 'data.job_secret_read' in diff_contracts(base, granted)['added']
+  app = SimpleNamespace(capability_contract=granted)
+  accepted = contract_from_app_state(app, contract_permissions=manifest['permissions'])
+  assert accepted['data']['job_secret_read'] == ['tg-1', 'tg-2']
+  assert contract_from_app_state(app)['data']['job_secret_read'] == ['tg-1', 'tg-2']
+  revoked = contract_from_app_state(app, contract_permissions={})
+  assert 'job_secret_read' not in revoked['data']

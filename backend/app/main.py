@@ -5,6 +5,7 @@ static files.  API routes are registered first; the frontend SPA is
 mounted last as a catch-all so that client-side routing works.
 """
 
+import asyncio
 import ipaddress
 import json
 import logging
@@ -26,9 +27,9 @@ from app.allocator import limit_glibc_arenas
 
 limit_glibc_arenas()
 
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy import inspect as inspect_database
@@ -57,13 +58,15 @@ from app.runtime_provenance import (
 )
 from app.response_policy import (
   chat_embed_csp,
+  PLATFORM_CODE_SCOPE_KEY,
   PUBLISHED_SITE_CSP,
   absolute_csp_origin,
   app_frame_csp,
+  serves_platform_code,
   shell_csp,
   static_embed_csp,
 )
-from app.storage_io import atomic_write
+from app.storage_io import ParentIsFile, atomic_write
 from app import activity, models
 # providers and push are on the agent's write surface; deferred into
 # lifespan with try/except so a SyntaxError in either doesn't prevent
@@ -313,9 +316,20 @@ async def lifespan(app):
         exc_info=True,
       )
     record_memory_checkpoint("startup_ready")
+    supervisors.reclaim_boot_file_cache()
+  from app import app_setup
+  # Like cron mutation, restoration never runs inside the test runtime (its
+  # readiness probe would reach other tests' HTTP doubles); its own tests
+  # drive the runner directly.
+  setup_task = app_setup.start() if (
+    database_boot.serviceable and os.environ.get("MOBIUS_TEST_RUNTIME") != "1"
+  ) else None
   try:
     yield
   finally:
+    if setup_task is not None:
+      setup_task.cancel()
+      await asyncio.gather(setup_task, return_exceptions=True)
     record_memory_checkpoint("shutdown_begin")
     try:
       from app.public_app_transport import close_public_fetch_clients
@@ -372,6 +386,17 @@ app = FastAPI(
 
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+@app.exception_handler(ParentIsFile)
+async def _parent_is_file_handler(_request: Request, exc: ParentIsFile):
+  # Every storage, project, app-source, and shared-state write creates its
+  # folders through storage_io, so one mapping gives them one answer.
+  return JSONResponse(
+    status_code=400,
+    content={"detail": {"code": "parent_is_file", "message": str(exc)}},
+  )
+
 
 # Global request-body backstop. Endpoints that read raw bodies stream-cap
 # themselves (storage PUT 50 MB, icon 12 MB via storage_io.read_capped_body),
@@ -460,6 +485,9 @@ _APP_FRAME_PATH = re.compile(r"^/api/apps/[^/]+/frame$")
 _ARTIFACT_OUTPUT_PATH = re.compile(
   r"^/api/projects/[^/]+/artifacts/[^/]+/output/"
 )
+# App service responses are app-authored documents. They keep scripts, like a
+# published site, but only inside an opaque origin.
+_APP_SERVICE_PATH = re.compile(r"^/api/(?:(?:app-)?services|apps/[^/]+/service)/")
 
 # This isolation boundary must always be enforced, never Report-Only: browsers
 # ignore the CSP sandbox directive in a Report-Only policy. The sandbox omits
@@ -583,6 +611,16 @@ _ARTIFACT_OUTPUT_CSP = (
   "frame-ancestors 'self'"
 )
 
+# The default for every response outside a namespace lane that is not platform
+# code (see serves_platform_code): a sandbox without allow-scripts or
+# allow-same-origin. Images, media, and plain documents still display when
+# opened directly, but nothing runs and the document cannot act as the shell
+# origin. API JSON is unaffected. Must be enforcing, never Report-Only.
+_INERT_CONTENT_CSP = (
+  "sandbox; default-src 'none'; img-src 'self' data:; media-src 'self'; "
+  "style-src 'unsafe-inline'; frame-ancestors 'self'"
+)
+
 
 def _is_public_service_surface(scope) -> bool:
   """Whether the gateway host may frame this registered service route."""
@@ -600,9 +638,10 @@ class _SecurityHeadersMiddleware:
   """Authoritatively sets the platform security headers on every response. Pure
   ASGI so it never buffers a streaming body. It strips any same-named header a
   route may have set first and replaces it with the platform value, so no route
-  can weaken the HSTS/MIME/etc. wall. Document policies are selected by exact
-  origin-owned namespaces. The shared service gateway is the sole exception:
-  its host adapter supplies a topology-specific frame policy."""
+  can weaken the HSTS/MIME/etc. wall. A few origin-owned namespaces carry their
+  own document policy; every other response is inert unless the handler that
+  answered declared it serves platform code. The shared service gateway is the
+  sole exception: its host adapter supplies a topology-specific frame policy."""
 
   def __init__(self, app):
     self.app = app
@@ -627,6 +666,7 @@ class _SecurityHeadersMiddleware:
         (name, value) for name, value in _SECURITY_HEADERS
         if name != _X_FRAME_OPTIONS
       ]
+    csp = None
     if not service_surface:
       if opaque_static_embed:
         csp = _static_embed_csp_for_scope(scope)
@@ -638,12 +678,8 @@ class _SecurityHeadersMiddleware:
         csp = _app_frame_csp_for_scope(scope)
       elif artifact_output:
         csp = _ARTIFACT_OUTPUT_CSP
-      else:
-        csp = _SHELL_CSP
-      response_headers.append((
-        _CONTENT_SECURITY_POLICY,
-        csp.encode("ascii"),
-      ))
+      elif _APP_SERVICE_PATH.match(path):
+        csp = _PUBLISHED_SITE_CSP
       replaced_header_names = replaced_header_names | {
         _CONTENT_SECURITY_POLICY
       }
@@ -659,6 +695,14 @@ class _SecurityHeadersMiddleware:
           if k.lower() not in replaced_header_names
         ]
         headers.extend(response_headers)
+        if not service_surface:
+          # Outside the namespace lanes, the handler that answered decides:
+          # platform code runs as the shell, everything else is inert.
+          policy = csp or (
+            _SHELL_CSP if scope.get(PLATFORM_CODE_SCOPE_KEY)
+            else _INERT_CONTENT_CSP
+          )
+          headers.append((_CONTENT_SECURITY_POLICY, policy.encode("ascii")))
         message["headers"] = headers
       await send(message)
 
@@ -819,7 +863,9 @@ app.add_middleware(
   # All sensitive endpoints are independently protected by JWT.
   allow_origins=[settings.frontend_origin, "null"],
   allow_credentials=False,
-  allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  # HEAD is the documented app-secret presence check; an Authorization
+  # header makes the opaque frame preflight it like any other method.
+  allow_methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   # The app runtime uses X-Mobius-Version to opt into ETag reads, then
   # If-Match / If-None-Match for conflict-safe writes. Sandboxed app frames
   # have the opaque `null` origin, so Chromium preflights these non-simple
@@ -1000,8 +1046,13 @@ def health(response: Response):
     "container_replacement_handoff": None,
   }
   from app.deployment_control import managed_cutover_ready
+  from app.platform_update import BOOT_PROTOCOL, image_activates_updates
   if managed_cutover_ready():
     payload["container_replacement_handoff"] = "external-cutover-v1"
+  # The boot protocol this boot's image ran, or None. The account service
+  # offers a container-only upgrade to a runtime that reports none: its image
+  # predates the boot transaction and cannot take a package-changing release.
+  payload["boot_protocol"] = BOOT_PROTOCOL if image_activates_updates() else None
   if degraded:
     # Still HTTP 200: database failure must never masquerade as device offline.
     # The strict and readiness variants below carry the 5xx service verdict.
@@ -1035,6 +1086,9 @@ def health_strict(response: Response):
   "/api/browser-bootstrap",
   response_class=HTMLResponse,
   include_in_schema=False,
+  # Automation opens this document to write the owner session into the
+  # shell origin's storage, so it must not be an opaque sandbox.
+  dependencies=[Depends(serves_platform_code)],
 )
 def browser_bootstrap():
   """Stable same-origin document for authenticated browser automation setup."""
@@ -1741,7 +1795,8 @@ if _baked_dir.is_dir() or _live_dir.is_dir():
   # module load; this resolves per request, so a post-boot dist and a mid-swap
   # old generation both serve without a restart.
   @app.api_route(
-    "/assets/{asset_path:path}", methods=["GET", "HEAD"], include_in_schema=False
+    "/assets/{asset_path:path}", methods=["GET", "HEAD"], include_in_schema=False,
+    dependencies=[Depends(serves_platform_code)],
   )
   async def serve_asset(request: Request, asset_path: str):
     target = await run_in_threadpool(_resolve_asset_file, asset_path)
@@ -1763,7 +1818,11 @@ if _baked_dir.is_dir() or _live_dir.is_dir():
       },
     )
 
-  @app.get("/{path:path}")
+  # The frontend build is platform code: the shell document, the public app
+  # host, and every worker the shell constructs (sw.js, sw-push.js, pdf.js,
+  # speech) come from here or /assets, and a worker runs under the policy of
+  # its own script response.
+  @app.get("/{path:path}", dependencies=[Depends(serves_platform_code)])
   async def spa_fallback(request: Request, path: str):
     """Serves the SPA index.html for any non-API, non-asset path."""
     if path == _PUSH_WORKER_SCOPE or path.startswith(f"{_PUSH_WORKER_SCOPE}/"):

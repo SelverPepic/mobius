@@ -124,6 +124,9 @@ def test_message_stop_and_list_address_helpers_by_name(monkeypatch):
   assert control._call_stop_agent({"helper": "del-2"})["status"] == "cancelled"
   assert [h["helper"] for h in control._call_list_agents({})["helpers"]] == ["review", "scan"]
   assert control._call_list_agents({"helper": "scan"})["result"] == "All good."
+  # Reading one helper's result goes through the agent-side read, which
+  # records receipt; the bare listing stays a plain read.
+  assert ("POST", "/api/delegations/del-2/result-read", {}) in calls
   with pytest.raises(ValueError, match="No helper"):
     control._call_stop_agent({"helper": "missing"})
 
@@ -210,16 +213,78 @@ def test_a_working_or_stopped_helper_cannot_be_messaged(client, owner_token, db)
   assert gone.status_code == 409 and "stopped" in gone.text
 
 
+def test_an_agent_reading_a_settled_result_is_not_woken_to_receive_it_again(
+  client, owner_token, db,
+):
+  """A helper read its sub-helpers' results itself, finished, and was woken 2 s
+  later to 'receive' them, so it repeated its whole report to its parent."""
+  parent_id, _child_id, delegation_id = _seed_delegation(
+    db, suffix="read-in-turn",
+    result_blocks=[{"type": "text", "content": "Sub-helper findings."}],
+  )
+  row = db.get(models.Delegation, delegation_id)
+  assert delegations_mod.available_delegation_results(db, parent_id)
+
+  response = client.post(
+    f"/api/delegations/{delegation_id}/result-read", json={},
+    headers={"Authorization": f"Bearer {owner_token}"},
+  )
+
+  assert response.status_code == 200, response.text
+  assert "Sub-helper findings." in response.json()["result"]
+  db.expire_all()
+  row = db.get(models.Delegation, delegation_id)
+  assert row.delivered_run_id == row.incorporated_run_id is not None
+  assert delegations_mod.available_delegation_results(db, parent_id) == []
+  assert delegations_mod._wake_eligible_rows_for_parent(
+    db, parent_id, row.parent_root_run_id,
+  ) == []
+
+
+def test_viewing_a_helper_does_not_count_as_its_parent_receiving_the_result(
+  client, owner_token, db,
+):
+  parent_id, _child_id, delegation_id = _seed_delegation(
+    db, suffix="view-only",
+    result_blocks=[{"type": "text", "content": "Still owed."}],
+  )
+  response = client.get(
+    f"/api/delegations/{delegation_id}",
+    headers={"Authorization": f"Bearer {owner_token}"},
+  )
+  assert response.status_code == 200, response.text
+  db.expire_all()
+  assert db.get(models.Delegation, delegation_id).delivered_run_id is None
+  assert delegations_mod.available_delegation_results(db, parent_id)
+
+
+def test_reading_a_helper_that_is_still_working_leaves_its_result_owed(
+  client, owner_token, db,
+):
+  _parent_id, _child_id, delegation_id = _seed_delegation(
+    db, suffix="read-running", child_status="running",
+  )
+  response = client.post(
+    f"/api/delegations/{delegation_id}/result-read", json={},
+    headers={"Authorization": f"Bearer {owner_token}"},
+  )
+  assert response.status_code == 200, response.text
+  db.expire_all()
+  row = db.get(models.Delegation, delegation_id)
+  assert row.delivered_run_id is None and row.incorporated_run_id is None
+
+
 # ----------------------------------------------------------------- live delivery
 
 
-def _running_parent(db, suffix):
+def _running_parent(db, suffix, *, provider="claude"):
   parent_id, child_id, delegation_id = _seed_delegation(
     db, suffix=suffix, result_blocks=[{"type": "text", "content": "Done while you worked."}],
   )
+  db.get(models.Chat, parent_id).provider = provider
   db.add(make_goal_run(db,
     id=f"root-{suffix}", root_run_id=f"root-{suffix}",
-    chat_id=parent_id, status="running", provider="claude",
+    chat_id=parent_id, status="running", provider=provider,
     started_at=now_naive_utc(),
   ))
   db.commit()
@@ -240,19 +305,166 @@ def _live_parent(monkeypatch, accepted):
   return steered
 
 
-def test_a_result_is_steered_into_the_running_parent_turn_once(db, monkeypatch):
-  parent_id, child_id, delegation_id = _running_parent(db, "steer-yes")
+def _steer_cut(parent_id, user_msgs, consume):
+  """The live turn lands its steer: the queued carrier moves into the transcript."""
+  from app.chat_writer import AppendSteeredUserMessage, get_writer
+
+  get_writer().submit(AppendSteeredUserMessage(
+    chat_id=parent_id, user_msgs=user_msgs, consume_pending_cids=consume,
+  )).result(timeout=5)
+
+
+def test_a_steered_result_is_delivered_at_the_steer_cut_once(db, monkeypatch):
+  """A steered result travels as a queued carrier, like a peer note.
+
+  Codex consumes that carrier at the steer cut. Until then the result
+  is owed; after it, the result is delivered and the after-turn wake has
+  nothing left to start.
+  """
+  parent_id, child_id, delegation_id = _running_parent(
+    db, "steer-yes", provider="codex",
+  )
   steered = _live_parent(monkeypatch, accepted=True)
 
   asyncio.run(delegations_mod.wake_parent_after_child_settled(child_id))
 
   (chat_id, content, user_msgs, consume), = steered
   assert chat_id == parent_id and "Done while you worked." in content
-  assert user_msgs[0]["kind"] == "delegation_result" and consume is None
+  assert user_msgs[0]["kind"] == "delegation_result"
+  assert consume == [user_msgs[0]["cid"]]
   db.expire_all()
+  assert db.get(models.Chat, parent_id).pending_messages == user_msgs
+  assert db.get(models.Delegation, delegation_id).delivered_run_id is None
+
+  _steer_cut(parent_id, user_msgs, consume)
+
+  db.expire_all()
+  assert db.get(models.Chat, parent_id).pending_messages == []
   assert db.get(models.Delegation, delegation_id).delivered_run_id is not None
   # Delivered: the next turn's context does not repeat it.
   assert delegations_mod.available_delegation_results(db, parent_id) == []
+  db.get(models.ChatRun, "root-steer-yes").status = "completed"
+  db.commit()
+  monkeypatch.setattr(chat_mod, "is_chat_running", lambda _chat_id: False)
+  starts = []
+
+  async def record_start(**kwargs):
+    starts.append(kwargs)
+    return True
+
+  monkeypatch.setattr(
+    chat_start_mod, "start_programmatic_activity_continuation", record_start,
+  )
+  asyncio.run(delegations_mod.deliver_results_after_parent_settled(parent_id))
+  assert starts == []
+
+
+def test_claude_stop_does_not_wake_an_unread_helper_result(
+  db,
+):
+  """Stop, not the helper, cuts Claude and leaves the result for the owner."""
+  from app.claude_sdk_runner import ActiveClaudeClient
+  from app.runner_registry import registry
+
+  parent_id, child_id, delegation_id = _running_parent(db, "steer-stopped")
+  interrupts = []
+
+  class _Client:
+    async def interrupt(self):
+      interrupts.append("interrupt")
+
+  async def settle_then_stop():
+    handle = ActiveClaudeClient(_Client(), chat_id=parent_id)
+    registry.register(handle)
+    try:
+      await delegations_mod.wake_parent_after_child_settled(child_id)
+      assert interrupts == []
+      handle.mark_finished()  # Simulate the runner's completed SDK drain.
+      stopped, cleared = await chat_mod.stop_chat_for(parent_id)
+      assert stopped is True and cleared == []
+      assert handle.interrupt_requested is True
+    finally:
+      registry.unregister(parent_id, handle.kind)
+
+  asyncio.run(settle_then_stop())
+  assert interrupts == ["interrupt"]
+  db.expire_all()
+  assert db.get(models.Chat, parent_id).pending_messages == []
+  assert db.get(models.Delegation, delegation_id).delivered_run_id is None
+  # The synthetic runner's final status follows the real Stop above.
+  db.get(models.ChatRun, "root-steer-stopped").status = "stopped"
+  db.commit()
+  before = {row.id for row in db.query(models.ChatRun.id).filter(
+    models.ChatRun.chat_id == parent_id,
+  )}
+  asyncio.run(delegations_mod.deliver_results_after_parent_settled(parent_id))
+  db.expire_all()
+  assert {row.id for row in db.query(models.ChatRun.id).filter(
+    models.ChatRun.chat_id == parent_id,
+  )} == before
+  assert delegations_mod.parent_wake_blocker(
+    db, parent_id, "root-steer-stopped", "root-steer-stopped",
+  )[0] == "parent_not_waiting"
+  assert delegations_mod.build_delegation_result_context(
+    db, parent_id,
+  ).delegation_ids == (delegation_id,)
+
+
+def test_claude_helper_result_does_not_block_immediate_owner_steer(db):
+  """The helper cannot cut a command; a deliberate owner steer still can."""
+  from app.claude_sdk_runner import ActiveClaudeClient
+  from app.chat_steering import steer_into_active_turn
+  from app.runner_registry import registry
+
+  parent_id, child_id, delegation_id = _running_parent(db, "owner-steer")
+  interrupts = []
+
+  class _Client:
+    async def interrupt(self):
+      interrupts.append("interrupt")
+
+  async def settle_then_steer():
+    handle = ActiveClaudeClient(_Client(), chat_id=parent_id)
+    handle.mark_generating()
+    registry.register(handle)
+    try:
+      await delegations_mod.wake_parent_after_child_settled(child_id)
+      assert interrupts == []
+      assert await steer_into_active_turn(
+        "claude", parent_id, "The owner changed course.",
+      ) is True
+      assert interrupts == ["interrupt"]
+      assert handle.pending_steer == ["The owner changed course."]
+    finally:
+      registry.unregister(parent_id, handle.kind)
+
+  asyncio.run(settle_then_steer())
+  db.expire_all()
+  assert db.get(models.Chat, parent_id).pending_messages == []
+  assert db.get(models.Delegation, delegation_id).delivered_run_id is None
+
+
+def test_a_result_the_live_turn_already_admitted_is_not_steered_again(
+  db, monkeypatch,
+):
+  """A result admitted into the running turn's opening context latches only at
+  Finalize; the helper's delayed settle hook must not steer it in twice."""
+  parent_id, child_id, delegation_id = _running_parent(
+    db, "steer-admitted", provider="codex",
+  )
+  db.get(models.ChatRun, "root-steer-admitted").activity_delivery_json = {
+    "delegation_ids": [delegation_id],
+    "result_run_ids": {delegation_id: "child-run-steer-admitted"},
+    "delivery_contract": delegations_mod.ACTIVITY_DELIVERY_FINALIZE_ATOMIC,
+  }
+  db.commit()
+  steered = _live_parent(monkeypatch, accepted=True)
+
+  asyncio.run(delegations_mod.wake_parent_after_child_settled(child_id))
+
+  assert steered == []
+  db.expire_all()
+  assert db.get(models.Delegation, delegation_id).delivered_run_id is None
 
 
 def test_a_reopened_helper_result_is_steered_again_not_deduplicated(
@@ -264,14 +476,14 @@ def test_a_reopened_helper_result_is_steered_again_not_deduplicated(
   follow-up (message_agent) settles as a new child run, that carrier must
   neither mark the new result delivered nor share its steer identity.
   """
-  parent_id, child_id, delegation_id = _running_parent(db, "steer-again")
+  parent_id, child_id, delegation_id = _running_parent(
+    db, "steer-again", provider="codex",
+  )
   steered = _live_parent(monkeypatch, accepted=True)
 
   asyncio.run(delegations_mod.wake_parent_after_child_settled(child_id))
-  (_chat, _content, first_msgs, _consume), = steered
-  # The live turn persists the carrier it accepted.
-  parent = db.get(models.Chat, parent_id)
-  parent.messages = [*first_msgs]
+  (_chat, _content, first_msgs, first_consume), = steered
+  _steer_cut(parent_id, first_msgs, first_consume)
   db.add(make_goal_run(db,
     id="child-run-steer-again-2", root_run_id="child-run-steer-again-2",
     chat_id=child_id, status="completed", provider="claude",
@@ -282,9 +494,14 @@ def test_a_reopened_helper_result_is_steered_again_not_deduplicated(
   asyncio.run(delegations_mod.wake_parent_after_child_settled(child_id))
 
   assert len(steered) == 2
-  second_msgs = steered[1][2]
+  _chat, _content, second_msgs, second_consume = steered[1]
   assert second_msgs[0]["cid"] != first_msgs[0]["cid"]
   assert '"run_id":"child-run-steer-again-2"' in second_msgs[0]["content"]
+  db.expire_all()
+  assert db.get(
+    models.Delegation, delegation_id,
+  ).delivered_run_id == "child-run-steer-again"
+  _steer_cut(parent_id, second_msgs, second_consume)
   db.expire_all()
   assert db.get(
     models.Delegation, delegation_id,
@@ -292,18 +509,54 @@ def test_a_reopened_helper_result_is_steered_again_not_deduplicated(
   assert delegations_mod.available_delegation_results(db, parent_id) == []
 
 
-def test_a_refused_steer_leaves_the_result_for_after_the_turn(db, monkeypatch):
-  parent_id, child_id, delegation_id = _running_parent(db, "steer-no")
+def test_a_refused_steer_leaves_the_result_queued_for_after_the_turn(
+  db, monkeypatch,
+):
+  """A turn that ends before taking the steer (Codex refuses a second
+  simultaneous steer; a closing turn refuses any) leaves the carrier queued,
+  exactly like a peer note, and the result owed until a turn carries it."""
+  parent_id, child_id, delegation_id = _running_parent(
+    db, "steer-no", provider="codex",
+  )
   _live_parent(monkeypatch, accepted=False)
 
   asyncio.run(delegations_mod.wake_parent_after_child_settled(child_id))
 
   db.expire_all()
   assert db.get(models.Delegation, delegation_id).delivered_run_id is None
+  [carrier] = db.get(models.Chat, parent_id).pending_messages
+  assert carrier["kind"] == "delegation_result"
+  assert delegation_id in delegations_mod.carrier_results(db, carrier)
+
+
+def test_a_helper_finishing_during_claude_turn_wakes_after_it(db, monkeypatch):
+  """A saved helper result never cuts a Claude command or blocks owner input."""
+  parent_id, child_id, delegation_id = _running_parent(db, "tool-safe")
+  monkeypatch.setattr(chat_mod, "is_chat_running", lambda _chat_id: True)
+  steered = _live_parent(monkeypatch, accepted=True)
+  asyncio.run(delegations_mod.wake_parent_after_child_settled(child_id))
+  assert steered == []
+  db.expire_all()
   assert db.get(models.Chat, parent_id).pending_messages == []
-  assert [row.id for row in delegations_mod.available_delegation_results(db, parent_id)] == [
-    delegation_id,
-  ]
+  assert db.get(models.Delegation, delegation_id).delivered_run_id is None
+  db.get(models.ChatRun, "root-tool-safe").status = "completed"
+  db.commit()
+  monkeypatch.setattr(chat_mod, "is_chat_running", lambda _chat_id: False)
+  starts = []
+
+  async def record_start(**kwargs):
+    starts.append(kwargs)
+    return True
+
+  monkeypatch.setattr(
+    chat_start_mod, "start_programmatic_activity_continuation", record_start,
+  )
+  asyncio.run(delegations_mod.deliver_results_after_parent_settled(parent_id))
+  assert len(starts) == 1
+  assert starts[0]["chat_id"] == parent_id
+  assert starts[0]["activity_id"] == delegation_id
+  db.expire_all()
+  assert db.get(models.Delegation, delegation_id).delivered_run_id is None
 
 
 # ----------------------------------------------------------------- display

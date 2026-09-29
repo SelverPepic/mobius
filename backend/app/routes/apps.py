@@ -42,7 +42,9 @@ from app.routes.app_publication import (
 from app.routes.app_runtime import router as runtime_router
 from app.storage_io import (
   delete_content_type_tree,
+  make_parent_folders,
   read_capped_body,
+  require_parent_folders,
   rmtree_strict as _rmtree_strict,
 )
 from app.app_capabilities import (
@@ -69,7 +71,8 @@ from app.config import get_settings
 from app.database import get_db
 from app.deps import (
   get_current_owner, get_current_owner_for_lifecycle_control,
-  get_current_owner_or_app, get_principal, Principal,
+  get_current_owner_or_app, get_principal, get_principal_or_public_service,
+  Principal,
   get_owner_or_app_with_manage_apps, reject_cross_site,
   require_nondelegated_owner_control,
 )
@@ -269,6 +272,7 @@ async def create_app_source_folder(
     target = _resolve_app_source_path(root, body.path)
     if target == root:
       raise HTTPException(400, "The app source root already exists.")
+    require_parent_folders(target)
     try:
       target.mkdir(parents=True, exist_ok=False)
     except FileExistsError as exc:
@@ -322,7 +326,7 @@ async def move_app_source_path(
       raise HTTPException(404, "Source path not found.")
     if destination.exists():
       raise HTTPException(409, "A file or folder already uses the destination.")
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    make_parent_folders(destination)
     try:
       os.replace(source, destination)
     except OSError as exc:
@@ -521,8 +525,13 @@ async def _hard_delete_app(db: Session, app: models.App) -> None:
   purge_app_bundles(deleted_app_id)
   await asyncio.to_thread(_rmtree_strict, storage_dir)
   await asyncio.to_thread(_rmtree_strict, secrets_dir)
+  from app import service_preload
+  from app.app_python_env import remove_app_envs
   from app.applied_app_runtime import runtime_parent
+  # A preloaded service host runs from, and pins, the tree removed next.
+  service_preload.retire(deleted_app_id)
   await asyncio.to_thread(_rmtree_strict, runtime_parent(deleted_app_id))
+  await asyncio.to_thread(remove_app_envs, settings.data_dir, deleted_app_id)
 
   # Storage is gone; only now free the row and its reusable id. A partial
   # cleanup of the slug-keyed source tree below leaves harmless orphans — those
@@ -612,7 +621,7 @@ async def _hard_delete_app(db: Session, app: models.App) -> None:
 @router.get("/", response_model=list[schemas.AppOut])
 async def list_apps(
   db: Session = Depends(get_db),
-  _: models.Owner = Depends(get_current_owner_or_app),
+  _: Principal = Depends(get_principal_or_public_service),
 ):
   """Returns all LIVE registered mini-apps (tombstoned ones are hidden).
 
@@ -1503,9 +1512,10 @@ async def update_check(
     if pending is not None:
       return _pending_result(pending, pending_state)
     # One digest owns the complete declared package: manifest/capabilities,
-    # executable source, icon, static assets, and seeds. The one-time synthetic
-    # migration baseline has no manifest, so its first real-origin commit is
-    # intentionally offered once and then future checks compare exact packages.
+    # executable source, icon, static assets, and seeds. A trusted catalog
+    # app's migration bridge has no manifest to compare, so its first real
+    # release is offered once: install replaces the bridge on exactly this
+    # predicate, and later checks compare exact packages.
     if "mobius.json" in recorded_tree:
       try:
         _, recorded_digest = install.package_content_digest_from_tree(
@@ -1514,6 +1524,15 @@ async def update_check(
       except install.PackageContentError:
         return _unknown()
       update_available = recorded_digest != candidate.source_digest
+    elif install.replaces_migration_bridge(
+      recorded_tree,
+      trusted_origin=await asyncio.to_thread(
+        install.trusted_catalog_checkout,
+        installed_manifest_url, repo, fetch_manifest_url,
+        candidate.manifest.get("id"),
+      ),
+    ):
+      update_available = True
     else:
       try:
         capability_changes = diff_contracts(
@@ -2063,7 +2082,6 @@ async def resolve_app_update(
         _require_pending_resolution, Path(source_dir),
         receipt["upstream_commit"],
       )
-      replay_app_name = app.name
       replay_upstream_commit = app.upstream_commit
 
     # The installer owns promotion of source, bundle, metadata, static assets,
@@ -2088,11 +2106,16 @@ async def resolve_app_update(
         and isinstance(detail, dict)
         and detail.get("code") == "pending_update_changed"
       ):
-        get_system_broadcast().publish({
-          "type": "app_update_stale",
-          "appId": str(app_id),
-          "appName": replay_app_name,
-        })
+        # The reviewed release can never be replayed again. The live version
+        # is untouched, so drop its receipt and let the next update check
+        # offer the new candidate instead of a pending update that never ends.
+        async with (
+          fs_locks.app_storage_lock(app_id),
+          fs_locks.source_dir_lock(source_dir),
+        ):
+          await asyncio.to_thread(
+            install.clear_pending_conflict_update, source_dir,
+          )
       raise
 
   reapplied = result.app

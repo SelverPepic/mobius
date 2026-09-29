@@ -207,6 +207,22 @@ export function isPackagedAppAsset(pathname) {
   return pathname.startsWith('/app-assets/') || pathname.startsWith('/app-embeds/')
 }
 
+// PURE: which packaged-asset cache lane may answer a same-origin request:
+// 'immutable' (cache-first), 'revalidate' (stale-while-revalidate), or null
+// (the network). Only an /app-embeds document may come from cache as a
+// document, because packagedAssetUpdateGuard stores one only when its response
+// carried the opaque sandbox. /app-assets bytes are inert subresources: a
+// navigation there must reach the server's fresh inert response, never a copy
+// stored earlier, under an older policy, by a subresource fetch.
+export function packagedAssetCacheLane(url, request, origin) {
+  if (url.origin !== origin || !isPackagedAppAsset(url.pathname)) return null
+  if (isRangeRequest(request)) return null
+  if (request.mode === 'navigate' || request.destination === 'document') {
+    return url.pathname.startsWith('/app-embeds/') ? 'revalidate' : null
+  }
+  return isImmutableAppAsset(url.pathname) ? 'immutable' : 'revalidate'
+}
+
 // Entry documents and script-level fetches keep their /app-embeds identity so
 // a response-sandboxed document can never be stored on the ordinary protected
 // lane. Only actual, SW-controlled browser subresource requests share the
@@ -427,4 +443,19 @@ export function requiresLiveShellList(request) {
 export function isShellListUrl(url) {
   return url.search === ''
     && (url.pathname === '/api/chats' || url.pathname === '/api/apps/')
+}
+
+// /api/proxy responses worth caching: asset extensions (images, fonts, audio,
+// video) and favicons. JSON APIs and other dynamic responses go straight to
+// network. Cached third-party bytes are subresources only: never answer a
+// navigation with one, since it would open as a shell-origin document.
+const CACHEABLE_PROXY_EXT =
+  /\.(jpg|jpeg|png|gif|webp|svg|ico|woff2?|ttf|otf|eot|hdr|exr|mp3|mp4|webm|ogg|wav)(\?|$)/i
+
+export function isCacheableProxyRequest(url, request, origin) {
+  if (url.origin !== origin) return false
+  if (request?.mode === 'navigate') return false
+  if (url.pathname === '/api/proxy/favicon') return true
+  if (url.pathname !== '/api/proxy') return false
+  return CACHEABLE_PROXY_EXT.test(url.searchParams.get('url') || '')
 }

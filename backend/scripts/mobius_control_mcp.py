@@ -115,7 +115,7 @@ UPDATE_GOAL_DESCRIPTION = (
   "Advance this chat's Goal in one call. tasks edits the plan as one "
   "revision: a known id changes only the fields given (for example status "
   "completed with a result, and the next task running), a new id adds a task. "
-  "next_action leaves the exact next step before a real handoff. complete "
+  "next_action records the exact next step. complete "
   "records the verified outcome and closes the Goal; it is refused while "
   "tasks or helpers are unfinished. With no arguments it returns the current "
   "plan. goal_id attaches to a named retained Goal instead of the presented one."
@@ -513,7 +513,8 @@ def _goal_report(payload: dict[str, Any], *, full: bool) -> str:
         f"- {task.get('id')} [{task.get('status')}]{parent}{depends}: "
         f"{task.get('title')}" + (f" — {detail}" if detail else "")
       )
-    if goal.get("next_action"):
+    # A settled Goal has no next step; its last handoff note is history.
+    if goal.get("next_action") and goal.get("status") == "open":
       lines.append(f"Next action: {goal['next_action']}")
   return "\n".join(lines)
 
@@ -862,7 +863,8 @@ def _call_spawn_agent(arguments: dict[str, Any]) -> dict:
   view = _helper_view(row)
   view["note"] = (
     "Started in the background. Its result arrives in this chat by itself: "
-    "during this turn if it is still running, otherwise by waking this chat. "
+    "Codex may receive it during this turn; Claude receives it after this "
+    "turn. Stop leaves it owed for the next owner turn. "
     "Keep working or end your turn; do not poll."
   )
   return view
@@ -897,7 +899,11 @@ def _call_list_agents(arguments: dict[str, Any]) -> dict:
     raise ValueError("list_agents takes only an optional helper")
   if arguments.get("helper"):
     row = _find_helper(arguments["helper"])
-    detail = _agent_api_call("GET", f"/api/delegations/{row['id']}")
+    # Reading a finished result is receiving it: the platform records that,
+    # so it does not wake this chat later to deliver the same result again.
+    detail = _agent_api_call(
+      "POST", f"/api/delegations/{row['id']}/result-read", {},
+    )
     return _helper_view(detail, result=True)
   return {"helpers": [_helper_view(row) for row in _helper_rows()]}
 
@@ -1113,8 +1119,10 @@ _TOOL_DEFINITIONS = {
       "Subagents app) and has the same tools you do, but it does not see this "
       "conversation: write a self-contained task with the files, constraints, "
       "and what done looks like. Its result arrives in this chat by itself, "
-      "during this turn if you are still working or by waking the chat after "
-      "you end it, so never poll. access=read forbids file changes."
+      "during a live Codex turn when safe or after the turn settles; Claude "
+      "is not interrupted just for a helper result. Stop leaves it owed for "
+      "the next owner turn; never poll. "
+      "access=read forbids file changes."
     ),
     "inputSchema": {
       "type": "object",
@@ -1218,7 +1226,7 @@ _TOOL_DEFINITIONS = {
               "label": {"type": "string", "minLength": 1, "maxLength": 100},
               "description": {"type": "string", "minLength": 1, "maxLength": 500},
               "on_answer": {"type": "string", "enum": ["resume", "close"],
-                "description": "Default resume. Explicit close saves this choice without an agent reply; arrange a durable next owner first if the Goal is unfinished."},
+                "description": "Default resume. Explicit close saves this choice without an agent reply."},
             },
             "required": ["label", "description"], "additionalProperties": False,
           },
@@ -1285,7 +1293,7 @@ _TOOL_DEFINITIONS = {
                 "label": {"type": "string", "minLength": 1, "maxLength": 100},
                 "description": {"type": "string", "minLength": 1, "maxLength": 500},
                 "on_answer": {"type": "string", "enum": ["resume", "close"],
-                "description": "Default resume. Explicit close saves this choice without an agent reply; arrange a durable next owner first if the Goal is unfinished."},},
+                "description": "Default resume. Explicit close saves this choice without an agent reply."},},
             }},
           },
         },
@@ -1752,15 +1760,18 @@ def _cli_call(argv: list[str]) -> int:
   """
   if len(argv) < 2 or argv[0] != "call" or len(argv) > 4:
     print(
-      "usage: mobius_control_mcp.py call <tool_name> [--args-json JSON]",
+      "usage: mobius_control_mcp.py call <tool_name> [--args-json JSON|-]",
       file=sys.stderr,
     )
     return 2
   tool_name = argv[1]
   arguments: dict[str, Any] = {}
   if len(argv) == 4 and argv[2] == "--args-json":
+    # "-" reads the JSON from stdin, so a quoted heredoc can carry commands
+    # and prose literally instead of nesting them inside shell quotes.
+    raw = sys.stdin.read() if argv[3] == "-" else argv[3]
     try:
-      parsed = json.loads(argv[3])
+      parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
       print(f"invalid --args-json: {exc}", file=sys.stderr)
       return 2
@@ -1769,7 +1780,7 @@ def _cli_call(argv: list[str]) -> int:
       return 2
     arguments = parsed
   elif len(argv) > 2:
-    print("usage: mobius_control_mcp.py call <tool_name> [--args-json JSON]",
+    print("usage: mobius_control_mcp.py call <tool_name> [--args-json JSON|-]",
           file=sys.stderr)
     return 2
   result = _call_tool({"name": tool_name, "arguments": arguments})

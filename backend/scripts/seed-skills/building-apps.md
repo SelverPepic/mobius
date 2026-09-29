@@ -268,10 +268,27 @@ manifest, layered by how always-on they are:
   `description`, and `input_schema` (a JSON Schema `object`). Requires a
   `service`: agents see `<app slug>_<name>`, and each call reaches the service
   as `POST /tools/<name>` with body `{"arguments": ..., "call": ...}` and the
-  app's own authority (`backend/app/app_tools.py`). Helpers get the tools too:
+  app's own authority (`backend/app/app_tools.py`). Only the platform reaches
+  `tools/`: HTTP calls to the service there get 404, so `call` is trustworthy. Helpers get the tools too:
   the request's `actor` has `delegated: true` for a helper and
   `access: "read"` for a read-only one, so refuse any change for a read-only
-  caller. Keep tools few.
+  caller. Tool calls run on their own concurrency lane that is NOT serialized
+  per app (unlike a service's private/public requests), so several — from this
+  chat, other chats, or helpers — can reach the service at once; a tool that
+  writes must do its own file or database locking. Keep tools few.
+- **Python dependencies for a service or Python job.** Without a declaration,
+  these run on the platform's interpreter and borrow its libraries, which can
+  change on any platform update, and anything installed live disappears when
+  the container is replaced. To own them, commit a complete
+  `pip-compile --generate-hashes` lock (list it in `source_files`) and declare
+  `"python": {"lock": "requirements.lock"}`. Apply or install then builds the
+  app's own environment on `/data` from wheels only. It checks the environment
+  by running the service's setup code, which is your code, unsandboxed. The
+  service and every job then run with the environment first on `PATH`, and a
+  `#!/usr/bin/env python3` job uses its interpreter. If a package fails to
+  build, the Apply fails and names it. After a platform update that changes
+  Python, the service returns 503 and jobs fail until you Apply again. Details
+  are in `CAPABILITIES.md`.
 
 Anything that depends on your app being installed belongs in its fragment (the
 always-on default) and/or its skill (the how-to). A not-installed app then
@@ -280,10 +297,12 @@ prompt in the Skills app.
 
 ### App-owned agent activity cards
 
-An app whose skill asks the agent to run one of its scripts can declare that
-command as an activity. This is presentation only: it grants no storage,
-network, or execution authority. The shell authenticates the app and command;
-the app owns all domain language and result links.
+An app can declare an activity card for either an agent tool it exposes or a
+script its skill asks the agent to run. This is presentation only: it grants no
+storage, network, or execution authority. The shell authenticates the app,
+tool, or command; the app owns all domain language and result links.
+
+The command form names one of its source scripts:
 
 ```json
 "agent_activities": {
@@ -317,13 +336,33 @@ and are ignored by the shell, so a retrieval app can carry its own cursors,
 page metadata, and protocol without teaching the platform any of those
 concepts. Keep the receipt bounded and print it last.
 
+The tool form instead names one of the app's `tools`, so a call to that agent
+tool shows the card while it runs:
+
+```json
+"agent_activities": {
+  "lookup": {
+    "tool": "search",
+    "running_label": "Searching"
+  }
+}
+```
+
+The `tool` must be one of the app's declared `tools`, and each tool triggers at
+most one card. The card settles from the same `MOBIUS_APP_ACTIVITY_V1:` receipt
+line, which the tool's service returns in its result text (the shell reads that
+line whether the provider reports the result as text or as the JSON of an MCP
+result object). Everything else about the receipt is identical.
+
 ---
 
 ## Storage — `window.mobius.storage` is the default
 
 Persist app data through `window.mobius.storage` — injected into EVERY mini-app before your module loads, so make it your DEFAULT (not raw `fetch`). It's a read-through wrapper over the storage API: reads are instant (local cache, revalidated in the background) and keep working offline (last-known value overlaid with pending writes — read-your-writes); writes made offline queue and auto-sync on reconnect. Raw `fetch('/api/storage/...')` inside an app has no offline queue/cache and silently drops offline writes.
 
-**Boundary:** Every app owns its data model. Offline support is a product choice, not a default requirement; choose it when it materially benefits the app's use case or preserves an existing product promise. Möbius supplies isolated cached storage, durable queues, connectivity, listing completeness, conditional writes, and conflict delivery. When offline behavior is part of the app's contract, the app chooses what to warm, whether partial data is safe, how conflicts reconcile, and its offline UI. Keep domain merge logic out of the platform.
+Storage caching and queuing apply to every app; they do not depend on
+`offline_capable`. That flag is a separate product and standalone-surface
+promise, covered under *Offline-capable apps* below.
 
 ```jsx
 // read: your data, or null if the path is absent (never written/removed/404).
@@ -392,8 +431,9 @@ Keep that variable inside the helper process. Never echo it, pass it on a comman
 // read the value AND its server version, merge, then write conditionally
 const { value, version } = await window.mobius.storage.getWithVersion('index.json')
 const next = mergeInMyItem(value || [])   // YOUR merge — add your item, don't overwrite theirs
+const guard = version ? { ifMatch: version } : { ifNoneMatch: true }
 try {
-  await window.mobius.storage.durableWrite('index.json', next, { ifMatch: version })
+  await window.mobius.storage.durableWrite('index.json', next, guard)
 } catch (e) {
   if (e.code === 'conflict') { /* someone wrote first — re-read (getWithVersion) and retry */ }
   else throw e
@@ -402,7 +442,18 @@ try {
 
 `durableWrite({ ifMatch: version })` sends the version as an `If-Match`; the server rejects a stale write with a `DurableWriteError` whose `code === 'conflict'` (`retryable: true`). The runtime does NOT loop for you — you own the merge, so re-read and retry on conflict. For a create-only write pass `{ ifNoneMatch: true }` (conflicts if the path already exists). If the data is naturally per-record, one file per record sidesteps contention entirely — reach for CAS only when writers genuinely share one file. (A React list document can let `window.mobius.createUseDocument(React)`'s `useDocument(path, {mode:'cas'})` do the read-merge-retry for you.)
 
-For conditional writes that can queue offline, pass a small JSON `conflictContext` describing the **mutation intent**, not merely the resulting whole document, and recover through `storage.onConflict(async conflict => ...)`. Several offline writes to the same path coalesce to the newest value, while the runtime preserves their opaque contexts in order. Always normalize with `storage.conflictContextItems(conflict.conflictContext)` and apply every returned intent to a fresh versioned read before the recovery write. The callback must resolve truthy only after that recovery is durable; returning `false` keeps the conflict for replay after an app-frame reload. The combined contexts remain bounded to 64 KiB; beyond that bound the runtime retains separate queued writes rather than silently dropping intent.
+#### Offline conflict contract
+
+For conditional writes that can queue offline, pass a small JSON `conflictContext` describing the **mutation intent**, not merely the resulting whole document. Several offline writes to one path can coalesce while the runtime retains those opaque intents in order; the combined contexts remain bounded to 64 KiB, and beyond that bound the runtime keeps separate queued writes rather than silently dropping intent. Keep each intent deterministic and safe to apply twice (or carry a stable operation id).
+
+Do not copy a generic auto-recovery callback that writes from inside `storage.onConflict`; its asynchronous delivery and replay lifecycle must be tested with the app's own domain operations. Preserve the conflict visibly and make its resolution deliberate. Whatever triggers resolution, these rules hold:
+
+- **The callback's result is the acknowledgement.** A truthy result from any `onConflict` listener consumes the durable conflict; `false` or `undefined` preserves it. Return truthy only after the conflict is actually resolved, never merely because it was shown.
+- **Replay happens on registration, not reconnect.** A preserved conflict is re-delivered when an `onConflict` listener registers (normally the next frame load or remount). Reconnect alone does not redispatch it, and the same conflict can arrive more than once — tolerate repeated delivery.
+- **Normalize every retained intent** with `storage.conflictContextItems(conflict.conflictContext)` and apply all of them, not only the latest.
+- **Merge against an authoritative base.** Use `getWithVersion()` only when `window.mobius.runtimeFeatures?.authoritativeVersionedReads === true` and the result is not marked `offline`; otherwise keep the conflict preserved.
+- **Carry intent onto any recovery write that can queue** by passing the original `conflictContext` with the fresh version guard, so a recovery that conflicts again still has the intent it needs.
+- **Queued is not accepted.** A `durability: "queued"` result is not server acceptance, and a separate `pendingCount()` check cannot prove it; only `durability === 'synced'` confirms the write.
 
 **Any view the agent might write to externally MUST `subscribe()`, not load-on-mount.** A current-session draft, today's log, an inbox — anything the Möbius agent populates from a chat turn while the app sits open — has to use `window.mobius.storage.subscribe(path, cb)` so it repaints when that storage changes under it. A view that only reads once in its mount effect leaves the owner staring at a blank panel after the agent writes. If a view genuinely can't subscribe, tell the owner up front they must reopen or refresh to see agent-written entries — and never claim the shell remounts a mini-app when your turn ends, because there is no such guarantee (the iframe stays in the LRU cache).
 
@@ -432,14 +483,13 @@ const res = await fetch(`/api/storage/apps/${appId}/${path}`, {
 
 The extension picks the form (same `.json`-no-envelope rule as above).
 
+Shared storage is owner-written. An app token cannot write or delete there, and it can read and list only `skills/`, `self-reminders.jsonl`, and `memory/` (the last only with a declared `shared_memory` read contract). Every other shared path returns 403 to an app.
+
 ### Cross-app feedback
 
-When an app asks the partner for feedback that another agent should notice, write it twice:
+When an app asks the partner for feedback that another agent should notice, store it in the app's own storage as `feedback/<id>.json` via `window.mobius.storage`, so the app owns its audit trail and offline/read-your-writes behavior. Apps cannot write shared storage.
 
-- Local app storage: `feedback/<id>.json` via `window.mobius.storage`, so the app owns its audit trail and offline/read-your-writes behavior.
-- Shared storage: `app-feedback/<app-slug>/<id>.json` via `PUT /api/storage/shared/...`, best-effort and honestly surfaced if it fails, so Reflection and future cross-app agents can enumerate it without knowing the app's numeric id.
-
-Use a small structured object: `app`, `kind`, `created_at`, `signal`, `text`, and domain context such as `report_date`, `article_headlines`, `source_id`, or `screen`. Keep one record per file. Consumers must enumerate `shared-list/app-feedback/` and app subfolders; do not probe guessed ids.
+Use a small structured object: `app`, `kind`, `created_at`, `signal`, `text`, and domain context such as `report_date`, `article_headlines`, `source_id`, or `screen`. Keep one record per file. Consumers enumerate `apps-list/{appId}/feedback/`; do not probe guessed ids.
 
 ---
 
@@ -534,11 +584,24 @@ Online-only apps may still use an explicit `https://esm.sh/...` dynamic import w
 
 ## Offline-capable apps (opt-in)
 
-Storage already works offline via `window.mobius.storage` (above), and the shell caches every in-shell app's frame + self-contained module after an online open. `offline_capable: true` is the separate promise that the app's standalone PWA surface and product behavior are designed for offline use. Set it in `mobius.json`; `apply_app.py` applies it with the accepted source revision. Set it true only after testing a cold offline reload.
+Offline support is an app-level product choice, not a requirement. Möbius supplies the generic primitives: an isolated read-through cache and durable write queue per app, read-your-writes for ordinary reads, connectivity state and queue drain after reconnect, complete/incomplete listing status, authoritative value/version pairs, bounded intent retention with conflict replay, and host loading/error boundaries. The app owns its data model and product policy: which data to warm, whether partial data is safe to show or act on, how domain edits merge (the [offline conflict contract](#offline-conflict-contract) above), its conflict and recovery UI, and whether offline use is worth promising at all. Keep domain merge rules in the app; never add app-specific sync to the platform or a second cache/queue beside `window.mobius.storage`.
+
+Storage already works offline via `window.mobius.storage` (above), and the shell caches every in-shell app's frame + self-contained module after an online open. `offline_capable: true` is the separate promise that the app's standalone PWA surface and product behavior work through a cold offline reload. Set it in `mobius.json` only after the verification below passes for every surface the app claims to support; `apply_app.py` applies it with the accepted source revision. Packaged nested documents under `/app-embeds/` have no recursive offline guarantee yet, so an app that depends on them stays online-only.
+
+A network-dependent app marked offline-capable can reopen into stale or empty state and look broken. Keep the flag false unless the product promise is real.
 
 Separately, and automatically for EVERY app (no flag), the shell's service worker keeps an installed PWA out of the browser's native "no internet" page: a non-offline-capable app shows a branded offline screen when opened offline, never browser chrome. So the flag is the difference between "the real app runs offline" (set it) and "a branded you're-offline screen" (the automatic default) — neither ever drops to the browser error page.
 
-Only set `offline_capable` when the app genuinely works offline. A network-dependent app marked offline-capable caches stale/empty state and looks broken — leave those at the default.
+**Verify behavior, not the flag.** For each claimed surface (workspace and standalone):
+
+1. Open online and warm every required code and data path.
+2. Go fully offline (page, frame, and service-worker network paths) and reload.
+3. Confirm complete cached views stay intact and incomplete reads never erase prior state.
+4. Make offline writes, reload, and confirm they remain visible and queued.
+5. Reconnect and wait for actual server synchronization.
+6. Introduce a disjoint remote edit and confirm recovery keeps the remote change and every retained local intent, including after a frame remount and under reversed async completion order.
+
+Browser automation covers workspace and standalone documents, frames, and the service worker; OS-installed-PWA launch and device install UI remain device-only and must not be implied by a browser pass.
 
 ---
 
@@ -757,6 +820,9 @@ useEffect(() => {
 - **Viewer variant:** to display an EXISTING chat owned by this app (including a
   same-app cron-attributed daily chat resolved from a `meta.json`), pass an explicit
   `chatId` and no `persist` — the helper just mounts it read-through.
+  `GET /api/app-chats` lists this app's chats; each entry's `running` says a
+  turn is live and `awaiting_owner` says a question card is waiting, so a list
+  can show status without reading transcripts.
 - Keep the chat as the interaction surface; it gives the user a persistent
   transcript, normal agent tooling, and follow-up questions in one place.
 

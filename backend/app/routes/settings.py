@@ -539,8 +539,56 @@ def mark_walkthrough_complete(
   return Response(status_code=204)
 
 
+class OwnerTimezoneUpdate(BaseModel):
+  timezone: str
+
+
+@owner_router.get("/timezone")
+def get_owner_timezone(
+  owner: models.Owner = Depends(get_current_owner),
+) -> dict:
+  """Returns the owner's recorded IANA timezone, or null before any report."""
+  return {"timezone": owner.timezone}
+
+
+@owner_router.put("/timezone", dependencies=[Depends(reject_cross_site)])
+async def set_owner_timezone(
+  body: OwnerTimezoneUpdate,
+  owner: models.Owner = Depends(get_current_owner),
+  db: Session = Depends(get_db),
+) -> dict:
+  """Records the owner's IANA timezone as reported by the shell's browser.
+
+  Fixed wall-time schedules that are still the app's manifest default move to
+  this zone now; schedules the owner chose keep their own zone.
+  """
+  from app import cron_tz, install
+
+  zone = body.timezone.strip()
+  if not cron_tz.valid_timezone(zone):
+    raise HTTPException(400, f"Unknown IANA timezone: {zone!r}")
+  if owner.timezone != zone:
+    owner.timezone = zone
+    db.commit()
+  await install.converge_manifest_schedule_zones(db, zone)
+  return {"timezone": zone}
+
+
 # Compose: a single outer router so routes/__init__.py's frozen
 # `_load("settings")` picks up all the surfaces.
 router.include_router(settings_router)
 router.include_router(models_router)
 router.include_router(owner_router)
+
+
+@router.get("/api/setup")
+def dependency_setup_status(_: models.Owner = Depends(get_current_owner)):
+  from app import app_setup
+  return app_setup.status()
+
+
+@router.post("/api/setup/rerun", status_code=202, dependencies=[Depends(reject_cross_site)])
+async def rerun_dependency_setup(_: models.Owner = Depends(get_current_owner)):
+  from app import app_setup
+  app_setup.request_run(cancel=True)
+  return {"status": "pending"}

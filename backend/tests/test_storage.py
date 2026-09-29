@@ -188,13 +188,19 @@ def test_shared_memory_reads_require_live_declared_contract(
   assert client.get(
     "/api/storage/shared-list/memory", headers=app_auth,
   ).status_code == 403
-  # Other longstanding shared resources retain their existing app-readable
-  # behavior; the new gate is scoped to the optional graph namespace.
+  # A dot segment names the same directory and must meet the same gate.
+  assert client.get(
+    "/api/storage/shared/%2E/memory/.ready", headers=app_auth,
+  ).status_code == 403
+  assert client.get(
+    "/api/storage/shared-list/.%2Fmemory", headers=app_auth,
+  ).status_code == 403
+  # Skills stay app-readable without a contract; only memory is gated by one.
   client.put(
-    "/api/storage/shared/config.json", json={"ok": True}, headers=auth,
+    "/api/storage/shared/skills/cron.md", json={"content": "x"}, headers=auth,
   )
   assert client.get(
-    "/api/storage/shared/config.json", headers=app_auth,
+    "/api/storage/shared/skills/cron.md", headers=app_auth,
   ).status_code == 200
 
   app = db.query(models.App).filter(models.App.id == app_id).one()
@@ -420,8 +426,9 @@ def test_list_can_include_bounded_json_content(
 ):
   """The opt-in batches small JSON reads without changing the default.
 
-  Oversized files and entries beyond the aggregate response budget stay
-  metadata-only, which gives callers an explicit per-file fallback path.
+  Oversized or invalid files stay metadata-only (the per-file fallback path).
+  The aggregate read budget ends the page instead of stripping bodies, so an
+  eligible entry past the budget arrives with its content on the next page.
   """
   app_id = _make_app(client, owner_token)
   for name, doc in (
@@ -455,10 +462,19 @@ def test_list_can_include_bounded_json_content(
     headers=auth,
   )
   assert included.status_code == 200
-  by_name = {entry["name"]: entry for entry in included.json()["entries"]}
-  assert by_name["a.json"]["content"] == {"id": "a", "value": "small"}
-  assert "content" not in by_name["b.json"]
+  first = included.json()
+  assert [entry["name"] for entry in first["entries"]] == ["a.json"]
+  assert first["entries"][0]["content"] == {"id": "a", "value": "small"}
+  assert first["next_cursor"]
+  rest = client.get(
+    f"/api/storage/apps-list/{app_id}/records?include_content=true"
+    f"&cursor={first['next_cursor']}",
+    headers=auth,
+  ).json()
+  by_name = {entry["name"]: entry for entry in rest["entries"]}
+  assert by_name["b.json"]["content"] == {"id": "b", "value": "small"}
   assert "content" not in by_name["note.txt"]
+  assert rest["next_cursor"] is None
 
   # Malformed candidates consume the same bounded read budget even though
   # they add nothing to the response. Otherwise a page of invalid records
@@ -474,11 +490,12 @@ def test_list_can_include_bounded_json_content(
     headers=auth,
   )
   assert bounded.status_code == 200
-  bounded_by_name = {
-    entry["name"]: entry for entry in bounded.json()["entries"]
-  }
-  assert "content" not in bounded_by_name["0-invalid.json"]
-  assert "content" not in bounded_by_name["a.json"]
+  bounded_page = bounded.json()
+  assert [entry["name"] for entry in bounded_page["entries"]] == [
+    "0-invalid.json",
+  ]
+  assert "content" not in bounded_page["entries"][0]
+  assert bounded_page["next_cursor"]
 
 
 def test_list_includes_directories(client, auth, owner_token):
@@ -1548,6 +1565,52 @@ def test_move_rejects_traversal_in_source(client, auth, owner_token):
   assert r.status_code == 400
 
 
+def test_move_folder_into_itself_is_rejected_cleanly(client, auth, owner_token):
+  """A folder moved beneath itself is a 400 and leaves no stray folders."""
+  app_id = _make_app(client, owner_token)
+  client.put(f"/api/storage/apps/{app_id}/a/x.json", json={"k": 1}, headers=auth)
+  for target in ("a/b", "a/b/c"):
+    r = client.post(
+      f"/api/storage/apps/{app_id}/move",
+      json={"from": "a", "to": target},
+      headers=auth,
+    )
+    assert r.status_code == 400
+  listing = client.get(f"/api/storage/apps-list/{app_id}/a", headers=auth).json()
+  assert [entry["name"] for entry in listing["entries"]] == ["x.json"]
+
+
+def test_move_beneath_a_file_is_rejected_cleanly(client, auth, owner_token):
+  """A destination whose parent is a file is a 400 and the source stays put."""
+  app_id = _make_app(client, owner_token)
+  client.put(f"/api/storage/apps/{app_id}/a.json", json={"k": 1}, headers=auth)
+  client.put(f"/api/storage/apps/{app_id}/b.json", json={"k": 2}, headers=auth)
+  r = client.post(
+    f"/api/storage/apps/{app_id}/move",
+    json={"from": "b.json", "to": "a.json/nested/b.json"},
+    headers=auth,
+  )
+  assert r.status_code == 400
+  assert r.json()["detail"]["code"] == "parent_is_file"
+  assert client.get(
+    f"/api/storage/apps/{app_id}/b.json", headers=auth
+  ).json() == {"k": 2}
+
+
+def test_write_beneath_a_file_is_rejected_cleanly(client, auth, owner_token):
+  """Writing `file.json/child.json` is a 400, not a server error."""
+  app_id = _make_app(client, owner_token)
+  client.put(f"/api/storage/apps/{app_id}/a.json", json={"k": 1}, headers=auth)
+  r = client.put(
+    f"/api/storage/apps/{app_id}/a.json/child.json", json={"k": 2}, headers=auth,
+  )
+  assert r.status_code == 400
+  assert r.json()["detail"]["code"] == "parent_is_file"
+  assert client.get(
+    f"/api/storage/apps/{app_id}/a.json", headers=auth
+  ).json() == {"k": 1}
+
+
 # -- recursive folder delete --------------------------------------------
 
 
@@ -1740,3 +1803,112 @@ def test_app_storage_if_none_match_create_if_absent(client, auth, owner_token):
   second = client.put(path, json={"v": 2}, headers={**auth, "If-None-Match": "*"})
   assert second.status_code == 412
   assert client.get(path, headers=auth).json() == {"v": 1}
+
+
+def test_app_reads_only_allowlisted_shared_paths(client, auth, owner_token):
+  """An app token reads skills and self-reminders, never other shared data.
+
+  Agents write credentials anywhere under /data/shared, so the app gate is an
+  allowlist rather than a list of known-secret roots. Owner reads are unchanged.
+  """
+  app_id = _make_app(client, owner_token)
+  token = client.post(
+    "/api/auth/app-token",
+    json={"app_id": app_id},
+    headers={"Authorization": f"Bearer {owner_token}"},
+  ).json()["token"]
+  app_auth = {"Authorization": f"Bearer {token}"}
+  shared = Path(get_settings().data_dir) / "shared"
+  for rel in (
+    "connect/outbound/config.json",
+    "vendor/token",
+    "vendor/.env",
+    "theme.css",
+    "skills/cron.md",
+    "self-reminders.jsonl",
+  ):
+    (shared / rel).parent.mkdir(parents=True, exist_ok=True)
+    (shared / rel).write_text("x", encoding="utf-8")
+  repo = shared / "vendor" / "repository"
+  subprocess.run(
+    ["git", "init", "-b", "main", str(repo)], check=True, capture_output=True,
+  )
+  (repo / "token").write_text("x", encoding="utf-8")
+  subprocess.run(["git", "-C", str(repo), "add", "token"], check=True)
+  subprocess.run(
+    ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t",
+     "commit", "-m", "i"],
+    check=True, capture_output=True,
+  )
+  revision = subprocess.run(
+    ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+    capture_output=True, text=True,
+  ).stdout.strip()
+
+  denied = (
+    "/api/storage/shared/connect/outbound/config.json",
+    "/api/storage/shared/%2E/connect/outbound/config.json",
+    "/api/storage/shared/vendor/token",
+    "/api/storage/shared/vendor/.env",
+    "/api/storage/shared/theme.css",
+    "/api/storage/shared-list/",
+    "/api/storage/shared-list/vendor",
+    "/api/storage/shared-list/connect/outbound",
+    f"/api/storage/shared-git/vendor/repository?revision={revision}&file=token",
+  )
+  for path in denied:
+    assert client.get(path, headers=app_auth).status_code == 403, path
+    assert client.get(path, headers=auth).status_code == 200, path
+  for path in (
+    "/api/storage/shared/skills/cron.md",
+    "/api/storage/shared-list/skills",
+    "/api/storage/shared/self-reminders.jsonl",
+  ):
+    assert client.get(path, headers=app_auth).status_code == 200, path
+
+
+def test_full_size_content_pages_deliver_every_body_in_few_requests(
+  client, auth, owner_token, monkeypatch,
+):
+  """A large collection listed at the maximum page size loses no content.
+
+  The byte budget splits it into a few budget-sized pages; each eligible
+  record carries its body on exactly one page, and non-JSON siblings still
+  appear as metadata.
+  """
+  app_id = _make_app(client, owner_token)
+  records_dir = Path(get_settings().data_dir) / "apps" / str(app_id) / "ledger"
+  records_dir.mkdir(parents=True)
+  for index in range(60):
+    (records_dir / f"r{index:03d}.json").write_text(
+      json.dumps({"id": index, "pad": "x" * 200}),
+    )
+    (records_dir / f"r{index:03d}.diff").write_text("diff")
+  one = (records_dir / "r000.json").stat().st_size
+  monkeypatch.setattr(storage_routes, "_LIST_CONTENT_PAGE_MAX", one * 25)
+
+  seen, pages, cursor = {}, 0, None
+  while True:
+    query = "limit=500&include_content=true" + (
+      f"&cursor={cursor}" if cursor else ""
+    )
+    body = client.get(
+      f"/api/storage/apps-list/{app_id}/ledger?{query}", headers=auth,
+    ).json()
+    pages += 1
+    for entry in body["entries"]:
+      assert entry["name"] not in seen
+      seen[entry["name"]] = entry
+    cursor = body["next_cursor"]
+    if not cursor:
+      break
+
+  assert pages == 3
+  assert len(seen) == 120
+  bodies = [e for name, e in seen.items() if name.endswith(".json")]
+  assert all("content" in entry for entry in bodies)
+  assert sorted(entry["content"]["id"] for entry in bodies) == list(range(60))
+  assert all(
+    "content" not in entry for name, entry in seen.items()
+    if name.endswith(".diff")
+  )
