@@ -460,6 +460,9 @@ def programmatic_start_blocked(
   are not owner intent: they append to ``pending_messages``, which the answer,
   park resume, or owner's manual Resume promotes at the legitimate boundary.
   """
+  from app.delegations import retired_delegation_for_chat
+  if retired_delegation_for_chat(db, chat_id):
+    return True
   from app.platform_restart import (
     ACTIVATION_WAIT_KIND,
     activation_barrier_wait_id,
@@ -803,6 +806,8 @@ def reconcile_startup_chats(
     if registry.is_alive(chat.id):
       continue
     try:
+      from app.delegations import retired_delegation_for_chat
+      retired_helper = retired_delegation_for_chat(db, chat.id)
       queued = len(chat.pending_messages or [])
       running_runs = (
         db.query(models.ChatRun)
@@ -885,7 +890,11 @@ def reconcile_startup_chats(
       )
       from app.chat_transcript import materialized_messages
       msgs = materialized_messages(chat)
-      note = "This turn was paused when Möbius restarted."
+      note = (
+        "This legacy helper was interrupted during the single-mode cutover. "
+        "Its transcript is preserved; start a new helper to rerun the task."
+        if retired_helper else "This turn was paused when Möbius restarted."
+      )
       if queued:
         # The queue is PRESERVED across the restart (it is NOT cleared
         # below); it drains on the next send. Tell the user it is still
@@ -901,8 +910,8 @@ def reconcile_startup_chats(
       # block["message"]. Matching that shape makes the synthetic note
       # render identically to a live provider error. `resumable` marks the
       # note for the one-tap Resume affordance (MsgContent renders a Resume
-      # button on a resumable interrupt note); every interrupted turn — crash
-      # or drain-gated restart — is resumable via a fresh "continue" send.
+      # button on a resumable interrupt note); ordinary interrupted turns
+      # are resumable via a fresh "continue" send, but retired helpers are not.
       # `pause.kind='restart'` marks this as a benign restart pause (not a
       # failure) so the card renders in the calm "Paused" family rather than
       # the danger-red error styling — a restart is a maintenance event, not
@@ -911,7 +920,10 @@ def reconcile_startup_chats(
       restart_pause = {"kind": "restart"}
       if not restart_eligible:
         restart_pause["manual"] = True
-      err_block = {**_pause_note(note, kind="restart"), "pause": restart_pause}
+      err_block = {
+        **_pause_note(note, kind="restart", resumable=not retired_helper),
+        "pause": restart_pause,
+      }
       live_id = (
         chat.live_assistant.get("id")
         if isinstance(chat.live_assistant, dict) else None
@@ -970,7 +982,14 @@ def reconcile_startup_chats(
           and blocks[idx].get("type") == "error"
           and blocks[idx].get("message") == PAUSED_FOR_RESTART_MESSAGE
         ), None)
-        if paused_idx is not None:
+        if retired_helper:
+          # The old task is retired, not paused. Keep the earlier transcript
+          # but leave no Resume affordance or promise of automatic continuation.
+          if paused_idx is not None:
+            blocks[paused_idx] = err_block
+          else:
+            blocks.append(err_block)
+        elif paused_idx is not None:
           # Normalize both historical orderings around an open question. The
           # drain marker belongs immediately BEFORE a trailing unanswered
           # question so the card remains the tail affordance; in that shape it
@@ -1082,7 +1101,7 @@ def reconcile_startup_chats(
         # Keep it distinct from a generic crash/manual Resume so startup does
         # not send the false "tap to resume" notification.
         restart_waiting.append(chat.id)
-      else:
+      elif not retired_helper:
         manual.append(chat.id)
     except Exception:
       db.rollback()
@@ -1911,6 +1930,9 @@ def _auto_resume_recovery(
   """
   if chat is None or physical is None:
     return None
+  from app.delegations import retired_delegation_for_chat
+  if retired_delegation_for_chat(db, chat.id):
+    return None
   control = physical.continuation_json
   messages = list(chat.messages or [])
   source = messages[-1] if messages else None
@@ -2117,6 +2139,9 @@ async def _auto_resume_chat(
             chat = check_db.query(models.Chat).filter(
               models.Chat.id == chat_id,
             ).first()
+            from app.delegations import retired_delegation_for_chat
+            if retired_delegation_for_chat(check_db, chat_id):
+              return False
             pending = (
               list(chat.pending_messages or []) if chat is not None else []
             )
@@ -2433,6 +2458,9 @@ async def sweep_reset_parks(
     notification_requests.append((chat_id, run.park_reason == "restart"))
 
   def auto_resume_rejection(chat, run) -> str | None:
+    from app.delegations import retired_delegation_for_chat
+    if retired_delegation_for_chat(db, run.chat_id):
+      return "legacy helper interrupted"
     pending = list(chat.pending_messages or []) if chat is not None else []
     app_work_queued = any(
       isinstance(msg, dict) and msg.get("_initiated_by_app_id") is not None
@@ -4855,7 +4883,7 @@ def _build_provider_skills_block(
 def _helper_host_key(db, run_policy, *, provider_id: str, connector_plan):
   """The shared helper host a delegated turn runs in, or None for its own process.
 
-  One host per parent chat and setup (provider, access scope, working
+  One host per parent chat and setup (provider, working
   directory, connected services), so helpers of different chats or setups
   never share a process, environment, or permissions. See helper_hosts.
   """
@@ -4886,7 +4914,6 @@ def _helper_host_key(db, run_policy, *, provider_id: str, connector_plan):
   return helper_hosts.HostKey(
     parent_chat_id=row[0],
     provider_id=provider_id,
-    scope=run_policy.scope,
     cwd=run_policy.cwd,
     setup=helper_hosts.setup_digest(connectors, model),
   )
@@ -5540,11 +5567,8 @@ async def _run_chat_impl_with_db(
   if startup_context:
     system_prompt = f"{system_prompt}\n\n{startup_context}"
 
-  # A delegated helper's task exists only in its own transcript. A helper that
-  # starts a fresh provider session after earlier turns (its first turn ended
-  # before the provider named a session, or it never started) would otherwise
-  # receive only this turn's input — a restart continuation or a follow-up —
-  # and work without its task. Such a session is seeded with that history.
+  # A trusted delegated task may already have changed state. If it has history
+  # but no resumable provider session, refuse replay for parent review.
   fresh_delegated_session = (
     run_policy is not None and not session_id and len(messages) > 1
   )
@@ -5557,7 +5581,7 @@ async def _run_chat_impl_with_db(
     if (
       (session_id or fresh_delegated_session)
       and provider_runtime_kind(provider) in ("claude_sdk", "codex_sdk")
-      and (run_policy is None or run_policy.allow_session_reseed)
+      and run_policy is None
     )
     else None
   )
@@ -5649,13 +5673,10 @@ async def _run_chat_impl_with_db(
   )
 
   if fresh_delegated_session:
-    if not run_policy.allow_session_reseed:
-      return await _refuse_delegated_write_replay(
-        bc=bc, db=db, chat_id=chat_id, run_token=run_token, run_gen=run_gen,
-        provider_id=provider_id, agent_activity_binding=agent_activity_binding,
-      )
-    if resumed_context_fallback:
-      user_message = f"{resumed_context_fallback}\n\n{user_message}"
+    return await _refuse_delegated_write_replay(
+      bc=bc, db=db, chat_id=chat_id, run_token=run_token, run_gen=run_gen,
+      provider_id=provider_id, agent_activity_binding=agent_activity_binding,
+    )
 
   # SDK dispatch: route both Claude and Codex through their official
   # Agent SDK runners.
@@ -5837,7 +5858,7 @@ async def _run_chat_impl_with_db(
     if helper_host_key is None and session_id and not _resumable(
       session_id, cwd, sdk_env.get("CLAUDE_CONFIG_DIR")
     ):
-      if run_policy is not None and not run_policy.allow_session_reseed:
+      if run_policy is not None:
         return await _refuse_delegated_write_replay(
           bc=bc, db=db, chat_id=chat_id, run_token=run_token, run_gen=run_gen,
           provider_id=provider_id,
@@ -5894,7 +5915,6 @@ async def _run_chat_impl_with_db(
           skills_enabled=_skills_enabled(settings.data_dir),
           run_policy=run_policy,
           connector_plan=connector_turn_plan,
-          resumed_context=resumed_context_fallback,
           helper_host_key=helper_host_key,
           data_dir=settings.data_dir,
         )

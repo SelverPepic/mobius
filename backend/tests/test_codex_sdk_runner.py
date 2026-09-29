@@ -3646,10 +3646,6 @@ def test_delegated_codex_approval_guard_fails_closed():
   "scope, expected_sandbox, expected_approval",
   [
     (None, "full-access", "auto_review"),
-    # Codex 0.156+ needs bubblewrap for any filesystem-restricted policy and
-    # the container cannot start it, so Codex's sandbox stays off and Möbius
-    # confines the read app-server with Landlock instead.
-    ("read", "full-access", "deny_all"),
     ("write", "full-access", "deny_all"),
   ],
 )
@@ -3673,7 +3669,6 @@ def test_codex_delegation_policy_reaches_the_provider_boundary(
   paths = {
     "codex": "/usr/local/bin/codex",
     "setsid": "/usr/bin/setsid",
-    "setpriv": "/usr/bin/setpriv",
   }
   monkeypatch.setattr(
     codex_sdk_runner.shutil, "which", lambda name: paths.get(name),
@@ -3701,7 +3696,7 @@ def test_codex_delegation_policy_reaches_the_provider_boundary(
   monkeypatch.setattr(
     codex_sdk_runner, "_sdk_imports", lambda: _fake_sdk(FakeAsyncCodex),
   )
-  policy = None if scope is None else SimpleNamespace(scope=scope)
+  policy = None if scope is None else SimpleNamespace()
 
   result = asyncio.run(codex_sdk_runner.run_codex_sdk_turn(
     user_message="inspect",
@@ -3728,60 +3723,10 @@ def test_codex_delegation_policy_reaches_the_provider_boundary(
   }
   assert not any("use_legacy_landlock" in override for override in overrides)
   launch = captured["config"].kwargs["launch_args_override"]
-  confined = "--landlock-access" in launch
-  assert confined is (scope == "read")
+  assert "--landlock-access" not in launch
   assert launch[0] == "/usr/bin/setsid"
-  assert launch[launch.index("/usr/local/bin/codex") - 1] == (
-    "--" if confined else "/usr/bin/setsid"
-  )
+  assert launch[launch.index("/usr/local/bin/codex") - 1] == "/usr/bin/setsid"
   assert result["error"] is None
-
-
-def test_read_confinement_fails_closed_without_setpriv(monkeypatch):
-  paths = {"setsid": "/usr/bin/setsid"}
-  monkeypatch.setattr(
-    codex_sdk_runner.shutil, "which", lambda name: paths.get(name),
-  )
-
-  with pytest.raises(codex_sdk_runner.CodexReadConfinementUnavailable):
-    codex_sdk_runner._codex_app_server_launch_args(
-      "/usr/local/bin/codex", [], read_only_writable_roots=[],
-    )
-
-
-def test_read_confinement_blocks_workspace_writes_on_this_kernel(tmp_path):
-  import subprocess
-
-  if not shutil.which("setpriv"):
-    pytest.skip("setpriv unavailable")
-  workspace = tmp_path / "workspace"
-  scratch = tmp_path / "scratch"
-  workspace.mkdir()
-  scratch.mkdir()
-  (workspace / "f.txt").write_text("before\n")
-  prefix = codex_sdk_runner._landlock_read_only_prefix([str(scratch)])
-  probe = subprocess.run(
-    [*prefix, "true"], capture_output=True, text=True, check=False,
-  )
-  if probe.returncode != 0:
-    pytest.skip(f"Landlock unavailable: {probe.stderr.strip()}")
-
-  result = subprocess.run(
-    [
-      *prefix, "sh", "-c",
-      'cat f.txt; echo after > f.txt; touch new; '
-      'touch "$1/ok" && echo scratch-ok; echo x > /dev/null && echo null-ok',
-      "sh", str(scratch),
-    ],
-    cwd=workspace, capture_output=True, text=True, check=False,
-  )
-
-  assert "before" in result.stdout
-  assert "scratch-ok" in result.stdout
-  assert "null-ok" in result.stdout
-  assert (workspace / "f.txt").read_text() == "before\n"
-  assert not (workspace / "new").exists()
-  assert (scratch / "ok").exists()
 
 
 def test_codex_app_server_launch_args_preserve_overrides_under_setsid(

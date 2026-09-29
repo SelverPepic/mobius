@@ -79,7 +79,7 @@ class _FakeHost(helper_hosts.Host):
 
 
 def _key(parent="p1"):
-  return helper_hosts.HostKey(parent, "codex", "write", "/data", "s")
+  return helper_hosts.HostKey(parent, "codex", "/data", "s")
 
 
 def test_one_host_serves_every_turn_of_a_parent_and_setup(monkeypatch):
@@ -127,9 +127,12 @@ def test_an_idle_host_closes_and_a_dead_one_is_replaced(monkeypatch):
   assert third is not second
 
 
-def test_host_digest_separates_parents_and_setups():
+def test_host_digest_separates_parents_and_setups_without_changing_write_identity():
   assert _key("a").digest != _key("b").digest
-  assert helper_hosts.HostKey("a", "codex", "read", "/data", "s").digest != _key("a").digest
+  assert helper_hosts.HostKey("a", "codex", "/data", "other-setup").digest != _key("a").digest
+  import hashlib, json
+  old_write_key = ["a", "codex", "write", "/data", "s"]
+  assert _key("a").digest == hashlib.sha256(json.dumps(old_write_key).encode()).hexdigest()[:24]
 
 
 # ----------------------------------------------------------------- Claude dispatch
@@ -141,12 +144,11 @@ def _claude_host(tmp_path):
   )
 
 
-def _turn(tmp_path, *, read_only=False, dispatch_id="d1"):
+def _turn(tmp_path, *, dispatch_id="d1"):
   return claude_host.HelperTurn(
     dispatch_id=dispatch_id, kind="spawn",
     spec={"description": dispatch_id, "prompt": "exact task", "subagent_type": "mobius-helper"},
     sink=None, env_file=helper_hosts.TurnEnvFile(tmp_path, dispatch_id, {"CHAT_ID": "c"}),
-    read_only=read_only,
   )
 
 
@@ -177,11 +179,10 @@ def test_dispatcher_launches_only_registered_specs_verbatim(tmp_path):
   )) == {}
 
 
-def test_helper_calls_carry_their_own_identity_and_respect_their_limits(tmp_path):
+def test_helper_calls_carry_their_own_identity_and_block_native_fanout(tmp_path):
   host = _claude_host(tmp_path)
   writer = _turn(tmp_path, dispatch_id="dw")
-  reader = _turn(tmp_path, read_only=True, dispatch_id="dr")
-  host._turn_by_agent.update({"agent-w": writer, "agent-r": reader})
+  host._turn_by_agent.update({"agent-w": writer})
 
   def call(agent, name, tool_input):
     return asyncio.run(host.pre_tool_use(
@@ -197,10 +198,10 @@ def test_helper_calls_carry_their_own_identity_and_respect_their_limits(tmp_path
     writer.env_file.path,
   )
 
-  for agent, name in (("agent-r", "Write"), ("agent-w", "Agent"), ("agent-w", "Workflow")):
+  for agent, name in (("agent-w", "Agent"), ("agent-w", "Workflow")):
     denied = call(agent, name, {})
     assert denied["hookSpecificOutput"]["permissionDecision"] == "deny", (agent, name)
-  assert call("agent-r", "Read", {"file_path": "/data/x"}) == {}
+  assert call("agent-w", "Write", {"file_path": "/data/x"}) == {}
 
 
 def test_a_resumed_helper_reports_to_its_current_follow_up_turn(tmp_path):
@@ -364,7 +365,7 @@ def _host_turns(tmp_path, monkeypatch, settle):
       base_env={"CHAT_ID": "child", "TMPDIR": str(tmp_path)},
       chat_id="child", skill_text="helper", bc=None, agent_settings=None,
       skills_enabled=False, run_policy=None, connector_plan=None,
-      resumed_context=None, helper_host_key=_key(), data_dir=str(tmp_path),
+      helper_host_key=_key(), data_dir=str(tmp_path),
     ))
 
   return turn, client, saved
@@ -584,9 +585,9 @@ def test_boot_ends_only_hosts_whose_server_is_gone(monkeypatch):
 def test_a_new_host_for_a_changed_setup_releases_the_old_idle_one(monkeypatch):
   monkeypatch.setattr(helper_hosts, "HOST_IDLE_SECONDS", 60)
   manager = helper_hosts.HostManager()
-  old_key = helper_hosts.HostKey("p1", "codex", "write", "/data", "setup-a")
-  new_key = helper_hosts.HostKey("p1", "codex", "write", "/data", "setup-b")
-  other_chat = helper_hosts.HostKey("p2", "codex", "write", "/data", "setup-a")
+  old_key = helper_hosts.HostKey("p1", "codex", "/data", "setup-a")
+  new_key = helper_hosts.HostKey("p1", "codex", "/data", "setup-b")
+  other_chat = helper_hosts.HostKey("p2", "codex", "/data", "setup-a")
 
   async def scenario():
     async with manager.lease(old_key, lambda: _FakeHost(old_key)) as old:
@@ -616,7 +617,7 @@ def test_connector_capabilities_do_not_change_the_host_key(monkeypatch):
       return ("parent-1",)
 
   db = types.SimpleNamespace(query=lambda *_a: _Query())
-  policy = types.SimpleNamespace(delegation_id="d", scope="read", cwd="/data", model="m")
+  policy = types.SimpleNamespace(delegation_id="d", cwd="/data", model="m")
 
   def plan(token):
     return types.SimpleNamespace(

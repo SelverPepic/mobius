@@ -1462,9 +1462,7 @@ async def run_claude_sdk_turn(
       restricted_options = {}
       if run_policy is not None:
         restricted_options.update({
-        "permission_mode": (
-          "plan" if run_policy.scope == "read" else "acceptEdits"
-        ),
+        "permission_mode": "acceptEdits",
         })
       options_kwargs.update(restricted_options)
     if skills_enabled:

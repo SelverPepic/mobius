@@ -5552,6 +5552,23 @@ def _record_schedule_provenance(eng) -> None:
     os.replace(tmp, target)
 
 
+def _add_legacy_helper_interruption(eng) -> None:
+  """Store the one-time cutover verdict without changing historical scope."""
+  from sqlalchemy import inspect as sa_inspect, text
+
+  inspector = sa_inspect(eng)
+  if "delegations" not in inspector.get_table_names():
+    return
+  if "interrupted_at" in {
+    column["name"] for column in inspector.get_columns("delegations")
+  }:
+    return
+  with eng.begin() as conn:
+    conn.execute(text(
+      "ALTER TABLE delegations ADD COLUMN interrupted_at DATETIME NULL"
+    ))
+
+
 _SCHEMA_MIGRATIONS = (
   # Full IDs are permanent identities, not sequence positions. Append new
   # work in execution order; never renumber a shipped ID to reconcile sources.
@@ -5635,6 +5652,7 @@ _SCHEMA_MIGRATIONS = (
   ("0071_delegation_result_identity", _add_delegation_result_identity),
   ("0072_owner_timezone", _add_owner_timezone),
   ("0073_schedule_provenance", _record_schedule_provenance),
+  ("0074_legacy_helper_interruption", _add_legacy_helper_interruption),
 )
 
 

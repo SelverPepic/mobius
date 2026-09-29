@@ -796,7 +796,6 @@ def _helper_view(row: dict[str, Any], *, result: bool = False) -> dict[str, Any]
     "helper_id": row.get("id"),
     "provider": row.get("provider"),
     "model": row.get("model"),
-    "access": row.get("scope"),
     "status": row.get("status"),
   }
   if result and row.get("result"):
@@ -805,17 +804,19 @@ def _helper_view(row: dict[str, Any], *, result: bool = False) -> dict[str, Any]
 
 
 def _call_spawn_agent(arguments: dict[str, Any]) -> dict:
-  allowed = {"name", "task", "access", "provider", "model", "effort", "cwd"}
+  if "access" in arguments:
+    raise ValueError(
+      "spawn_agent no longer takes access; state any read-only constraint "
+      "in the bounded task instead"
+    )
+  allowed = {"name", "task", "provider", "model", "effort", "cwd"}
   if not set(arguments).issubset(allowed):
     raise ValueError("spawn_agent received unknown arguments")
   name, task = arguments.get("name"), arguments.get("task")
-  access = arguments.get("access")
   if not isinstance(name, str) or not name.strip():
     raise ValueError("name is required")
   if not isinstance(task, str) or not task.strip():
     raise ValueError("task is required")
-  if access not in ("read", "write"):
-    raise ValueError("access must be read or write")
   app = _subagents_app()
   try:
     snapshot = app.snapshot()
@@ -854,7 +855,7 @@ def _call_spawn_agent(arguments: dict[str, Any]) -> dict:
     "provider": provider,
     "model": model,
     "effort": effort,
-    "scope": access,
+    "scope": "write",
     "notify_parent_on_complete": True,
   }
   if isinstance(arguments.get("cwd"), str) and arguments["cwd"].strip():
@@ -1071,7 +1072,7 @@ def _call_screenshot(arguments: dict[str, Any]) -> ToolContent:
   if done.returncode != 0 or not lines:
     output = (done.stderr or done.stdout).strip()
     if "Permission denied" in output:
-      # A read-only sandbox (for example an access=read helper) also confines
+      # A read-only sandbox also confines
       # this server, and a capture must write its image and browser profile.
       raise RuntimeError(
         "screenshot needs write access: it saves the image and a browser "
@@ -1122,7 +1123,7 @@ _TOOL_DEFINITIONS = {
       "during a live Codex turn when safe or after the turn settles; Claude "
       "is not interrupted just for a helper result. Stop leaves it owed for "
       "the next owner turn; never poll. "
-      "access=read forbids file changes."
+      "The task instructions define its work; owner and public-action safeguards still apply."
     ),
     "inputSchema": {
       "type": "object",
@@ -1133,7 +1134,6 @@ _TOOL_DEFINITIONS = {
           "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
         },
         "task": {"type": "string", "minLength": 1, "maxLength": 200000},
-        "access": {"type": "string", "enum": ["read", "write"]},
         "provider": {
           "type": "string", "enum": ["claude", "codex", "mobius"],
           "description": "Omit to use this chat's provider.",
@@ -1142,7 +1142,7 @@ _TOOL_DEFINITIONS = {
         "effort": {"type": "string", "description": "Reasoning effort; omit for the default."},
         "cwd": {"type": "string", "description": "Working directory under /data; omit for /data."},
       },
-      "required": ["name", "task", "access"],
+      "required": ["name", "task"],
       "additionalProperties": False,
     },
   },

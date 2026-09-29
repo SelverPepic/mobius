@@ -644,6 +644,9 @@ def safe_startup_writer_orphan(
   still open; any drift or partial output falls through to conservative normal
   crash recovery.
   """
+  from app.delegations import retired_delegation_for_chat
+  if retired_delegation_for_chat(db, chat.id):
+    return False
   activation = physical.id.startswith("activation-resume-")
   prefix = "activation-resume-" if activation else "wait-resume-"
   if (
