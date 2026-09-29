@@ -90,7 +90,6 @@ import {
 } from './workspacePlacement.js'
 import {
   appCrashReportDraft,
-  findAppStoreApp,
 } from '../../lib/appRecovery.js'
 import {
   acknowledgeAppActivity,
@@ -2145,9 +2144,7 @@ export default function Shell({ onInitialVisualReady }) {
     visualContentOnly = sessionStorage.getItem('mobius:visual-content-only') === '1'
   } catch (_) {}
   const showWalkthrough = !visualContentOnly
-    && walkthroughQuery.isFetched
-    && walkthroughQuery.data
-    && !walkthroughQuery.data.completed
+    && walkthroughQuery.isFetched && walkthroughQuery.data && !walkthroughQuery.data.completed
 
   // Local streaming ids come from the mounted ChatView immediately at send
   // time. The run-lifecycle owner merges those with durable
@@ -4599,20 +4596,7 @@ export default function Shell({ onInitialVisualReady }) {
 
       {showWalkthrough && (
         <WalkthroughOverlay
-          onOpenSettings={() => {
-            setSettingsFocusTarget({ section: 'ai-providers', nonce: Date.now() })
-            navTo('settings')
-          }}
-          onExploreApps={() => {
-            const appStore = findAppStoreApp(apps)
-            if (appStore) navTo('canvas', { appId: appStore.id })
-            else openDrawer()
-          }}
-          onDone={() => {
-            // Query invalidation inside WalkthroughOverlay flips
-            // `showWalkthrough` to false on the next render. Nothing
-            // else to do here.
-          }}
+          apps={apps}
         />
       )}
 

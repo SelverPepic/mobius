@@ -51,6 +51,12 @@ const walkthrough = readFileSync(
 const walkthroughCss = readFileSync(
   new URL('../../Walkthrough/WalkthroughOverlay.css', import.meta.url), 'utf8',
 )
+const walkthroughSetup = readFileSync(
+  new URL('../../Walkthrough/WalkthroughSetup.jsx', import.meta.url), 'utf8',
+)
+const walkthroughStore = readFileSync(
+  new URL('../../Walkthrough/WalkthroughStore.jsx', import.meta.url), 'utf8',
+)
 
 test('the workspace menu avoids an oversized border-and-shadow card', () => {
   const rule = css.match(/\.workspace__menu\s*\{[\s\S]*?\}/)?.[0] || ''
@@ -221,15 +227,91 @@ test('the undo chord defers to focused inputs', () => {
   assert.match(shell, /dispatchWorkspace\(\{ type: 'UNDO_LAST' \}\)/)
 })
 
-test('the first-run walkthrough stays short and action-first', () => {
-  assert.doesNotMatch(walkthrough, /const STEPS/)
-  assert.match(walkthrough, /Your Möbius is ready/)
+test('the first-run slideshow teaches, offers setup, and never navigates on advance', () => {
+  assert.match(walkthrough, /const SLIDES = \['welcome', 'connect', 'chat', 'apps', 'settings', 'identity'\]/)
+  assert.match(walkthrough, /const GUIDE_COUNT = SLIDES\.length/, 'welcome belongs to the six-step guide')
+  assert.match(walkthrough, /className="wt__count"[\s\S]*?className="sr-only">Step \{stepIndex \+ 1\} of \{GUIDE_COUNT\}/, 'step count has valid accessible text')
+  assert.doesNotMatch(walkthrough, /wt__progress/, 'the old progress strip is removed')
+  assert.match(walkthroughCss, /\.wt__count\s*\{[^}]*color:\s*var\(--wt-accent-ink/, 'count uses a readable variant of the primary color')
+  assert.match(walkthrough, /<div className="wt__brand">[\s\S]*?<span className="wt__count"/, 'count follows the modal heading')
+  assert.match(walkthroughCss, /\.wt__card::backdrop\s*\{[^}]*78%/, 'first-run backdrop keeps its approved opacity')
+  assert.match(walkthrough, /<dialog ref=\{dialogRef\}[\s\S]*?aria-modal="true"/, 'guide uses a native modal')
+  assert.match(walkthrough, /if \(!dialog\.open\) dialog\.showModal\(\)/, 'modal opens through the browser focus boundary')
+  assert.match(walkthrough, /onCancel=\{event => \{ event\.preventDefault\(\); finish\(\) \}\}/, 'Escape closes the guide through its normal finish action')
+  assert.match(walkthrough, /function keepTabInside\(event\)[\s\S]*?event\.preventDefault\(\)[\s\S]*?destination\?\.focus\(\)/, 'Tab wraps within visible guide controls')
+  assert.match(walkthrough, /useEffect\(\(\) => \{ titleRef\.current\?\.focus\(\{ preventScroll: true \}\) \}, \[stepIndex\]\)/, 'focus enters the guide and moves to each slide title')
+  assert.match(walkthroughCss, /\.wt__slide h2:focus\s*\{\s*outline:\s*none/, 'static headings do not get an interactive-looking outline')
+  assert.match(walkthroughCss, /\.wt__slide h2:focus-visible::before\s*\{[^}]*background:\s*var\(--accent/, 'keyboard-visible heading focus has a quiet accent marker')
+  assert.match(walkthroughCss, /\.wt__card button:focus-visible,[^}]*\.wt__card input:focus-visible[^}]*outline:\s*2px/, 'interactive controls retain visible keyboard focus')
+  assert.match(walkthrough, /stepIndex > 0 && <button type="button" className="wt__back"/, 'the second slide can return to welcome')
+  assert.match(walkthrough, /slide === 'identity' \? 'Finish guide' : 'Next'/, 'welcome and intermediate slides share a Next action')
+  assert.doesNotMatch(walkthrough, /← Back|Next →/, 'navigation labels do not use arrow icons')
+  assert.match(walkthrough, /<nav className="wt__rail" aria-label="Guide sections">/)
+  assert.match(walkthrough, /aria-current=\{index === stepIndex \? 'step' : undefined\} onClick=\{\(\) => goTo\(index\)\}/, 'desktop chapters are real navigation')
+  assert.match(walkthroughCss, /\.wt__card\s*\{[\s\S]*?width:\s*min\(1040px[^}]*height:\s*min\(710px/, 'desktop card has room for the guide and stable height across slides')
+  assert.match(walkthrough, /Welcome to Möbius/)
   assert.match(walkthrough, /Connect an agent/)
-  assert.match(walkthrough, /Open the App Store/)
+  assert.match(walkthrough, /Chat and Projects/)
+  assert.match(walkthrough, /Explore apps/)
+  assert.match(walkthrough, /Your settings/)
+  assert.match(walkthrough, /Choose a handle/)
+  assert.match(walkthrough, /slide === 'apps'[\s\S]*?<WalkthroughStore/, 'included and optional apps share one slide')
+  assert.match(walkthroughStore, /Included with Möbius[\s\S]*?Discover in the App Store/, 'built-in and optional apps stay together')
+  assert.doesNotMatch(walkthrough, /wt__kicker|people that make Möbius yours/, 'no redundant over-heading labels or unrelated people claim')
+  assert.match(walkthroughCss, /\.wt__slide h2\s*\{[^}]*white-space:\s*nowrap/, 'slide headings remain on one line')
+  assert.match(walkthrough, /className="wt__slide" ref=\{scrollRef\} role="region" aria-labelledby="wt-title" tabIndex=\{0\}/, 'scrollable slide body is keyboard reachable')
+  assert.match(walkthroughSetup, /aria-pressed=\{choice === 'codex'\}/, 'provider selection is announced')
+  assert.match(walkthrough, /<AgentSetup \/>/)
+  assert.match(walkthrough, /<HandleSetup \/>/)
+  assert.match(walkthrough, /<WalkthroughStore apps=\{apps\} \/>/)
+  assert.doesNotMatch(walkthrough + walkthroughSetup + walkthroughStore, /leaveTo\(|onOpenSettings|onExploreApps|onOpenIdentity|Open Settings ↗|Browse the full App Store ↗|Open Möbius · You ↗/, 'guide does not leave the slideshow for destination links')
+  assert.match(walkthrough, /change your provider or model in Settings/)
+  assert.match(walkthroughStore, /Install any that catch your eye right here/)
+  assert.doesNotMatch(walkthroughSetup, /After the guide, open Möbius · You to manage your profile and handle/)
+  assert.match(walkthrough, /function goTo\(index\) \{\s*setStepIndex\(index\)/)
+  assert.doesNotMatch(walkthrough, /function goTo\(index\)[\s\S]*?navTo\(/)
   assert.match(walkthrough, /Keep Möbius close/)
   assert.match(walkthrough, /requestInstall/)
-  assert.match(walkthrough, /I’ll explore/)
+  assert.match(walkthrough, /installState === 'installed' && installFeedback && <p className="wt__install-feedback" role="status">/, 'PWA install confirmation remains visible after the install card closes')
+  assert.doesNotMatch(walkthrough, /Skip guide/, 'close button is the sole way to leave early')
   assert.match(walkthrough, /mobius:walkthrough-completed/)
+  assert.match(shell, /walkthroughQuery\.isFetched && walkthroughQuery\.data && !walkthroughQuery\.data\.completed/, 'the real owner completion status gates first-run onboarding')
+  assert.match(shell, /<WalkthroughOverlay[\s\S]*?apps=\{apps\}/, 'onboarding uses real installed app data')
+  assert.doesNotMatch(shell + walkthrough + walkthroughSetup + walkthroughStore, /walkthroughPreviewMode|walkthroughFreshPreview|freshPreview|onboarding=first-run|wt__card--fresh/, 'temporary preview paths are gone')
+  assert.match(walkthroughStore, /CORE_IDS\.map\(id => apps\.find/)
+  assert.match(walkthroughStore, /<AppIcon className="wt__built-in-icon"/)
+  assert.match(walkthroughStore, /guideDescription\(app\.description\)/, 'app-owned descriptions follow the guide’s punctuation style')
+  assert.match(walkthroughStore, /PICK_IDS = \['notes', 'habits', 'kanban', 'pages', 'webstudio', 'connect'\]/)
+  assert.match(walkthroughStore, /<AppIcon className="wt__store-icon"/)
+  assert.match(walkthroughStore, /reader\.readAsDataURL\(blob\)/, 'Store artwork is loaded through authenticated requests')
+  assert.match(walkthroughStore, /label=\{item\.name\} size=\{null\}/, 'guide icons use the authenticated image without an appended size query')
+  assert.match(walkthroughStore, /source\/file\?path=catalog\.json/, 'local Store catalog is the offline floor')
+  assert.match(walkthroughStore, /app-store\/main\/catalog\.json/, 'published Store catalog refreshes picks')
+  assert.match(walkthroughStore, /manifest_url: item\.manifest_url/, 'install uses the catalog listing, not a constructed URL')
+  assert.doesNotMatch(walkthroughStore, /notesIcon|habitsIcon|kind: 'Write'|copy: 'Keep notes'/, 'guide does not copy Store art or listing text')
+  assert.match(walkthrough, /api\.owner\.walkthrough\.complete\(\)/)
+  assert.match(walkthrough, /disabled=\{installBusy\}/)
+  assert.match(walkthroughSetup, /authQueries\.provider\.statuses\.useQuery\(\)/, 'agent setup reads the real connection status')
+  assert.match(walkthroughSetup, /apiFetch\('\/identity'/, 'handle setup reads the real profile')
+  assert.match(walkthroughSetup, /if \(!valid \|\| saving\) return/, 'handle claim is available in real onboarding')
+  assert.match(walkthroughSetup, /<CodexAuth \/>/)
+  assert.match(walkthroughSetup, /<ProviderAuth authenticated=\{false\}/)
+  assert.match(walkthroughSetup, /configured\.size > 0 \? <div className="wt__success" role="status">An agent is connected/, 'connection success is visible in the guide')
+  assert.match(walkthroughSetup, /handle \? <div className="wt__success" role="status">You’re/, 'claimed handle has a visible success state')
+  assert.match(walkthroughSetup, /setIdentity\(data\)/, 'claim updates the guide immediately')
+  assert.match(walkthroughSetup, /apiFetch\('\/identity\/profile'/)
+  assert.match(walkthroughStore, /apiFetch\('\/apps\/preview'/)
+  assert.match(walkthroughStore, /reviewed_capability_digest: reviewed\.capability_digest/, 'click-time check is bound to install')
+  assert.match(walkthroughStore, /apiFetch\('\/apps\/install'/)
+  assert.match(walkthroughStore, /reviewed\.manifest\?\.id !== item\.id \|\| !reviewed\.capability_digest \|\| !reviewed\.capability_contract/, 'install stops if the app cannot be checked')
+  assert.match(walkthroughStore, /response\.status === 409 && data\.detail\?\.code === 'capability_changed'/, 'changed apps are not installed')
+  assert.match(walkthroughStore, /Nothing was installed\. Choose Install again to retry/, 'a changed app requires a fresh click')
+  assert.match(walkthroughStore, /className=\{installed \? 'wt__installed' : 'wt__action'\}/, 'Install is primary; Installed is neutral')
+  assert.match(walkthroughStore, /setInstalledNow\(current => new Set\(current\)\.add\(item\.id\)\)/, 'successful install changes the card immediately')
+  assert.match(walkthroughStore, /state\?\.phase === 'installed' && <p className="wt__store-success" role="status">/, 'newly installed apps have a visible success message')
+  assert.match(walkthroughStore, /disabled=\{installed \|\| busy\}/, 'install is enabled for available apps')
+  assert.match(walkthroughStore, /role="alert">\{state.error\}/, 'install errors are announced')
+  assert.doesNotMatch(walkthroughStore, /AppReview|AccessDetails|View access|wt__store-inline-review/, 'the onboarding card has no expanded access view')
 })
 
 test('the first-run walkthrough remains dismissible in a short landscape viewport wider than 520px', () => {
@@ -240,15 +322,13 @@ test('the first-run walkthrough remains dismissible in a short landscape viewpor
   const baseCardRule = walkthroughCss.match(/\.wt__card\s*\{[\s\S]*?\n\}/)?.[0] || ''
   assert.match(
     baseCardRule,
-    /max-height:\s*calc\(100dvh - 80px - env\(safe-area-inset-top,\s*0px\)\)/,
+    /max-height:\s*calc\(100dvh - 36px - env\(safe-area-inset-top,\s*0px\) - env\(safe-area-inset-bottom,\s*0px\)\)/,
     'the viewport-height cap must apply outside the phone-width media query',
   )
-  assert.match(baseCardRule, /overflow-y:\s*auto/,
-    'clipped actions must remain reachable by scrolling')
-  assert.match(baseCardRule, /overscroll-behavior:\s*contain/,
-    'scrolling the coach card must not move the workspace behind it')
-  assert.doesNotMatch(baseCardRule, /overflow:\s*hidden/,
-    'the width-independent card rule must never clip its final actions')
+  const slideRule = walkthroughCss.match(/\.wt__slide\s*\{[\s\S]*?\n\}/)?.[0] || ''
+  assert.match(slideRule, /overflow-y:\s*auto/, 'long slide content remains reachable')
+  assert.match(slideRule, /overscroll-behavior:\s*contain/, 'slide scrolling stays inside the card')
+  assert.match(walkthroughCss, /\.wt__footer\s*\{/, 'navigation remains outside the scroll area')
 })
 
 test('the authenticated shell offers a keyboard skip link', () => {
@@ -1253,11 +1333,11 @@ test('the builder no-full-screen invariant scopes to DESTINATIONS, not transient
   const urmCss = readFileSync(
     new URL('../../SettingsView/UpdateReviewModal.css', import.meta.url), 'utf8',
   )
-  // First-use guidance is now a non-modal region layered over the live shell,
-  // with an explicit dismiss action; update review remains a pane-scoped modal.
-  assert.match(walkthrough, /role="region"/)
-  assert.match(walkthrough, /aria-label="Dismiss welcome"/)
-  assert.doesNotMatch(walkthrough, /aria-modal="true"/)
+  // Owner approved a first-use modal for keyboard focus safety; it remains a
+  // dismissible overlay, not a workspace destination. Update review stays pane-scoped.
+  assert.match(walkthrough, /<dialog ref=\{dialogRef\}/)
+  assert.match(walkthrough, /aria-label="Close guide"/)
+  assert.match(walkthrough, /aria-modal="true"/)
   assert.match(urmCss, /\.urm__overlay\s*\{[\s\S]*?position:\s*absolute/)
 })
 
