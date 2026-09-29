@@ -90,6 +90,7 @@ function CustomAnswerArea({
       placeholder={answered ? 'No custom answer' : (placeholder || 'Or type your own answer…')}
       autoComplete="off"
       rows={1}
+      wrap="soft"
       value={value}
       onChange={e => onChange(e.target.value)}
       onFocus={e => placeCaretAtTextEnd(e.currentTarget)}

@@ -83,6 +83,10 @@ test('unanswered question cards do not have a stale gray state', () => {
 test('question cards wrap long unbroken content within a mobile pane', () => {
   assert.match(css, /\.qcard\s*\{[^}]*overflow-wrap:\s*anywhere/,
     'long unbroken question and option text should not widen the card on mobile')
+  assert.match(css, /\.qcard__input\s*\{[^}]*min-width:\s*0;[^}]*overflow-wrap:\s*anywhere;[^}]*word-break:\s*break-word;/s,
+    'a long pasted answer should wrap within its textarea, not widen the chat')
+  assert.match(component, /<textarea[\s\S]*?wrap="soft"[\s\S]*?value=\{value\}/,
+    'custom answers should retain soft-wrapped text without inserting newlines into the submitted URL')
 })
 
 test('question card css has no stale styling hook', () => {
