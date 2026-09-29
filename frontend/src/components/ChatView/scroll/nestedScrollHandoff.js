@@ -3,7 +3,9 @@ import { nestedScrollRange } from './policy.js'
 const PIXEL_DELTA = 0
 const LINE_DELTA = 1
 const PAGE_DELTA = 2
-const WHEEL_GESTURE_IDLE_MS = 280
+// Wheel momentum arrives in a tight burst. A short quiet edge lets a second
+// deliberate notch/swipe continue in chat without demanding a visible pause.
+const WHEEL_GESTURE_IDLE_MS = 120
 
 function lineHeightInPixels(element, readStyle) {
   const style = readStyle?.(element)
@@ -88,7 +90,8 @@ export function createNestedScrollHandoff(scrollEl, {
       : Math.max(0, range.scrollTop)
     const time = Number.isFinite(event?.timeStamp) ? event.timeStamp : performance.now()
     const crossesEdge = Math.abs(delta) > available
-    const canTransfer = crossesEdge && wheel.nested === range.nested
+    const canTransfer = crossesEdge && available <= 1
+      && wheel.nested === range.nested
       && wheel.edge === direction
       && (wheel.transferring || time - wheel.lastTime > WHEEL_GESTURE_IDLE_MS)
     wheel = {
@@ -98,9 +101,15 @@ export function createNestedScrollHandoff(scrollEl, {
       transferring: canTransfer,
     }
     if (!crossesEdge) return false
-    // Native containment still owns a non-cancelable wheel event. Do not let
-    // the outer input policy mistake it for a chat gesture.
-    if (event?.cancelable === false) return true
+    // A non-cancelable event still bubbles from the reader. Its CSS contains
+    // native chaining, but a fresh edge gesture can move the chat explicitly.
+    if (event?.cancelable === false) {
+      if (canTransfer) {
+        onHandoff?.({ delta, type: 'wheel' })
+        scrollEl.scrollTop += delta - direction * available
+      }
+      return true
+    }
     const residual = consumeNestedEdge(range, delta)
     if (residual == null) return false
     if (canTransfer) {

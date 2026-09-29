@@ -62,9 +62,11 @@ test('wheel burst stays in its reader; a new edge gesture transfers only residua
   assert.equal(outer.scrollTop, 400, 'the first crossing cannot spill into chat')
   assert.equal(crossing.prevented(), true)
 
-  handlers.onWheel(wheel(child, { deltaY: 30, timeStamp: 1080 }))
+  handlers.onWheel(wheel(child, { deltaY: 30, timeStamp: 1050 }))
   assert.equal(outer.scrollTop, 400, 'momentum from the same burst stays contained')
-  const deliberate = wheel(child, { deltaY: 15, timeStamp: 1450 })
+  handlers.onWheel(wheel(child, { deltaY: 18, timeStamp: 1130 }))
+  assert.equal(outer.scrollTop, 400, 'continued fast wheel motion stays contained')
+  const deliberate = wheel(child, { deltaY: 15, timeStamp: 1280 })
   handlers.onWheel(deliberate)
   assert.equal(outer.scrollTop, 415, 'a fresh edge gesture reaches the transcript')
   assert.equal(deliberate.prevented(), true)
@@ -79,7 +81,7 @@ test('line and page wheel handoff uses CSS pixels after a deliberate new gesture
   const { child, handlers, nested, outer } = fixture({ nestedTop: 200 })
   handlers.onWheel(wheel(child, { deltaY: 1, deltaMode: 1, timeStamp: 1000 }))
   assert.equal(outer.scrollTop, 400)
-  const lines = wheel(child, { deltaY: 3, deltaMode: 1, timeStamp: 1400 })
+  const lines = wheel(child, { deltaY: 3, deltaMode: 1, timeStamp: 1160 })
   handlers.onWheel(lines)
   assert.equal(outer.scrollTop, 460, 'three computed 20px lines stay in CSS pixels')
   assert.equal(lines.prevented(), true)
@@ -88,7 +90,7 @@ test('line and page wheel handoff uses CSS pixels after a deliberate new gesture
   nested.scrollTop = 0
   handlers.onWheel(wheel(child, { deltaY: -1, deltaMode: 2, timeStamp: 1500 }))
   assert.equal(outer.scrollTop, 400)
-  const page = wheel(child, { deltaY: -1, deltaMode: 2, timeStamp: 1900 })
+  const page = wheel(child, { deltaY: -1, deltaMode: 2, timeStamp: 1660 })
   handlers.onWheel(page)
   assert.equal(outer.scrollTop, 300, 'one page is the nested 100px client height')
   assert.equal(page.prevented(), true)
@@ -98,7 +100,7 @@ test('line and page wheel handoff uses CSS pixels after a deliberate new gesture
 test('delegation keeps each marked nested region independent', () => {
   const { child, handlers, nested, outer } = fixture({ nestedTop: 200 })
   handlers.onWheel(wheel(child, { deltaY: 30, timeStamp: 1000 }))
-  const event = wheel(child, { deltaY: 30, timeStamp: 1400 })
+  const event = wheel(child, { deltaY: 30, timeStamp: 1160 })
   handlers.onWheel(event)
   assert.equal(outer.scrollTop, 430)
   assert.equal(event.prevented(), true)
@@ -110,7 +112,7 @@ test('delegation keeps each marked nested region independent', () => {
       : null,
   }
   outer.contains = node => node === nested || node === second
-  handlers.onWheel(wheel(second, { deltaY: 30, timeStamp: 1800 }))
+  handlers.onWheel(wheel(second, { deltaY: 30, timeStamp: 1320 }))
   assert.equal(outer.scrollTop, 430, 'a different reader cannot inherit the first reader’s handoff')
 
   const unrelated = { closest: () => null }
@@ -128,7 +130,7 @@ test('reaching the edge exactly arms the next gesture without handing off the fi
   handlers.onWheel(exact)
   assert.equal(exact.prevented(), false, 'native scrolling consumes the whole delta')
   nested.scrollTop = 200 // browser applies the native movement after the event
-  handlers.onWheel(wheel(child, { deltaY: 20, timeStamp: 1400 }))
+  handlers.onWheel(wheel(child, { deltaY: 20, timeStamp: 1160 }))
   assert.equal(outer.scrollTop, 420)
   handlers.dispose()
 })
@@ -148,12 +150,14 @@ test('ctrl-wheel zoom and scrollable room retain native browser behavior', () =>
   handlers.dispose()
 })
 
-test('non-cancelable edge momentum stays owned by the nested reader', () => {
+test('non-cancelable edge momentum stays contained but a fresh gesture can hand off', () => {
   const { child, handlers, outer } = fixture({ nestedTop: 200 })
   const event = wheel(child, { deltaY: 30, timeStamp: 1000, cancelable: false })
   assert.equal(handlers.onWheel(event), true)
   assert.equal(event.prevented(), false)
   assert.equal(outer.scrollTop, 400)
+  handlers.onWheel(wheel(child, { deltaY: 20, timeStamp: 1160, cancelable: false }))
+  assert.equal(outer.scrollTop, 420)
   handlers.dispose()
 })
 
