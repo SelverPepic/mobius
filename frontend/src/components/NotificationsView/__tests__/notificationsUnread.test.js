@@ -1,4 +1,4 @@
-/* Opening clears the new badge, not the unread dot or the row action. */
+/* Opening clears the new badge, not the unread dot or the list. */
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import React from 'react'
@@ -23,9 +23,9 @@ test('one chronological list marks unread rows with a purple accent dot', () => 
     }),
   ))
   assert.match(html, /Mark all as read/)
-  assert.match(html, /Fresh item[\s\S]*Mark as read[\s\S]*Older item/)
+  assert.match(html, /Fresh item[\s\S]*Older item/)
   assert.doesNotMatch(html, /notifications__group-label/)
   assert.match(html, /notifications__unread-dot/)
   assert.match(html, /notifications__row-item--unread/)
-  assert.equal((html.match(/Mark as read/g) || []).length, 1)
+  assert.doesNotMatch(html, /Mark as read/)
 })

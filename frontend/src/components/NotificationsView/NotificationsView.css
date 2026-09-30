@@ -212,31 +212,6 @@
   font-weight: 700;
 }
 
-.notifications__read-action {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 0 14px 10px 41px;
-  color: var(--danger);
-  font-size: 12px;
-}
-
-.notifications__read-action button {
-  min-height: 32px;
-  padding: 0 8px;
-  border: 0;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--accent);
-  font: inherit;
-  font-weight: 650;
-  cursor: pointer;
-}
-
-.notifications__read-action button:hover:not(:disabled) { background: var(--surface); }
-.notifications__read-action button:focus-visible { outline: 2px solid var(--accent); }
-.notifications__read-action button:disabled { opacity: 0.62; cursor: default; }
-
 .notifications__row-item + .notifications__row-item {
   border-top: 1px solid var(--border-light);
 }

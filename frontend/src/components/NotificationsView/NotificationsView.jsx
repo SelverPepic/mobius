@@ -57,7 +57,6 @@ export default function NotificationsView({
   const [clearError, setClearError] = useState(false)
   const [isMarkingAll, setIsMarkingAll] = useState(false)
   const [markAllError, setMarkAllError] = useState(false)
-  const [readState, setReadState] = useState({})
   const [dismissState, setDismissState] = useState({})
   const [recoveryState, setRecoveryState] = useState({})
 
@@ -139,17 +138,6 @@ export default function NotificationsView({
       setMarkAllError(true)
     } finally {
       setIsMarkingAll(false)
-    }
-  }
-
-  const handleMarkRead = async (notificationId) => {
-    if (!onMarkRead || readState[notificationId] === 'working') return
-    setReadState(current => ({ ...current, [notificationId]: 'working' }))
-    try {
-      await onMarkRead(notificationId)
-      setReadState(current => ({ ...current, [notificationId]: 'done' }))
-    } catch {
-      setReadState(current => ({ ...current, [notificationId]: 'error' }))
     }
   }
 
@@ -348,7 +336,7 @@ export default function NotificationsView({
                             event.currentTarget,
                           )
                         ) return
-                        if (!n.read_at) void handleMarkRead(n.id)
+                        if (!n.read_at && onMarkRead) void onMarkRead(n.id).catch(() => {})
                         onOpenTarget?.(nav)
                       }}
                     >
@@ -370,20 +358,6 @@ export default function NotificationsView({
                     </button>
                   )}
                 </div>
-                {!n.read_at && (
-                  <div className="notifications__read-action">
-                    <button
-                      type="button"
-                      disabled={!onMarkRead || readState[n.id] === 'working'}
-                      onClick={() => handleMarkRead(n.id)}
-                    >
-                      {readState[n.id] === 'working' ? 'Marking…' : 'Mark as read'}
-                    </button>
-                    {readState[n.id] === 'error' && (
-                      <span role="alert">Couldn’t mark read. Try again.</span>
-                    )}
-                  </div>
-                )}
                 {dismissState[n.id] === 'error' && (
                   <p className="notifications__dismiss-error" role="alert">
                     Couldn’t dismiss this notification. Try again.
