@@ -255,13 +255,18 @@ def clear_notifications(
   db: Session = Depends(get_db),
 ):
   """Clear ordinary history without destroying still-usable Undo receipts."""
-  now = datetime.now(UTC)
+  started_at = datetime.now(UTC)
   deleted = 0
   cursor = ""
   while True:
     batch = (
       db.query(models.Notification.id, models.Notification.actions)
-      .filter(models.Notification.owner_id == owner.id, models.Notification.id > cursor)
+      .filter(
+        models.Notification.owner_id == owner.id,
+        models.Notification.id > cursor,
+        # A notification delivered during this sweep belongs to the next history.
+        or_(models.Notification.sent_at.is_(None), models.Notification.sent_at < started_at),
+      )
       .order_by(models.Notification.id)
       .limit(500)
       .all()
@@ -269,7 +274,7 @@ def clear_notifications(
     if not batch:
       break
     cursor = batch[-1].id
-    removable = [row.id for row in batch if not _has_active_undo(row.actions, now)]
+    removable = [row.id for row in batch if not _has_active_undo(row.actions, started_at)]
     if removable:
       deleted += db.query(models.Notification).filter(
         models.Notification.owner_id == owner.id,
@@ -328,6 +333,7 @@ def list_notifications(
   db: Session = Depends(get_db),
   limit: int = Query(20, ge=1, le=100),
   before: str | None = Query(None),
+  before_at: datetime | None = Query(None),
 ):
   """Return notification history, paginated."""
   q = (
@@ -338,22 +344,30 @@ def list_notifications(
       models.Notification.id.desc(),
     )
   )
+  if before_at is not None and (not before or before_at.tzinfo is None):
+    raise HTTPException(status_code=400, detail="Invalid notification cursor.")
   if before:
-    ref = (
-      db.query(models.Notification)
-      .filter(
-        models.Notification.owner_id == owner.id,
-        models.Notification.id == before,
+    if before_at is None:
+      # Existing ID-only callers retain their cursor contract. The shell also
+      # sends the row's timestamp so paging survives that row being removed.
+      ref = (
+        db.query(models.Notification)
+        .filter(
+          models.Notification.owner_id == owner.id,
+          models.Notification.id == before,
+        )
+        .one_or_none()
       )
-      .one_or_none()
-    )
-    if ref is None:
-      raise HTTPException(status_code=400, detail="Invalid notification cursor.")
+      if ref is None:
+        raise HTTPException(status_code=400, detail="Invalid notification cursor.")
+      cursor_at = ref.sent_at
+    else:
+      cursor_at = before_at.astimezone(UTC).replace(tzinfo=None)
     q = q.filter(or_(
-      models.Notification.sent_at < ref.sent_at,
+      models.Notification.sent_at < cursor_at,
       and_(
-        models.Notification.sent_at == ref.sent_at,
-        models.Notification.id < ref.id,
+        models.Notification.sent_at == cursor_at,
+        models.Notification.id < before,
       ),
     ))
   return [

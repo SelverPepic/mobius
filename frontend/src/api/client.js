@@ -1378,10 +1378,11 @@ export const api = {
     ),
   },
   notifications: {
-    // Cursor pagination: `before` is the last row id of the previous page.
-    list: ({ before, limit } = {}) => {
+    // Carry the last row's sort key so paging survives its deletion elsewhere.
+    list: ({ before, beforeAt, limit } = {}) => {
       const params = new URLSearchParams()
       if (before) params.set('before', String(before))
+      if (beforeAt) params.set('before_at', String(beforeAt))
       if (limit) params.set('limit', String(limit))
       const qs = params.toString()
       return apiFetch(`/notifications${qs ? `?${qs}` : ''}`)

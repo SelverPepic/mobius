@@ -153,6 +153,33 @@ def test_history_cursor_is_stable_when_timestamps_tie(client, auth, db):
   assert [row["id"] for row in second.json()] == ["n-a"]
 
 
+def test_history_continues_after_cursor_row_is_deleted(client, auth, db):
+  owner = db.query(models.Owner).first()
+  sent_at = datetime(2026, 7, 27, 2, 0, tzinfo=UTC)
+  for notification_id in ("n-a", "n-b", "n-c"):
+    db.add(models.Notification(
+      id=notification_id, owner_id=owner.id, source_type="system",
+      title=notification_id, sent_at=sent_at,
+    ))
+  db.commit()
+
+  first = client.get("/api/notifications", headers=auth, params={"limit": 2})
+  assert [row["id"] for row in first.json()] == ["n-c", "n-b"]
+  cursor = first.json()[-1]
+  db.delete(db.query(models.Notification).filter_by(id=cursor["id"]).one())
+  db.commit()
+
+  second = client.get("/api/notifications", headers=auth, params={
+    "limit": 2, "before": cursor["id"], "before_at": cursor["sent_at"],
+  })
+  assert second.status_code == 200, second.text
+  assert [row["id"] for row in second.json()] == ["n-a"]
+  offset = client.get("/api/notifications", headers=auth, params={
+    "limit": 2, "before": cursor["id"], "before_at": "2026-07-27T04:00:00+02:00",
+  })
+  assert [row["id"] for row in offset.json()] == ["n-a"]
+
+
 def test_history_rejects_an_unknown_cursor(client, auth):
   response = client.get(
     "/api/notifications",
@@ -161,6 +188,14 @@ def test_history_rejects_an_unknown_cursor(client, auth):
   )
   assert response.status_code == 400
   assert response.json()["detail"] == "Invalid notification cursor."
+
+  for params in (
+    {"before_at": "2026-07-27T02:00:00Z"},
+    {"before": "n-a", "before_at": "2026-07-27T02:00:00"},
+  ):
+    invalid = client.get("/api/notifications", headers=auth, params=params)
+    assert invalid.status_code == 400
+    assert invalid.json()["detail"] == "Invalid notification cursor."
 
 
 def test_owner_can_dismiss_one_notification(client, auth):
@@ -263,6 +298,39 @@ def test_clear_scans_large_history_without_skipping_live_undo(client, auth, db):
   assert cleared.status_code == 200, cleared.text
   assert cleared.json() == {"deleted": 505}
   assert {row.id for row in db.query(models.Notification).all()} == {"bulk-0250-undo"}
+
+
+def test_clear_does_not_delete_arrival_between_batches(client, auth, db, monkeypatch):
+  from app.database import SessionLocal
+  from app.routes import notifications as route
+
+  owner_id = db.query(models.Owner.id).first()[0]
+  db.add(models.Notification(
+    id="a-old", owner_id=owner_id, source_type="agent", title="Old",
+    sent_at=datetime.now(UTC) - timedelta(minutes=1),
+  ))
+  db.commit()
+
+  original = route._has_active_undo
+  inserted = False
+
+  def insert_after_sweep_started(actions, started_at):
+    nonlocal inserted
+    if not inserted:
+      inserted = True
+      with SessionLocal() as other:
+        other.add(models.Notification(
+          id="z-new", owner_id=owner_id, source_type="agent", title="New",
+          sent_at=started_at + timedelta(microseconds=1),
+        ))
+        other.commit()
+    return original(actions, started_at)
+
+  monkeypatch.setattr(route, "_has_active_undo", insert_after_sweep_started)
+  cleared = client.delete("/api/notifications", headers=auth)
+  assert cleared.status_code == 200, cleared.text
+  assert cleared.json() == {"deleted": 1}
+  assert {row.id for row in db.query(models.Notification).all()} == {"z-new"}
 
 
 def test_notification_created_published_on_system_bus(client, auth):

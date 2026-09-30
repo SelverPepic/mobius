@@ -723,7 +723,9 @@ const NOTIFICATIONS_PREVIEW_SIZE = 8
 
 async function fetchNotificationsPage({ pageParam = null } = {}) {
   const res = await api.notifications.list({
-    limit: NOTIFICATIONS_PREVIEW_SIZE, before: pageParam,
+    limit: NOTIFICATIONS_PREVIEW_SIZE,
+    before: pageParam?.id,
+    beforeAt: pageParam?.sentAt,
   })
   const data = await jsonOrThrow(res, 'notifications fetch failed:')
   return Array.isArray(data) ? data : []
@@ -734,7 +736,9 @@ const notificationHistoryOptions = {
   queryFn: fetchNotificationsPage,
   initialPageParam: null,
   getNextPageParam: page => (
-    page.length === NOTIFICATIONS_PREVIEW_SIZE ? page.at(-1).id : undefined
+    page.length === NOTIFICATIONS_PREVIEW_SIZE
+      ? { id: page.at(-1).id, sentAt: page.at(-1).sent_at }
+      : undefined
   ),
 }
 
