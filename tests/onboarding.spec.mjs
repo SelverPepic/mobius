@@ -91,3 +91,61 @@ test('mobile guide content scrolls while its Next action remains usable', async 
   await guide.getByRole('button', { name: 'Next' }).click()
   await expect(guide.getByRole('heading', { name: 'Your settings' })).toBeVisible()
 })
+
+test('an app is installed only after its access is shown in the Apps slide', async ({ page }) => {
+  let previews = 0
+  let installs = 0
+  await page.route(/\/api\/apps\/$/, async route => {
+    const response = await route.fetch()
+    const apps = (await response.json()).filter(app => app.slug !== 'notes')
+    await route.fulfill({ response, body: JSON.stringify(apps) })
+  })
+  await page.route(/\/api\/apps\/\d+\/source\/file\?path=catalog\.json$/, route => route.fulfill({ status: 503 }))
+  await page.route(/\/api\/proxy\?/, route => {
+    const source = new URL(route.request().url()).searchParams.get('url')
+    if (source?.endsWith('/catalog.json')) return route.fulfill({
+      status: 200, contentType: 'application/json',
+      body: JSON.stringify({ schema: 1, apps: [{ id: 'notes', name: 'Notes', description: 'Write notes.', collection: 'Everyday', manifest_url: 'https://example.com/notes/mobius.json', raw_base: 'https://example.com/notes/' }] }),
+    })
+    if (source?.endsWith('/notes/mobius.json')) return route.fulfill({ status: 200, contentType: 'application/json', body: '{"id":"notes"}' })
+    return route.continue()
+  })
+  await page.route(/\/api\/apps\/preview$/, route => {
+    previews += 1
+    if (previews === 1) return route.fulfill({ status: 503, contentType: 'application/json', body: '{"detail":"App source unavailable"}' })
+    return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
+      manifest: { id: 'notes' }, capability_digest: 'reviewed-notes-access',
+      capability_contract: { agent: { skills: [] }, data: { github_access: true }, runtime: {} },
+      installed_contract: null,
+    }) })
+  })
+  await page.route(/\/api\/apps\/install$/, route => {
+    installs += 1
+    expect(route.request().postDataJSON().reviewed_capability_digest).toBe(installs === 1 ? 'reviewed-notes-access' : 'changed-notes-access')
+    if (installs === 1) return route.fulfill({ status: 409, contentType: 'application/json', body: JSON.stringify({ detail: {
+      code: 'capability_changed', manifest: { id: 'notes' }, capability_digest: 'changed-notes-access',
+      capability_contract: { agent: { skills: [] }, data: { shared_memory: 'read' }, runtime: {} },
+    } }) })
+    return route.fulfill({ status: 201, contentType: 'application/json', body: '{"id":42}' })
+  })
+
+  const { guide } = await openGuide(page)
+  for (let step = 0; step < 3; step += 1) await guide.getByRole('button', { name: 'Next' }).click()
+  await expect(guide.getByRole('heading', { name: 'Explore apps' })).toBeVisible()
+  await guide.getByRole('button', { name: 'Install Notes' }).click()
+  const access = guide.getByRole('region', { name: 'Notes requested access' })
+  await expect(access.getByRole('alert')).toContainText('App source unavailable')
+  expect(installs).toBe(0)
+  await access.getByRole('button', { name: 'Retry check' }).click()
+  await expect(access).toContainText('GitHub data')
+  await expect(guide.getByRole('button', { name: 'Cancel Notes' })).toBeFocused()
+  expect(installs).toBe(0)
+  await access.getByRole('button', { name: 'Install app' }).click()
+  await expect(access.getByRole('alert')).toContainText('Nothing was installed')
+  await expect(access).toContainText('Shared memory')
+  expect(installs).toBe(1)
+  await access.getByRole('button', { name: 'Install app' }).click()
+  await expect(guide.getByRole('button', { name: 'Installed Notes' })).toBeDisabled()
+  await expect(guide.getByRole('button', { name: 'Installed Notes' })).toBeFocused()
+  expect(installs).toBe(2)
+})
