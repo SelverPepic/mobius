@@ -276,13 +276,36 @@ def test_renaming_an_archived_chat_keeps_it_archived(client, auth, chat, db):
   assert chat.archived_at is not None
 
 
-def test_pinning_an_archived_chat_does_not_restore_it(client, auth, chat, db):
+def test_an_archived_chat_cannot_be_pinned_so_restore_never_brings_back_a_pin(
+  client, auth, chat, db,
+):
+  """Archive -> stale pin attempt -> restore leaves the chat unpinned."""
   client.post(f"/api/chats/{chat.id}/archive", headers=auth)
 
-  client.patch(f"/api/chats/{chat.id}", json={"pinned": True}, headers=auth)
+  pinned = client.patch(
+    f"/api/chats/{chat.id}", json={"pinned": True}, headers=auth,
+  )
 
+  assert pinned.status_code == 409, pinned.text
   db.refresh(chat)
   assert chat.archived_at is not None
+  assert chat.pinned_at is None
+
+  restored = client.post(f"/api/chats/{chat.id}/unarchive", headers=auth)
+  assert restored.json() == {"archived_at": None, "pinned_at": None}
+
+
+def test_archived_chats_still_accept_unpin_and_other_edits(client, auth, chat, db):
+  client.post(f"/api/chats/{chat.id}/archive", headers=auth)
+
+  unpinned = client.patch(
+    f"/api/chats/{chat.id}", json={"pinned": False, "title": "Filed"}, headers=auth,
+  )
+
+  assert unpinned.status_code == 200, unpinned.text
+  db.refresh(chat)
+  assert chat.pinned_at is None
+  assert chat.title == "Filed"
 
 
 def test_embedded_app_panel_send_leaves_an_archived_chat_archived(

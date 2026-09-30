@@ -1605,8 +1605,24 @@ async def patch_chat(
         superseded = drawer_pins.intent_is_superseded(
           body.pin_intent_client, body.pin_intent_version,
         )
-        if not superseded:
-          chat.pinned_at = now_naive_utc() if body.pinned else None
+        if not superseded and body.pinned:
+          # Pinning keeps a chat in view; archiving files it away and clears
+          # the pin (app.chat_archive). One conditional UPDATE decides both,
+          # so a stale client cannot pin a chat archived meanwhile.
+          pinned = db.query(models.Chat).filter(
+            models.Chat.id == chat.id,
+            models.Chat.archived_at.is_(None),
+          ).update(
+            {models.Chat.pinned_at: now_naive_utc()},
+            synchronize_session="fetch",
+          )
+          if not pinned:
+            db.rollback()
+            raise HTTPException(
+              status_code=409, detail="Restore this chat before pinning it.",
+            )
+        elif not superseded:
+          chat.pinned_at = None
         db.commit()
         if not superseded:
           drawer_pins.record_committed_intent(
