@@ -21,6 +21,7 @@ import re
 import signal
 import time
 from collections import Counter, defaultdict, deque
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Lock
@@ -240,6 +241,22 @@ def cgroup_oom_kill_count(
   return None
 
 
+@dataclass(frozen=True)
+class ProcessExitEvidence:
+  """Original process outcome and cgroup counter, never cleanup's outcome."""
+
+  exit_code: int | None
+  oom_kills: int | None
+
+  def was_oom_killed(self, oom_kills_before: int | None) -> bool:
+    return (
+      self.exit_code == -signal.SIGKILL
+      and oom_kills_before is not None
+      and self.oom_kills is not None
+      and self.oom_kills > oom_kills_before
+    )
+
+
 def process_was_oom_killed(
   exit_code: int | None, *, oom_kills_before: int | None,
 ) -> bool:
@@ -250,10 +267,9 @@ def process_was_oom_killed(
   is best-effort evidence, not kernel victim identification. Missing counters
   fail closed; historical kills cannot be consumed by later failed requests.
   """
-  if exit_code != -signal.SIGKILL or oom_kills_before is None:
-    return False
-  count = cgroup_oom_kill_count()
-  return count is not None and count > oom_kills_before
+  return ProcessExitEvidence(
+    exit_code, cgroup_oom_kill_count() if exit_code == -signal.SIGKILL else None,
+  ).was_oom_killed(oom_kills_before)
 
 
 def cgroup_memory_snapshot(

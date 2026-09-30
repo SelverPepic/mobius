@@ -46,6 +46,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable
 
+from app.codex_sdk_contract import app_server_exit_code
+from app.memory_observability import ProcessExitEvidence, cgroup_oom_kill_count
+
 log = logging.getLogger(__name__)
 
 HOST_IDLE_SECONDS = 90.0
@@ -360,13 +363,30 @@ class CodexHelperHost(Host):
     self.client: Any = None
     self.process_group_id: int | None = None
     self._executor: Any = None
+    self._exit_evidence: ProcessExitEvidence | None = None
 
   @property
   def alive(self) -> bool:
     if self._closed or self.client is None:
       return False
-    proc = getattr(getattr(getattr(self.client, "_client", None), "_sync", None), "_proc", None)
-    return proc is None or proc.poll() is None
+    return self.exit_evidence.exit_code is None
+
+  @property
+  def exit_evidence(self) -> ProcessExitEvidence:
+    """Retain the first death observation for every outstanding lease.
+
+    Close freezes even absent evidence before the SDK can kill or clear _proc.
+    A later lease's counter baseline must not reinterpret this host's death.
+    """
+    if self._exit_evidence is None:
+      code = app_server_exit_code(self.client)
+      evidence = ProcessExitEvidence(
+        code, cgroup_oom_kill_count() if code is not None else None,
+      )
+      if code is not None:
+        self._exit_evidence = evidence
+      return evidence
+    return self._exit_evidence
 
   async def start(self) -> None:
     from app.codex_sdk_runner import (
@@ -409,6 +429,7 @@ class CodexHelperHost(Host):
       log.debug("helper thread unload failed thread=%s", thread_id, exc_info=True)
 
   async def close(self) -> None:
+    self._exit_evidence = self.exit_evidence
     self._closed = True
     context, self._context = self._context, None
     if context is not None:

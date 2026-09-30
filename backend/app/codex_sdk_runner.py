@@ -381,7 +381,7 @@ async def _enter_codex_context_owned(
 @contextlib.asynccontextmanager
 async def _codex_client_scope(
   codex_context, helper_host_key, sdk, config,
-  *, observe_exit: Callable[[Any], None],
+  *, oom_kills_before: int | None, observe_exit: Callable[[bool], None],
 ):
   """Yield ``(client, entry_cancel, helper_host)`` for one turn.
 
@@ -397,7 +397,9 @@ async def _codex_client_scope(
       finally:
         # SDK close can SIGKILL and discard _proc. Observe the original
         # process outcome before cleanup can manufacture different evidence.
-        observe_exit(codex)
+        observe_exit(process_was_oom_killed(
+          app_server_exit_code(codex), oom_kills_before=oom_kills_before,
+        ))
     return
   from app import helper_hosts
   async with helper_hosts.MANAGER.lease(
@@ -407,7 +409,7 @@ async def _codex_client_scope(
     try:
       yield host.client, None, host
     finally:
-      observe_exit(host.client)
+      observe_exit(host.exit_evidence.was_oom_killed(oom_kills_before))
 
 
 class _EnteredCodexContext:
@@ -1734,16 +1736,14 @@ async def _run_codex_sdk_turn(
   oom_kills_before = cgroup_oom_kill_count()
   process_oom_killed = False
 
-  def observe_process_exit(codex: Any) -> None:
+  def observe_process_exit(oom_killed: bool) -> None:
     nonlocal process_oom_killed
-    process_oom_killed = process_was_oom_killed(
-      app_server_exit_code(codex), oom_kills_before=oom_kills_before,
-    )
+    process_oom_killed = oom_killed
 
   try:
     async with _codex_client_scope(
       codex_context, helper_host_key, sdk, config,
-      observe_exit=observe_process_exit,
+      oom_kills_before=oom_kills_before, observe_exit=observe_process_exit,
     ) as (codex, entry_cancel, helper_host):
       goal_client = control_client(codex) if session_id and retire_native_goal else None
       record_memory_checkpoint_once(
