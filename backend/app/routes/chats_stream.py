@@ -13,7 +13,7 @@ from starlette.background import BackgroundTask
 from starlette.responses import Response
 from sqlalchemy.orm import Session
 
-from app import activity, models, questions, schemas
+from app import activity, chat_archive, models, questions, schemas
 from app.broadcast import create_broadcast, get_broadcast, get_system_broadcast
 from app.chat_event_sink import active_sink_stream_snapshot
 from app.chat import (
@@ -687,6 +687,15 @@ async def send_message(
     body = _confine_agent_card_answer(body, exact_card)
     if exact_retry:
       agent_exact_retry = _is_exact_agent_card_retry(body, exact_card)
+
+  # The owner writing into an archived chat is picking it back up, so it
+  # returns to Recents. Agent, helper, and app sends leave it filed away.
+  if (
+    chat.archived_at is not None
+    and principal.scope == "owner"
+    and is_owner_input_principal(principal)
+  ):
+    chat_archive.unarchive_chat(db, chat)
 
   # A typed Restart card is a platform action, not a prose continuation. The
   # writer re-matches the exact card and option identity inside its mutation;

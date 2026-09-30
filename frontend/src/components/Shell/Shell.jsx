@@ -136,6 +136,7 @@ import {
   ownerInputChangeFromEvent,
   reconcileChatRenameGuards,
   withChatOwnerActivity,
+  withChatArchive,
   withChatOwnerInput,
   withChatRename,
   withChatRunState,
@@ -2509,6 +2510,45 @@ export default function Shell({ onInitialVisualReady }) {
     }
   }, [projectChatLookup, queryClient])
 
+  // Archive state is owner filing, so both directions apply optimistically and
+  // roll back on failure. The committed `chat_archive_changed` event then
+  // re-reads the row in every open window, this one included.
+  const setChatArchived = useCallback(async (chatId, archived, { undoable = true } = {}) => {
+    const sid = String(chatId)
+    const previous = chatsRef.current.find(row => String(row?.id) === sid)
+    if (!previous) return
+    projectChatList(rows => withChatArchive(rows, sid, {
+      archivedAt: archived ? (previous.archived_at || new Date().toISOString()) : null,
+      pinnedAt: archived ? null : previous.pinned_at,
+    }))
+    let committed = false
+    try {
+      const response = await (archived ? api.chats.archive(sid) : api.chats.unarchive(sid))
+      committed = response.ok
+    } catch {}
+    if (!committed) {
+      projectChatList(rows => withChatArchive(rows, sid, {
+        archivedAt: previous.archived_at,
+        pinnedAt: previous.pinned_at,
+      }))
+      showToast(`Couldn’t ${archived ? 'archive' : 'restore'} that chat.`, { variant: 'error' })
+      return
+    }
+    if (!undoable) return
+    // Undo needs time to read and reach, matching the shell's other
+    // actionable notices rather than the 4 s informational default.
+    showToast(archived ? 'Chat archived' : 'Chat restored', {
+      duration: 6000,
+      action: {
+        label: 'Undo',
+        onAction: () => { void setChatArchived(sid, !archived, { undoable: false }) },
+      },
+    })
+  }, [projectChatList, showToast])
+  const archivedChatIds = useMemo(() => new Set(
+    chats.filter(row => row?.archived_at).map(row => String(row.id)),
+  ), [chats])
+
   const confirmAppDeleted = useCallback((id) => {
     const sid = String(id)
     rememberConfirmedDeletion(deletedAppIdsRef.current, sid)
@@ -2977,6 +3017,11 @@ export default function Shell({ onInitialVisualReady }) {
       // pill and hot-swaps the preview when a build finishes — no polling.
       const projectId = buildEventProjectId(ev)
       if (projectId != null) projectQueries.artifacts.invalidate(queryClient, projectId)
+      void projectQueries.list.invalidate(queryClient)
+    } else if (ev.type === 'chat_archive_changed') {
+      // Re-read the one row rather than patch it: this window may hold no
+      // copy, or a stale one, of a chat archived elsewhere.
+      if (ev.chatId) refreshChatRows(ev.chatId)
       void projectQueries.list.invalidate(queryClient)
     } else if (ev.type === 'chat_renamed') {
       // The committed event carries the exact changed row fields. Apply those
@@ -4579,6 +4624,7 @@ export default function Shell({ onInitialVisualReady }) {
         onAddSourceToProjects={addSourceToProjects}
         onNewChat={startUserChat}
         onDeleteChat={deleteChat}
+        onSetChatArchived={setChatArchived}
         onDeleteApp={deleteApp}
         onDeleteAppData={deleteAppData}
         onNotice={showToast}
@@ -4941,6 +4987,8 @@ export default function Shell({ onInitialVisualReady }) {
                 onInternalNav={handleChatInternalNav}
                 onChatMissing={handlePaneChatMissing}
                 onFirstMessage={handlePaneChatFirstMessage}
+                archived={archivedChatIds.has(String(chatId))}
+                setChatArchived={setChatArchived}
                 onDisplayReady={role === 'held' || !surfaceVisible
                   ? null
                   : handlePaneChatDisplayReady}

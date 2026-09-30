@@ -291,6 +291,11 @@ class Chat(Base):
   # column DESC (newest pin at top of pinned group). PATCH
   # /api/chats/{id} accepts `pinned: bool` to toggle.
   pinned_at = Column(DateTime, nullable=True, default=None)
+  # Owner filing: NOT NULL = archived. An archived chat is a complete, live
+  # chat (history, runs, waits, helpers all untouched) that the drawer lists
+  # under Archived instead of Recents and startup continuity skips. Unlike
+  # deleted_at it never expires. See app.chat_archive for every transition.
+  archived_at = Column(DateTime, nullable=True, default=None)
   # App that created this chat, when it was opened through the
   # app-attributed chat contract (design §1) rather than by the owner
   # in the shell. NULL = an ordinary owner chat. Set, this chat is

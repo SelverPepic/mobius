@@ -57,6 +57,17 @@ export function withChatOwnerActivity(rows, chatId, at = new Date().toISOString(
   return withChatListRowPatch(rows, chatId, {
     has_messages: true,
     activity_at: activityAt,
+    // The owner writing into an archived chat restores it (the server applies
+    // the same rule in the send route), so it returns to Recents immediately.
+    archived_at: null,
+  })
+}
+
+/** Apply one chat's committed (or optimistic) archive state in place. */
+export function withChatArchive(rows, chatId, { archivedAt, pinnedAt } = {}) {
+  return withChatListRowPatch(rows, chatId, {
+    archived_at: archivedAt || null,
+    pinned_at: pinnedAt || null,
   })
 }
 

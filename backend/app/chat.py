@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import Text, cast, func, literal_column, or_, text
+from sqlalchemy import Text, cast, literal_column, or_, text
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
@@ -73,6 +73,7 @@ from app.chat_context import (
   _last_user_message_elapsed,
   _latest_compaction_brief,
   _strip_report_html,
+  recent_chat_digest_order,
 )
 from app.chat_logging import (
   get_chat_log_handler,
@@ -1371,7 +1372,7 @@ def _nonempty_pending_queues(db: Session) -> list:
   that column for every chat walks every transcript; on a cold page cache that
   blocked the event loop for 20-40 s. The partial index
   ``ix_chats_pending_queue`` (migration 0069) lists only non-empty queues.
-  Without ANALYZE statistics SQLite prefers ``ix_chats_drawer``'s
+  Without ANALYZE statistics SQLite prefers ``ix_chats_drawer_v2``'s
   ``deleted_at`` equality and reads every row anyway, so the plan is pinned
   with INDEXED BY. Other databases store large values out of line.
   """
@@ -5122,15 +5123,7 @@ async def _run_chat_impl_with_db(
   startup_context = ""
   if not session_id and run_policy is None:
     # `build_memory_block` is pure; the activity emit + envelope live here.
-    ordered_chat_ids = [
-      row[0]
-      for row in db.query(models.Chat.id).filter(
-        models.Chat.deleted_at.is_(None),
-      ).order_by(
-        func.coalesce(models.Chat.activity_at, models.Chat.updated_at).desc(),
-        models.Chat.id.desc(),
-      ).all()
-    ]
+    ordered_chat_ids = recent_chat_digest_order(db)
     block = memory.build_memory_block(
       settings.data_dir,
       ordered_chat_ids=ordered_chat_ids,

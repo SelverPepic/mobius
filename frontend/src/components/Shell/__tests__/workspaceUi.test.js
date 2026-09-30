@@ -981,7 +981,7 @@ test('large drawer lists memoize ordering and row actions without changing row o
   assert.match(drawer, /const filteredApps = useMemo\(/)
   assert.match(drawer, /const rowActions = useMemo\(/)
   assert.match(drawer, /const DrawerRow = memo\(function DrawerRow/)
-  assert.match(drawer, /visibleRecents\.map\(\(\{ kind, item \}\)[\s\S]*?item=\{item\}[\s\S]*?actions=\{rowActions\}/)
+  assert.match(drawer, /visibleListItems\.map\(\(\{ kind, item \}\)[\s\S]*?item=\{item\}[\s\S]*?actions=\{rowActions\}/)
   assert.match(drawer, /item=\{app\}[\s\S]*?actions=\{rowActions\}/)
   assert.doesNotMatch(drawer, /onSelect=\{\(\) => on(?:Chat|App)/)
   assert.equal((drawer.match(/<DrawerItemMenu/g) || []).length, 1,
