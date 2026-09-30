@@ -3280,6 +3280,8 @@ async def _run_post_commit_effects(
   Every failure here becomes a warning. The app row and selected bundle are
   already durable, so this phase must never enter the pre-commit rollback path.
   """
+  from app import app_setup
+  app_setup.request_run()
   manifest = candidate.manifest
   schedule = manifest.get("schedule")
   job_name = schedule.get("job") if schedule else None
