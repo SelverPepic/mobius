@@ -7,6 +7,7 @@ import { createServer } from 'vite'
 globalThis.window = { location: { origin: 'http://localhost', href: 'http://localhost/shell/' }, innerWidth: 420 }
 const vite = await createServer({ appType: 'custom', logLevel: 'error', server: { middlewareMode: true, hmr: false, ws: false }, ssr: { noExternal: ['@openai/apps-sdk-ui'] } })
 const { default: Active } = await vite.ssrLoadModule('/src/components/ChatView/ActiveAssistantSurface.jsx')
+const { assistantReplyGroups } = await vite.ssrLoadModule('/src/components/ChatView/assistantReplies.js')
 const { default: Message } = await vite.ssrLoadModule('/src/components/ChatView/MsgContent.jsx')
 const { PeerTimelineRows } = await vite.ssrLoadModule('/src/components/ChatView/PeerTimeline.jsx')
 const { PeerTimelineContext } = await vite.ssrLoadModule('/src/components/ChatView/peerTimelineContext.js')
@@ -15,13 +16,14 @@ after(() => vite.close())
 const note = { id: 'incoming', sender_chat_id: 'peer', sender_name: 'Colleague', body: 'New information', created_at: 2000, display_position: { assistant_message_id: 'answer', block_index: 0, text_offset: 9 } }
 const context = { tools: new Map([['peer-incoming', [note]]]), positions: new Map([['answer', [note]]]) }
 const message = { id: 'answer', role: 'assistant', blocks: [{ type: 'text', content: 'Earlier\n\nLater response' }] }
+const replyGroup = { rows: [{ message, key: 'answer', anchorKey: 'answer', notes: [] }] }
 function render(Component, props, value = context) {
   return renderWithModels(React.createElement(PeerTimelineContext.Provider, { value }, React.createElement(Component, props)))
 }
 test('live and reopened response place the incoming row before later prose', () => {
   const saved = render(Message, { msg: message, chatId: 'chat', messageKey: 'answer' })
-  const live = render(Active, { activeMirrorMsg: message, activityMessageId: 'answer', activitySourceBlocks: message.blocks, useDbActivePayload: true, hasLivePayload: false, streamItems: [], chatId: 'chat', dataKey: 'answer', isStreaming: true })
-  const streamed = render(Active, { activeMirrorMsg: null, activityMessageId: 'answer', useDbActivePayload: false, hasLivePayload: true, streamItems: message.blocks, chatId: 'chat', dataKey: 'answer', isStreaming: true })
+  const live = render(Active, { replyGroup, activeMirrorMsg: message, activitySourceBlocks: message.blocks, useDbActivePayload: true, hasLivePayload: false, streamItems: [], chatId: 'chat', isStreaming: true })
+  const streamed = render(Active, { replyGroup, activeMirrorMsg: null, useDbActivePayload: false, hasLivePayload: true, streamItems: message.blocks, chatId: 'chat', isStreaming: true })
   for (const html of [saved, live, streamed]) {
     assert.ok(html.indexOf('Earlier') < html.indexOf('Received from Colleague'))
     assert.ok(html.indexOf('Received from Colleague') < html.indexOf('Later response'))
@@ -315,3 +317,23 @@ test('a later standalone Restart request owns the card before legacy activity', 
   assert.match(html, /\(3 steps\)/)
   assert.doesNotMatch(html, /standalone-success/)
 })
+
+for (const isStreaming of [true, false]) {
+  test(`hidden replay uses one Markdown paragraph in the shared reply surface (${isStreaming})`, () => {
+    const prefix = 'This sentence continues;'
+    const answer = `${prefix} without an artificial paragraph boundary.`
+    const first = { role: 'assistant', id: 'reply', blocks: [{ type: 'text', content: prefix }], source_ref: { message_index: 1, count: 1 } }
+    const tail = { role: 'assistant', id: 'reply:assistant:1', blocks: [{ type: 'text', content: answer }], source_ref: { message_index: 3, count: 1 } }
+    const group = assistantReplyGroups([first, { role: 'user', hidden: true, steered: true }, tail]).get(0)
+    const html = render(Active, {
+      replyGroup: group, activeRowIndex: isStreaming ? 1 : -1,
+      activeMirrorMsg: tail, activitySourceBlocks: tail.blocks,
+      useDbActivePayload: true, isStreaming, chatId: 'reply-fixture',
+    }, { tools: new Map(), positions: new Map() })
+    assert.ok(html.includes(answer), 'the suffix belongs to the original paragraph')
+    assert.equal((html.match(/<p\b[^>]*>/g) || []).length, 1)
+    assert.equal((html.match(/<section class="chat__sources"/g) || []).length, isStreaming ? 0 : 1)
+    assert.match(html, /data-key="reply"/)
+    assert.match(html, /data-key="reply:assistant:1"/)
+  })
+}

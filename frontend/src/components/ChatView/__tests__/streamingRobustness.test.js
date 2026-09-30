@@ -29,8 +29,10 @@ test('active DB, live deltas, and reconnect snapshots share one assistant surfac
     'StreamingMessage must not mount a competing assistant block tree')
   assert.match(activeAssistantSource, /streamItemsToAssistantPayload\(streamItems, \{ finalize: false \}\)/,
     'the live source must feed the same DB-shaped payload consumed by MsgContent')
-  assert.match(chatViewSource, /key=\{streamingDataKey\}[\s\S]*dataKey=\{streamingDataKey\}/,
-    'the active row key and scroll-anchor data-key must remain stable across source selection')
+  assert.match(chatViewSource, /activeKey: streamingDataKey/,
+    'the active source row must retain its display key across live and DB selection')
+  assert.match(activeAssistantSource, /<Fragment key=\{row\.key\}>[\s\S]*dataKey=\{row\.key\}/,
+    'each physical row must use the same React key and scroll-anchor data-key')
   assert.match(streamHookSource, /\/stream[\s\S]*?'X-Mobius-Stream-Snapshot': '1'/,
     'new clients must opt into snapshot catch-up without changing the stable stream URL')
   assert.match(

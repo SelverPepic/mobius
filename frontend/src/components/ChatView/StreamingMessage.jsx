@@ -31,12 +31,25 @@ export default function StreamingMessage({
   pendingQuestionRef,
   resumeCardRef,
   isStreaming,
+  isActiveAnswer = true,
+  isLastMsg = true,
+  anchorKey,
+  replyFragment = false,
+  emptyReplyRow = false,
+  hideReferences = false,
+  continuationWait,
+  recoveryCredit,
+  suppressedQuestionKeys = null,
 }) {
   return (
     <li
-      className="chat__msg chat__msg--assistant"
+      className={`chat__msg chat__msg--assistant${replyFragment ? ' chat__msg--reply-fragment' : ''}${emptyReplyRow ? ' chat__msg--reply-empty' : ''}`}
       data-key={dataKey}
-      data-active-assistant="true"
+      data-source-key={msg.id && msg.id !== dataKey ? msg.id : undefined}
+      data-text-owner-key={msg.reply_text_owner_key}
+      data-anchor-key={anchorKey && anchorKey !== dataKey ? anchorKey : undefined}
+      data-active-assistant={isActiveAnswer ? 'true' : undefined}
+      tabIndex={-1}
     >
       <MsgContent
         msg={msg}
@@ -57,13 +70,16 @@ export default function StreamingMessage({
         onAutoResumeChange={onAutoResumeChange}
         limitResetElapsed={limitResetElapsed}
         submissionBlocked={submissionBlocked}
-        isLastMsg
+        isLastMsg={isLastMsg}
         liveQuestionId={liveQuestionId}
         pendingQuestionRef={pendingQuestionRef}
         resumeCardRef={resumeCardRef}
-        isActiveAnswer
+        isActiveAnswer={isActiveAnswer}
         isStreaming={isStreaming}
-        suppressedQuestionKeys={null}
+        hideReferences={hideReferences}
+        continuationWait={continuationWait}
+        recoveryCredit={recoveryCredit}
+        suppressedQuestionKeys={suppressedQuestionKeys}
       />
     </li>
   )

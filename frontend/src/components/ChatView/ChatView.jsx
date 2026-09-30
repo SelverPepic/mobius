@@ -188,7 +188,9 @@ import {
   commitAssistantPromotion,
   deriveActiveAssistantSelection,
 } from './activeAssistantSelection.js'
+import { assistantReplyGroups } from './assistantReplies.js'
 import {
+  assistantReplyRoot,
   projectSettledSteerContinuations,
   sealedAssistantBeforeSteer,
 } from './steerContinuity.js'
@@ -1036,6 +1038,10 @@ export default function ChatView({
   const hadMessagesRef = useRef((cached?.messages?.length ?? 0) > 0)
   const promotedRef = useRef(false)
   const activeAssistantDataKeyRef = useRef(null)
+  // A sealed row keeps the display identity it first painted under. Hidden
+  // cuts grow its reply surface instead of remounting the earlier paragraph.
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- Reset the identity cache when this pane changes chat.
+  const assistantDisplayKeys = useMemo(() => new Map(), [chatId])
   // Current promotion is owned by the stream's durable assistant id. This
   // sticky mount bridge is the id-less rolling-data fallback: its captured ts
   // may identify the kept DB partial until markBridged() retires the gate.
@@ -5372,14 +5378,27 @@ export default function ChatView({
     ))
     if (localIndex < 0) return
     const renderIndex = ownerMessageBatch(messages, localIndex)?.start ?? localIndex
-    const canonicalKey = messageKey(messages[renderIndex], offset + renderIndex)
-    const row = [...(scrollRef.current?.querySelectorAll('.chat__msg[data-key]') || [])]
-      .find(element => element.dataset.key === canonicalKey)
+    let canonicalKey = messageKey(messages[renderIndex], offset + renderIndex)
+    const sourceRows = [...(scrollRef.current?.querySelectorAll('.chat__msg[data-key]') || [])]
+    let row = sourceRows
+      .find(element => element.dataset.key === canonicalKey || element.dataset.sourceKey === canonicalKey)
     if (!canonicalKey || !row) return
+    canonicalKey = row.dataset.key
 
     searchRevealCleanupRef.current()
+    let highlight = highlightSearchTerms(row, searchReveal.terms)
+    // Exact hidden replay may extend an earlier text surface. Keep the saved
+    // source identity, but reveal the rendered words rather than its empty row.
+    if (!highlight.firstRange && row.dataset.textOwnerKey) {
+      const owner = sourceRows.find(element => element.dataset.key === row.dataset.textOwnerKey)
+      if (owner) {
+        highlight.clear()
+        row = owner
+        canonicalKey = row.dataset.key
+        highlight = highlightSearchTerms(row, searchReveal.terms)
+      }
+    }
     row.classList.add('chat__msg--search-reveal')
-    const highlight = highlightSearchTerms(row, searchReveal.terms)
     row.focus({ preventScroll: true })
     if (!revealAnchor(canonicalKey, 96, highlight.firstRange)) {
       row.classList.remove('chat__msg--search-reveal')
@@ -5698,6 +5717,8 @@ export default function ChatView({
     activeSteerContinuationIndex,
   )
   useLayoutEffect(() => {
+    const sourceId = activeMirrorMsg?.id || streamAssistantMessageId || activeAssistantMessageId
+    if (showActiveAssistantSurface && sourceId) assistantDisplayKeys.set(sourceId, streamingDataKey)
     if (!turnActive) {
       activeAssistantDataKeyRef.current = null
       return
@@ -5712,7 +5733,7 @@ export default function ChatView({
           : null,
       }
     }
-  }, [turnActive, showActiveAssistantSurface, streamingDataKey, activeMirrorMsg, activeMirrorMsgIdx])
+  }, [turnActive, showActiveAssistantSurface, streamingDataKey, activeMirrorMsg, activeMirrorMsgIdx, streamAssistantMessageId, activeAssistantMessageId, assistantDisplayKeys])
 
   // Polite aria-live status: announced once per state transition, not per
   // token. Visually hidden via the sr-only utility in ChatView.css.
@@ -5831,6 +5852,7 @@ export default function ChatView({
   const displayedMessages = useMemo(
     () => projectSettledSteerContinuations(
       supersedeResumedPauseBlocks(messages),
+      { preserveHidden: true },
     ),
     [messages],
   )
@@ -5841,6 +5863,12 @@ export default function ChatView({
     streamItems,
     showActiveAssistantSurface ? activeMirrorMsgIdx : -1,
   )
+  const replyGroups = useMemo(() => assistantReplyGroups(
+    showActiveAssistantSurface && activeMirrorMsgIdx < 0
+      ? [...peerTimeline.messages, { role: 'assistant', id: streamAssistantMessageId || activeAssistantMessageId || streamingDataKey, blocks: [] }]
+      : peerTimeline.messages,
+    { offset, slots: peerTimeline.slots, activeIndex: showActiveAssistantSurface ? (activeMirrorMsgIdx >= 0 ? activeMirrorMsgIdx : messages.length) : -1, activeKey: streamingDataKey, displayKeys: assistantDisplayKeys },
+  ), [peerTimeline.messages, peerTimeline.slots, offset, showActiveAssistantSurface, activeMirrorMsgIdx, streamingDataKey, streamAssistantMessageId, activeAssistantMessageId, messages.length, assistantDisplayKeys])
   // Activity projection is a transcript-source commit too: peer rows may
   // arrive after the first reveal without changing message count. Keep all
   // source handoffs in the controller's same pre-paint transaction.
@@ -5874,50 +5902,55 @@ export default function ChatView({
   // A DB refresh may commit the steer before its cut reaches this socket.
   // Keep the identity-owned active row in its transcript slot through that
   // handoff; moving it to the tail would paint the owner message above it.
-  const activeAssistantSurface = showActiveAssistantSurface ? (
-    <ActiveAssistantSurface
-      key={streamingDataKey}
-      activeMirrorMsg={projectedActiveMirrorMsg}
-      activityMessageId={activeAssistantMessageId}
-      activitySourceBlocks={activeMirrorMsg?.blocks}
-      useDbActivePayload={useDbActivePayload}
-      hasLivePayload={hasLiveAssistantPayload}
-      streamItems={streamItems}
-      dataKey={streamingDataKey}
+  const renderAssistantReply = group => {
+    if (!group) return null
+    const activeIndex = showActiveAssistantSurface
+      ? group.rows.findIndex(row => row.index === (activeMirrorMsgIdx >= 0 ? activeMirrorMsgIdx : messages.length))
+      : -1
+    const active = activeIndex >= 0
+    const replyRoot = assistantReplyRoot(group.rows[0].message)
+    const continuingRun = !!(turnActive && replyRoot && replyRoot
+      === assistantReplyRoot({ role: 'assistant', id: activeAssistantMessageId || streamAssistantMessageId }))
+    const tail = group.rows.at(-1)
+    const last = active || group.end === lastVisibleMessageIndex
+    return <ActiveAssistantSurface
+      key={group.rows[0].key}
+      replyGroup={group}
+      activeRowIndex={activeIndex}
+      activeMirrorMsg={active ? projectedActiveMirrorMsg : tail.message}
+      activitySourceBlocks={active ? activeMirrorMsg?.blocks : tail.message.blocks}
+      useDbActivePayload={active ? useDbActivePayload : true}
+      hasLivePayload={active && hasLiveAssistantPayload}
+      streamItems={active ? streamItems : null}
       chatId={chatId}
       onAnswer={doSendSilent}
       onPrepareAnswer={prepareQuestionSubmission}
       onCancelAnswer={cancelQuestionSubmission}
-      onResume={activeAssistantIsStreaming ? undefined : handleResume}
+      onResume={activeAssistantIsStreaming && active ? undefined : handleResume}
       resumeState={resumeState}
       onInternalNav={internalNav}
-      autoResumeEnabled={autoResumeEnabled}
-      autoResumeAvailable={showAutoResumeControl}
-      autoResumeSaving={autoResumeSaving}
-      autoResumeError={
-        autoResumeErrorSource === 'card' ? autoResumeError : ''
-      }
-      onAutoResumeChange={handleAutoResumeChange}
-      limitResetElapsed={limitResetElapsed}
-      recoveryCredit={pendingLimitRecoveryCredit}
+      autoResumeEnabled={last && autoResumeEnabled}
+      autoResumeAvailable={last && showAutoResumeControl}
+      autoResumeSaving={last && autoResumeSaving}
+      autoResumeError={last && autoResumeErrorSource === 'card' ? autoResumeError : ''}
+      onAutoResumeChange={last ? handleAutoResumeChange : undefined}
+      limitResetElapsed={last && limitResetElapsed}
+      recoveryCredit={last ? pendingLimitRecoveryCredit : null}
+      continuationWait={last ? continuationWait : null}
       submissionBlocked={providerSwitching}
       liveQuestionId={answerableQuestionId}
-      // Same publication channel as the durable rows above: while the
-      // turn is live THIS surface owns the pending question card, so
-      // the offscreen observer follows the handoff automatically.
       pendingQuestionRef={pendingQuestionRef}
       resumeCardRef={resumeCardRef}
-      // Liveness for the ACTIVE surface follows the TURN, not the
-      // payload source: when a richer DB partial wins source selection
-      // (useDbActivePayload, e.g. through the reconnect catch-up
-      // window) the turn is still running, and its trailing activity
-      // must keep the in-progress face — shimmer, progressive tense,
-      // ", in progress" — instead of settling early. Source selection
-      // still gates resume/question routing above (review 2026-07-17).
-      isStreaming={activeAssistantIsStreaming || turnActive}
-      sealedSteerAssistant={sealedSteerAssistant}
+      isStreaming={continuingRun || (active && activeAssistantIsStreaming)}
+      isLastMsg={last}
+      suppressedQuestionKeys={streamItemQuestionKeys}
+      sealedSteerAssistant={active ? sealedSteerAssistant : sealedAssistantBeforeSteer(messages, group.start)}
     />
-  ) : null
+  }
+  const appendedReply = replyGroups.get(messages.length)
+  const activeAssistantSurface = activeMirrorMsgIdx < 0 && appendedReply?.start === messages.length
+    ? renderAssistantReply(appendedReply) : null
+
 
   return (
     <div
@@ -6077,6 +6110,9 @@ export default function ChatView({
         <ul className="chat__list" style={{ minHeight: 0 }}>
           {displayedMessages.flatMap((msg, i) => {
             const peerRows = <PeerTimelineRows key={`peer-slot-${msg.cid || msg.id || msg.ts || i}`} notes={peerTimeline.slots.get(i)} chatId={chatId} onInternalNav={internalNav} />
+            const replyGroup = replyGroups.get(i)
+            if (replyGroup) return i === replyGroup.start
+              ? [peerRows, renderAssistantReply(replyGroup)] : []
             const projectedMsg = peerTimeline.messages[i] || msg
             if (projectedMsg.hidden) return [peerRows]
             const ownerBatch = ownerMessageBatch(displayedMessages, i)
@@ -6091,11 +6127,6 @@ export default function ChatView({
             const isLastMsg = renderedEndIndex === lastVisibleMessageIndex
             // DB and stream payloads occupy the same identity-owned row,
             // including when a committed steer already follows that row.
-            if (i === activeMirrorMsgIdx
-                && msg.role === 'assistant'
-                && showActiveAssistantSurface) {
-              return [peerRows, activeAssistantSurface]
-            }
             // A question is answerable while the runner is parked on it,
             // waiting for the answer. The runner BLOCKS the turn on the
             // AskUserQuestion future until it is answered, so an unanswered

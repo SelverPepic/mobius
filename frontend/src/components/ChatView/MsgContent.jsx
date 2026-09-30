@@ -194,6 +194,7 @@ function MsgContentInner({
   suppressedQuestionKeys,
   activityMessageId,
   activitySourceBlocks,
+  hideReferences = false,
 }) {
   const positionedNotes = usePositionedPeerNotes(activityMessageId || msg.id)
   // Build a stable per-render answerable predicate that closes over the
@@ -388,10 +389,10 @@ function MsgContentInner({
             data-assistant-markdown-block={msg.role === 'assistant' ? i : undefined}
           >
             {msg.role === 'assistant'
-              ? (isActiveAnswer
+              ? (isActiveAnswer || block.reply_text_owner
                   ? <ProgressiveMarkdown
                       text={text}
-                      isStreaming={isStreaming && i === lastEntryIdx}
+                      isStreaming={block.reply_live_text || (isStreaming && i === lastEntryIdx)}
                       onInternalNav={onInternalNav}
                       mediaDimensions={msg.media_dimensions}
                     />
@@ -635,11 +636,13 @@ function MsgContentInner({
         })()}
         {/* Web sources collected from the turn's tool blocks and shown once
             after the answer. Memory keeps its own richer lookup card inline. */}
-        {msg.role === 'assistant' && !isStreaming && (
+        {msg.role === 'assistant' && !isStreaming && !hideReferences && !msg.hide_reply_sources && (
           <MessageSources
             blocks={msg.blocks}
+            sourceGroups={msg.reply_sources?.groups}
             chatId={chatId}
             sourceRef={msg.source_ref}
+            sourceRefs={msg.reply_sources?.refs}
             disclosureKey={`${messageKey}:references`}
           />
         )}
@@ -731,6 +734,7 @@ export default memo(MsgContentInner, (prev, next) => {
     && prev.resumeCardRef === next.resumeCardRef
     && prev.isActiveAnswer === next.isActiveAnswer
     && prev.isStreaming === next.isStreaming
+    && prev.hideReferences === next.hideReferences
     // suppressedQuestionKeys is a Set (new reference each render) or null.
     // Compare by size + content when both are Sets; treat null vs Set as unequal.
     // This is intentionally conservative — a false inequality triggers a

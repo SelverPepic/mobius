@@ -992,14 +992,24 @@ and attaches their rule ids to new diagnostic chats. The Playwright lock-in spec
   cross a later visible turn or a different explicit id.
 - **R6a — Exact steer replay is one continuous answer.** A committed steer stamps
   every inserted owner row with durable `steered: true` provenance. That marker,
-  not transcript adjacency or fuzzy content overlap, is the sole authority for
-  joining presentation across the boundary. When the first post-steer text block
-  starts with the complete sealed pre-steer text exactly, the repeated raw prefix
-  remains stored but only its unseen suffix renders below the owner row. While the
+  not transcript adjacency or fuzzy content overlap, authorizes replay projection
+  across the boundary. Explicit differing run identities always fail closed.
+  When the first post-steer text block starts with the complete terminal sealed
+  text section exactly, the repeated raw prefix remains stored but only its unseen
+  suffix renders below a visible owner row. A platform-hidden steer within the
+  same explicit run instead forms one presentation reply: across an empty seam,
+  exact replay extends the original Markdown text surface without a false paragraph
+  break. Thoughts, tools, cards, or positioned timeline activity at the seam prevent
+  text fusion and keep their original chronological place. Each physical row,
+  key, anchor, source block index and raw transcript remains addressable. Reply
+  References render once at the final visible segment, combining per-message
+  bounded metadata lazily, deduplicating URLs, and retaining successfully read
+  pages when another fails. Real owner messages and different runs never share
+  this footer. While the
   turn is active, a growing new text block that is itself still an exact prefix of
   the sealed text stays provisionally hidden; the first mismatch immediately
   reveals the complete accumulated block. A settled shorter response, an ordinary
-  send, multiple sealed text blocks, a tool/question/error before the continuation,
+  send, an ambiguous sealed text section, a tool/question/error before the continuation,
   or a cut inside an open Markdown/container construct all fail closed and render
   the post-steer response intact. A plain-text cut may split a word at any
   Unicode grapheme boundary, but never splits a character reference. Literal

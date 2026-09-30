@@ -127,6 +127,7 @@ for (const isStreaming of [true, false]) {
       status: 'done', input: '', output: '',
     }
     const html = renderToStaticMarkup(createElement(ActiveAssistantSurface, {
+      replyGroup: { rows: [{ message: generatedMessage, key: 'assistant-file', anchorKey: 'assistant-file', notes: [] }] },
       activeMirrorMsg: { ...generatedMessage, blocks: [peer, ...rawBlocks] },
       activitySourceBlocks: rawBlocks,
       useDbActivePayload: false,
@@ -134,7 +135,7 @@ for (const isStreaming of [true, false]) {
       streamItems: [{
         type: 'tool', tool: 'Bash', tool_use_id: 'tool-pdf', status: 'done',
       }],
-      chatId: 'chat-generated-file', dataKey: 'assistant-file', isStreaming,
+      chatId: 'chat-generated-file', isStreaming,
     }))
     assert.match(html, /Exchang(?:ing|ed) messages/i)
     assert.equal(html.includes('chat__attach-file'), !isStreaming)
