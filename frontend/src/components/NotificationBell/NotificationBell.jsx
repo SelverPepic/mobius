@@ -3,8 +3,8 @@ import './NotificationBell.css'
 
 // The header bell — lives in the shell bar's right-side action slot
 // (shell__bar-actions), so it renders identically on desktop and mobile by
-// construction. It toggles one bounded preview; opening that preview marks the
-// current rows seen without creating a navigation or workspace destination.
+// construction. It toggles one bounded preview; opening it does not mark rows
+// read or create a navigation/workspace destination.
 export default function NotificationBell({
   unreadCount = 0, active = false, buttonRef, onClick,
 }) {

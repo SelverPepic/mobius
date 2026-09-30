@@ -1387,10 +1387,23 @@ export const api = {
       return apiFetch(`/notifications${qs ? `?${qs}` : ''}`)
     },
     unreadCount: () => apiFetch('/notifications/unread-count'),
-    // Seen-on-open: idempotent bulk mark-read (clears the bell badge).
-    readAll: () => apiFetch('/notifications/read-all', { method: 'POST' }),
-    // Owner action from the preview: remove all stored notifications.
-    clearAll: () => apiFetch('/notifications', { method: 'DELETE' }),
+    // Reading is explicit: opening the bell never clears its badge.
+    readAll: async () => jsonOrThrow(
+      await apiFetch('/notifications/read-all', { method: 'POST' }),
+      'Could not mark notifications read:',
+    ),
+    read: async (notificationId) => jsonOrThrow(
+      await apiFetch(
+        `/notifications/${encodeURIComponent(notificationId)}/read`,
+        { method: 'POST' },
+      ),
+      'Could not mark notification read:',
+    ),
+    // Owner action from the preview: clear ordinary history, retaining active Undo receipts.
+    clearAll: async () => jsonOrThrow(
+      await apiFetch('/notifications', { method: 'DELETE' }),
+      'Could not clear notifications:',
+    ),
     // Per-item dismissal is limited by the server to ordinary notifications.
     dismiss: async (notificationId) => jsonOrThrow(
       await apiFetch(

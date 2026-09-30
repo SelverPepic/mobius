@@ -1,4 +1,4 @@
-/* Notification actions stay lightweight: one-step clear and no redundant close control. */
+/* Notification actions stay lightweight and protect irreversible clearing. */
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
@@ -11,12 +11,16 @@ const center = readFileSync(
 )
 const client = readFileSync(new URL('../../../api/client.js', import.meta.url), 'utf8')
 
-test('notification header clears immediately and closes through the bell boundary', () => {
+test('notification header confirms clearing without a blocking modal', () => {
+  assert.match(component, /setConfirmClear\(true\)/)
+  assert.match(component, /Clear history\?/)
+  assert.match(component, /Active Undo stays; the rest is deleted/)
   assert.match(component, /onClick=\{handleClearAll\}/)
   assert.match(component, /await onClearAll\(\)/)
-  assert.match(component, /isClearing \? 'Clearing…' : 'Clear all'/)
-  assert.doesNotMatch(component, /confirmClear|Confirm clear|Close notifications/)
-  assert.doesNotMatch(css, /notifications__clear-actions|notifications__close/)
+  assert.match(component, /isClearing \? 'Clearing…' : 'Clear history'/)
+  assert.doesNotMatch(component, /Close notifications/)
+  assert.match(css, /notifications__clear-confirm/)
+  assert.doesNotMatch(css, /notifications__close/)
   assert.match(
     css,
     /@media \(hover: hover\) and \(pointer: fine\)[\s\S]*?\.notifications__clear:hover/,

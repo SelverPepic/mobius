@@ -32,7 +32,7 @@ const NotificationCenter = forwardRef(function NotificationCenter(
   const [updateNoticeSeen, setUpdateNoticeSeen] = useState(false)
   const {
     state: { open, unreadCount },
-    actions: { toggle, close, clearAll, dismiss, reconcile, onCreated },
+    actions: { toggle, close, clearAll, dismiss, markRead, markAllRead, reconcile, onCreated },
     meta: { rootRef, bellRef },
   } = useNotificationCenter(queryClient)
   const updateNoticeActive = updateAvailable && typeof onUpdateNow === 'function'
@@ -120,6 +120,9 @@ const NotificationCenter = forwardRef(function NotificationCenter(
           onOpenTarget={openTarget}
           onClearAll={clearAll}
           onDismiss={dismiss}
+          onMarkRead={markRead}
+          onMarkAllRead={markAllRead}
+          unreadCount={unreadCount}
           onRecoveryAction={onRecoveryAction}
           updateAvailable={updateNoticeActive}
           onUpdateNow={applyUpdate}

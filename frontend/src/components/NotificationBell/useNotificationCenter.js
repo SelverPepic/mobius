@@ -15,18 +15,28 @@ export default function useNotificationCenter(queryClient) {
   const unreadQuery = notificationQueries.unreadCount.useQuery()
   const unreadCount = unreadQuery.data ?? 0
 
-  const markSeen = useCallback(() => (
-    api.notifications.readAll()
-      .then(() => {
-        queryClient.setQueryData(notificationQueries.unreadCount.key, 0)
-      })
-      .catch(() => { /* Offline is safe: the unread count retries later. */ })
-  ), [queryClient])
+  const markAllRead = useCallback(async () => {
+    await api.notifications.readAll()
+    await Promise.all([
+      notificationQueries.list.invalidate(queryClient),
+      notificationQueries.unreadCount.invalidate(queryClient),
+    ])
+  }, [queryClient])
+
+  const markRead = useCallback(async (notificationId) => {
+    await api.notifications.read(notificationId)
+    await Promise.all([
+      notificationQueries.list.invalidate(queryClient),
+      notificationQueries.unreadCount.invalidate(queryClient),
+    ])
+  }, [queryClient])
 
   const clearAll = useCallback(async () => {
     await api.notifications.clearAll()
-    queryClient.setQueryData(notificationQueries.list.key, { pages: [[]], pageParams: [null] })
-    queryClient.setQueryData(notificationQueries.unreadCount.key, 0)
+    await Promise.all([
+      queryClient.resetQueries({ queryKey: notificationQueries.list.key }),
+      notificationQueries.unreadCount.invalidate(queryClient),
+    ])
   }, [queryClient])
 
   const dismiss = useCallback(async (notificationId) => {
@@ -34,10 +44,6 @@ export default function useNotificationCenter(queryClient) {
     await queryClient.resetQueries({ queryKey: notificationQueries.list.key })
     notificationQueries.unreadCount.invalidate(queryClient)
   }, [queryClient])
-
-  useEffect(() => {
-    if (open) void markSeen()
-  }, [open, markSeen])
 
   useEffect(() => {
     if (!open) return undefined
@@ -66,12 +72,11 @@ export default function useNotificationCenter(queryClient) {
   const onCreated = useCallback(() => {
     notificationQueries.unreadCount.invalidate(queryClient)
     notificationQueries.list.invalidate(queryClient)
-    if (openRef.current) void markSeen()
-  }, [markSeen, queryClient])
+  }, [queryClient])
 
   return {
     state: { open, unreadCount },
-    actions: { toggle, close, clearAll, dismiss, reconcile, onCreated },
+    actions: { toggle, close, clearAll, dismiss, markRead, markAllRead, reconcile, onCreated },
     meta: { rootRef, bellRef },
   }
 }

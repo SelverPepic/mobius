@@ -1,6 +1,6 @@
 import { Agent, Bell, Chat, Grid, SettingsSlider, X } from '@openai/apps-sdk-ui/components/Icon'
 import { useQueryClient } from '@tanstack/react-query'
-import { useEffect, useRef, useState } from 'react'
+import { Fragment, useEffect, useRef, useState } from 'react'
 import { notificationQueries } from '../../hooks/queries.js'
 import { formatDateTime } from '../../lib/dateTimeFormat.js'
 import {
@@ -34,6 +34,9 @@ export default function NotificationsView({
   onOpenTarget,
   onClearAll,
   onDismiss,
+  onMarkRead,
+  onMarkAllRead,
+  unreadCount = 0,
   onRecoveryAction,
   updateAvailable = false,
   onUpdateNow,
@@ -45,12 +48,18 @@ export default function NotificationsView({
     isFetchNextPageError,
   } = notificationQueries.list.useQuery({ enabled: active })
   const rows = data?.pages.flat() ?? []
+  const unreadRows = rows.filter(n => !n.read_at)
+  const orderedRows = [...unreadRows, ...rows.filter(n => n.read_at)]
   const [now, setNow] = useState(() => Date.now())
   const pointerSelectionRef = useRef(null)
   const contentRef = useRef(null)
   const paginationRef = useRef(null)
   const [isClearing, setIsClearing] = useState(false)
+  const [confirmClear, setConfirmClear] = useState(false)
   const [clearError, setClearError] = useState(false)
+  const [isMarkingAll, setIsMarkingAll] = useState(false)
+  const [markAllError, setMarkAllError] = useState(false)
+  const [readState, setReadState] = useState({})
   const [dismissState, setDismissState] = useState({})
   const [recoveryState, setRecoveryState] = useState({})
 
@@ -61,6 +70,10 @@ export default function NotificationsView({
     setNow(Date.now())
     const timer = window.setInterval(() => setNow(Date.now()), 60_000)
     return () => window.clearInterval(timer)
+  }, [active])
+
+  useEffect(() => {
+    if (!active) setConfirmClear(false)
   }, [active])
 
   useEffect(() => {
@@ -77,11 +90,12 @@ export default function NotificationsView({
   }, [active, fetchNextPage, hasNextPage, isFetchNextPageError, isFetchingNextPage])
 
   const handleClearAll = async () => {
-    if (!rows.length || isClearing) return
+    if (!rows.length || isClearing || !confirmClear) return
     setIsClearing(true)
     setClearError(false)
     try {
       await onClearAll()
+      setConfirmClear(false)
     } catch {
       setClearError(true)
     } finally {
@@ -117,6 +131,30 @@ export default function NotificationsView({
     }
   }
 
+  const handleMarkAllRead = async () => {
+    if (!unreadCount || isMarkingAll || !onMarkAllRead) return
+    setIsMarkingAll(true)
+    setMarkAllError(false)
+    try {
+      await onMarkAllRead()
+    } catch {
+      setMarkAllError(true)
+    } finally {
+      setIsMarkingAll(false)
+    }
+  }
+
+  const handleMarkRead = async (notificationId) => {
+    if (!onMarkRead || readState[notificationId] === 'working') return
+    setReadState(current => ({ ...current, [notificationId]: 'working' }))
+    try {
+      await onMarkRead(notificationId)
+      setReadState(current => ({ ...current, [notificationId]: 'done' }))
+    } catch {
+      setReadState(current => ({ ...current, [notificationId]: 'error' }))
+    }
+  }
+
   return (
     <section
       id="notification-preview"
@@ -127,18 +165,46 @@ export default function NotificationsView({
         <h2 id="notification-preview-title" className="notifications__title">
           Notifications
         </h2>
-        {rows.length > 0 && (
-          <button
-            type="button"
-            className="notifications__clear"
-            onClick={handleClearAll}
-            disabled={isClearing}
-          >
-            {isClearing ? 'Clearing…' : 'Clear all'}
-          </button>
-        )}
+        <span className="notifications__header-actions">
+          {unreadCount > 0 && (
+            <button
+              type="button"
+              className="notifications__mark-all"
+              onClick={handleMarkAllRead}
+              disabled={isMarkingAll}
+            >
+              {isMarkingAll ? 'Marking…' : 'Mark all as read'}
+            </button>
+          )}
+          {rows.length > 0 && !confirmClear && (
+            <button
+              type="button"
+              className="notifications__clear"
+              onClick={() => { setConfirmClear(true); setClearError(false) }}
+              disabled={isClearing}
+            >
+              Clear all
+            </button>
+          )}
+        </span>
       </div>
       <div className="notifications__content" ref={contentRef}>
+        {confirmClear && (
+          <div className="notifications__clear-confirm" role="group" aria-label="Confirm clear notifications">
+            <div className="notifications__clear-confirm-copy">
+              <strong>Clear history?</strong>
+              <span>Active Undo stays; the rest is deleted.</span>
+            </div>
+            <div className="notifications__clear-confirm-actions">
+              <button type="button" onClick={() => setConfirmClear(false)} disabled={isClearing}>
+                Keep
+              </button>
+              <button type="button" className="notifications__clear-confirm-danger" onClick={handleClearAll} disabled={isClearing}>
+                {isClearing ? 'Clearing…' : 'Clear history'}
+              </button>
+            </div>
+          </div>
+        )}
         {isLoading && (
           <p className="notifications__hint" role="status">Loading…</p>
         )}
@@ -150,6 +216,11 @@ export default function NotificationsView({
         {clearError && (
           <p className="notifications__hint notifications__hint--error" role="alert">
             Couldn’t clear notifications. Try again when you’re online.
+          </p>
+        )}
+        {markAllError && (
+          <p className="notifications__hint notifications__hint--error" role="alert">
+            Couldn’t mark notifications read. Try again when you’re online.
           </p>
         )}
         {!isLoading && !isError && rows.length === 0 && !updateAvailable && (
@@ -192,7 +263,7 @@ export default function NotificationsView({
               </div>
             </li>
           )}
-          {rows.map((n) => {
+          {orderedRows.map((n, index) => {
             const parsedNav = parseNotificationTarget(n.target)
             const nav = parsedNav?.view === 'chat' && n.title === 'Möbius needs your answer'
               ? { ...parsedNav, focusQuestion: true }
@@ -257,7 +328,13 @@ export default function NotificationsView({
               </>
             )
             return (
-              <li key={n.id} className="notifications__row-item">
+              <Fragment key={n.id}>
+              {(index === 0 || index === unreadRows.length) && (
+                <li className="notifications__group-label">
+                  {index === 0 && unreadRows.length > 0 ? 'New' : 'Earlier'}
+                </li>
+              )}
+              <li className={`notifications__row-item${!n.read_at ? ' notifications__row-item--unread' : ''}`}>
                 <div className="notifications__row-shell">
                   {nav && !recovery ? (
                     <button
@@ -276,6 +353,7 @@ export default function NotificationsView({
                             event.currentTarget,
                           )
                         ) return
+                        if (!n.read_at) void handleMarkRead(n.id)
                         onOpenTarget?.(nav)
                       }}
                     >
@@ -297,6 +375,20 @@ export default function NotificationsView({
                     </button>
                   )}
                 </div>
+                {!n.read_at && (
+                  <div className="notifications__read-action">
+                    <button
+                      type="button"
+                      disabled={!onMarkRead || readState[n.id] === 'working'}
+                      onClick={() => handleMarkRead(n.id)}
+                    >
+                      {readState[n.id] === 'working' ? 'Marking…' : 'Mark as read'}
+                    </button>
+                    {readState[n.id] === 'error' && (
+                      <span role="alert">Couldn’t mark read. Try again.</span>
+                    )}
+                  </div>
+                )}
                 {dismissState[n.id] === 'error' && (
                   <p className="notifications__dismiss-error" role="alert">
                     Couldn’t dismiss this notification. Try again.
@@ -304,6 +396,7 @@ export default function NotificationsView({
                   </p>
                 )}
               </li>
+              </Fragment>
             )
           })}
         </ul>

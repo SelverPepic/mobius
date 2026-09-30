@@ -8,7 +8,7 @@ from slowapi import Limiter
 from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
-from app import models
+from app import activity, models
 from app.database import get_db
 from app.deps import (
   Principal,
@@ -52,6 +52,26 @@ def _sender_bucket(request: Request) -> str:
 
 
 limiter = Limiter(key_func=_sender_bucket)
+
+
+def _has_active_undo(actions: object, now: datetime) -> bool:
+  """Keep a live Undo receipt; preserve malformed ones rather than risk losing one."""
+  if not isinstance(actions, list):
+    return False
+  for action in actions:
+    if not isinstance(action, dict) or action.get("action") not in (
+      "recover_chat", "recover_app", "recover_project",
+    ):
+      continue
+    if action.get("completed_at"):
+      continue
+    try:
+      expires_at = datetime.fromisoformat(action["expires_at"].replace("Z", "+00:00"))
+      if expires_at.tzinfo is None or expires_at.astimezone(UTC) > now:
+        return True
+    except (KeyError, AttributeError, TypeError, ValueError):
+      return True
+  return False
 
 
 @router.post(
@@ -115,7 +135,7 @@ def unread_count(
   owner: models.Owner = Depends(get_current_owner),
   db: Session = Depends(get_db),
 ):
-  """Count of notifications not yet seen via the notification preview."""
+  """Count of notifications not explicitly marked read."""
   n = (
     db.query(func.count(models.Notification.id))
     .filter(
@@ -138,7 +158,7 @@ def read_all(
   owner: models.Owner = Depends(get_current_owner),
   db: Session = Depends(get_db),
 ):
-  """Seen-on-open: mark every unread notification read. Idempotent.
+  """Explicitly mark every unread notification read. Idempotent.
 
   Only rows with read_at NULL are touched, so a notification that commits
   concurrently with this UPDATE simply stays unread and is picked up by the
@@ -158,6 +178,34 @@ def read_all(
   return {"updated": int(updated)}
 
 
+@router.post(
+  "/{notification_id}/read",
+  dependencies=[
+    Depends(reject_cross_site),
+    Depends(require_nondelegated_owner_or_app_control),
+  ],
+)
+def read_notification(
+  notification_id: str,
+  owner: models.Owner = Depends(get_current_owner),
+  db: Session = Depends(get_db),
+):
+  """Mark one owner's notification read without removing its history or actions."""
+  exists = db.query(models.Notification.id).filter(
+    models.Notification.owner_id == owner.id,
+    models.Notification.id == notification_id,
+  ).first()
+  if exists is None:
+    raise HTTPException(status_code=404, detail="Notification not found.")
+  updated = db.query(models.Notification).filter(
+    models.Notification.owner_id == owner.id,
+    models.Notification.id == notification_id,
+    models.Notification.read_at.is_(None),
+  ).update({"read_at": datetime.now(UTC)}, synchronize_session=False)
+  db.commit()
+  return {"updated": int(updated)}
+
+
 @router.delete(
   "",
   dependencies=[
@@ -169,13 +217,30 @@ def clear_notifications(
   owner: models.Owner = Depends(get_current_owner),
   db: Session = Depends(get_db),
 ):
-  """Delete all stored notifications for the owner. Idempotent."""
-  deleted = (
-    db.query(models.Notification)
-    .filter(models.Notification.owner_id == owner.id)
-    .delete(synchronize_session=False)
-  )
+  """Clear ordinary history without destroying still-usable Undo receipts."""
+  now = datetime.now(UTC)
+  deleted = 0
+  cursor = ""
+  while True:
+    batch = (
+      db.query(models.Notification.id, models.Notification.actions)
+      .filter(models.Notification.owner_id == owner.id, models.Notification.id > cursor)
+      .order_by(models.Notification.id)
+      .limit(500)
+      .all()
+    )
+    if not batch:
+      break
+    cursor = batch[-1].id
+    removable = [row.id for row in batch if not _has_active_undo(row.actions, now)]
+    if removable:
+      deleted += db.query(models.Notification).filter(
+        models.Notification.owner_id == owner.id,
+        models.Notification.id.in_(removable),
+      ).delete(synchronize_session=False)
   db.commit()
+  # Content-free, timestamped activity record for future history-loss diagnosis.
+  activity.log_event("notification_history_cleared", deleted=deleted)
   return {"deleted": int(deleted)}
 
 

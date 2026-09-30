@@ -1649,7 +1649,8 @@ def test_run_migrations_adds_read_at_and_backfills_notifications(tmp_path):
     ))
     conn.execute(text(
       "INSERT INTO notifications (id, owner_id, source_type, title, sent_at) "
-      "VALUES ('n-legacy', 1, 'agent', 'Old', '2026-01-02 03:04:05')"
+      "VALUES ('n-legacy', 1, 'agent', 'Old', '2026-01-02 03:04:05'), "
+      "('n-legacy-2', 1, 'app', 'Older', '2026-01-01 00:00:00')"
     ))
     conn.commit()
 
@@ -1660,10 +1661,15 @@ def test_run_migrations_adds_read_at_and_backfills_notifications(tmp_path):
   cols = {c["name"] for c in inspector.get_columns("notifications")}
   assert "read_at" in cols
   with eng.connect() as conn:
-    read_at = conn.execute(text(
-      "SELECT read_at FROM notifications WHERE id = 'n-legacy'"
-    )).scalar_one()
-  assert str(read_at) == "2026-01-02 03:04:05"
+    history = conn.execute(text(
+      "SELECT id, source_type, title, sent_at, read_at "
+      "FROM notifications ORDER BY id"
+    )).all()
+  assert [(row.id, row.source_type, row.title, str(row.sent_at), str(row.read_at))
+          for row in history] == [
+    ("n-legacy", "agent", "Old", "2026-01-02 03:04:05", "2026-01-02 03:04:05"),
+    ("n-legacy-2", "app", "Older", "2026-01-01 00:00:00", "2026-01-01 00:00:00"),
+  ]
 def test_run_migrations_records_an_inspectable_append_only_history(tmp_path):
   eng = create_engine(f"sqlite:///{tmp_path / 'migration-ledger.db'}")
   with eng.begin() as conn:
