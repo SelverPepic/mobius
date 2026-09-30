@@ -15,6 +15,7 @@ import json
 import os
 import pathlib
 import tempfile
+import time
 from collections import deque
 from types import SimpleNamespace
 from typing import Any
@@ -1758,6 +1759,39 @@ async def test_claude_new_and_resumed_turns_exclude_native_owner_questions(
     denied = await clients[0].options.can_use_tool(name, {}, None)
     assert isinstance(denied, PermissionResultDeny)
   assert not any(event.get("type") == "question" for event in bus.events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("effort", ["high", "ultracode"])
+async def test_saved_effort_never_reaches_a_model_that_rejects_it(
+  monkeypatch, effort,
+):
+  # A global or saved effort still rides along after the owner picks a model
+  # without an effort setting; the API rejects the parameter on such a model.
+  # The runner reads Claude's capability without discovering other providers,
+  # so a live-only effortless model is covered even on the first turn after boot.
+  from app import providers
+
+  monkeypatch.setitem(providers._model_registry_cache, "claude", (time.monotonic(), [
+      {"id": "claude-live-no-effort", "effort_levels": []},
+      {"id": "claude-live-default"},
+  ]))
+  monkeypatch.setattr(providers, "list_models", lambda *_a, **_kw: pytest.fail(
+    "a Claude turn must not fetch provider catalogs"
+  ))
+  clients = _install_fake_client(monkeypatch)
+
+  for model in ("claude-live-no-effort", "claude-haiku-4-5-20251001"):
+    await _run_turn(
+      f"chat-no-effort-{model}", bc=_Bus(), cwd="/data",
+      agent_settings={"model": model, "effort": effort},
+    )
+  await _run_turn(
+    "chat-default-effort", bc=_Bus(), cwd="/data",
+    agent_settings={"model": "claude-live-default", "effort": "high"},
+  )
+
+  assert [client.options.effort for client in clients] == [None, None, "high"]
 
 
 @pytest.mark.asyncio
