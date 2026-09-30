@@ -179,6 +179,9 @@ async function mockApps(page, apps) {
 async function seedWorkspace(page, ws) {
   const blob = paneModel.serializeWorkspace(ws)
   await page.addInitScript(([wsKey, wsBlob]) => {
+    // Playwright also runs page init scripts in child frames. A same-origin
+    // mock app frame must not replay the shell's boot workspace after opening.
+    if (window !== window.top) return
     try {
       localStorage.setItem(wsKey, wsBlob)
     } catch { /* private mode */ }
@@ -1494,6 +1497,9 @@ test.describe('Workspace view-mode toggle', () => {
     await expect(page.locator('.shell__view--paned')).toHaveCount(0)
 
     await cta.click()
+    // Observe the actual mock app frame before checking the durable selection.
+    // Its own document load must not rewrite the shell's seeded workspace.
+    await expect(page.frameLocator(`iframe[data-app-id="${appId}"]`).locator('#probe')).toBeVisible()
     await expect.poll(async () => (await readWs(page)).singleScreen, {
       timeout: 3000,
       message: 'the explicit preview CTA opens the app',
