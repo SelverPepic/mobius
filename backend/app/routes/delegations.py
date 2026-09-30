@@ -229,11 +229,18 @@ async def submit_or_attach(
           status_code=404, detail="Delegation owner app not found.",
         )
     parent = get_active_chat_or_404(db, body.parent_chat_id)
-    root_id = parent_root_run_id(db, parent.id, require_active=True)
-    if root_id is None:
+    current_root_id = parent_root_run_id(db, parent.id, require_active=True)
+    if current_root_id is None:
       raise HTTPException(
         status_code=409,
         detail="Delegation requires an active parent chat run.",
+      )
+    # Ownership and its lifecycle lock were selected for this logical root.
+    # Never carry them into a newer run that began while admission waited.
+    if current_root_id != root_id:
+      raise HTTPException(
+        status_code=409,
+        detail="The parent chat run changed during delegation admission.",
       )
     existing = db.query(models.Delegation).filter(
       models.Delegation.parent_root_run_id == root_id,

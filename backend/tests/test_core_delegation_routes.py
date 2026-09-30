@@ -1,5 +1,12 @@
 """Core delegation admission without an installed owner app."""
 
+import asyncio
+from contextlib import asynccontextmanager
+
+import pytest
+from fastapi import HTTPException
+from sqlalchemy.orm import Session
+
 from app import models
 from app.delegations import delegation_execution_token, policy_for_chat
 from test_app_fixtures import create_local_app
@@ -162,3 +169,88 @@ def test_only_live_installed_app_preferences_overlay_core_defaults(client, owner
   assert after.status_code == 200, after.text
   assert after.json()["config"] == {} and after.json()["app_id"] is None
   assert (root / "config.json").read_text() == json.dumps(preferences)
+
+
+@pytest.mark.parametrize("gate", ["app", "parent"])
+@pytest.mark.parametrize("advance_root", [False, True])
+def test_legacy_owner_attachment_pins_root_while_waiting_for_admission(
+  client, owner_token, db, monkeypatch, gate, advance_root,
+):
+  from app.deps import Principal
+  from app.routes.delegations import DelegationSubmit, submit_or_attach
+
+  auth = {"Authorization": f"Bearer {owner_token}"}
+  app_id = create_local_app(client, auth, name="Legacy owner")["id"]
+  parent = _parent_with_run(client, owner_token, db)
+  starts = []
+  async def fake_start(**kwargs):
+    starts.append(kwargs)
+    return True
+  monkeypatch.setattr(
+    "app.routes.delegations.start_programmatic_chat_turn", fake_start,
+  )
+  original = _submit(client, auth, parent, app_id=app_id)
+  assert original.status_code == 201, original.text
+  starts.clear()
+
+  from app import chat_queue
+  original_lock = chat_queue.get_transition_lock
+
+  async def race():
+    lock = asyncio.Lock()
+    waiting = asyncio.Event()
+    blocked_key = f"app-lifecycle:{app_id}" if gate == "app" else parent
+
+    @asynccontextmanager
+    async def transition_lock(key):
+      if key == blocked_key:
+        waiting.set()
+        async with lock:
+          yield
+      else:
+        yield
+
+    monkeypatch.setattr(
+      "app.chat_queue.get_transition_lock", transition_lock,
+    )
+    body = DelegationSubmit(
+      parent_chat_id=parent, task_key="review",
+      prompt="Review one bounded task.", provider="codex", scope="read",
+    )
+    async with lock:
+      task = asyncio.create_task(submit_or_attach(
+        body,
+        principal=Principal(owner=db.query(models.Owner).first(), app_id=None),
+        db=db,
+      ))
+      await asyncio.wait_for(waiting.wait(), timeout=5)
+      assert not task.done()
+      if advance_root:
+        with Session(db.get_bind()) as writer:
+          writer.get(models.ChatRun, "core-parent-run").status = "completed"
+          writer.add(make_goal_run(
+            writer, id="next-parent-run", root_run_id="next-parent-root",
+            chat_id=parent, status="running", provider="codex",
+          ))
+          writer.commit()
+    if advance_root:
+      with pytest.raises(HTTPException) as rejected:
+        await task
+      assert rejected.value.status_code == 409
+      assert "parent chat run changed" in rejected.value.detail
+      assert starts == []
+    else:
+      attached = await task
+      assert attached["attached"] is True
+      assert attached["id"] == original.json()["id"]
+      assert attached["app_id"] == app_id
+
+  asyncio.run(race())
+  monkeypatch.setattr(chat_queue, "get_transition_lock", original_lock)
+  assert db.query(models.Delegation).count() == 1
+  if advance_root:
+    # A fresh request belongs to the new root, not the old app owner.
+    fresh = _submit(client, auth, parent)
+    assert fresh.status_code == 201, fresh.text
+    assert fresh.json()["app_id"] is None
+    assert fresh.json()["attached"] is False
