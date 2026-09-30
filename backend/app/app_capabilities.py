@@ -927,6 +927,8 @@ def _widens(path: str, before: Any, after: Any, after_leaves: dict) -> bool:
     if not any(key.startswith(prefix) for key in after_leaves):
       return False  # The entire capability was revoked.
     suffix = path.removeprefix(prefix)
+    if suffix == "reason":
+      return False  # Explanatory copy grants no additional access.
     limit_key = suffix.removeprefix("limits.")
     if suffix.startswith("limits.") and limit_key in definition["hard_limits"]:
       if after is None:

@@ -748,6 +748,32 @@ def test_dropping_a_whole_capability_with_its_limit_narrows():
   assert report["widens"] is False
 
 
+@pytest.mark.parametrize("reason", ["Speak the current page.", None])
+def test_runtime_reason_changes_do_not_widen_access(reason):
+  before = _contract(capabilities=_speech(max_text_chars=1000))
+  declaration = _speech(max_text_chars=1000)
+  declaration["media.speech"]["reason"] = reason
+  after = _contract(capabilities=declaration)
+
+  report = diff_contracts(before, after)
+
+  assert report["widens"] is False
+  assert "runtime.media.speech.reason" in report["changed"] + report["removed"]
+
+
+def test_runtime_version_and_unknown_reason_changes_still_require_review():
+  before = _contract(capabilities=_speech(max_text_chars=1000))
+  after = json.loads(json.dumps(before))
+  after["runtime"]["media.speech"]["version"] = 2
+  assert diff_contracts(before, after)["widens"] is True
+
+  # Unknown capabilities have unknown semantics, even on a reason-like path.
+  before["runtime"]["future.capability"] = {"reason": "Original."}
+  after = json.loads(json.dumps(before))
+  after["runtime"]["future.capability"]["reason"] = "Changed."
+  assert diff_contracts(before, after)["widens"] is True
+
+
 def test_offline_contract_changes_never_ask_for_access():
   online = _contract()
   offline = _contract(offline_capable=True, offline={"reads": True, "writes": "none"})
