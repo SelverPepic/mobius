@@ -1813,13 +1813,13 @@ async def prepare_restart_intents(
   return list(prepared or [])
 
 
-# One-shot notify copy for a limit park whose reset time has arrived
-# (design §2.4 step "at parked_until, push-notify").
-LIMIT_RESET_NOTIFY_TITLE = "Your limit has reset"
-LIMIT_RESET_NOTIFY_BODY = "Your limit has reset."
+# A due retry is not proof that the provider's quota has reset, especially
+# after a bounded or fallback check. Notification remains at-most-once.
+LIMIT_RETRY_NOTIFY_TITLE = "Your paused chat is ready to retry"
+LIMIT_RETRY_NOTIFY_BODY = "The retry check is due. The provider may still be limited."
 CONTINUATION_SWEEP_BATCH_SIZE = 100
 # Start due provider-limit continuations gradually. Unrelated live work must
-# not delay an opted-in chat after its reset, but a bad/early reset timestamp
+# not delay an opted-in chat after its retry check, but a bad/early timestamp
 # also must not launch a whole parked batch in one burst.
 LIMIT_AUTO_RESUME_STAGGER_SECS = 30.0
 # Planned restarts restore work that was already concurrent, but relaunching a
@@ -2302,8 +2302,8 @@ async def sweep_reset_parks(
 
   A due park is a `chat_runs` row whose
   ``status`` is ``parked`` or ``resume_pending`` and whose
-  `parked_until` has passed. Provider limits use their reset time; a planned
-  restart is parked by the drain itself with a due time of now. Each pass
+  `parked_until` has passed. Provider limits use a bounded retry/check time;
+  a planned restart is parked by the drain itself with a due time of now. Each pass
   processes a bounded oldest-first batch so a large backlog cannot monopolize
   the event loop or produce an unbounded burst of database work. For each row:
 
@@ -2655,12 +2655,12 @@ async def sweep_reset_parks(
               notification_db,
               owner_id,
               title=(
-                "Möbius restarted" if restarted else LIMIT_RESET_NOTIFY_TITLE
+                "Möbius restarted" if restarted else LIMIT_RETRY_NOTIFY_TITLE
               ),
               body=(
                 "Your paused turn is ready."
                 if restarted
-                else LIMIT_RESET_NOTIFY_BODY
+                else LIMIT_RETRY_NOTIFY_BODY
               ),
               source_type="system",
               source_id=chat_id,
@@ -3605,6 +3605,13 @@ _RESET_RELATIVE_RE = re.compile(
 _RESET_ISO_RE = re.compile(
   r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?"
 )
+_RESET_DATED_CLOCK_RE = re.compile(
+  r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+"
+  r"(\d{1,2})(?:st|nd|rd|th)?(?:,?\s+(\d{4}))?\s+"
+  r"(\d{1,2}):(\d{2})\s*(am|pm)\b",
+  re.IGNORECASE,
+)
+_RESET_MONTHS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
 # Clock form: "resets 1:40am", "try again at 3pm", "resets at 14:30". Minutes
 # or an am/pm suffix is REQUIRED so a bare number (e.g. the "429" in a status
 # line) can never read as a clock time.
@@ -3648,8 +3655,8 @@ def _parse_reset_text(text: str, now: datetime) -> datetime | None:
   """Lenient reset-time parse from a provider limit-error string.
 
   Tries, in order: a relative duration ("resets in 2 hours"), an ISO
-  timestamp, and a clock time ("resets 1:40am" — read as UTC and rolled to
-  the NEXT occurrence, since the strings carry no date). Returns naive UTC,
+  timestamp, a dated clock, and a bare clock time ("resets 1:40am" — read as
+  UTC and rolled to the NEXT occurrence). Returns naive UTC,
   or None when nothing parses — the caller applies the 30-minute fallback.
   A clock time without a timezone is genuinely ambiguous; UTC keeps the
   server-side math consistent and the clamp bounds the damage (design
@@ -3673,6 +3680,17 @@ def _parse_reset_text(text: str, now: datetime) -> datetime | None:
     parsed = _coerce_reset_datetime(match.group(0))
     if parsed is not None:
       return parsed
+  match = _RESET_DATED_CLOCK_RE.search(text)
+  if match:
+    month = _RESET_MONTHS.index(match.group(1)[:3].lower()) + 1
+    hour = int(match.group(4)) % 12 + (12 if match.group(6).lower() == "pm" else 0)
+    try:
+      candidate = datetime(int(match.group(3) or now.year), month, int(match.group(2)), hour, int(match.group(5)))
+      if match.group(3) is None and candidate <= now:
+        candidate = candidate.replace(year=candidate.year + 1)
+      return candidate
+    except ValueError:
+      pass
   match = _RESET_CLOCK_RE.search(text)
   if match:
     if match.group(1) is not None:
@@ -3728,31 +3746,39 @@ MEMORY_KILL_MESSAGE = (
 )
 
 
+@dataclass(frozen=True)
+class LimitParkTiming:
+  """Provider evidence and our bounded retry schedule are different facts."""
+
+  check_at: datetime
+  reason: str
+  resets_at: datetime | None = None
+
+
 def _limit_park_fields(
   runner_result: dict,
   error_text: str | None,
   now: datetime | None = None,
-) -> tuple[datetime, str]:
-  """Compute (parked_until, park_reason) for a limit-killed turn.
+) -> LimitParkTiming:
+  """Keep the reported reset separate from the bounded continuation time.
 
   Precedence: the structured reset time the runner captured
   (`rate_limit_resets_at`, from the SDK's RateLimitEvent) → lenient text
-  parse of the error string → 30-minute re-check fallback. The result is
-  clamped to [now+60s, now+7d] so a bad parse can neither park in the past
-  nor beyond any real provider window. NEVER raises — a parse failure must
-  still park (design §2.4), so the whole computation degrades to the
+  parse of the error string. Unknown stays unknown in the transcript. Only
+  the retry time uses the 30-minute fallback and [now+60s, now+7d] clamp,
+  preventing an instant retry storm or an unbounded park. NEVER raises — a
+  parse failure must still park (design §2.4), so computation degrades to the
   fallback on any error.
   """
   if now is None:
     now = datetime.now(UTC).replace(tzinfo=None)
   try:
-    target = _coerce_reset_datetime(
+    resets_at = _coerce_reset_datetime(
       (runner_result or {}).get("rate_limit_resets_at")
     )
-    if target is None:
-      target = _parse_reset_text(error_text or "", now)
-    if target is None:
-      target = now + PARK_FALLBACK_DELAY
+    if resets_at is None:
+      resets_at = _parse_reset_text(error_text or "", now)
+    target = resets_at if resets_at is not None else now + PARK_FALLBACK_DELAY
     target = max(now + _PARK_MIN_DELAY, min(target, now + _PARK_MAX_DELAY))
     low = (error_text or "").lower()
     if any(m in low for m in ("usage limit", "usage_limit", "weekly limit",
@@ -3760,12 +3786,12 @@ def _limit_park_fields(
       reason = "usage_limit"
     else:
       reason = "rate_limit"
-    return target, reason
+    return LimitParkTiming(target, reason, resets_at)
   except Exception:
     _get_logger().warning(
       "limit-park reset parse failed; using fallback", exc_info=True,
     )
-    return now + PARK_FALLBACK_DELAY, "rate_limit"
+    return LimitParkTiming(now + PARK_FALLBACK_DELAY, "rate_limit")
 
 
 def _park_event(
@@ -3774,22 +3800,21 @@ def _park_event(
   park_reason: str,
   *,
   provider_id: str | None = None,
+  resets_at: datetime | None = None,
 ) -> dict:
   """The enriched error event a limit kill publishes through the sink.
 
-  Maps the DB park fields into the block's single `pause` descriptor
-  (`kind` = `park_reason`, `resets_at` = the reset time) — whitelisted through
-  events.process_event onto the persisted block — so the transcript card
-  renders live as "Rate limit — resets at … · Resume now". `resets_at` is
-  serialized as EXPLICIT-UTC ISO: a naive isoformat would be parsed as local
-  time by the client's `new Date()` and shift the displayed reset by the
-  viewer's UTC offset. The raw (parked_until, park_reason) still flow
-  separately to the DB ChatRun row via _complete_turn/ParkRun.
+  `check_at` is the bounded due time stored on ChatRun; optional `resets_at`
+  preserves provider evidence independently in the persisted transcript.
+  Resource/model waits have a check but no provider reset. Both timestamps
+  are explicit UTC so the browser does not interpret naive ISO as local time.
+  The sweep needs only the due time and never claims quota has reset.
   """
   return _pause_note(
     message,
     kind=park_reason,
-    resets_at=parked_until.replace(tzinfo=UTC).isoformat(),
+    check_at=parked_until.replace(tzinfo=UTC).isoformat(),
+    resets_at=resets_at.replace(tzinfo=UTC).isoformat() if resets_at is not None else None,
     provider=provider_id,
   )
 
@@ -3935,20 +3960,20 @@ def _park_exit(
         "message": "The turn failed unexpectedly. Please try again.",
       })
     return {"parked": False}
-  parked_until, park_reason = _limit_park_fields(
+  timing = _limit_park_fields(
     runner_result or {}, error_text
   )
   message = error_text or (
-    "The provider's rate limit was reached; this turn is paused until the "
-    "limit resets."
+    "The provider's rate limit was reached; this turn is paused for a retry."
   )
   sink.publish(_park_event(
-    message, parked_until, park_reason, provider_id=provider_id,
+    message, timing.check_at, timing.reason, provider_id=provider_id,
+    resets_at=timing.resets_at,
   ))
   return {
     "parked": True,
-    "parked_until": parked_until,
-    "park_reason": park_reason,
+    "parked_until": timing.check_at,
+    "park_reason": timing.reason,
   }
 
 
@@ -4186,11 +4211,12 @@ async def _complete_turn(
     # drops into the markerless-queue state that self-heals on the user's
     # next send (chats_stream's stale-pending drain). The limit error itself
     # was already published + persisted by the call site before finalize
-    # (with the park fields, so it renders as the live "resets at …" card).
+    # (with the distinct provider reset and retry/check times).
     if parked_until is None:
       # Direct/legacy callers that didn't parse a target still park with the
       # fallback re-check — a limit exit must never skip the park silently.
-      parked_until, park_reason = _limit_park_fields({}, None)
+      timing = _limit_park_fields({}, None)
+      parked_until, park_reason = timing.check_at, timing.reason
     try:
       # Park under the SAME bounded terminal lock the drain uses, so a racing
       # stale-pending self-heal drain / append can't interleave with the
@@ -4227,7 +4253,7 @@ async def _complete_turn(
         "limit-park ParkRun did not persist chat_id=%s "
         "(reconciliation will repair)", chat_id, exc_info=True,
       )
-      # The call site already published the parked card ("resets at …")
+      # The call site already published the parked retry card
       # BEFORE this park was durable. The park did NOT land, so the sweep
       # will never fire for it — degrade the card honestly: this follow-up
       # error coalesces onto the same tail block and, per the latest-wins
@@ -4236,7 +4262,7 @@ async def _complete_turn(
       # fire-and-forget PersistError (finalize already ran) — best-effort,
       # and boot reconcile repairs the marker either way.
       sink.publish(_pause_note(
-        "Rate limited — the reset reminder could not be scheduled. "
+        "Rate limited — the retry reminder could not be scheduled. "
         "Send a message or tap Resume to continue.",
       ))
       bc.publish({"type": "done"})

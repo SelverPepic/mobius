@@ -173,80 +173,149 @@ def _chat_row(chat_id: str):
 
 def test_park_fields_structured_datetime_aware():
   aware = datetime(2026, 7, 11, 1, 40, tzinfo=UTC)
-  target, reason = chat_mod._limit_park_fields(
+  timing = chat_mod._limit_park_fields(
     {"rate_limit_resets_at": aware}, "usage limit reached", now=NOW,
   )
-  assert target == datetime(2026, 7, 11, 1, 40)
-  assert reason == "usage_limit"
+  assert timing.check_at == datetime(2026, 7, 11, 1, 40)
+  assert timing.reason == "usage_limit"
+  assert timing.resets_at == datetime(2026, 7, 11, 1, 40)
 
 
 def test_park_fields_structured_epoch_seconds():
   epoch = int(datetime(2026, 7, 11, 1, 40, tzinfo=UTC).timestamp())
-  target, _ = chat_mod._limit_park_fields(
+  timing = chat_mod._limit_park_fields(
     {"rate_limit_resets_at": epoch}, None, now=NOW,
   )
-  assert target == datetime(2026, 7, 11, 1, 40)
+  assert timing.check_at == datetime(2026, 7, 11, 1, 40)
 
 
 def test_park_fields_structured_iso_string():
-  target, _ = chat_mod._limit_park_fields(
+  timing = chat_mod._limit_park_fields(
     {"rate_limit_resets_at": "2026-07-11T01:40:00Z"}, None, now=NOW,
   )
-  assert target == datetime(2026, 7, 11, 1, 40)
+  assert timing.check_at == datetime(2026, 7, 11, 1, 40)
 
 
 def test_park_fields_text_clock_rolls_to_next_occurrence():
   # 1:40am has already passed at NOW (22:00), so the park rolls to tomorrow.
-  target, reason = chat_mod._limit_park_fields(
+  timing = chat_mod._limit_park_fields(
     {}, "You've hit your weekly limit · resets 1:40am", now=NOW,
   )
-  assert target == datetime(2026, 7, 11, 1, 40)
-  assert reason == "usage_limit"
+  assert timing.check_at == datetime(2026, 7, 11, 1, 40)
+  assert timing.reason == "usage_limit"
+
+
+def test_park_fields_text_dated_clock_keeps_the_date():
+  # Reading only the clock would schedule tomorrow instead of the dated reset.
+  now = datetime(2031, 3, 4, 8)
+  timing = chat_mod._limit_park_fields(
+    {}, "Usage limit reached. Try again at Mar 9th, 2031 6:25 AM.",
+    now=now,
+  )
+  assert timing.check_at == datetime(2031, 3, 9, 6, 25)
+  assert timing.reason == "usage_limit"
+
+
+def test_park_fields_text_dated_clock_without_year_rolls_forward():
+  now = datetime(2031, 3, 4, 8)
+  timing = chat_mod._limit_park_fields(
+    {}, "Usage limit reached. Resets Mar 7 9:15 am", now=now,
+  )
+  assert timing.check_at == datetime(2031, 3, 7, 9, 15)
 
 
 def test_park_fields_text_relative_duration():
-  target, reason = chat_mod._limit_park_fields(
+  timing = chat_mod._limit_park_fields(
     {}, "Server is temporarily limiting requests. Try again in 30 minutes.",
     now=NOW,
   )
-  assert target == NOW + timedelta(minutes=30)
-  assert reason == "rate_limit"
+  assert timing.check_at == NOW + timedelta(minutes=30)
+  assert timing.reason == "rate_limit"
 
 
 def test_park_fields_text_iso_timestamp():
-  target, _ = chat_mod._limit_park_fields(
+  timing = chat_mod._limit_park_fields(
     {}, "Rate limited. Resets at 2026-07-11T01:40:00Z.", now=NOW,
   )
-  assert target == datetime(2026, 7, 11, 1, 40)
+  assert timing.check_at == datetime(2026, 7, 11, 1, 40)
 
 
 def test_park_fields_fallback_on_unparseable_text():
-  target, reason = chat_mod._limit_park_fields(
+  timing = chat_mod._limit_park_fields(
     {}, "429 too many requests", now=NOW,
   )
-  assert target == NOW + chat_mod.PARK_FALLBACK_DELAY
-  assert reason == "rate_limit"
+  assert timing.check_at == NOW + chat_mod.PARK_FALLBACK_DELAY
+  assert timing.reason == "rate_limit"
+  assert timing.resets_at is None
 
 
 def test_park_fields_clamps_past_reset_to_min_delay():
   past = datetime(2026, 7, 10, 1, 0, tzinfo=UTC)
-  target, _ = chat_mod._limit_park_fields(
+  timing = chat_mod._limit_park_fields(
     {"rate_limit_resets_at": past}, None, now=NOW,
   )
-  assert target == NOW + timedelta(seconds=60)
+  assert timing.check_at == NOW + timedelta(seconds=60)
+  assert timing.resets_at == past.replace(tzinfo=None)
 
 
 def test_park_fields_clamps_absurd_future_and_never_raises():
-  target, _ = chat_mod._limit_park_fields(
+  timing = chat_mod._limit_park_fields(
     {"rate_limit_resets_at": "9999-01-01T00:00:00Z"}, None, now=NOW,
   )
-  assert target == NOW + timedelta(days=7)
+  assert timing.check_at == NOW + timedelta(days=7)
+  assert timing.resets_at == datetime(9999, 1, 1)
   # A hostile structured value must degrade to the fallback, not raise.
-  target, reason = chat_mod._limit_park_fields(
+  timing = chat_mod._limit_park_fields(
     {"rate_limit_resets_at": object()}, None, now=NOW,
   )
-  assert target == NOW + chat_mod.PARK_FALLBACK_DELAY
-  assert reason == "rate_limit"
+  assert timing.check_at == NOW + chat_mod.PARK_FALLBACK_DELAY
+  assert timing.reason == "rate_limit"
+  assert timing.resets_at is None
+
+
+def test_monthly_reset_is_not_replaced_by_the_seven_day_check():
+  now = datetime(2032, 2, 3, 9, 47)
+  timing = chat_mod._limit_park_fields(
+    {}, "Usage limit reached. Try again at Mar 16th, 2032 10:26 AM.", now=now,
+  )
+  assert timing.resets_at == datetime(2032, 3, 16, 10, 26)
+  assert timing.check_at == now + timedelta(days=7)
+
+
+def test_structured_reset_wins_without_losing_its_timezone_or_date():
+  timing = chat_mod._limit_park_fields(
+    {"rate_limit_resets_at": "2026-08-10T09:00:00+02:00"},
+    "Usage limit; resets in 1 hour", now=NOW,
+  )
+  assert timing.resets_at == datetime(2026, 8, 10, 7)
+  assert timing.check_at == NOW + timedelta(days=7)
+
+
+def test_park_exit_keeps_long_reset_and_check_as_distinct_utc_facts():
+  sink = _Sink()
+  kwargs = chat_mod._park_exit(
+    sink, {"api_error_status": 429, "rate_limit_resets_at": "2099-05-08T12:34:00Z"},
+    "Usage limit reached", provider_id="codex",
+  )
+  pause = sink.events[-1]["pause"]
+  assert pause["resets_at"] == "2099-05-08T12:34:00+00:00"
+  assert pause["check_at"] == kwargs["parked_until"].replace(tzinfo=UTC).isoformat()
+  assert kwargs["parked_until"] <= datetime.now(UTC).replace(tzinfo=None) + timedelta(days=7)
+
+
+@pytest.mark.parametrize("reason", ["memory", "storage", "model_capacity", "rate_limit"])
+def test_check_only_park_does_not_invent_a_provider_reset(reason):
+  pause = chat_mod._park_event("waiting", NOW, reason)["pause"]
+  assert pause["check_at"] == NOW.replace(tzinfo=UTC).isoformat()
+  assert "resets_at" not in pause
+
+
+def test_unknown_limit_reset_stays_unknown_with_fallback_retry():
+  sink = _Sink()
+  kwargs = chat_mod._park_exit(sink, {"api_error_status": 429}, None)
+  assert kwargs["parked"] is True
+  assert "check_at" in sink.events[-1]["pause"]
+  assert "resets_at" not in sink.events[-1]["pause"]
 
 
 # -- the shared exit classifier ------------------------------------------------
@@ -1027,7 +1096,9 @@ def test_sweep_notifies_once_and_resolves(owner_token, monkeypatch):
 
   assert resolved == ["sweep-once"]
   assert len(calls) == 1
-  assert "reset" in calls[0]["body"].lower()
+  assert "retry" in calls[0]["title"].lower()
+  assert "may still be limited" in calls[0]["body"]
+  assert "has reset" not in calls[0]["body"]
   assert calls[0]["source_id"] == "sweep-once"
   assert _run_row("rt-sweep-once")["status"] == "parked_notified"
 
@@ -2932,7 +3003,7 @@ def test_parked_probe_tiebreak_is_deterministic():
     db.close()
 
 
-def _limit_complete_turn(cid, *, parked_until, monkeypatch=None,
+def _limit_complete_turn(cid, *, parked_until, provider_reset_at=None, monkeypatch=None,
                          park_raises=False, park_returns_false=False):
   """Drive _complete_turn's limit branch with a real bc + sink + seeded run."""
   from app.broadcast import create_broadcast
@@ -2944,6 +3015,7 @@ def _limit_complete_turn(cid, *, parked_until, monkeypatch=None,
   sink.publish({"type": "text", "content": "partial answer"})
   sink.publish(chat_mod._park_event(
     "hit your weekly limit · resets 1:40am", parked_until, "usage_limit",
+    resets_at=provider_reset_at,
   ))
   if park_raises:
     async def _boom(*a, **kw):
@@ -2963,6 +3035,29 @@ def _limit_complete_turn(cid, *, parked_until, monkeypatch=None,
   ))
   _drain_writer()
   return disposition
+
+
+@pytest.mark.parametrize("reset_days", [29, None, -1, "absurd"])
+def test_terminal_park_preserves_reported_reset_but_bounds_availability(reset_days):
+  now = datetime.now(UTC).replace(tzinfo=None)
+  check = now + timedelta(days=7)
+  reset = (datetime(9999, 1, 1) if reset_days == "absurd" else
+           now + timedelta(days=reset_days) if reset_days is not None else None)
+  cid = f"distinct-quota-clocks-{reset_days}"
+  disposition = _limit_complete_turn(cid, parked_until=check, provider_reset_at=reset)
+  assert disposition.value == "limit_parked"
+  assert _run_row(f"rt-{cid}")["parked_until"] == check
+  # Reopen sessions to prove both facts survive persistence/restart, not just
+  # an in-memory event. The transcript is the display owner, not the scheduler.
+  block = _chat_row(cid)["messages"][-1]["blocks"][-1]
+  assert block["pause"]["check_at"] == check.replace(tzinfo=UTC).isoformat()
+  if reset is None:
+    assert "resets_at" not in block["pause"]
+  else:
+    assert block["pause"]["resets_at"] == reset.replace(tzinfo=UTC).isoformat()
+  with SessionLocal() as db:
+    availability = db.get(models.ProviderAvailability, "claude")
+    assert availability.limited_until == check
 
 
 def test_park_failure_degrades_card_and_keeps_resume(monkeypatch):
