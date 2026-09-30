@@ -179,8 +179,8 @@ test('Resume button clears the 44px touch floor with press feedback', () => {
 test('ChatView routes both offscreen attention nudges through the controller', () => {
   assert.match(chatView, /hasPendingResume/,
     'ChatView detects a tail resumable pause/park block')
-  assert.match(chatView, /const pendingResumeBlock = tailResumableBlock\(messages\)/,
-    'the tail resumable block is found by walking the visible message tail')
+  assert.match(chatView, /const pendingResumeBlock = tailResumableBlock\(recoveryMessages\)/,
+    'the recovery cue uses the same superseded pause projection as the visible transcript')
   assert.match(chatView, /hasPendingResume && resumeCardOffscreen/,
     'the nudge shows only when the resume card is offscreen')
   assert.match(chatView, /Turn paused — tap to resume/,

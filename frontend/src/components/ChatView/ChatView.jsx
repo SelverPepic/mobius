@@ -5520,7 +5520,12 @@ export default function ChatView({
   // then just looks stopped. Detect the tail resumable block so the offscreen
   // nudge + SR status can name the recovery. A pause is terminal (the turn has
   // ended), so it only ever lives in `messages`, never in a live stream item.
-  const pendingResumeBlock = tailResumableBlock(messages)
+  const recoveryMessages = useMemo(() => supersedeResumedPauseBlocks(messages, {
+    running: serverRunning && !hasPendingQuestion,
+    activeAssistantMessageId,
+    streamAssistantMessageId,
+  }), [messages, serverRunning, hasPendingQuestion, activeAssistantMessageId, streamAssistantMessageId])
+  const pendingResumeBlock = tailResumableBlock(recoveryMessages)
   const resourcePause = isResourcePause(pendingResumeBlock)
     ? pendingResumeBlock
     : null
@@ -5830,9 +5835,9 @@ export default function ChatView({
   const draftGoal = draftGoalObjective(input)
   const displayedMessages = useMemo(
     () => projectSettledSteerContinuations(
-      supersedeResumedPauseBlocks(messages),
+      recoveryMessages,
     ),
-    [messages],
+    [recoveryMessages],
   )
   const peerTimeline = usePeerTimeline(
     chatId,
