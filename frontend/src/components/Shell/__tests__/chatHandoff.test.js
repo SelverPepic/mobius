@@ -152,8 +152,8 @@ test('activation presents a confirmed running transcript while stream catch-up r
     /runtime\.requested_anchor_found === false[\s\S]*if \(runtimeAnchorMatch\)[\s\S]*CHAT_READING_ANCHOR_NOT_FOUND[\s\S]*retireSavedReadingPosition\(chatId\)[\s\S]*anchorRetired = true/,
     'only an authoritative absent row retires the saved coordinate')
   assert.match(initialLoad,
-    /if \(activationCacheReusable && cacheCoversSavedAnchor && !anchorRetired\) \{[\s\S]*applyMessagesToView\(refreshed\.messages, refreshed\.offset\)[\s\S]*settleRuntime\(runtime, refreshed\.messages\)[\s\S]*return[\s\S]*const renderFrames = coldTranscriptRenderFrames/,
-    'a warm version mismatch must settle atomically before the cold prefix scheduler')
+    /if \(activationCacheEntryState !== 'missing' && !anchorRetired\) \{[\s\S]*applyMessagesToView\(refreshed\.messages, refreshed\.offset\)[\s\S]*settleRuntime\(runtime, refreshed\.messages\)[\s\S]*return[\s\S]*const renderFrames = coldTranscriptRenderFrames/,
+    'a complete warm window, including nested-coordinate validation, must settle atomically before the cold prefix scheduler')
   assert.match(chatView,
     /cacheIsSafeFallback[\s\S]*CHAT_READING_ANCHOR_NOT_FOUND[\s\S]*applyMessagesToView\(\[\], 0\)[\s\S]*setLoadError\(!cacheIsSafeFallback && retry == null\)/,
     'an incomplete or contradictory cache must be cleared before the error surface paints')
@@ -207,7 +207,7 @@ test('a staging chat cannot leave the outgoing transcript held on a wedged reque
 test('a fresh empty chat settles before interruptible transcript work', () => {
   const emptySettlement = chatView.indexOf('if (refreshed.messages.length === 0)')
   const warmTransition = chatView.indexOf(
-    'if (activationCacheReusable && cacheCoversSavedAnchor && !anchorRetired)',
+    "if (activationCacheEntryState !== 'missing' && !anchorRetired)",
     emptySettlement,
   )
 
@@ -523,4 +523,14 @@ test('only a loaded transcript lets runtime evidence attach a stream or reread h
   assert.match(chatView,
     /applyMessagesToView\(\[\], 0\)[\s\S]{0,300}disconnect\(\{ clearStreaming: true \}\)/,
     'a load that shows nothing also detaches any live stream')
+})
+
+test('peer activity handover observes fetched source identity, not live projection churn', () => {
+  const peerTimeline = readFileSync(new URL('../../ChatView/PeerTimeline.jsx', import.meta.url), 'utf8')
+  assert.match(peerTimeline, /const events = useMemo\([\s\S]*\[pages\]\)/,
+    'activity source identity stays stable across streaming projection frames')
+  assert.match(peerTimeline, /activityEvents: events/)
+  assert.match(chatView,
+    /useLayoutEffect\(\(\) => \{\s*reapplyActiveMode\(\)\s*\}, \[catchUpCommitSeq, transcriptReconcileSeq, peerTimeline\.activityEvents, reapplyActiveMode\]\)/,
+    'one pre-paint source handover excludes streamItems and the whole projected timeline')
 })

@@ -441,6 +441,43 @@ def test_tool_completed_events_emit_output_before_end():
   ]
 
 
+@pytest.mark.parametrize("status", ["completed", "failed"])
+def test_mcp_completion_preserves_result_body_even_when_tool_refuses(status):
+  """Real SDK failures may have result.content but no transport error."""
+  v2 = pytest.importorskip("openai_codex.generated.v2_all")
+  result = {"content": [{"type": "text", "text":
+    "Task edits were saved, but no open claims are held by this Goal."}]}
+  item = v2.McpToolCallThreadItem.model_validate({
+    "type": "mcpToolCall", "id": "goal-refusal", "server": "mobius_control",
+    "tool": "update_goal", "arguments": {"complete": "Verified"},
+    "status": status, "error": None, "result": result,
+  })
+  sdk = {name: getattr(v2, name) for name in (
+    "CommandExecutionThreadItem", "FileChangeThreadItem", "McpToolCallThreadItem",
+  )}
+  events = codex_events._tool_completed_events(item, sdk)
+  assert events[-1] == {"type": "tool_end"}
+  output = events[0]
+  assert output["output_complete"] is True
+  assert output["output_exit_code"] == (1 if status == "failed" else 0)
+  assert "Task edits were saved" in output["content"]
+
+
+def test_mcp_transport_error_is_preserved_without_a_result():
+  v2 = pytest.importorskip("openai_codex.generated.v2_all")
+  item = v2.McpToolCallThreadItem.model_validate({
+    "type": "mcpToolCall", "id": "transport-error", "server": "mobius_control",
+    "tool": "update_goal", "arguments": {}, "status": "failed",
+    "error": {"message": "Connection closed"}, "result": None,
+  })
+  sdk = {name: getattr(v2, name) for name in (
+    "CommandExecutionThreadItem", "FileChangeThreadItem", "McpToolCallThreadItem",
+  )}
+  output = codex_events._tool_completed_events(item, sdk)[0]
+  assert output["output_exit_code"] == 1
+  assert "Connection closed" in output["content"]
+
+
 def test_dynamic_tool_completion_marks_its_authoritative_result():
   class DynamicToolCallThreadItem:
     def __init__(self, status="completed"):
@@ -4450,6 +4487,9 @@ def test_run_codex_sdk_turn_controls_prompt_layers(monkeypatch, session_id):
     "FROZEN CONSTITUTION SNAPSHOT"
   )
   assert "$MOBIUS_GENERATED_DIR" in (
+    captured["thread_options"]["base_instructions"]
+  )
+  assert "Create downloadable deliverables only when the owner explicitly requests" in (
     captured["thread_options"]["base_instructions"]
   )
   assert captured["thread_options"]["developer_instructions"] == ""

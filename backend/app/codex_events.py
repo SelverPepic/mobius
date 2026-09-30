@@ -806,7 +806,9 @@ def _tool_completed_events(
     status = _enum_wire_value(getattr(item, "status", None))
     error = _format_json(getattr(item, "error", None))
     failed = status == "failed" or bool(error)
-    content = error if failed else _format_json(getattr(item, "result", None))
+    # A tool-level refusal arrives as a failed call with its explanation in
+    # result.content, not a transport error. Keep that body even when failed.
+    content = error or _format_json(getattr(item, "result", None))
     return [
       {
         "type": "tool_output",

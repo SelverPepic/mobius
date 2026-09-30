@@ -51,6 +51,25 @@ def test_saves_replace_the_digest_append_to_the_summary_and_name_the_chat(
   assert db.get(models.Chat, chat.id).title == "Fixing the sync bug"
 
 
+def test_batched_delta_preserves_omitted_fields_and_prior_evidence(client, chat):
+  agent = _start(chat)
+  assert _save(client, agent, title="Investigating sync", digest="Repairing sync.",
+               summary="Preserve offline edits.").status_code == 204
+  before = _note(chat)
+  delta = "Cause: stale cursor. Replaced cursor ownership. Offline replay passed."
+  assert _save(client, agent, summary=delta).status_code == 204
+  after = _note(chat)
+  assert parse_frontmatter(after)["description"] == parse_frontmatter(before)["description"]
+  assert extract_section(after, "Digest") == extract_section(before, "Digest")
+  history = extract_cumulative_summary(after)
+  assert history.startswith(extract_cumulative_summary(before))
+  assert history.count(delta) == 1
+  assert history.count("### ") == 2  # Initial evidence plus one combined delta.
+  # A digest-only change must not append an empty or repeated Summary entry.
+  assert _save(client, agent, digest="Repair verified.").status_code == 204
+  assert extract_cumulative_summary(_note(chat)) == history
+
+
 def test_a_name_the_owner_chose_always_wins(client, chat, db):
   chat.title = "Owner title"
   chat.title_locked = True

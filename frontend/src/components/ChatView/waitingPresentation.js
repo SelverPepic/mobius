@@ -60,6 +60,17 @@ export function resourcePausePresentation(block) {
   }
 }
 
+const RESUME_BLOCKERS = {
+  platform_restart: ['waiting for platform restart', 'Complete the pending platform restart; this chat resumes after restored code loads'],
+  restoring_edits: ['restoring local work', 'Möbius is restoring local work before this chat can resume'],
+  owner_input: ['waiting for your answer', 'Answer the saved card in this chat; the result remains saved until then'],
+  restart: ['waiting for restart', 'Use the pending Restart card; a ready restart releases this follow-up'],
+  provider_park: ['waiting for agent availability', 'The existing agent recovery hold must clear before this chat can resume'],
+  manual_resume: ['waiting for Resume', 'Resume this chat to release its manual recovery hold'],
+  live_turn: ['waiting for current turn', 'The result is saved while this chat finishes its current turn'],
+  resume_failed: ['follow-up needs attention', 'The follow-up could not start successfully; resume this chat to inspect the saved result'],
+}
+
 export function waitPresentation(wait) {
   const activation = wait.kind === 'platform_activation'
   const cadence = cadenceLabel(wait)
@@ -73,6 +84,25 @@ export function waitPresentation(wait) {
   const summary = wait.kind === 'timer'
     ? (due ? `resumes ${due}` : 'resumes later')
     : (next ? `next check ${next}` : cadence)
+
+  if (wait.delivery_pending) {
+    const outcome = wait.status === 'failed' ? 'Check failed'
+      : wait.status === 'expired' ? 'Check reached its deadline'
+      : activation ? 'Restart confirmed'
+      : wait.kind === 'timer' ? 'Timer finished' : 'Checks finished'
+    const [summary, wakeUp] = RESUME_BLOCKERS[wait.resume_blocker]
+      || ['follow-up pending', 'The result is saved until this chat can resume']
+    return {
+      condition: `${outcome}; ${summary}`,
+      owner: wait.condition_owner || (wait.kind === 'timer' ? 'Time' : 'External system'),
+      summary: 'result saved',
+      checker: 'Finished · no more checks',
+      activity,
+      timeoutLabel: 'Next step',
+      timeout: wakeUp,
+      usage: 'No model tokens while blocked · one turn when the result is delivered',
+    }
+  }
 
   return {
     condition: waitConditionLabel(wait.description) || 'External condition',

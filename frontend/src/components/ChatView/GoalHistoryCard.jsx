@@ -1,4 +1,4 @@
-/* GoalHistoryCard keeps a terminal Goal's outcome beside its final answer. */
+/* GoalHistoryCard shows a terminal Goal's outcome at its completion step. */
 
 import GoalPlanDetails from './GoalPlanDetails.jsx'
 import LifecycleIcon, { LifecycleOutcome } from './LifecycleIcon.jsx'

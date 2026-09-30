@@ -3104,8 +3104,16 @@ def test_model_capacity_sweep_continues_and_preserves_retry_lineage(
   _due_park(
     cid, root_token, auto_resume=False, park_reason="model_capacity",
   )
+  held = {"value": True}
+  monkeypatch.setattr("app.platform_update.late_edits_pending", lambda: held["value"])
 
   try:
+    # The saved retry deadline does not bypass update recovery. Waiting must
+    # neither launch nor spend an attempt; loading the restored work releases it.
+    assert _run_sweep() == []
+    assert scheduled == []
+    assert _run_row(root_token)["status"] == "parked"
+    held["value"] = False
     assert _run_sweep() == [cid]
     assert len(scheduled) == 1
     resumed_token = scheduled[0]["run_token"]

@@ -40,6 +40,9 @@ _INLINE_MIME_TYPES = {
 }
 
 
+_UPLOAD_NAME_MAX_BYTES = 200
+
+
 def _safe_filename(filename: str) -> str:
   """Strips directory components and rejects dangerous filenames."""
   # Strip any path component — only the final name segment is kept.
@@ -49,6 +52,17 @@ def _safe_filename(filename: str) -> str:
   # Reject empty names after sanitization.
   if not name or name.startswith("."):
     name = "upload"
+  # A phone or browser can hand over a name longer than the filesystem allows
+  # (255 bytes, easily reached with non-Latin text). Shorten the stem and keep
+  # the extension, leaving room for `_unique_name`'s collision suffix.
+  if len(name.encode("utf-8")) > _UPLOAD_NAME_MAX_BYTES:
+    suffix = pathlib.Path(name).suffix
+    if len(suffix.encode("utf-8")) > 32:
+      suffix = ""
+    budget = _UPLOAD_NAME_MAX_BYTES - len(suffix.encode("utf-8"))
+    stem = name[:len(name) - len(suffix)] if suffix else name
+    stem = stem.encode("utf-8")[:budget].decode("utf-8", "ignore") or "upload"
+    name = stem + suffix
   return name
 
 

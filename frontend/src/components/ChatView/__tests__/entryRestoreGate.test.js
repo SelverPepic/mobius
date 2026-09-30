@@ -147,3 +147,39 @@ test('entryRestoreDecision is idle outside the restore window', () => {
     mode: { kind: 'FOLLOW_BOTTOM' }, saved: undefined, messages: [], scrollEl, phase: 'ready',
   }).action, 'idle', 'an already-restored mode is not re-resolved')
 })
+
+for (const phase of ['cached', 'cache-validating', 'stream-catchup', 'ready']) {
+  test(`restored-open detail holds coordinate validation until its layout settles (${phase})`, () => {
+    const row = partedRow('detail-row', 0, [800])
+    const scrollEl = paintedScrollEl(row)
+    const query = scrollEl.querySelector.bind(scrollEl)
+    let pending = true
+    scrollEl.querySelector = selector => selector === '[data-reading-layout-pending="true"]'
+      ? (pending ? {} : null) : query(selector)
+    const input = {
+      mode: { kind: 'INITIAL' },
+      saved: { kind: 'ANCHOR_AT', key: 'detail-row', part: [1], offset: 20 },
+      messages: [], scrollEl, phase,
+    }
+    assert.equal(entryRestoreDecision(input).action, 'wait', 'missing part is temporary, not retired')
+    const detail = { offsetTop: 800, offsetHeight: 400, getBoundingClientRect: () => ({ top: 800, bottom: 1200, height: 400 }) }
+    row.children.push(detail)
+    pending = false
+    const restored = entryRestoreDecision(input)
+    assert.equal(restored.action, 'commit')
+    assert.equal(restored.resolved, true)
+    assert.deepEqual(restored.mode.part, [1])
+  })
+}
+
+test('terminal detail failure permits the existing fallback, rather than an endless wait', () => {
+  const scrollEl = paintedScrollEl(partedRow('detail-row', 0, [800]))
+  const decision = entryRestoreDecision({
+    mode: { kind: 'INITIAL' },
+    saved: { kind: 'ANCHOR_AT', key: 'detail-row', part: [8], offset: 0 },
+    messages: [], scrollEl, phase: 'ready',
+  })
+  assert.equal(decision.action, 'commit')
+  assert.equal(decision.resolved, false)
+  assert.equal(decision.savedPresent, true, 'failed retrieval does not authorize deleting saved position')
+})

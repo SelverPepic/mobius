@@ -420,6 +420,26 @@ def usage_limit_waiting_chat_ids(
   return {cid for cid in candidates if _latest_run_is_usage_park(db, cid)}
 
 
+def continuation_wait_for_chat(db: Session, chat_id: str) -> str | None:
+  """Project restart and busy-model holds without changing recovery admission.
+
+  The transcript records why a turn stopped; this live projection explains
+  what it is waiting for now. Never attach a current blocker to a superseded
+  park or a run already retired to manual recovery.
+  """
+  run = _latest_continuation_park(db, chat_id)
+  if run is None or run.park_reason not in {"restart", "model_capacity"}:
+    return None
+  from app.platform_update import late_edits_pending, read_prepared_update
+
+  if late_edits_pending():
+    update = read_prepared_update()
+    if update and update["replayed"]:
+      return "restart_required"
+    return "restoring_edits"
+  return "restart" if run.park_reason == "restart" else None
+
+
 def _restart_manual_hold_for_chat(db: Session, chat_id: str) -> bool:
   """Whether the latest run retired to manual restart recovery.
 
@@ -448,10 +468,10 @@ def _restart_manual_hold_for_chat(db: Session, chat_id: str) -> bool:
   )
 
 
-def programmatic_start_blocked(
+def programmatic_start_blocker(
   db: Session, chat_id: str, *, activation_wait_id: str | None = None,
-) -> bool:
-  """Whether a product wake (delegation result, wait resume) must queue
+) -> str | None:
+  """Why a product wake (delegation result, wait resume) must queue
   instead of starting a turn.
 
   An owner question, limit-park, or restart hold can have no live process, so
@@ -474,7 +494,7 @@ def programmatic_start_blocked(
       models.ChatWait.resume_delivered_at.is_(None),
     ).first()
     if activation_wait is None:
-      return True
+      return "restart"
   pending_question = db.query(models.Chat.pending_question_id).filter(
     models.Chat.id == chat_id,
     models.Chat.deleted_at.is_(None),
@@ -486,15 +506,15 @@ def programmatic_start_blocked(
       or pending_question != activation_wait.linked_question_id
     )
   )
-  return (
-    question_blocked
-    or (
-      activation_wait is None
-      and activation_barrier_wait_id(db, chat_id) is not None
-    )
-    or _parked_until_for_chat(db, chat_id) is not None
-    or _restart_manual_hold_for_chat(db, chat_id)
-  )
+  if question_blocked:
+    return "owner_input"
+  if activation_wait is None and activation_barrier_wait_id(db, chat_id) is not None:
+    return "restart"
+  if _parked_until_for_chat(db, chat_id) is not None:
+    return "provider_park"
+  if _restart_manual_hold_for_chat(db, chat_id):
+    return "manual_resume"
+  return None
 
 
 def forget_chat(chat_id: str) -> None:
@@ -1409,7 +1429,7 @@ async def sweep_idle_pending_chats(db: Session) -> list[str]:
     # sweep_reset_parks (when the chat policy is enabled) or the user's own
     # next send. A terminal-looking queue alone cannot distinguish "crashed
     # drain" from "parked on purpose".
-    if programmatic_start_blocked(db, chat_id):
+    if programmatic_start_blocker(db, chat_id):
       continue
     claimed = False
     try:
@@ -1429,7 +1449,7 @@ async def sweep_idle_pending_chats(db: Session) -> list[str]:
             if (
               has_running_run(db, chat_id)
               or not _pending_head_is_stale(pending, now_ms)
-              or programmatic_start_blocked(db, chat_id)
+              or programmatic_start_blocker(db, chat_id)
               or not mark_starting(chat_id)
             ):
               continue

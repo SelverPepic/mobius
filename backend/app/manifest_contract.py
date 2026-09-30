@@ -246,6 +246,14 @@ def validate_repo_relative_path(path: str, field: str) -> None:
       f"Manifest `{field}` must not contain encoded path separators."
       f"{seed_hint}"
     )
+  # Git owns its metadata directory and refuses to track any path inside it,
+  # so a package naming one could never install; say so instead of failing
+  # later inside Git with an unexplained server error.
+  if any(part.lower() == ".git" for part in parts):
+    _fail(
+      f"Manifest `{field}` must not point inside a `.git` directory."
+      f"{seed_hint}"
+    )
 
 
 def validate_storage_destination(path: str) -> None:
@@ -581,6 +589,15 @@ def validate_manifest_contract(manifest) -> None:
       f"Manifest permission {names} has been removed; server-side app jobs "
       "run as ordinary Möbius processes."
     )
+  job_secrets = permissions.get("job_secret_read", [])
+  if (
+    not isinstance(job_secrets, list) or len(job_secrets) > 16
+    or any(not isinstance(name, str) or not re.fullmatch(
+      r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", name,
+    ) for name in job_secrets)
+    or len(set(job_secrets)) != len(job_secrets)
+  ):
+    _fail("Manifest `permissions.job_secret_read` must list up to 16 unique secret names.")
   for field in RECOGNIZED_CAPABILITIES:
     if field in permissions and not isinstance(permissions[field], bool):
       _fail(f"Manifest `permissions.{field}` must be a boolean.")

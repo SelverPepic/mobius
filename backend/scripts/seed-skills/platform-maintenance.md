@@ -170,6 +170,17 @@ because `/data/platform` is the persistent served clone. The baked
    `request_approval` or Codex's
    `request_user_input` for platform restart permission.
 
+   Every chat that still owes activation and verification calls
+   `request_restart` itself, even if another chat already has a Restart card.
+   Each card saves that chat's visible owner decision and post-restart
+   continuation. These are separate chat handoffs, not duplicate restart
+   executors: selecting any card requests one platform-owned restart, and a
+   later ready boot resumes every still-registered chat independently. Each
+   agent then verifies its own changes before completing its Goal. Do not
+   substitute a peer note, shared work claim, or monitor of the owner's
+   decision for your own card. Stop or a written response cancels only that
+   chat's activation wait; unrelated owner-input and recovery holds still apply.
+
    If the tool is absent, the same saved-card operation is available through:
 
    ```bash
