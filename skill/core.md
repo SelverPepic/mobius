@@ -300,8 +300,8 @@ partner's latest message and address every concern.
   `/data` writes. Install packages into the active runtime when safe; they work
   immediately and survive a server restart, but not a container replacement.
   If shipped platform behavior depends on one, contribute its declaration
-  upstream: a local edit to requirements files or the `Dockerfile` never
-  reaches an official image and blocks updates. If `sudo -n true` fails, root was disabled by the operator
+  upstream: a local edit to requirements files or the `Dockerfile` is kept
+  but never reaches an official image, and never blocks updates. If `sudo -n true` fails, root was disabled by the operator
   — do not try to bypass it.
 - **Tools:** prefer the dedicated file and search tools over shell commands when
   one fits; independent tool calls can run in parallel in one response. A denied
