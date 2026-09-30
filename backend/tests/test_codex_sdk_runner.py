@@ -3177,20 +3177,20 @@ def test_upstream_stream_stall_explains_the_stop_and_keeps_the_detail():
   assert "No next token received for 60000ms" in message
 
 
-def test_mobius_gateway_out_of_credit_points_to_mobius_you():
-  # The gateway's 402 body; the same wording applies whenever a turn has
-  # nothing left to spend, before the first token or mid-answer.
+def test_mobius_gateway_max_request_cost_points_to_mobius_you():
+  # The gateway's 402 body names the maximum request cost; it does not prove
+  # the account has no remaining credit.
   error = (
     "unexpected status 402 Payment Required: {\"error\":{\"message\":"
     "\"not enough credits for the maximum request cost\",\"type\":"
     "\"insufficient_credits\",\"code\":\"insufficient_credits\"}}"
   )
 
-  from app.codex_events import MOBIUS_NO_CREDIT_MESSAGE
+  from app.codex_events import MOBIUS_MAX_REQUEST_COST_MESSAGE
 
   message = codex_sdk_runner._codex_user_error(error)
 
-  assert message == MOBIUS_NO_CREDIT_MESSAGE
+  assert message == MOBIUS_MAX_REQUEST_COST_MESSAGE
   assert "[Open Möbius · You](/shell/?app=identity)" in message
 
 
