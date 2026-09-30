@@ -15,6 +15,8 @@ test('guide review explains the access in a live app contract', () => {
   ])
   assert.match(rows.find(row => row.title === 'Chat history').detail, /redacted/)
   assert.match(rows.find(row => row.title === 'Background work').detail, /schedule/)
+  assert.equal(rows.find(row => row.title === 'Other apps’ data').tag, 'Read')
+  assert.equal(rows.find(row => row.title === 'Background work').tag, 'Server job')
 })
 
 test('guide review discloses unfamiliar data grants instead of hiding them', () => {

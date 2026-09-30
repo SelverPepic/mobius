@@ -191,9 +191,10 @@ export default function WalkthroughStore({ apps }) {
         const busy = review?.phase === 'checking' || review?.phase === 'installing'
         const actionLabel = installed ? 'Installed' : expanded ? 'Cancel' : 'Install'
         const rows = state?.preview ? accessRows(state.preview.capability_contract) : []
-        return <article className={`wt__store-pick${expanded ? ' is-expanded' : ''}`} key={item.id}>
+        return <article className={`wt__store-pick${expanded ? ' is-expanded' : ''}${installed ? ' is-installed' : ''}`} key={item.id}>
           <AppIcon className="wt__store-icon" item={{ slug: item.id, icon_url: icons[item.id] }} label={item.name} size={null} />
-          <div><span className="wt__store-kind">{item.collection || 'App'}</span><h3>{item.name}</h3><p>{guideDescription(item.description)}</p></div>
+          <h3>{item.name}</h3>
+          <p className="wt__store-description">{guideDescription(item.description)}</p>
           <button type="button" ref={state?.phase === 'installed' ? installedButton : expanded ? reviewButton : null} className={installed || expanded ? 'wt__installed' : 'wt__action'} aria-label={`${actionLabel} ${item.name}`} aria-disabled={installed} aria-expanded={installed ? undefined : expanded} aria-controls={expanded ? `wt-access-${item.id}` : undefined} tabIndex={installed && state?.phase !== 'installed' ? -1 : undefined} disabled={(busy && !expanded) || state?.phase === 'installing'} onClick={() => {
             if (installed) return
             if (expanded) { reviewRequest.current += 1; setReview(null) }
@@ -208,7 +209,7 @@ export default function WalkthroughStore({ apps }) {
               {state.notice && <p className="wt__store-error" role="alert">{state.notice}</p>}
               {rows.length === 0
                 ? <p>No special permissions requested.</p>
-                : <ul className="wt__access-list">{rows.map(row => <li key={row.key}><strong>{row.title}</strong><span>{row.detail}</span></li>)}</ul>}
+                : <ul className="wt__access-list">{rows.map(row => <li key={row.key}><div><strong>{row.title}</strong><span>{row.detail}</span></div><em>{row.tag || 'Access'}</em></li>)}</ul>}
               <button type="button" className="wt__access-install wt__action" disabled={state.phase === 'installing'} onClick={() => void install(item)}>{state.phase === 'installing' ? 'Installing…' : 'Install app'}</button>
               {state.phase === 'installing' && <span className="sr-only" role="status">Installing {item.name}</span>}
             </>}
