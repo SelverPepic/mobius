@@ -1,4 +1,4 @@
-/* Unread rows stay visible and actionable without opening the bell clearing them. */
+/* Opening clears the new badge, not the unread dot or the row action. */
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import React from 'react'
@@ -7,12 +7,12 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import NotificationsView from '../NotificationsView.jsx'
 import { notificationQueries } from '../../../hooks/queries.js'
 
-test('new and earlier rows are distinguished and can be marked read without deleting', () => {
+test('one chronological list marks unread rows with a purple accent dot', () => {
   const queryClient = new QueryClient()
   queryClient.setQueryData(notificationQueries.list.key, {
     pages: [[
-      { id: 'old', source_type: 'agent', title: 'Older item', sent_at: '2026-09-29T12:00:00Z', read_at: '2026-09-29T13:00:00Z' },
       { id: 'new', source_type: 'agent', title: 'Fresh item', sent_at: '2026-09-30T10:00:00Z', read_at: null },
+      { id: 'old', source_type: 'agent', title: 'Older item', sent_at: '2026-09-29T12:00:00Z', read_at: '2026-09-29T13:00:00Z' },
     ]],
     pageParams: [null],
   })
@@ -23,7 +23,9 @@ test('new and earlier rows are distinguished and can be marked read without dele
     }),
   ))
   assert.match(html, /Mark all as read/)
-  assert.match(html, /New[\s\S]*Fresh item[\s\S]*Mark as read[\s\S]*Earlier[\s\S]*Older item/)
+  assert.match(html, /Fresh item[\s\S]*Mark as read[\s\S]*Older item/)
+  assert.doesNotMatch(html, /notifications__group-label/)
+  assert.match(html, /notifications__unread-dot/)
   assert.match(html, /notifications__row-item--unread/)
   assert.equal((html.match(/Mark as read/g) || []).length, 1)
 })

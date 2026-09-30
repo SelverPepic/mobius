@@ -996,7 +996,7 @@ class NotificationOut(BaseModel):
   actions: list | None
   sent_at: datetime
   clicked_at: datetime | None
-  # Null = not yet marked read (counts toward the bell badge). Owner-only
+  # Null = not yet marked read (shows the panel's unread dot). Owner-only
   # surfaces return this schema, so it never reaches
   # app-scoped tokens.
   read_at: datetime | None

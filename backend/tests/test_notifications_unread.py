@@ -20,12 +20,45 @@ def _count(client, auth) -> int:
   return res.json()["count"]
 
 
+def _new_count(client, auth) -> int:
+  res = client.get("/api/notifications/new-count", headers=auth)
+  assert res.status_code == 200, res.text
+  return res.json()["count"]
+
+
+def test_opening_acknowledges_new_arrivals_without_reading_or_deleting(client, auth):
+  first = _send(client, auth, title="First")
+  second = _send(client, auth, title="Second")
+  assert _new_count(client, auth) == 2
+  assert _count(client, auth) == 2
+
+  seen = client.post("/api/notifications/seen-all", headers=auth)
+  assert seen.status_code == 200, seen.text
+  assert seen.json() == {"updated": 2}
+  assert _new_count(client, auth) == 0
+  assert _count(client, auth) == 2
+  rows = {row["id"]: row for row in client.get("/api/notifications", headers=auth).json()}
+  assert {first, second}.issubset(rows)
+  assert rows[first]["read_at"] is None
+  assert rows[second]["read_at"] is None
+  assert client.post("/api/notifications/seen-all", headers=auth).json() == {"updated": 0}
+
+  third = _send(client, auth, title="Later")
+  assert _new_count(client, auth) == 1
+  assert _count(client, auth) == 3
+  assert client.post(f"/api/notifications/{third}/read", headers=auth).json() == {"updated": 1}
+  assert _new_count(client, auth) == 0
+  assert _count(client, auth) == 2
+
+
 def test_explicit_read_all_lifecycle(client, auth):
   """Listing leaves unread intact; read-all is explicit and idempotent."""
   assert _count(client, auth) == 0
+  assert _new_count(client, auth) == 0
 
   sent_id = _send(client, auth)
   assert _count(client, auth) == 1
+  assert _new_count(client, auth) == 1
   listed = client.get("/api/notifications", headers=auth).json()
   row = next(n for n in listed if n["id"] == sent_id)
   assert row["read_at"] is None
@@ -36,6 +69,7 @@ def test_explicit_read_all_lifecycle(client, auth):
   assert first.status_code == 200, first.text
   assert first.json() == {"updated": 1}
   assert _count(client, auth) == 0
+  assert _new_count(client, auth) == 0
   listed = client.get("/api/notifications", headers=auth).json()
   row = next(n for n in listed if n["id"] == sent_id)
   assert row["read_at"] is not None
@@ -276,7 +310,9 @@ def test_app_attributed_send_publishes_activity_then_badge(client, auth, db):
 def test_unread_endpoints_are_owner_only(client, auth, db):
   """The bell is the owner's surface: no token → 401, app token → 403."""
   assert client.get("/api/notifications/unread-count").status_code == 401
+  assert client.get("/api/notifications/new-count").status_code == 401
   assert client.post("/api/notifications/read-all").status_code == 401
+  assert client.post("/api/notifications/seen-all").status_code == 401
   assert client.post("/api/notifications/n-1/read").status_code == 401
 
   app = models.App(
@@ -298,8 +334,14 @@ def test_unread_endpoints_are_owner_only(client, auth, db):
   assert client.get(
     "/api/notifications/unread-count", headers=app_headers,
   ).status_code == 403
+  assert client.get(
+    "/api/notifications/new-count", headers=app_headers,
+  ).status_code == 403
   assert client.post(
     "/api/notifications/read-all", headers=app_headers,
+  ).status_code == 403
+  assert client.post(
+    "/api/notifications/seen-all", headers=app_headers,
   ).status_code == 403
   assert client.post(
     "/api/notifications/n-1/read", headers=app_headers,

@@ -147,6 +147,39 @@ def unread_count(
   return {"count": int(n or 0)}
 
 
+@router.get("/new-count")
+def new_count(
+  owner: models.Owner = Depends(get_current_owner),
+  db: Session = Depends(get_db),
+):
+  """Arrivals not yet acknowledged by opening the notification panel."""
+  n = db.query(func.count(models.Notification.id)).filter(
+    models.Notification.owner_id == owner.id,
+    models.Notification.seen_at.is_(None),
+  ).scalar()
+  return {"count": int(n or 0)}
+
+
+@router.post(
+  "/seen-all",
+  dependencies=[
+    Depends(reject_cross_site),
+    Depends(require_nondelegated_owner_or_app_control),
+  ],
+)
+def seen_all(
+  owner: models.Owner = Depends(get_current_owner),
+  db: Session = Depends(get_db),
+):
+  """Acknowledge current arrivals while leaving unread rows and history intact."""
+  updated = db.query(models.Notification).filter(
+    models.Notification.owner_id == owner.id,
+    models.Notification.seen_at.is_(None),
+  ).update({"seen_at": datetime.now(UTC)}, synchronize_session=False)
+  db.commit()
+  return {"updated": int(updated)}
+
+
 @router.post(
   "/read-all",
   dependencies=[
@@ -171,7 +204,8 @@ def read_all(
       models.Notification.read_at.is_(None),
     )
     .update(
-      {"read_at": datetime.now(UTC)}, synchronize_session=False,
+      {"read_at": datetime.now(UTC), "seen_at": datetime.now(UTC)},
+      synchronize_session=False,
     )
   )
   db.commit()
@@ -201,7 +235,10 @@ def read_notification(
     models.Notification.owner_id == owner.id,
     models.Notification.id == notification_id,
     models.Notification.read_at.is_(None),
-  ).update({"read_at": datetime.now(UTC)}, synchronize_session=False)
+  ).update(
+    {"read_at": datetime.now(UTC), "seen_at": datetime.now(UTC)},
+    synchronize_session=False,
+  )
   db.commit()
   return {"updated": int(updated)}
 

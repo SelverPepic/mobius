@@ -197,17 +197,14 @@
   list-style: none;
 }
 
-.notifications__group-label {
-  padding: 10px 14px 5px;
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.07em;
-  text-transform: uppercase;
-}
-
-.notifications__row-item--unread {
-  background: color-mix(in srgb, var(--accent) 7%, transparent);
+.notifications__unread-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  vertical-align: 1px;
 }
 
 .notifications__row-item--unread .notifications__row-title {

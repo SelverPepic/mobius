@@ -1,6 +1,6 @@
 import { Agent, Bell, Chat, Grid, SettingsSlider, X } from '@openai/apps-sdk-ui/components/Icon'
 import { useQueryClient } from '@tanstack/react-query'
-import { Fragment, useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { notificationQueries } from '../../hooks/queries.js'
 import { formatDateTime } from '../../lib/dateTimeFormat.js'
 import {
@@ -48,8 +48,6 @@ export default function NotificationsView({
     isFetchNextPageError,
   } = notificationQueries.list.useQuery({ enabled: active })
   const rows = data?.pages.flat() ?? []
-  const unreadRows = rows.filter(n => !n.read_at)
-  const orderedRows = [...unreadRows, ...rows.filter(n => n.read_at)]
   const [now, setNow] = useState(() => Date.now())
   const pointerSelectionRef = useRef(null)
   const contentRef = useRef(null)
@@ -263,7 +261,7 @@ export default function NotificationsView({
               </div>
             </li>
           )}
-          {orderedRows.map((n, index) => {
+          {rows.map((n) => {
             const parsedNav = parseNotificationTarget(n.target)
             const nav = parsedNav?.view === 'chat' && n.title === 'Möbius needs your answer'
               ? { ...parsedNav, focusQuestion: true }
@@ -285,7 +283,10 @@ export default function NotificationsView({
                 </span>
                 <span className="notifications__row-main">
                   <span className="notifications__row-head">
-                    <span className="notifications__row-title">{n.title}</span>
+                    <span className="notifications__row-title">
+                      {!n.read_at && <span className="notifications__unread-dot" aria-label="Unread" />}
+                      {n.title}
+                    </span>
                     <time
                       className="notifications__row-time"
                       dateTime={n.sent_at}
@@ -328,13 +329,7 @@ export default function NotificationsView({
               </>
             )
             return (
-              <Fragment key={n.id}>
-              {(index === 0 || index === unreadRows.length) && (
-                <li className="notifications__group-label">
-                  {index === 0 && unreadRows.length > 0 ? 'New' : 'Earlier'}
-                </li>
-              )}
-              <li className={`notifications__row-item${!n.read_at ? ' notifications__row-item--unread' : ''}`}>
+              <li key={n.id} className={`notifications__row-item${!n.read_at ? ' notifications__row-item--unread' : ''}`}>
                 <div className="notifications__row-shell">
                   {nav && !recovery ? (
                     <button
@@ -396,7 +391,6 @@ export default function NotificationsView({
                   </p>
                 )}
               </li>
-              </Fragment>
             )
           })}
         </ul>

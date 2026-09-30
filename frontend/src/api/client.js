@@ -1387,7 +1387,12 @@ export const api = {
       return apiFetch(`/notifications${qs ? `?${qs}` : ''}`)
     },
     unreadCount: () => apiFetch('/notifications/unread-count'),
-    // Reading is explicit: opening the bell never clears its badge.
+    newCount: () => apiFetch('/notifications/new-count'),
+    // Opening acknowledges arrivals, but reading an item stays explicit.
+    seenAll: async () => jsonOrThrow(
+      await apiFetch('/notifications/seen-all', { method: 'POST' }),
+      'Could not acknowledge notifications:',
+    ),
     readAll: async () => jsonOrThrow(
       await apiFetch('/notifications/read-all', { method: 'POST' }),
       'Could not mark notifications read:',

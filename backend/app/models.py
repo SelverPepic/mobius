@@ -1717,6 +1717,8 @@ class Notification(Base):
   # Distinct from clicked_at, which records a tap on the OS push itself —
   # bulk-marking THAT would fabricate click data.
   read_at = Column(DateTime, nullable=True)
+  # Opening the panel acknowledges an arrival without marking its row read.
+  seen_at = Column(DateTime, nullable=True)
 
 
 class ToolOutput(Base):
