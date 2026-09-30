@@ -58,11 +58,10 @@
    ║      Tall state anchors send/stop/mic to flex-end so the   ║
    ║      action stays near the cursor.                         ║
    ║                                                            ║
-   ║   8. `.chat__pill--with-attach .chat__input-line` always   ║
-   ║      uses align-items: flex-end. When chips are present    ║
-   ║      and the user types multi-line, the cursor must stay   ║
-   ║      pinned at the visible bottom of the pill — pure       ║
-   ║      `--tall` alignment alone missed the chips case.       ║
+   ║   8. Attachments add room above the text row, not a new   ║
+   ║      alignment policy. Single-line text stays centered;    ║
+   ║      `--tall` alone bottom-aligns multi-line text and its   ║
+   ║      action, with or without attachment chips.             ║
    ║                                                            ║
    ║   9. Attach cards are UNIFORM 96×96 squares (image and     ║
    ║      file alike). Tray uses `align-items: center` so a     ║
@@ -3199,13 +3198,10 @@
     + var(--composer-stack-chrome)
   );
 }
-/* When chips are attached the pill is in column layout and the
-   input-line sits BELOW the chip tray. Anchor send/mic to the
-   bottom of input-line regardless of textarea height so they don't
-   drift upward as the user types multiple lines. */
+/* Keep the text row's alignment independent of the attachment tray;
+   --tall already anchors multi-line actions at the bottom of the row. */
 .chat__pill--with-attach .chat__input-line {
   min-height: 38px;
-  align-items: flex-end;
 }
 
 /* `align-items: center` keeps the row from stretching a shorter
