@@ -5738,13 +5738,13 @@ export default function ChatView({
       const label = formatResetTime(pendingLimitCheckAt)
       const resetLabel = formatResetTime(pendingLimitResetAt)
       const providerReset = resetLabel
-        ? `Provider reports usage resets ${resetLabel}.`
+        ? `Provider reports the limit resets ${resetLabel}.`
         : 'Provider reset time unknown.'
       if (autoResumeEnabled) {
-        return `Usage limit reached. ${providerReset} ${label ? `Next retry check ${label}.` : 'Retry check pending.'} Automatic continuation enabled.`
+        return `Provider limit reached. ${providerReset} ${label ? `Next retry check ${label}.` : 'Retry check pending.'} Automatic continuation enabled.`
       }
-      if (limitResetElapsed) return `Ready to retry usage; availability is not confirmed. ${providerReset}`
-      return `Usage limit reached. ${providerReset} ${label ? `Next retry check ${label}.` : 'Retry check pending.'} Automatic continuation available.`
+      if (limitResetElapsed) return `Ready to retry; availability is not confirmed. ${providerReset}`
+      return `Provider limit reached. ${providerReset} ${label ? `Next retry check ${label}.` : 'Retry check pending.'} Automatic continuation available.`
     }
     if (pendingResumeBlock.pause?.kind === 'restart' && !pendingResumeBlock.pause.manual) {
       return 'Response paused for restart. Möbius will continue automatically.'
@@ -6315,8 +6315,8 @@ export default function ChatView({
                                 : 'Queued to retry automatically'
                             })()
                           : limitResetElapsed
-                            ? 'Ready to retry — usage unconfirmed'
-                            : 'Usage limit reached — continuation available'
+                            ? 'Ready to retry — availability unconfirmed'
+                            : 'Provider limit reached — continuation available'
                         : pendingResumeBlock?.pause?.kind === 'restart' && !pendingResumeBlock.pause.manual
                           ? 'Paused for restart — continuing automatically'
                           : 'Turn paused — tap to resume'}

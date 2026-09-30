@@ -12,7 +12,7 @@ import { isResourcePause } from './waitingPresentation.js'
 // that changes how the card reads must land here.
 //
 // Classification, all from the single `pause` descriptor: a provider-limit
-// park carries `pause.kind='usage_limit'` or `rate_limit` and reads "Rate limit". Its check_at is a
+// park carries `pause.kind='usage_limit'` or `rate_limit`. Its check_at is a
 // bounded retry clock, not proof of a provider reset. A restart pause carries
 // `pause.kind='restart'`
 // without a reset time and reads "Paused". Both are WAIT
@@ -27,7 +27,7 @@ export function errorCardViewModel(block) {
   const modelCapacity = block.pause?.kind === 'model_capacity'
   const modelCapacityExhausted = block.pause?.kind === 'model_capacity_exhausted'
   const { checkAt, resetAt } = pauseTiming(block.pause)
-  const parked = !resourceWait && !modelCapacity && (isProviderLimitPause(block.pause) || (!!checkAt && !block.pause?.kind))
+  const parked = isProviderLimitPause(block.pause) || (!!checkAt && !block.pause?.kind)
   // Old saved handoff notes lacked the pause descriptor. Recognize only
   // that exact producer's prefix; unrelated resumable errors remain errors.
   const goalHandoff = block.pause?.kind === 'goal_handoff' || (
@@ -77,8 +77,8 @@ export default function ErrorCard({
     ? autoResume
       ? (vm.checkLabel ? `Queued to retry ${vm.checkLabel}` : 'Queued to retry')
       : resetElapsed
-        ? 'Ready to retry usage'
-        : 'Usage limit reached'
+        ? 'Ready to retry'
+        : 'Provider limit reached'
     : null
   const recoveryCopy = busyModelHold
     ? (continuationWait === 'restart_required'
@@ -88,9 +88,9 @@ export default function ErrorCard({
     ? 'Your work is safe. Möbius will retry with increasing pauses, up to five times. If the model stays busy, you can choose another model and Resume.'
     : vm.parked
     ? autoResume
-      ? `Your work is safe. ${recoveryCredit?.label ? `${recoveryCredit.label}. ` : ''}Möbius will check again${vm.checkLabel ? ` ${vm.checkLabel}` : ' automatically'}; usage may still be limited.`
+      ? `Your work is safe. ${recoveryCredit?.label ? `${recoveryCredit.label}. ` : ''}Möbius will check again${vm.checkLabel ? ` ${vm.checkLabel}` : ' automatically'}; the provider may still be limited.`
       : resetElapsed
-        ? 'Your work is safe. You can retry now; usage may still be limited.'
+        ? 'Your work is safe. You can retry now; the provider may still be limited.'
         : recoveryCredit?.label
           ? `Your work is safe. ${recoveryCredit.label}. Continuing now may use it.`
           : 'Your work is safe. Turn on auto-continue, or try again manually.'
@@ -113,7 +113,7 @@ export default function ErrorCard({
             <div className="chat__recovery-title">{recoveryTitle}</div>
             <div className="chat__recovery-copy">{recoveryCopy}</div>
             {vm.parked && <div className="chat__recovery-copy">
-              {vm.resetLabel ? `Provider reports usage resets ${vm.resetLabel}.` : 'Provider reset time unknown.'}
+              {vm.resetLabel ? `Provider reports the limit resets ${vm.resetLabel}.` : 'Provider reset time unknown.'}
               {vm.checkLabel ? ` Next retry check ${vm.checkLabel}.` : ''}
             </div>}
             {block.message && (

@@ -3369,3 +3369,15 @@ def test_model_capacity_sixth_failure_becomes_manual_resume(db, chat):
   assert kwargs == {"parked": False}
   assert sink.events[-1]["pause"]["kind"] == "model_capacity_exhausted"
   assert "five automatic retries" in sink.events[-1]["message"]
+
+
+def test_provider_limit_continuation_does_not_claim_quota_recovered():
+  from app.continuations import continuation_protocol_source
+
+  source = continuation_protocol_source(
+    reason="usage_limit", control_id="limit-check", run_token="retry-run",
+  )
+  assert source["continuation_reason"] == "usage_limit"
+  assert source["hidden"] is True
+  assert "Provider availability is not yet confirmed" in source["content"]
+  assert "usage is available" not in source["content"]
