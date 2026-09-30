@@ -29,6 +29,19 @@ def test_turn_identity_never_lives_in_the_shared_host_environment():
   }
 
 
+def test_core_helpers_are_available_and_caller_defaults_are_turn_scoped():
+  from app import platform_tools
+  host, turn = helper_hosts.split_env({
+    "MOBIUS_AGENT_PROVIDER": "codex", "MOBIUS_AGENT_MODEL": "chosen-model",
+    "MOBIUS_AGENT_EFFORT": "high", "AGENT_TOKEN": "secret",
+  })
+  assert host == {}
+  assert turn["MOBIUS_AGENT_MODEL"] == "chosen-model"
+  assert turn["MOBIUS_AGENT_PROVIDER"] == "codex"
+  assert turn["MOBIUS_AGENT_EFFORT"] == "high"
+  assert "spawn_agent" in platform_tools.expected_control_tool_names(top_level=False)
+
+
 def test_turn_env_file_is_private_round_trips_and_is_removed(tmp_path):
   values = {"AGENT_TOKEN": "tok with 'quotes' $x", "CHAT_ID": "c1"}
   env_file = helper_hosts.TurnEnvFile(tmp_path, "marker", values)

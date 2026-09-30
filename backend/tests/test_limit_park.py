@@ -1194,8 +1194,9 @@ def test_sweep_auto_resume_on_starts_one_staggered_continue(
     chat_mod.discard_starting("sweep-auto")
 
 
-def test_sweep_auto_resumes_an_active_delegation_under_its_app_identity(
-  owner_token, monkeypatch,
+@pytest.mark.parametrize("app_owned", [True, False])
+def test_sweep_auto_resumes_an_active_delegation_under_its_original_identity(
+  owner_token, monkeypatch, app_owned,
 ):
   """Quota suspension must not strand a bounded child behind its parent."""
   del owner_token
@@ -1217,9 +1218,11 @@ def test_sweep_auto_resumes_an_active_delegation_under_its_app_identity(
       source_dir="/tmp/mobius-tests/limit-resume-delegation",
       name="Subagents", description="", jsx_source="",
     )
-    db.add(app)
-    db.flush()
-    app_id = app.id
+    app_id = None
+    if app_owned:
+      db.add(app)
+      db.flush()
+      app_id = app.id
     db.add(models.Chat(
       id="sweep-delegation-parent", title="Parent", messages=[],
       provider="codex",

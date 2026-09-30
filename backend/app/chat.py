@@ -871,13 +871,10 @@ def reconcile_startup_chats(
         and msg.get("_initiated_by_app_id") is not None
         for msg in pending
       )
-      delegated_restart_app_id = None
-      if (
-        restart_run is not None
-        and restart_run.initiated_by_app_id is not None
-      ):
-        from app.delegations import restart_resume_app_id
-        delegated_restart_app_id = restart_resume_app_id(
+      delegated_restart = None
+      if restart_run is not None:
+        from app.delegations import restart_resume_delegation
+        delegated_restart = restart_resume_delegation(
           db,
           child_chat_id=chat.id,
           run_token=restart_run.id,
@@ -887,8 +884,13 @@ def reconcile_startup_chats(
       restart_identity_owned = bool(
         restart_run is not None
         and (
-          restart_run.initiated_by_app_id is None
-          or delegated_restart_app_id == restart_run.initiated_by_app_id
+          (
+            restart_run.initiated_by_app_id is None
+            and not db.query(models.Delegation.id).filter(
+              models.Delegation.child_chat_id == chat.id,
+            ).first()
+          )
+          or delegated_restart is not None
         )
       )
       restart_question_wait = bool(
@@ -1977,6 +1979,11 @@ def _auto_resume_recovery(
     or (physical.root_run_id or physical.id) != (park.root_run_id or park.id)
   ):
     return None
+  from app.delegations import delegation_recovery_allowed
+  if not delegation_recovery_allowed(
+    db, child_chat_id=chat.id, initiated_by_app_id=park.initiated_by_app_id,
+  ):
+    return None
   if reason == "model_capacity" and _model_capacity_retry_exhausted(db, park):
     return None
   payload = recover_start_continuation(
@@ -2012,16 +2019,19 @@ def _auto_resume_recovery(
       return None
     return park, payload
 
-  if park.initiated_by_app_id is not None:
-    from app.delegations import limit_resume_successor_app_id
-    delegation_app_id = limit_resume_successor_app_id(
+  delegated = db.query(models.Delegation.id).filter(
+    models.Delegation.child_chat_id == chat.id,
+  ).first() is not None
+  if park.initiated_by_app_id is not None or delegated:
+    from app.delegations import limit_resume_successor_delegation
+    delegation_owner = limit_resume_successor_delegation(
       db,
       child_chat_id=chat.id,
       parked_run_token=park.id,
       successor_run_token=physical.id,
       initiated_by_app_id=park.initiated_by_app_id,
     )
-    if delegation_app_id != park.initiated_by_app_id:
+    if delegation_owner is None:
       return None
   else:
     if (
@@ -2160,10 +2170,10 @@ async def _auto_resume_chat(
               park is not None
               and park.park_reason in AUTO_RETRY_PARK_REASONS
             )
-            delegation_resume_app_id = None
+            delegation_resume = None
             if park is not None and not restart_park and not auto_retry_park:
-              from app.delegations import limit_resume_app_id
-              delegation_resume_app_id = limit_resume_app_id(
+              from app.delegations import limit_resume_delegation
+              delegation_resume = limit_resume_delegation(
                 check_db,
                 child_chat_id=chat_id,
                 run_token=park.id,
@@ -2181,14 +2191,20 @@ async def _auto_resume_chat(
                 and bool(park.restart_nonce)
                 and accepted_nonce == park.restart_nonce
               )
+            from app.delegations import delegation_recovery_allowed
+            delegated_authorized = park is not None and delegation_recovery_allowed(
+              check_db, child_chat_id=chat_id,
+              initiated_by_app_id=park.initiated_by_app_id,
+            )
             policy_enabled = chat is not None and (
               _park_continues_automatically(chat, park)
-              or delegation_resume_app_id is not None
+              or delegation_resume is not None
             )
             if (
               chat is None
               or chat.deleted_at is not None
               or not policy_enabled
+              or not delegated_authorized
               or not restart_authorized
               or _has_unanswered_question(chat)
               or park is None
@@ -2200,7 +2216,7 @@ async def _auto_resume_chat(
                 park.initiated_by_app_id is not None
                 and not restart_park
                 and not auto_retry_park
-                and delegation_resume_app_id is None
+                and delegation_resume is None
               )
               or latest_id != park.id
               or any(
@@ -2222,7 +2238,7 @@ async def _auto_resume_chat(
               # follow-ups acquire their own attribution only after it finishes.
               park.initiated_by_app_id
               if restart_park or auto_retry_park
-              else delegation_resume_app_id
+              else (delegation_resume.app_id if delegation_resume is not None else None)
             )
           if not mark_starting(chat_id):
             return False
@@ -2460,12 +2476,17 @@ async def sweep_reset_parks(
     )
     if chat is None or chat.deleted_at is not None:
       return "chat unavailable"
+    from app.delegations import delegation_recovery_allowed
+    if not delegation_recovery_allowed(
+      db, child_chat_id=run.chat_id, initiated_by_app_id=run.initiated_by_app_id,
+    ):
+      return "delegation no longer owns recovery"
     restart_park = run.park_reason == "restart"
     auto_retry_park = run.park_reason in AUTO_RETRY_PARK_REASONS
-    delegation_resume_app_id = None
+    delegation_resume = None
     if not restart_park and not auto_retry_park:
-      from app.delegations import limit_resume_app_id
-      delegation_resume_app_id = limit_resume_app_id(
+      from app.delegations import limit_resume_delegation
+      delegation_resume = limit_resume_delegation(
         db,
         child_chat_id=run.chat_id,
         run_token=run.id,
@@ -2477,7 +2498,7 @@ async def sweep_reset_parks(
       run.initiated_by_app_id is not None
       and not restart_park
       and not auto_retry_park
-      and delegation_resume_app_id is None
+      and delegation_resume is None
     ):
       return "app-attributed work"
     if _has_unanswered_question(chat):
@@ -2486,7 +2507,7 @@ async def sweep_reset_parks(
       return "busy-model retry exhausted"
     policy_enabled = (
       _park_continues_automatically(chat, run)
-      or delegation_resume_app_id is not None
+      or delegation_resume is not None
     )
     if not policy_enabled:
       return "policy disabled"
@@ -5383,7 +5404,6 @@ async def _run_chat_impl_with_db(
       "MOBIUS_SUBAGENT_DEPTH": str(run_policy.depth),
       "MOBIUS_DELEGATION_ID": run_policy.delegation_id,
       "MOBIUS_SUBAGENT_PROVIDER": run_policy.provider,
-      "MOBIUS_SUBAGENT_HELPER": "/data/apps/subagents/subagents.py",
     })
   # Overrides any inherited TMPDIR from _safe_keys: agent scratch belongs on
   # the bounded data volume, never the container's unbounded overlay. TMP and
@@ -5433,6 +5453,11 @@ async def _run_chat_impl_with_db(
       settings.data_dir, chat_overrides, provider=provider_id,
     )
   )
+
+  # Helpers inherit this admission's resolved selection, not mutable global
+  # preferences or another turn using the same provider host.
+  base_env["MOBIUS_AGENT_MODEL"] = str(agent_settings.get("model") or "")
+  base_env["MOBIUS_AGENT_EFFORT"] = str(agent_settings.get("effort") or "")
 
   # Snapshot-on-first-send: if the chat has no per-chat choices yet, freeze the
   # current explicit model/effort onto the row so subsequent turns in THIS

@@ -498,7 +498,7 @@ class ChatFailureActivity(Base):
 class Delegation(Base):
   """Immutable control plane for one durable delegated task.
 
-  The child conversation is an ordinary hidden app-owned ``Chat`` and its
+  The child conversation is an ordinary hidden ``Chat`` and its
   physical execution state remains authoritative in ``ChatRun``. This row
   stores the immutable intent/policy needed to attach retries, constrain the
   SDK runner, and relate the child back to its parent logical run. Ordinary
@@ -515,7 +515,9 @@ class Delegation(Base):
   )
 
   id = Column(String(64), primary_key=True)
-  app_id = Column(Integer, ForeignKey("apps.id"), nullable=False, index=True)
+  # Ordinary agent delegation is parent-chat-owned. Apps may still own their
+  # separately submitted work, whose lifecycle retains app deletion guards.
+  app_id = Column(Integer, ForeignKey("apps.id"), nullable=True, index=True)
   parent_chat_id = Column(
     String(64), ForeignKey("chats.id"), nullable=False, index=True
   )
