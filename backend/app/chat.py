@@ -80,7 +80,6 @@ from app.chat_logging import (
   safe_commit as _safe_commit,
 )
 from app.goal_commands import goal_request_for_agent, is_goal_continue
-from app.memory_observability import claim_oom_kill
 from app.chat_writer import (
   AcknowledgeProviderSuccess,
   AdmitProviderExecution,
@@ -3845,6 +3844,10 @@ def _park_exit(
   synthetic message: the persisted block IS the parked card, so it must
   exist.
 
+  Memory recovery requires the runner's attempt-correlated ``oom_killed``
+  evidence. A generic failure cannot claim another process's cgroup kill;
+  explicit request-size rejections remain terminal even if memory is low.
+
   A planned restart is already the authoritative terminal outcome by the time
   the provider exits: ``drain_all_for_restart`` publishes the resumable pause
   before interrupting the handle and records the chat in
@@ -3854,6 +3857,23 @@ def _park_exit(
   `_complete_turn` kwargs for the limit disposition.
   """
   if getattr(sink, "chat_id", None) in _restart_draining_chats:
+    return {"parked": False}
+  if (
+    (runner_result or {}).get("api_error_status") == 413
+    or any(marker in (error_text or "").lower() for marker in (
+      "request body is too large", "request body too large",
+      "request entity too large", "payload too large",
+    ))
+  ):
+    sink.publish({
+      "type": "error",
+      "message": (
+        f"{error_text or 'The provider rejected an oversized request.'}\n\n"
+        "This request is too large to send. Compact the conversation or "
+        "reduce its attachments, or continue in a new chat using your saved "
+        "files. Retrying it unchanged will not help."
+      ),
+    })
     return {"parked": False}
   if runner_result is not None:
     limit = _is_limit_terminal(runner_result)
@@ -3894,7 +3914,7 @@ def _park_exit(
       "parked_until": parked_until,
       "park_reason": "model_capacity",
     }
-  if not limit and failed and claim_oom_kill():
+  if not limit and failed and (runner_result or {}).get("oom_killed"):
     parked_until = datetime.now(UTC).replace(tzinfo=None) + _PARK_MIN_DELAY
     park_reason = "memory"
     sink.publish(

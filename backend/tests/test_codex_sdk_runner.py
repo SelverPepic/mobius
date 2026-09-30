@@ -2503,6 +2503,95 @@ def _mark_interrupted(handle):
   handle._interrupt_requested = True
 
 
+@pytest.mark.parametrize("exit_code, before, after, expected", [
+  (-9, 3, 4, True),
+  (-9, 4, 4, False),
+  (-15, 3, 4, False),
+  (1, 3, 4, False),
+  (None, 3, 4, False),
+  (-9, None, 4, False),
+])
+def test_codex_process_death_carries_only_attempt_correlated_oom_evidence(
+  monkeypatch, exit_code, before, after, expected,
+):
+  monkeypatch.setattr(codex_sdk_runner, "cgroup_oom_kill_count", lambda: before)
+  monkeypatch.setattr("app.memory_observability.cgroup_oom_kill_count", lambda: after)
+  monkeypatch.setattr(codex_sdk_runner, "app_server_exit_code", lambda _client: exit_code)
+  result, _ = _run_turn_whose_stream_dies(
+    monkeypatch, _KilledTransportError("closed stdout"),
+  )
+  assert result["oom_killed"] is expected
+  assert result["error"] == codex_sdk_runner._TRANSPORT_DEATH_MESSAGE
+
+
+def test_codex_oversized_provider_notification_is_not_laundered_into_memory_retry(
+  monkeypatch,
+):
+  from app import chat
+
+  monkeypatch.setattr(codex_sdk_runner, "cgroup_oom_kill_count", lambda: 100)
+  monkeypatch.setattr("app.memory_observability.cgroup_oom_kill_count", lambda: 103)
+  monkeypatch.setattr(codex_sdk_runner, "app_server_exit_code", lambda _client: -9)
+  sdk = _fake_sdk(None)
+  message = '{"error":"request body is too large"}'
+  result, bc = _run_turn_whose_stream_dies(
+    monkeypatch, AssertionError("must stop at the provider error"),
+    notifications=[SimpleNamespace(
+      method="error",
+      payload=sdk["ErrorNotification"](
+        error=SimpleNamespace(message=message), thread_id="thread-1",
+        turn_id="turn-1", will_retry=False,
+      ),
+    )],
+    sdk_patch={"ErrorNotification": sdk["ErrorNotification"]},
+  )
+  assert result["error"] == message
+  assert not result.get("oom_killed")
+  assert chat._park_exit(bc, result, result["error"]) == {"parked": False}
+  event = bc.events[-1]
+  assert "pause" not in event
+  assert message in event["message"]
+  assert "Retrying it unchanged will not help" in event["message"]
+
+
+def test_codex_owner_stop_is_not_an_oom_recovery_even_when_counter_increases(
+  monkeypatch,
+):
+  monkeypatch.setattr(codex_sdk_runner, "cgroup_oom_kill_count", lambda: 3)
+  monkeypatch.setattr("app.memory_observability.cgroup_oom_kill_count", lambda: 4)
+  monkeypatch.setattr(codex_sdk_runner, "app_server_exit_code", lambda _client: -9)
+  result, _ = _run_turn_whose_stream_dies(
+    monkeypatch, _KilledTransportError("closed stdout"),
+    on_register=_mark_interrupted,
+  )
+  assert result["error"] is None
+  assert not result.get("oom_killed")
+
+
+@pytest.mark.asyncio
+async def test_codex_exit_is_observed_before_sdk_cleanup_can_kill_the_process():
+  observations = []
+
+  class Context:
+    exit_code = None
+
+    async def __aenter__(self):
+      return self
+
+    async def __aexit__(self, *_args):
+      self.exit_code = -9
+
+  context = Context()
+  with pytest.raises(_KilledTransportError):
+    async with codex_sdk_runner._codex_client_scope(
+      context, None, {}, None,
+      observe_exit=lambda client: observations.append(client.exit_code),
+    ):
+      raise _KilledTransportError("closed stdout")
+  assert observations == [None]
+  assert context.exit_code == -9
+
+
 def test_run_codex_sdk_turn_reports_self_requested_kill_as_interrupted(
   monkeypatch, caplog,
 ):

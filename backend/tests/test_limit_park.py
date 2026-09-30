@@ -3031,19 +3031,16 @@ def test_limit_park_releases_starting_claim_before_returning():
 
 # -- (h) platform-resource parks: memory kill and admission deferral ----------
 
-def test_park_exit_attributes_a_kernel_oom_kill_to_a_memory_park(monkeypatch):
-  """A provider process the kernel killed for memory parks and self-continues."""
-  counts = iter([3, 4, 4])
-  monkeypatch.setattr(
-    "app.memory_observability.cgroup_oom_kill_count", lambda: next(counts),
-  )
-  monkeypatch.setattr("app.memory_observability._oom_kills_attributed", None)
+def test_park_exit_uses_runner_correlated_oom_evidence_for_memory_recovery():
+  """The runner, not an unrelated cgroup counter, owns process-death evidence."""
   sink = _Sink()
-  # First exit establishes the mark; nothing to attribute yet.
   assert chat_mod._park_exit(sink, None, "process exited -9") == {
     "parked": False,
   }
-  kwargs = chat_mod._park_exit(sink, None, "process exited -9")
+  kwargs = chat_mod._park_exit(
+    sink, {"error": "process exited -9", "oom_killed": True},
+    "process exited -9",
+  )
   assert kwargs["parked"] is True
   assert kwargs["park_reason"] == "memory"
   assert kwargs["parked_until"] - datetime.now(UTC).replace(tzinfo=None) <= (
@@ -3052,10 +3049,58 @@ def test_park_exit_attributes_a_kernel_oom_kill_to_a_memory_park(monkeypatch):
   event = sink.events[-1]
   assert event["pause"]["kind"] == "memory"
   assert "memory" in event["message"]
-  # The single kill is consumed: an unrelated later failure stays a failure.
+  # A later attempt cannot inherit a prior runner's evidence.
   assert chat_mod._park_exit(sink, None, "syntax error") == {
     "parked": False,
   }
+
+
+@pytest.mark.parametrize("message", [
+  '{"error":"request body is too large"}',
+  "Invalid authentication credentials",
+  "unexpected notification payload",
+  "process exited -9",
+])
+def test_unrelated_failures_never_consume_old_or_concurrent_oom_kills(
+  monkeypatch, message,
+):
+  counter = iter(range(100, 200))
+  monkeypatch.setattr(
+    "app.memory_observability.cgroup_oom_kill_count", lambda: next(counter),
+  )
+  sink = _Sink()
+  for _ in range(3):
+    assert chat_mod._park_exit(sink, {"error": message}, message) == {
+      "parked": False,
+    }
+  assert all("pause" not in event for event in sink.events)
+  assert all(message in event["message"] for event in sink.events)
+
+
+@pytest.mark.parametrize("result, message", [
+  ({"oom_killed": True}, '{"error":"request body is too large"}'),
+  ({"api_error_status": 413}, None),
+  ({}, "Request Entity Too Large"),
+])
+def test_oversized_request_preserves_reason_and_offers_remedy_without_retry(
+  result, message,
+):
+  sink = _Sink()
+  assert chat_mod._park_exit(sink, result, message) == {"parked": False}
+  assert len(sink.events) == 1
+  event = sink.events[0]
+  assert "pause" not in event
+  assert "Compact the conversation" in event["message"]
+  assert "Retrying it unchanged will not help" in event["message"]
+  if message:
+    assert message in event["message"]
+
+
+def test_generic_too_large_error_is_not_rewritten_as_a_provider_request_limit():
+  sink = _Sink()
+  message = "Image dimensions too large for the document layout"
+  assert chat_mod._park_exit(sink, {"error": message}, message) == {"parked": False}
+  assert sink.events == [{"type": "error", "message": message}]
 
 
 def test_sweep_continues_a_memory_park_without_the_limit_opt_in(
