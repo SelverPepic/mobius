@@ -48,6 +48,7 @@ for (const viewport of [{ width: 1512, height: 911 }, { width: 390, height: 844 
       })
       const remove = painted.getByRole('button', { name: 'Remove alignment.svg' })
       await expect(remove).toBeVisible()
+      await expect(painted.locator('.chat__attach-card-spin')).toHaveCount(0)
       await expect.poll(geometry).toEqual(before)
       await expect(composer).toHaveValue(draft)
       await expect(composer).toBeFocused()
