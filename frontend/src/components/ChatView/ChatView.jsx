@@ -3305,7 +3305,7 @@ export default function ChatView({
       clearComposerFilesForSend()
       if (inputRef.current) {
         resetComposerTextarea(inputRef.current)
-        // Drop the multi-line `.chat__pill--tall` class so send/mic
+        // Drop the multi-line `data-composer-tall` attribute so send/mic
         // re-center vertically. Without this, the pill stays in
         // flex-end alignment after a send-from-tall and the freshly
         // empty textarea renders pinned to the bottom — text appears
@@ -3601,7 +3601,7 @@ export default function ChatView({
     clearComposerFilesForSend()
     if (inputRef.current) {
       resetComposerTextarea(inputRef.current)
-      // Drop the multi-line `.chat__pill--tall` class — see queue-path
+      // Drop the multi-line `data-composer-tall` attribute — see queue-path
       // comment above for the full rationale.
     }
     setSending(true)
