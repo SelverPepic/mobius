@@ -228,6 +228,23 @@ for (const mode of ['single', 'panes']) {
   for (const outcome of ['success', 'error', 'ordinary']) {
     test(`provider callback provenance controls stale reload precedence (${mode}, ${outcome})`, async ({ page }) => {
       await setup(page, { width: 1512, height: 911 })
+      // Chrome exists only for a genuinely tiled workspace. Merely setting
+      // viewMode='panes' on one leaf still paints a full-bleed Settings tab.
+      let callbackWorkspace = paneModel.setViewMode(
+        paneModel.seedFromFlatTabs([
+          { kind: 'chat', id: NAV_CHATS[0].id },
+          ...(mode === 'panes' ? [{ kind: 'chat', id: NAV_CHATS[1].id }] : []),
+        ]),
+        mode,
+      )
+      if (mode === 'panes') {
+        callbackWorkspace = paneModel.moveTab(
+          callbackWorkspace, `chat:${NAV_CHATS[1].id}`,
+          { root: true, edge: 'right' },
+        )
+        callbackWorkspace = paneModel.focusPane(callbackWorkspace, 'p0')
+        expect(Object.keys(callbackWorkspace.panes)).toHaveLength(2)
+      }
       await page.evaluate(([key, blob, chatId]) => {
         localStorage.setItem(key, blob)
         sessionStorage.setItem('shell-reload', JSON.stringify({
@@ -235,9 +252,7 @@ for (const mode of ['single', 'panes']) {
         }))
       }, [
         paneModel.STORAGE_KEY,
-        paneModel.serializeWorkspace(paneModel.setViewMode(
-          paneModel.seedFromFlatTabs([{ kind: 'chat', id: NAV_CHATS[0].id }]), mode,
-        )),
+        paneModel.serializeWorkspace(callbackWorkspace),
         NAV_CHATS[0].id,
       ])
 
@@ -268,8 +283,11 @@ for (const mode of ['single', 'panes']) {
         await expect(page.locator('#settings-ai-providers')).toBeFocused()
         if (mode === 'panes') {
           await expect(page.locator('.workspace__chrome')).toBeVisible()
+          await expect(page.locator('.shell__settings-view[role="tabpanel"]')).toBeVisible()
+          await expect(page.locator(`[data-chat-id="${NAV_CHATS[1].id}"][data-chat-surface="painted"]`)).toBeVisible()
         } else {
           await expect(page.locator('.workspace__chrome')).not.toBeVisible()
+          await expect(page.locator('.shell__settings-view--active')).toBeVisible()
         }
       }
     })
