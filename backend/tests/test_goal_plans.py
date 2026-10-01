@@ -606,7 +606,7 @@ def test_idle_goal_lifecycle_is_stable_while_exact_handoffs_are_projected(db, ch
   db.add(goal_run)
   db.commit()
   expected = {
-    "id": "idle-goal-id", "objective": "Ship it", "status": "paused",
+    "id": "idle-goal-id", "revision": 0, "objective": "Ship it", "status": "paused",
     "resumable": True,
     "handoff": {"kind": "none", "reason": None},
   }
@@ -645,8 +645,8 @@ def test_retained_goal_does_not_inherit_unrelated_question_wait_or_park(db, chat
   goal.status = "stopped"
   db.commit()
   held = presented_goal(db, chat.id)
-  assert held["pause_reason"] == "owner"
-  assert held["handoff"] == {"kind": "owner_hold", "reason": "owner"}
+  assert held["pause_reason"] == "unknown"
+  assert held["handoff"] == {"kind": "recovery", "reason": "unknown_stop"}
 
 
 def test_exact_goal_wait_does_not_borrow_an_unrelated_question_action(db, chat):

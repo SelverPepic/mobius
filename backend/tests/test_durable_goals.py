@@ -105,7 +105,7 @@ def test_migration_preserves_intent_and_is_idempotent(
   tmp_path, attempt_status, task_status, dismissed, expected,
 ):
   from app.database import Base
-  from app.schema_migrations import _durable_goal_records
+  from app.schema_migrations import _durable_goal_records, _add_goal_hold
   engine = create_engine(f"sqlite:///{tmp_path}/upgrade.db")
   # A frozen minimal predecessor shape: no new Goal table.
   with engine.begin() as c:
@@ -127,6 +127,7 @@ def test_migration_preserves_intent_and_is_idempotent(
     ))
   _durable_goal_records(engine)
   _durable_goal_records(engine)
+  _add_goal_hold(engine)
   with engine.connect() as c:
     rows=c.execute(select(models.ChatGoal.__table__)).mappings().all()
     assert len(rows)==1

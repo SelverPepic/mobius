@@ -574,6 +574,7 @@ def _goal_presentation(
     status = "paused"
   presentation = {
     "id": physical.goal_id or root.id,
+    "revision": int(root.revision or 0),
     "objective": root.objective,
     "status": status,
     "resumable": status == "paused",
@@ -581,7 +582,9 @@ def _goal_presentation(
   if status in {"completed", "cannot_complete", "cancelled"}:
     presentation["result"] = root.result
   if root.status == "stopped":
-    presentation["pause_reason"] = "owner"
+    from app.goals import goal_hold
+    hold = goal_hold(root)
+    presentation["pause_reason"] = hold["actor"] if hold else "unknown"
   presentation["handoff"] = _goal_handoff(db, physical, root)
   return presentation
 
@@ -590,7 +593,12 @@ def _goal_handoff(db: Session, physical: models.ChatRun, goal: models.ChatGoal) 
   from app.chat_handoffs import project_handoff
   none = {"kind": "none", "reason": None}
   if goal.status == "stopped":
-    return {"kind": "owner_hold", "reason": "owner"}
+    from app.goals import goal_hold
+    hold = goal_hold(goal)
+    actor = hold["actor"] if hold else "unknown"
+    if actor == "owner":
+      return {"kind": "owner_hold", "reason": "owner"}
+    return {"kind": "recovery", "reason": "agent_pause" if actor == "agent" else "unknown_stop"}
   if goal.status != "open":
     return none
   latest = db.query(models.ChatRun.id, models.ChatRun.goal_id, models.ChatRun.status).filter(

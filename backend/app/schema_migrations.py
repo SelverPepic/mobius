@@ -5777,6 +5777,18 @@ def _add_embed_browser_lineage(eng) -> None:
         conn.execute(text(f"ALTER TABLE chat_embed_grants ADD COLUMN {name} {sqltype}"))
 
 
+def _add_goal_hold(eng) -> None:
+  """Add explicit pause attribution without inventing intent for old stops."""
+  from sqlalchemy import inspect as sa_inspect, text
+
+  inspector = sa_inspect(eng)
+  if "chat_goals" not in inspector.get_table_names():
+    return
+  if "hold_json" not in {c["name"] for c in inspector.get_columns("chat_goals")}:
+    with eng.begin() as conn:
+      conn.execute(text("ALTER TABLE chat_goals ADD COLUMN hold_json JSON"))
+
+
 _SCHEMA_MIGRATIONS = (
   # Full IDs are permanent identities, not sequence positions. Append new
   # work in execution order; never renumber a shipped ID to reconcile sources.
@@ -5869,6 +5881,7 @@ _SCHEMA_MIGRATIONS = (
   ("0079_chat_run_browser_lineage", _add_chat_run_browser_lineage),
   ("0080_embed_browser_lineage", _add_embed_browser_lineage),
   ("0078_agent_write_journal", _add_agent_write_journal),
+  ("0081_goal_hold", _add_goal_hold),
 )
 
 

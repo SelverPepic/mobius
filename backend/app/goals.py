@@ -7,6 +7,39 @@ from sqlalchemy import update
 from app import models
 
 
+def goal_hold(goal):
+  """Read only validated attribution; legacy stops never imply owner intent."""
+  hold = goal.hold_json
+  keys = ("cause", "actor", "source_id", "run_id", "actor_id", "at")
+  if not isinstance(hold, dict) or any(key not in hold for key in keys):
+    return None
+  if hold["cause"] not in ("stop", "quiet_answer") or hold["actor"] not in ("owner", "agent", "unknown"):
+    return None
+  if any(not isinstance(hold[key], str) or not hold[key].strip() for key in ("source_id", "at")):
+    return None
+  if any(hold[key] is not None and (not isinstance(hold[key], str) or not hold[key].strip())
+         for key in ("run_id", "actor_id")):
+    return None
+  try:
+    at = datetime.fromisoformat(hold["at"])
+  except ValueError:
+    return None
+  if at.tzinfo is None:
+    return None
+  return {key: hold[key] for key in keys}
+
+
+def stage_goal_hold(goal, *, cause, actor, source_id, run_id=None, actor_id=None) -> bool:
+  """Stage explicit intent in the writer's transaction, never replace a hold."""
+  if goal.status != "open":
+    return False
+  goal.hold_json = {"cause": cause, "actor": actor, "source_id": source_id,
+                    "run_id": run_id, "actor_id": actor_id, "at": datetime.now(UTC).isoformat()}
+  goal.status = "stopped"
+  goal.revision += 1
+  return True
+
+
 def goal_for_run(db, run):
   if run is None or not run.goal_id:
     return None
@@ -39,6 +72,7 @@ def admit_goal(db, chat_id, goal_id, objective, message=None):
     from app.goal_commands import is_goal_continue
     if goal.status == "stopped" and (reason == "manual" or is_goal_continue(str(message.get("content") or ""))):
       goal.status = "open"
+      goal.hold_json = None
       goal.revision += 1
 
 

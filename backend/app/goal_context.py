@@ -64,6 +64,11 @@ def project_goal(goal, task_id=None):
   ancestors = path(task_id)[:-1] if task_id else []
   payload = {"id": goal.id, "revision": goal.revision, "objective": goal.objective,
              "status": goal.status, "focus": task_id}
+  if goal.status == "stopped":
+    from app.goals import goal_hold
+    hold = goal_hold(goal)
+    if hold:
+      payload["hold"] = hold
   if goal.status == "open":
     payload["outcome_contract"] = (
       "Preserve the original objective. Complete only verified success; if it seems "

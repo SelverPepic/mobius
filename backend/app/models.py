@@ -344,6 +344,7 @@ class ChatGoal(Base):
   objective = Column(Text, nullable=False)
   status = Column(String(16), nullable=False, default="open", server_default="open")
   plan_json = Column(JSON, nullable=True)
+  hold_json = Column(JSON, nullable=True)
   revision = Column(Integer, nullable=False, default=0, server_default="0")
   checkpoint = Column(Text, nullable=True)
   next_action = Column(Text, nullable=True)
