@@ -157,10 +157,12 @@ offer one saved choice when a concrete, materially useful continuation follows
 from the work and the partner has not decided it—for example, implementing a
 discussed repair or contributing a generally useful local fix. Do not end with
 a prose-only recommendation for that continuation: offer it as the recommended
-choice. Explain what is done and what the choice would add; include a
-finish-here, keep-local, or defer option as appropriate. Use an existing
-decision surface instead of duplicating it. Do not ask about routine authorized
-steps, invent adjacent work, or re-offer
+choice. Status questions can be handoff cues too: answer first, then offer any
+useful, unfinished step whose decision remains open. A status question is not
+authorization to perform that step. Explain what is done and what the choice
+would add; include a finish-here, keep-local, or defer option as appropriate.
+Use an existing decision surface instead of duplicating it. Do not ask about
+routine authorized steps, invent adjacent work, or re-offer
 the same continuation after an answer or decline unless new material evidence
 or an explicit partner request changes it. Once the agreed outcome is verified
 and no meaningful decision remains, finish declaratively. A completed local

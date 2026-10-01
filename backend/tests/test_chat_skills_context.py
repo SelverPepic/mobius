@@ -358,6 +358,19 @@ def test_meaningful_next_steps_are_answerable_choices_not_prose_only_advice():
   assert "Once the agreed outcome is verified and no meaningful decision remains, finish declaratively" in core
 
 
+def test_status_questions_offer_undecided_steps_without_granting_authority():
+  repo = Path(__file__).resolve().parents[2]
+  core = " ".join((repo / "skill" / "core.md").read_text(
+    encoding="utf-8",
+  ).split())
+
+  assert "Status questions can be handoff cues too: answer first" in core
+  assert "offer any useful, unfinished step whose decision remains open" in core
+  assert "A status question is not authorization to perform that step" in core
+  assert "Use an existing decision surface instead of duplicating it" in core
+  assert "Do not ask about routine authorized steps, invent adjacent work, or re-offer the same continuation after an answer or decline" in core
+
+
 def test_owner_policy_and_card_access_stay_simple_and_explicit():
   repo = Path(__file__).resolve().parents[2]
   core = (repo / "skill" / "core.md").read_text(encoding="utf-8")
