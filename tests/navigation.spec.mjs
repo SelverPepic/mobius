@@ -277,7 +277,7 @@ for (const mode of ['single', 'panes']) {
 
       if (outcome === 'ordinary') {
         await expect(page.locator('.settings')).not.toBeVisible()
-        await expect(page.locator('[data-chat-surface="painted"]')).toBeVisible()
+        await expect(page.locator(`[data-chat-id="${NAV_CHATS[0].id}"][data-chat-surface="painted"]`)).toBeVisible()
       } else {
         await expect(page.locator('.settings')).toBeVisible()
         await expect(page.locator('#settings-ai-providers')).toBeFocused()
