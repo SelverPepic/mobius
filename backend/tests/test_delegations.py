@@ -1830,7 +1830,10 @@ def _drive_parent_turn(
     if provider_error is not None:
       bc.publish({"type": "error", "message": provider_error})
       return {"session_id": None, "cost_usd": None, "error": provider_error}
-    bc.publish({"type": "text", "content": response})
+    # Match the normalized provider stream: an identified delta followed by
+    # its authoritative snapshot. Anonymous provisional text is not publishable.
+    bc.publish({"type": "text", "text_item_id": "reply", "content": response})
+    bc.publish({"type": "text_final", "text_item_id": "reply", "content": response})
     if before_provider_return is not None:
       before_provider_return()
     return {
