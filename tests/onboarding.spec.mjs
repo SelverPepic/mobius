@@ -1,6 +1,40 @@
 import { test, expect } from '@playwright/test'
+import { applyApp } from './app-source.mjs'
 
 const BASE = process.env.MOBIUS_URL || 'http://localhost:8001'
+
+// A disposable Store-compatible frame owns the same host navigation seam as
+// the real Store. E2E disables first-boot apps, so discovery cannot assume a
+// bootstrapped Store. Keep the catalog deterministic and exercise real shell
+// app routing, intent delivery and reversible host history instead.
+const STORE_FIXTURE = `
+import React, { useEffect, useRef, useState } from 'react'
+
+export default function StoreFixture() {
+  const [detail, setDetail] = useState(null)
+  const entry = useRef(null)
+  useEffect(() => {
+    function onIntent(event) {
+      if (event.origin !== window.location.origin || event.source !== window.parent) return
+      if (event.data?.type !== 'moebius:app-intent') return
+      const match = /^app:([a-z0-9-]+)$/.exec(event.data.intent || '')
+      if (!match || match[1] !== 'notes') return
+      const handle = window.mobius.nav.open('app-store-detail', {
+        onBack: () => { entry.current = null; setDetail(null) },
+        onForward: () => { entry.current = handle; setDetail('Notes') },
+      })
+      entry.current = handle
+      handle.outcome.then(({ status }) => {
+        if (entry.current === handle && status === 'owned') setDetail('Notes')
+      })
+    }
+    window.addEventListener('message', onIntent)
+    return () => window.removeEventListener('message', onIntent)
+  }, [])
+  return detail ? <main><h1>{detail}</h1><details><summary>Privacy, access & technical details</summary><p>Privacy & access</p></details></main>
+    : <main><h1>App Store</h1></main>
+}
+`
 
 // Keep the browser's first-run requests inside this isolated test case.
 test.use({ serviceWorkers: 'block' })
@@ -101,44 +135,60 @@ test('short landscape keeps guide actions and dismissal reachable', async ({ pag
   await expect.poll(completionCount).toBe(1)
 })
 
-test('app discovery hands access review to Store and preserves the guide through history', async ({ page }) => {
-  const { guide, completionCount } = await openGuide(page)
+test('app discovery hands access review to Store and preserves the guide through history', async ({ page, request }) => {
+  // The disposable E2E server skips default-app bootstrap. Install this test's
+  // Store explicitly instead of making the test depend on host app inventory.
+  await page.goto(BASE, { waitUntil: 'domcontentloaded' })
   const token = await page.evaluate(() => localStorage.getItem('token'))
-  const appsResponse = await page.request.get(`${BASE}/api/apps/`, {
-    headers: { Authorization: `Bearer ${token}` },
+  const { app: storeApp } = await applyApp(request, token, {
+    slug: 'store', name: 'App Store', jsxSource: STORE_FIXTURE,
   })
-  expect(appsResponse.ok()).toBe(true)
-  const storeApp = (await appsResponse.json()).find(app => app.slug === 'store')
-  expect(storeApp).toBeTruthy()
-  const storeSelector = `iframe[data-app-id="${storeApp.id}"]`
-  for (let step = 0; step < 3; step += 1) {
-    await guide.getByRole('button', { name: 'Next', exact: true }).click()
+  try {
+    await page.route(/\/api\/proxy\?/, route => {
+      const source = new URL(route.request().url()).searchParams.get('url')
+      if (source?.endsWith('/catalog.json')) return route.fulfill({
+        status: 200, contentType: 'application/json',
+        body: JSON.stringify({ schema: 1, apps: [{
+          id: 'notes', name: 'Notes', description: 'Write notes.',
+          manifest_url: 'https://example.com/notes/mobius.json', raw_base: 'https://example.com/notes/',
+        }] }),
+      })
+      return route.continue()
+    })
+    const { guide, completionCount } = await openGuide(page)
+    const storeSelector = `iframe[data-app-id="${storeApp.id}"]`
+    for (let step = 0; step < 3; step += 1) {
+      await guide.getByRole('button', { name: 'Next', exact: true }).click()
+    }
+    const review = guide.getByRole('button', { name: 'Review Notes in App Store' })
+    await expect(review).toBeEnabled()
+    let installs = 0
+    await page.route(/\/api\/apps\/install$/, route => {
+      installs += 1
+      return route.abort('blockedbyclient')
+    })
+    await review.click()
+    await expect(guide).not.toBeVisible()
+    await expect(page.locator(storeSelector)).toBeVisible()
+    const store = page.frameLocator(storeSelector)
+    await expect(store.getByRole('heading', { name: 'Notes', exact: true })).toBeVisible()
+    await store.locator('summary').filter({ hasText: 'Privacy, access & technical details' }).click()
+    await expect(store.getByText('Privacy & access', { exact: true })).toBeVisible()
+    expect(installs).toBe(0)
+    expect(completionCount()).toBe(0)
+    await page.goBack() // Store detail -> Store browse.
+    await page.goBack() // Store route -> previous workspace and guide.
+    await expect(guide.getByRole('heading', { name: 'Explore apps' })).toBeVisible()
+    await expect(guide.getByRole('heading', { name: 'Explore apps' })).toBeFocused()
+    await page.goForward()
+    await expect(guide).not.toBeVisible()
+    expect(installs).toBe(0)
+    expect(completionCount()).toBe(0)
+  } finally {
+    await request.delete(`${BASE}/api/apps/${storeApp.id}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
   }
-  const review = guide.getByRole('button', { name: /^Review .+ in App Store$/ }).first()
-  await expect(review).toBeEnabled()
-  const name = (await review.getAttribute('aria-label')).replace(/^Review | in App Store$/g, '')
-  let installs = 0
-  await page.route(/\/api\/apps\/install$/, route => {
-    installs += 1
-    return route.abort('blockedbyclient')
-  })
-  await review.click()
-  await expect(guide).not.toBeVisible()
-  await expect(page.locator(storeSelector)).toBeVisible()
-  const store = page.frameLocator(storeSelector)
-  await expect(store.getByRole('heading', { name, exact: true })).toBeVisible()
-  await store.locator('summary').filter({ hasText: 'Privacy, access & technical details' }).click()
-  await expect(store.getByText('Privacy & access', { exact: true })).toBeVisible()
-  expect(installs).toBe(0)
-  expect(completionCount()).toBe(0)
-  await page.goBack() // Store detail -> Store browse.
-  await page.goBack() // Store route -> previous workspace and guide.
-  await expect(guide.getByRole('heading', { name: 'Explore apps' })).toBeVisible()
-  await expect(guide.getByRole('heading', { name: 'Explore apps' })).toBeFocused()
-  await page.goForward()
-  await expect(guide).not.toBeVisible()
-  expect(installs).toBe(0)
-  expect(completionCount()).toBe(0)
 })
 
 test('missing App Store does not block the guide or install from discovery', async ({ page }) => {
