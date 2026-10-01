@@ -86,6 +86,7 @@ from app.chat_writer import (
   AdmitProviderExecution,
   AppendPending,
   Barrier,
+  BeginNoteRecovery,
   CancelPending,
   ClearPresentedGoal,
   ClearPending,
@@ -1983,6 +1984,8 @@ def _auto_resume_recovery(
   )
   if not park_reasons:
     return None
+  if reason == "compaction" and (chat.pending_messages or _has_unanswered_question(chat)):
+    return None
   park = db.query(models.ChatRun).filter(
     models.ChatRun.id == recorded_park,
     models.ChatRun.chat_id == chat.id,
@@ -3768,10 +3771,10 @@ def _parse_reset_text(text: str, now: datetime) -> datetime | None:
 # interrupted the turn, not a provider quota, so the paid-retry opt-in for
 # limits does not apply.
 RESOURCE_PARK_REASONS = frozenset({"memory", "storage"})
-# These waits are owned by Möbius rather than the paid-limit preference. They
-# retain the interrupted request and retry with a pause; no extra usage is
-# requested or consumed merely because a model was momentarily busy.
-AUTO_RETRY_PARK_REASONS = RESOURCE_PARK_REASONS | frozenset({"model_capacity"})
+# These recoveries belong to the interrupted turn rather than the paid-limit
+# preference. Compaction is admitted only after one bounded synthesis succeeds;
+# the saved attempt flag prevents repeated synthesis/retry on the same root.
+AUTO_RETRY_PARK_REASONS = RESOURCE_PARK_REASONS | frozenset({"model_capacity", "compaction"})
 
 
 def _park_continues_automatically(chat, park) -> bool:
@@ -3784,6 +3787,8 @@ def _park_continues_automatically(chat, park) -> bool:
   reason = park.park_reason if park is not None else None
   if reason == "restart":
     return bool(chat.auto_resume_on_restart)
+  if reason == "compaction":
+    return not chat.pending_messages and not chat.pending_question_id
   if reason in AUTO_RETRY_PARK_REASONS:
     return True
   return bool(chat.auto_resume_on_limit)
@@ -3921,7 +3926,8 @@ def _park_exit(
 
   Memory recovery requires the runner's attempt-correlated ``oom_killed``
   evidence. A generic failure cannot claim another process's cgroup kill;
-  explicit request-size rejections remain terminal even if memory is low.
+  explicit size rejections never become memory retries. A separately fenced
+  note recovery may construct a smaller context after the failure is saved.
 
   A planned restart is already the authoritative terminal outcome by the time
   the provider exits: ``drain_all_for_restart`` publishes the resumable pause
@@ -3949,7 +3955,7 @@ def _park_exit(
         "files. Retrying it unchanged will not help."
       ),
     })
-    return {"parked": False}
+    return {"parked": False, "oversized": True}
   if runner_result is not None:
     limit = _is_limit_terminal(runner_result)
   else:
@@ -4047,6 +4053,86 @@ def _park_exit(
   }
 
 
+async def _recover_oversized_turn(*, sink, chat_id: str, run_gen: int | None):
+  """One source-fenced compaction, then the existing durable park/sweep handoff.
+
+  Failed synthesis never retires the session. A durable claim precedes any
+  model call; a crash or another oversized response cannot renew its budget.
+  Queued owner input wins, and helpers never gain new replay permission.
+  """
+  from app.compaction import PreparedNoteRecovery, RecoverySynthesisHandle
+  from app.config import get_settings
+
+  prepared = None
+  try:
+    async with chat_queue.get_transition_lock(chat_id):
+      async with chat_queue.get_lock(chat_id):
+        if _run_generation_superseded(chat_id, run_gen) or draining:
+          return chat_queue.TerminalDisposition.STALE_NO_ACTION
+        source = await _await_ack(get_writer().submit(BeginNoteRecovery(
+          chat_id=chat_id, run_token=sink.run_token or "", generation=run_gen,
+        )))
+    if source is not None:
+      if _run_generation_superseded(chat_id, run_gen) or draining:
+        return chat_queue.TerminalDisposition.STALE_NO_ACTION
+      task = asyncio.create_task(source.summarize(data_dir=get_settings().data_dir))
+      handle = RecoverySynthesisHandle(chat_id, task)
+      registry.register(handle)
+      # Restart/Stop must see this exact run while its isolated synthesis is
+      # active; late owner messages still queue (this handle cannot steer).
+      register_active_sink(chat_id, sink)
+      try:
+        briefing = await task
+        prepared = PreparedNoteRecovery(source, briefing)
+      except asyncio.CancelledError:
+        # Owner Stop/restart cancels the isolated synthesis, not another turn.
+        if not _run_generation_superseded(chat_id, run_gen) and not draining:
+          raise
+      finally:
+        unregister_active_sink(chat_id, sink)
+        if registry.get_handle(chat_id, handle.kind) is handle:
+          registry.unregister(chat_id, handle.kind)
+          if not _run_generation_superseded(chat_id, run_gen) and not draining:
+            registry.mark_starting(chat_id)
+  except Exception:
+    _get_logger().warning("note-based recovery failed chat_id=%s", chat_id, exc_info=True)
+
+  try:
+    async with asyncio.timeout(chat_queue.TERMINAL_LOCK_TIMEOUT_SECS):
+      async with chat_queue.get_transition_lock(chat_id):
+        async with chat_queue.get_lock(chat_id):
+          if _run_generation_superseded(chat_id, run_gen) or draining:
+            return chat_queue.TerminalDisposition.STALE_NO_ACTION
+          parked = False
+          if prepared is not None:
+            parked = bool(await _await_ack(get_writer().submit(ParkRun(
+              chat_id=chat_id, run_token=sink.run_token or "",
+              parked_until=datetime.now(UTC).replace(tzinfo=None),
+              park_reason="compaction", compaction=prepared,
+            ))))
+          if _run_generation_superseded(chat_id, run_gen) or draining:
+            return chat_queue.TerminalDisposition.STALE_NO_ACTION
+          if not parked:
+            sink.publish({"type": "error", "message": (
+              "Automatic compaction could not safely recover this oversized request. "
+              "Your conversation and previous session are unchanged. "
+              "No automatic retry was started; review the saved handoff or compact manually."
+            )})
+            await sink.finalize()
+            await _finish_run_strict(chat_id, sink.run_token or "", terminal_status="failed")
+          discard_starting(chat_id)
+          forget_chat_if_current(chat_id, run_gen)
+    # A committed compaction marker is read from the transcript, never streamed
+    # through the old sink (which would overwrite the finalized failed turn).
+    if parked:
+      get_system_broadcast().publish({"type": "chat_updated", "chatId": chat_id})
+    return (chat_queue.TerminalDisposition.LIMIT_PARKED if parked
+            else chat_queue.TerminalDisposition.EMPTY_TERMINAL_CLEARED)
+  except Exception:
+    _get_logger().warning("note recovery handoff not confirmed chat_id=%s", chat_id, exc_info=True)
+    return chat_queue.TerminalDisposition.FAILED_LEAVE_MARKER
+
+
 async def _complete_turn(
   *,
   bc,
@@ -4061,6 +4147,7 @@ async def _complete_turn(
   parked_until: datetime | None = None,
   park_reason: str | None = None,
   provider_free: bool = False,
+  oversized: bool = False,
   activity_results: tuple[tuple[str, str], ...] = (),
 ) -> chat_queue.TerminalDisposition:
   """Terminal sequence shared by both providers' success + error exits.
@@ -4253,6 +4340,20 @@ async def _complete_turn(
     _publish_chat_run_finished(chat_id)
     db.close()
     return chat_queue.TerminalDisposition.FAILED_LEAVE_MARKER
+
+  if oversized and we_own_gen and not stop_handoff_successor:
+    # This path owns its terminal transition: normal queue drain must not
+    # replay a failed context or promote another send while synthesis runs.
+    disposition = await _recover_oversized_turn(
+      sink=sink, chat_id=chat_id, run_gen=run_gen,
+    )
+    clear_active_broadcast_if(bc)
+    bc.publish({"type": "done", "cost_usd": cost_usd})
+    bc.mark_completed()
+    if disposition is not chat_queue.TerminalDisposition.STALE_NO_ACTION:
+      _publish_chat_run_finished(chat_id)
+    db.close()
+    return disposition
 
   # Finalize is the owning atomic boundary for the helper-result envelope and
   # terminal assistant response. Publish after that boundary so passive

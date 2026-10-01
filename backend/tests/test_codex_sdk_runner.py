@@ -2558,7 +2558,7 @@ def test_codex_oversized_provider_notification_is_not_laundered_into_memory_retr
   )
   assert result["error"] == message
   assert not result.get("oom_killed")
-  assert chat._park_exit(bc, result, result["error"]) == {"parked": False}
+  assert chat._park_exit(bc, result, result["error"]) == {"parked": False, "oversized": True}
   event = bc.events[-1]
   assert "pause" not in event
   assert message in event["message"]

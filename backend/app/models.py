@@ -417,6 +417,9 @@ class ChatRun(Base):
   # envelope keeps recovery identity out of Chat.messages/pending_messages so
   # it can never masquerade as owner speech or a queued owner send.
   continuation_json = Column(JSON, nullable=True, default=None)
+  # Claimed before note-based size recovery makes any model call. This is
+  # independent of continuation provenance: a direct owner run remains direct.
+  note_recovery_attempted = Column(Boolean, nullable=False, default=False, server_default="0")
   provider = Column(String(32), nullable=True, default=None)
   # Objective shown by the shell while this exact run is attached to a Goal.
   # This belongs to the run rather than the transcript tail: mid-turn owner

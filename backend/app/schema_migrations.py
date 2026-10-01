@@ -5677,6 +5677,21 @@ def _add_legacy_helper_interruption(eng) -> None:
     ))
 
 
+def _add_note_recovery_attempted(eng) -> None:
+  """Retain the one-shot size-recovery budget across physical restarts."""
+  from sqlalchemy import inspect as sa_inspect, text
+
+  inspector = sa_inspect(eng)
+  if "chat_runs" not in inspector.get_table_names():
+    return
+  if "note_recovery_attempted" in {c["name"] for c in inspector.get_columns("chat_runs")}:
+    return
+  with eng.begin() as conn:
+    conn.execute(text(
+      "ALTER TABLE chat_runs ADD COLUMN note_recovery_attempted BOOLEAN NOT NULL DEFAULT 0"
+    ))
+
+
 _SCHEMA_MIGRATIONS = (
   # Full IDs are permanent identities, not sequence positions. Append new
   # work in execution order; never renumber a shipped ID to reconcile sources.
@@ -5764,6 +5779,7 @@ _SCHEMA_MIGRATIONS = (
   ("0075_notification_seen_at", _add_notification_seen_at),
   ("0076_legacy_helper_interruption", _add_legacy_helper_interruption),
   ("0077_chat_archive", _add_chat_archive),
+  ("0077_note_recovery_attempted", _add_note_recovery_attempted),
 )
 
 

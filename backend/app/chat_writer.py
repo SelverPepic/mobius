@@ -51,6 +51,10 @@ from concurrent.futures import Future, InvalidStateError
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+  from app.compaction import PreparedNoteRecovery
 
 from sqlalchemy import and_, or_, select, text, update
 from sqlalchemy.exc import SQLAlchemyError
@@ -1049,6 +1053,15 @@ class PersistCompaction(_Command):
 
 
 @dataclass
+class BeginNoteRecovery(_Command):
+  """Claim one same-root recovery before synthesis; never retire its session."""
+
+  chat_id: str = ""
+  run_token: str = ""
+  generation: int | None = None
+
+
+@dataclass
 class AuthorizeCheckpoint(_Command):
   """Admit a continuity save from the chat's live run; apply its name.
 
@@ -1147,6 +1160,7 @@ class ParkRun(_Command):
   parked_until: object = None
   park_reason: str = ""
   restart_nonce: str = ""
+  compaction: "PreparedNoteRecovery | None" = None
 
 
 @dataclass
@@ -2083,6 +2097,8 @@ class ChatWriterActor:
       return self._append_pending(db, cmd)
     if isinstance(cmd, AppendSteeredUserMessage):
       return self._append_steered_user_message(db, cmd)
+    if isinstance(cmd, BeginNoteRecovery):
+      return self._begin_note_recovery(db, cmd)
     if isinstance(cmd, PersistCompaction):
       return self._persist_compaction(db, cmd)
     if isinstance(cmd, AuthorizeCheckpoint):
@@ -2589,6 +2605,10 @@ class ChatWriterActor:
       or run.provider_execution_admitted is not False
     ):
       raise _PersistFailed("AdmitProviderExecution: run is not eligible")
+    if (run.continuation_json or {}).get("reason") == "compaction" and (
+      chat.pending_messages or chat.pending_question_id
+    ):
+      raise _PersistFailed("AdmitProviderExecution: owner input superseded compaction recovery")
     activity_results = dict(cmd.activity_results)
     activity_ids = tuple(activity_results)
     if (
@@ -3672,6 +3692,13 @@ class ChatWriterActor:
       db.rollback()
       return StartContinuationBlocked("active_run")
 
+    if cmd.reason == "compaction" and (
+      superseded is None or superseded.park_reason != "compaction"
+      or chat.pending_messages or chat.pending_question_id
+      or chat.session_id is not None
+    ):
+      db.rollback()
+      return StartContinuationBlocked("compaction_recovery_changed")
     existing = list(chat.messages or [])
     pending = list(chat.pending_messages or [])
     control_only = (
@@ -4507,6 +4534,99 @@ class ChatWriterActor:
       raise _PersistFailed("AuthorizeCheckpoint title did not persist")
     return {"status": "ok", "title_applied": title_applied}
 
+  def _note_recovery_owner(self, db, chat, run) -> bool:
+    """Automatic reseeding belongs only to an unchanged owner conversation.
+
+    App jobs and delegated helpers carry independent replay permissions. Do
+    not turn a size failure into permission to restart their side effects.
+    """
+    from app.goals import goal_for_run
+    goal = goal_for_run(db, run) if run is not None else None
+    return bool(
+      chat is not None and run is not None and run.chat_id == chat.id
+      and run.status == "running"
+      and self._run_token_owner.get(chat.id) == run.id
+      and self._run_is_latest(db, run)
+      and chat.created_by_app_id is None and run.initiated_by_app_id is None
+      and not chat.pending_messages and not chat.pending_question_id
+      and not _tail_open_question_id(chat.messages)
+      and (not run.goal_id or (goal is not None and goal.status == "open"))
+      and db.query(models.Delegation.id).filter(
+        models.Delegation.child_chat_id == chat.id,
+      ).first() is None
+    )
+
+  def _begin_note_recovery(self, db, cmd: BeginNoteRecovery):
+    from app.chat_continuity import note_path, recovery_source
+    from app.compaction import NoteRecoverySource
+    from app.config import get_settings
+
+    from app.runner_registry import registry
+    if cmd.generation is None or registry.current_generation(cmd.chat_id) != cmd.generation:
+      return None
+    chat = _active_chat(db, cmd.chat_id)
+    run = db.get(models.ChatRun, cmd.run_token)
+    if not self._note_recovery_owner(db, chat, run) or not chat.session_id:
+      return None
+    # The logical root survives restart/resource/manual continuation. Neither
+    # a process death during synthesis nor a failed second request renews it.
+    attempted = db.query(models.ChatRun.id).filter(
+      models.ChatRun.chat_id == chat.id,
+      models.ChatRun.note_recovery_attempted.is_(True),
+      or_(models.ChatRun.root_run_id == (run.root_run_id or run.id),
+          models.ChatRun.id == (run.root_run_id or run.id)),
+    ).first()
+    if attempted is not None:
+      return None
+    try:
+      note = note_path(get_settings().data_dir, chat.id).read_text(encoding="utf-8")
+      recovery_source(note, list(chat.messages or []))
+    except (OSError, ValueError):
+      return None
+    source = NoteRecoverySource(
+      messages=copy.deepcopy(list(chat.messages or [])), note=note,
+      generation=cmd.generation,
+      provider=chat.provider or "claude", session_id=chat.session_id,
+      agent_settings=copy.deepcopy(chat.agent_settings_json or {}),
+    )
+    run.note_recovery_attempted = True
+    if not _commit_or_rollback(db):
+      raise _PersistFailed("BeginNoteRecovery did not persist")
+    return source
+
+  def _stage_note_compaction(self, db, chat, run, prepared) -> bool:
+    from app.chat_continuity import note_path
+    from app.compaction import _validated_briefing
+    from app.config import get_settings
+
+    if (not self._note_recovery_owner(db, chat, run)
+        or not run.note_recovery_attempted):
+      return False
+    source = prepared.source
+    from app.runner_registry import registry
+    if registry.current_generation(chat.id) != source.generation:
+      return False
+    try:
+      current_note = note_path(get_settings().data_dir, chat.id).read_text(encoding="utf-8")
+    except OSError:
+      return False
+    if (source.provider != (chat.provider or "claude")
+        or source.session_id != chat.session_id
+        or source.agent_settings != (chat.agent_settings_json or {})
+        or source.note != current_note
+        or messages_fingerprint(source.messages) != messages_fingerprint(list(chat.messages or []))):
+      return False
+    briefing = _validated_briefing(prepared.briefing)
+    messages = list(chat.messages or [])
+    messages.append({
+      "role": "assistant", "kind": "compaction", "content": briefing,
+      "from_provider": source.provider, "recovery_run_id": run.id,
+      "ts": next_message_ts(messages),
+    })
+    chat.messages = messages
+    chat.session_id = None
+    return True
+
   def _persist_compaction(self, db, cmd: PersistCompaction) -> dict:
     """Append one marker and reset the resumable provider session."""
     from datetime import UTC, datetime
@@ -5240,6 +5360,14 @@ class ChatWriterActor:
           )
         )
       run_is_current = owner_is_ours and self._run_is_latest(db, run)
+      if cmd.park_reason == "compaction":
+        chat = _active_chat(db, cmd.chat_id)
+        if (not run_is_current or cmd.compaction is None
+            or not self._stage_note_compaction(db, chat, run, cmd.compaction)):
+          db.rollback()
+          return False
+      elif cmd.compaction is not None:
+        raise _PersistFailed("Compaction belongs only to its recovery park")
       if run_is_current:
         run.status = "parked"
         run.parked_until = cmd.parked_until
