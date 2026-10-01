@@ -606,7 +606,7 @@ class ActiveClaudeHelperTurn:
 
 def _host_options(
   *, key: HostKey, host_env: dict, skill_text: str, connector_plan,
-  skills_enabled: bool, model: str | None,
+  skills_enabled: bool, model: str | None, supports_effort: bool,
 ):
   """Build the host's Claude Code options once per host start."""
   from claude_agent_sdk import AgentDefinition, ClaudeAgentOptions, HookMatcher
@@ -634,7 +634,7 @@ def _host_options(
       description="A Möbius helper working on one delegated task.",
       prompt=_system_prompt_with_register(skill_text),
       disallowedTools=blocked,
-      effort=effort,
+      effort=effort if supports_effort else None,
       model=model,
     )
 
@@ -715,6 +715,10 @@ async def run_claude_host_turn(
   settings = agent_settings or {}
   model = settings.get("model") or (run_policy.model if run_policy else None)
   effort = settings.get("effort") or (run_policy.effort if run_policy else None)
+  from app.providers import model_supports_effort
+  supports_effort = await model_supports_effort(data_dir, model)
+  if not supports_effort:
+    effort = None
   _host_session, agent_id, launch_tool_use_id = parse_session(session_id)
   dispatch_id = f"d{uuid.uuid4().hex[:16]}"
 
@@ -727,6 +731,8 @@ async def run_claude_host_turn(
     }
 
   if agent_id:
+    # The SDK keeps an existing agent's launch options; do not recreate it
+    # on capability changes, since that could replay already-completed work.
     turn = HelperTurn(
       dispatch_id=dispatch_id, kind="message",
       spec={"to": agent_id, "summary": dispatch_id, "message": user_message},
@@ -755,6 +761,7 @@ async def run_claude_host_turn(
   factory = _host_options(
     key=helper_host_key, host_env=host_env, skill_text=skill_text,
     connector_plan=connector_plan, skills_enabled=skills_enabled, model=model,
+    supports_effort=supports_effort,
   )
   session_file = Path(data_dir) / "run" / "helper-hosts" / f"{helper_host_key.digest}.json"
   handle: ActiveClaudeHelperTurn | None = None

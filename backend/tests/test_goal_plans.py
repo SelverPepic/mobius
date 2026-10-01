@@ -3,6 +3,7 @@
 from tests.goal_fixtures import goal_run as make_goal_run
 
 import hashlib
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -111,6 +112,66 @@ def test_terminal_goal_history_projects_onto_final_assistant_message(
     "can_complete": True,
     "completion_blockers": [],
   }
+
+
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("summarized", [False, True])
+def test_completed_card_stays_at_successful_completion_not_later_segment(
+  client, owner_token, db, compact, summarized,
+):
+  auth = {"Authorization": f"Bearer {owner_token}"}
+  base = datetime(2026, 8, 23, 12, 0, tzinfo=UTC)
+  complete = "Verified exact result"
+  completion = {
+    "type": "tool", "tool": "mobius_control:update_goal",
+    "input": f"complete={complete}" if summarized else json.dumps({"complete": complete}),
+    "output": "Goal completed, revision 2: 1/1 tasks complete.",
+    "status": "done", "output_exit_code": 0, "tool_use_id": "complete-call",
+  }
+  blocks = [
+    {"type": "text", "content": "Before completion"},
+    {**completion, "tool_use_id": "refused-call", "output_exit_code": 1},
+    {"type": "tool", "tool": "Bash", "status": "done", "tool_use_id": "verify"},
+    completion,
+    {"type": "tool", "tool": "Bash", "status": "done", "tool_use_id": "after-1"},
+    {"type": "tool", "tool": "Bash", "status": "done", "tool_use_id": "after-2"},
+    {"type": "text", "content": "Later prose"},
+  ]
+  messages = [
+    {"role": "assistant", "id": "anchor-run", "blocks": blocks},
+    {"role": "user", "content": "follow-up"},
+    {"role": "assistant", "id": "anchor-run:assistant:1", "content": "Later segment"},
+  ]
+  chat_id = client.post("/api/chats", json={"title": "Completion anchor", "messages": messages}, headers=auth).json()["id"]
+  db.add(make_goal_run(db,
+    id="anchor-run", root_run_id="anchor-run", chat_id=chat_id,
+    status="completed", provider="codex", goal_objective="Ship safely",
+    goal_id="anchor-goal", started_at=base, ended_at=base + timedelta(seconds=5),
+  ))
+  db.flush()
+  goal = db.get(models.ChatGoal, "anchor-goal")
+  goal.status = "completed"
+  goal.result = complete
+  db.commit()
+
+  payload = client.get(f"/api/chats/{chat_id}?limit=20&compact={str(compact).lower()}", headers=auth).json()
+  returned = payload["messages"]
+  projected = returned[0]["blocks"]
+  card_index = next(i for i, b in enumerate(projected) if b["type"] == "goal_history")
+  card = projected[card_index]
+  assert card["summary"]["completion_tool_use_id"] == "complete-call"
+  assert projected[card_index + 1].get("tool_use_id") == "after-1" or projected[card_index + 1].get("type") == "activity"
+  assert projected[card_index - 1].get("tool_use_id") == "complete-call" or projected[card_index - 1].get("end") == 4
+  if compact:
+    after = projected[card_index + 1]
+    assert (after["start"], after["end"]) == (4, 6), "lazy details keep stored ordinals"
+  assert "goal_summaries" not in returned[0]
+  assert "goal_summaries" not in returned[2]
+  latest_page = client.get(f"/api/chats/{chat_id}?limit=1", headers=auth).json()["messages"]
+  assert "goal_summaries" not in latest_page[0]
+  db.refresh(db.get(models.Chat, chat_id))
+  saved = db.get(models.Chat, chat_id).messages[0]["blocks"]
+  assert saved == blocks, "placement is a projection, never a transcript rewrite"
 
 
 def test_terminal_goal_history_uses_run_identity_despite_timestamp_skew(

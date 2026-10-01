@@ -99,7 +99,10 @@ function useProviderUsageQuery(provider, { enabled = true } = {}) {
     queryKey: providerUsageKey(provider),
     queryFn: () => fetchProviderUsage(provider),
     enabled: enabled && Boolean(provider),
-    staleTime: 60_000,
+    // A new chat or a return to Möbius must check the provider again. The
+    // server coalesces probes, so this does not poll the rate-limited service.
+    staleTime: 0,
+    refetchOnWindowFocus: true,
     retry: 0,
   })
 }
@@ -514,6 +517,9 @@ export const settingsQueries = {
     keyFor: providerUsageKey,
     fetch: fetchProviderUsage,
     useQuery: useProviderUsageQuery,
+    reset: (queryClient, provider) => queryClient.resetQueries({
+      queryKey: provider ? providerUsageKey(provider) : providerUsageRootKey,
+    }),
     invalidate: (queryClient, provider) => queryClient.invalidateQueries({
       queryKey: provider ? providerUsageKey(provider) : providerUsageRootKey,
     }),
@@ -712,11 +718,14 @@ export const ownerQueries = {
 // reconciles anything missed while disconnected — the same posture as apps.
 const notificationsListKey = ['notifications', 'history']
 const notificationsUnreadKey = ['notifications', 'unread-count']
+const notificationsNewKey = ['notifications', 'new-count']
 const NOTIFICATIONS_PREVIEW_SIZE = 8
 
 async function fetchNotificationsPage({ pageParam = null } = {}) {
   const res = await api.notifications.list({
-    limit: NOTIFICATIONS_PREVIEW_SIZE, before: pageParam,
+    limit: NOTIFICATIONS_PREVIEW_SIZE,
+    before: pageParam?.id,
+    beforeAt: pageParam?.sentAt,
   })
   const data = await jsonOrThrow(res, 'notifications fetch failed:')
   return Array.isArray(data) ? data : []
@@ -727,7 +736,9 @@ const notificationHistoryOptions = {
   queryFn: fetchNotificationsPage,
   initialPageParam: null,
   getNextPageParam: page => (
-    page.length === NOTIFICATIONS_PREVIEW_SIZE ? page.at(-1).id : undefined
+    page.length === NOTIFICATIONS_PREVIEW_SIZE
+      ? { id: page.at(-1).id, sentAt: page.at(-1).sent_at }
+      : undefined
   ),
 }
 
@@ -750,6 +761,21 @@ function useUnreadCountQuery({ enabled = true } = {}) {
   })
 }
 
+async function fetchNewCount() {
+  const res = await api.notifications.newCount()
+  const data = await jsonOrThrow(res, 'new count fetch failed:')
+  return typeof data?.count === 'number' ? data.count : 0
+}
+
+function useNewCountQuery({ enabled = true } = {}) {
+  return useQuery({
+    queryKey: notificationsNewKey,
+    queryFn: fetchNewCount,
+    enabled,
+    staleTime: 60_000,
+  })
+}
+
 export const notificationQueries = {
   list: {
     key: notificationsListKey,
@@ -763,6 +789,12 @@ export const notificationQueries = {
     fetch: fetchUnreadCount,
     useQuery: useUnreadCountQuery,
     invalidate: (queryClient) => queryClient.invalidateQueries({ queryKey: notificationsUnreadKey }),
+  },
+  newCount: {
+    key: notificationsNewKey,
+    fetch: fetchNewCount,
+    useQuery: useNewCountQuery,
+    invalidate: (queryClient) => queryClient.invalidateQueries({ queryKey: notificationsNewKey }),
   },
 }
 

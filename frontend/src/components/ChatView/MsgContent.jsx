@@ -1,4 +1,4 @@
-import { Fragment, memo } from 'react'
+import { Fragment, memo, useMemo } from 'react'
 import { usePositionedPeerNotes } from './peerTimelineContext.js'
 import {
   insertPositionedActivity,
@@ -156,6 +156,7 @@ function MsgContentInner({
   // button. Compared in the memo below, so pass a stable reference.
   onResume,
   resumeState,
+  continuationWait = null,
   onInternalNav,
   autoResumeEnabled,
   autoResumeAvailable,
@@ -195,6 +196,15 @@ function MsgContentInner({
   activitySourceBlocks,
 }) {
   const positionedNotes = usePositionedPeerNotes(activityMessageId || msg.id)
+  const generatedFiles = useMemo(() => (
+    msg.role === 'assistant' && !isStreaming
+      ? (msg.blocks || []).flatMap(block =>
+          block.type === 'generated_files' && Array.isArray(block.files)
+            ? block.files.map(file => ({ ...file, kind: 'generated' }))
+            : [],
+        )
+      : []
+  ), [msg.role, msg.blocks, isStreaming])
   // Build a stable per-render answerable predicate that closes over the
   // scalar props (no function prop needed from ChatView).
   const isQuestionAnswerable = (block) =>
@@ -303,6 +313,9 @@ function MsgContentInner({
     // are folded into an ActivityStretch below; this renders only the `single`
     // nodes — text, question, error, and provider context compaction.
     const renderBlock = (block, i) => {
+      if (block.type === 'goal_history') {
+        return <GoalHistoryCard key={`goal-${block.summary.id}`} summary={block.summary} />
+      }
       if (block.type === 'activity' && Array.isArray(block.entries)) {
         // Cold, very long turns can reach this renderer with their adjacent
         // tools already folded into an activity block. Filter the platform
@@ -343,6 +356,8 @@ function MsgContentInner({
             <ActivityStretch
               entries={visibleEntries}
               chatId={chatId}
+              generatedFiles={generatedFiles}
+              generatedCapturePending={isStreaming}
               live={false}
               surfaceKey={messageKey}
               detailRef={block.detail_segments ? null : {
@@ -515,6 +530,7 @@ function MsgContentInner({
           <ErrorCard
             key={assistantBlockKey(block, i)}
             block={block}
+            continuationWait={recoveryOwner ? continuationWait : null}
             autoResume={automaticContinuation}
             resetElapsed={!!limitResetElapsed}
             recoveryCredit={recoveryCredit}
@@ -557,7 +573,7 @@ function MsgContentInner({
                   : undefined}
               >
                 {resumeState?.pending ? 'Resuming…' : resumeState?.unavailable ? 'Reconnecting…' : parked
-                  ? limitResetElapsed ? 'Continue now' : (recoveryCredit?.actionLabel || 'Try now')
+                  ? limitResetElapsed ? 'Try now' : (recoveryCredit?.actionLabel || 'Try now')
                   : 'Resume'}
               </button>
             )}
@@ -607,6 +623,8 @@ function MsgContentInner({
                 <ActivityStretch
                   entries={node.group}
                   chatId={chatId}
+                  generatedFiles={generatedFiles}
+                  generatedCapturePending={isStreaming}
                   live={live}
                   surfaceKey={messageKey}
                   onInternalNav={onInternalNav}
@@ -616,18 +634,8 @@ function MsgContentInner({
           }
           return renderBlock(node.single.item, node.single.idx)
         })}
-        {/* Deliverables are one turn-owned block rendered after the final text.
-            Keep them hidden while prose is still moving. */}
-        {msg.role === 'assistant' && !isStreaming && (() => {
-          const allFiles = (msg.blocks || []).flatMap(b =>
-            b.type === 'generated_files' && Array.isArray(b.files)
-              ? b.files.map(f => ({ ...f, kind: 'generated' }))
-              : []
-          )
-          return allFiles.length > 0
-            ? <Attachments attachments={allFiles} chatId={chatId} />
-            : null
-        })()}
+        {/* One final attachment owns each deliverable; tool previews reuse it. */}
+        {generatedFiles.length > 0 && <Attachments attachments={generatedFiles} chatId={chatId} />}
         {/* Web sources collected from the turn's tool blocks and shown once
             after the answer. Memory keeps its own richer lookup card inline. */}
         {msg.role === 'assistant' && !isStreaming && (
@@ -703,6 +711,7 @@ export default memo(MsgContentInner, (prev, next) => {
     && prev.onQuestionSubmitCancel === next.onQuestionSubmitCancel
     && prev.onResume === next.onResume
     && prev.resumeState === next.resumeState
+    && prev.continuationWait === next.continuationWait
     && prev.onInternalNav === next.onInternalNav
     && prev.autoResumeEnabled === next.autoResumeEnabled
     && prev.autoResumeAvailable === next.autoResumeAvailable

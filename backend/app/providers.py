@@ -84,8 +84,15 @@ MODEL_LABELS = {
 # Optional model-specific effort capability overrides. Provider defaults remain
 # the fallback, so adding a new model normally needs no entry. Add a row only
 # when a model supports a narrower, reordered, or extended effort scale; the
-# registry carries it to every shell/app picker as data.
+# registry carries it to every shell/app picker as data. An empty scale means
+# the model takes no effort setting at all, so pickers hide the control and the
+# runner never sends one.
 MODEL_EFFORT_LEVELS: dict[str, list[str]] = {
+  # Anthropic rejects the effort parameter on these models. Live discovery
+  # reads the same fact from the Models API capabilities; these rows keep the
+  # offline fallback and the runner consistent with it.
+  "claude-sonnet-4-5-20250929": [],
+  "claude-haiku-4-5-20251001": [],
   # Keep the failure fallback aligned with Codex's shipped catalog. Live
   # discovery below carries each model's own advertised scale, so future
   # changes do not require a platform release.
@@ -1559,7 +1566,7 @@ def _live_model_entries(
       "provider": provider_id,
       "available": True,
     }
-    if isinstance(efforts, list) and efforts:
+    if isinstance(efforts, list):
       entry["effort_levels"] = efforts
     elif model_id in MODEL_EFFORT_LEVELS:
       entry["effort_levels"] = MODEL_EFFORT_LEVELS[model_id]
@@ -1863,6 +1870,12 @@ async def _fetch_claude_models(data_dir: str) -> list[dict[str, Any]]:
     max_input = entry.get("max_input_tokens")
     if isinstance(max_input, int) and not isinstance(max_input, bool):
       model["context_window"] = max_input
+    # A model that rejects the effort parameter gets an explicit empty scale;
+    # every other model keeps the provider's default scale.
+    capabilities = entry.get("capabilities")
+    effort = capabilities.get("effort") if isinstance(capabilities, dict) else None
+    if isinstance(effort, dict) and effort.get("supported") is False:
+      model["effort_levels"] = []
     models.append(model)
   return models
 
@@ -2005,6 +2018,38 @@ async def _fetch_codex_models(data_dir: str) -> list[dict[str, Any]]:
   return await _fetch_codex_models_from_cli(data_dir)
 
 
+def _fresh_model_entries(
+  provider_id: str, *, force_refresh: bool = False,
+) -> list[dict[str, Any]] | None:
+  if force_refresh:
+    return None
+  cached = _model_registry_cache.get(provider_id)
+  if cached and time.monotonic() - cached[0] < _MODEL_CACHE_TTL_SECONDS:
+    return cached[1]
+  return None
+
+
+async def _fetch_model_entries(
+  data_dir: str, provider_id: str, *, force_refresh: bool = False,
+) -> tuple[str, list[dict[str, Any]]]:
+  """Refresh one provider under its lock, or reuse a concurrent refresh."""
+  async with _model_registry_locks[provider_id]:
+    hit = _fresh_model_entries(provider_id, force_refresh=force_refresh)
+    if hit is not None:
+      return provider_id, hit
+    try:
+      live_models = await PROVIDERS[provider_id].fetch_models(data_dir)
+      entries = _live_model_entries(provider_id, live_models)
+    except Exception as exc:  # noqa: BLE001 — fallback is the contract
+      _model_registry_log.warning(
+        "model registry fetch failed for %s: %s; using KNOWN_MODELS",
+        provider_id, exc,
+      )
+      entries = _fallback_models(provider_id)
+    _model_registry_cache[provider_id] = (time.monotonic(), entries)
+    return provider_id, entries
+
+
 async def list_models(
   data_dir: str,
   force_refresh: bool = False,
@@ -2023,46 +2068,15 @@ async def list_models(
 
   sync_app_model_providers(data_dir, force=force_refresh)
 
-  def cache_fresh(provider_id: str) -> list[dict[str, Any]] | None:
-    """Returns cached entries if a non-forced read can use them."""
-    if force_refresh:
-      return None
-    cached = _model_registry_cache.get(provider_id)
-    if not cached:
-      return None
-    if time.monotonic() - cached[0] >= _MODEL_CACHE_TTL_SECONDS:
-      return None
-    return cached[1]
-
-  async def fetch_one(provider_id: str) -> tuple[str, list[dict[str, Any]]]:
-    """Refetches under the provider's lock, with a double-checked
-    cache read inside the lock so we don't redo a refetch another
-    caller just completed for us."""
-    async with _model_registry_locks[provider_id]:
-      hit = cache_fresh(provider_id)
-      if hit is not None:
-        return provider_id, hit
-      try:
-        live_models = await PROVIDERS[provider_id].fetch_models(data_dir)
-        entries = _live_model_entries(provider_id, live_models)
-      except Exception as exc:  # noqa: BLE001 — fallback is the contract
-        _model_registry_log.warning(
-          "model registry fetch failed for %s: %s; using KNOWN_MODELS",
-          provider_id, exc,
-        )
-        entries = _fallback_models(provider_id)
-      _model_registry_cache[provider_id] = (time.monotonic(), entries)
-      return provider_id, entries
-
   # Serve hot reads (cache hit + not forced) without ever taking a
   # lock — concurrent callers in the steady-state hit the cache
-  # directly. Only cache misses go through fetch_one.
+  # directly. Only cache misses go through _fetch_model_entries.
   result: dict[str, list[dict[str, Any]]] = {}
   cold: list[str] = []
   for provider_id in PROVIDERS:
     if not provider_selectable(data_dir, provider_id):
       continue
-    hit = cache_fresh(provider_id)
+    hit = _fresh_model_entries(provider_id, force_refresh=force_refresh)
     if hit is not None:
       result[provider_id] = hit
     else:
@@ -2072,11 +2086,32 @@ async def list_models(
     # Refetch missing providers in parallel — Claude and Codex have
     # independent upstreams, so there's no reason to serialize them
     # under one lock when both are stale.
-    fetched = await asyncio.gather(*(fetch_one(pid) for pid in cold))
+    fetched = await asyncio.gather(*(
+      _fetch_model_entries(data_dir, pid, force_refresh=force_refresh)
+      for pid in cold
+    ))
     for pid, entries in fetched:
       result[pid] = entries
 
   return result
+
+
+async def model_supports_effort(data_dir: str, model: str | None) -> bool:
+  """Read Claude's capability without refreshing unrelated providers.
+
+  A cold or expired Claude cache refreshes only Claude, so a saved live-only
+  effortless model works before its picker opens. Fresh entries answer a turn
+  without I/O; Codex and app-provider discovery never belongs here.
+  """
+  if not model:
+    return True
+  entries = _fresh_model_entries("claude")
+  if entries is None:
+    entries = (await _fetch_model_entries(data_dir, "claude"))[1]
+  for entry in entries:
+    if entry.get("id") == model:
+      return entry.get("effort_levels") != []
+  return MODEL_EFFORT_LEVELS.get(model) != []
 
 
 def invalidate_model_cache() -> None:

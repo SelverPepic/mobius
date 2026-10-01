@@ -1895,6 +1895,7 @@ def test_a_resume_whose_start_fails_is_re_woken_once_then_rides_the_next_turn(
   assert db.get(models.ChatWait, row.id).resume_delivered_at is None
   assert asyncio.run(chat_waits_mod._deliver_resume(row.id)) is False
   assert len(scheduled) == 2
+  assert chat_waits_mod.serialize_wait(db.get(models.ChatWait, row.id), db=db)["resume_blocker"] == "resume_failed"
 
   start_fails = False
   owner_run = f"owner-after-failed-resume-{provider_id}"
@@ -2000,3 +2001,213 @@ def test_a_turn_whose_prompt_was_never_sent_acknowledges_nothing(
   assert db.get(models.ChatWait, row.id).resume_delivered_at is None
   run = db.get(models.ChatRun, run_token)
   assert run.peer_message_through_id is None
+
+
+@pytest.mark.parametrize("outcome", ["met", "failed", "expired"])
+def test_finished_wait_stays_visible_until_result_delivery_not_just_check_success(
+  client, owner_token, db, monkeypatch, outcome,
+):
+  """The completion promise outlives polling, including a held deadline alarm."""
+  from app import platform_update
+
+  auth = {"Authorization": f"Bearer {owner_token}"}
+  chat_id = _owner_chat(client, owner_token)
+  row = _command_wait(db, chat_id=chat_id, description="Exact reviewed CI", command="true")
+  row.status = outcome
+  row.met_at = now_naive_utc() if outcome == "met" else None
+  row.last_checked_at = now_naive_utc()
+  row.deadline_at = now_naive_utc() - timedelta(minutes=30)
+  db.commit()
+  monkeypatch.setattr(platform_update, "late_edits_pending", lambda: True)
+  monkeypatch.setattr(platform_update, "read_prepared_update", lambda: {"replayed": "restored-sha"})
+
+  def visible():
+    detail = client.get(f"/api/chats/{chat_id}", headers=auth).json()
+    listing = client.get("/api/chats", headers=auth).json()
+    waits = client.get(f"/api/chat-waits?chat_id={chat_id}", headers=auth).json()["waits"]
+    return detail, next(c for c in listing if c["id"] == chat_id), waits
+
+  detail, listed, waits = visible()
+  assert listed["waiting"] is True
+  assert [wait["id"] for wait in waits] == [row.id]
+  assert detail["waits"] == waits
+  runtime = client.get(f"/api/chats/{chat_id}/runtime", headers=auth).json()
+  assert runtime["waits"] == waits
+  assert waits[0]["status"] == outcome
+  assert waits[0]["delivery_pending"] is True
+  assert waits[0]["resume_blocker"] == "platform_restart"
+  assert waits[0]["resume_delivered_at"] is None
+  assert build_active_waits_context(db, chat_id) == ""  # Do not repeat finished checks.
+  assert asyncio.run(sweep_due_waits()) == 0
+  db.expire_all()
+  assert db.get(models.ChatWait, row.id).checks_count == 0
+  _a_turn_carrying_it_succeeds(db, chat_id, row.id)
+  detail, listed, waits = visible()
+  assert detail["waits"] == waits == []
+  assert listed["waiting"] is False
+
+
+def test_loaded_restart_releases_visible_wait_once_without_rechecking_ci(
+  client, owner_token, db, monkeypatch,
+):
+  from app import platform_update
+
+  chat_id = _owner_chat(client, owner_token)
+  row = _command_wait(
+    db, chat_id=chat_id, description="CI finishes", command="true",
+    created_by_run_id=_seed_declaring_run(db, chat_id),
+  )
+  starts = _capture_starts(monkeypatch, running=False)
+  hold = [True]
+  monkeypatch.setattr(platform_update, "late_edits_pending", lambda: hold[0])
+  monkeypatch.setattr(platform_update, "read_prepared_update", lambda: {"replayed": "restored-sha"})
+  assert asyncio.run(sweep_due_waits()) == 0
+  db.expire_all()
+  row = db.get(models.ChatWait, row.id)
+  assert chat_waits_mod.serialize_wait(row, db=db)["resume_blocker"] == "platform_restart"
+  # The receipt is persisted, not owned by a monitor in the old turn.
+  db.expire_all()
+  hold[0] = False
+  assert asyncio.run(sweep_due_waits()) == 1
+  assert len(starts) == 1
+  _a_turn_carrying_it_succeeds(db, chat_id, row.id)
+  assert asyncio.run(sweep_due_waits()) == 0
+  assert db.get(models.ChatWait, row.id).checks_count == 1
+  assert chat_waits_mod.outstanding_waits_for_chat(db, chat_id) == []
+  assert len(starts) == 1
+
+
+@pytest.mark.parametrize("outcome", ["met", "failed", "expired"])
+@pytest.mark.parametrize("receiving_run_finished", [True, False])
+def test_wait_history_stays_with_the_turn_that_received_each_result(
+  client, owner_token, db, outcome, receiving_run_finished,
+):
+  """Provider success follows the answer's start, not the next answer's start.
+
+  A first CI result can be carried by an owner-approved update turn while a
+  later CI result wakes its own turn. Neither marker may drift to a newer
+  answer when history grows or when a paginated read excludes its owner.
+  """
+  base = datetime(2026, 9, 1, 8)
+
+  def at(seconds):
+    return base + timedelta(seconds=seconds)
+
+  def epoch(seconds):
+    return round(at(seconds).replace(tzinfo=UTC).timestamp() * 1000)
+
+  messages = [
+    {"role": "assistant", "id": "declaring", "ts": epoch(0)},
+    {"role": "assistant", "id": "handling-old", "ts": epoch(20)},
+    {"role": "assistant", "id": "handling-new", "ts": epoch(100)},
+    {"role": "assistant", "id": "unrelated", "ts": epoch(200)},
+  ]
+  auth = {"Authorization": f"Bearer {owner_token}"}
+  response = client.post(
+    "/api/chats", json={"title": "CI history", "messages": messages},
+    headers=auth,
+  )
+  assert response.status_code == 200, response.text
+  chat_id = response.json()["id"]
+  for run_id, start, end in (
+    ("handling-old", 20, 90), ("handling-new", 100, 170),
+  ):
+    db.add(models.ChatRun(
+      id=run_id, chat_id=chat_id, started_at=at(start),
+      ended_at=at(end) if run_id == "handling-old" or receiving_run_finished else None,
+      status="completed" if run_id == "handling-old" or receiving_run_finished else "running",
+    ))
+  for wait_id, created, settled, delivered in (
+    ("original-ci", 1, 10, 85), ("corrected-ci", 95, 99, 165),
+  ):
+    db.add(models.ChatWait(
+      id=wait_id, chat_id=chat_id, description=wait_id,
+      kind="command", command="true", condition_owner="CI executor",
+      status=outcome, created_at=at(created), deadline_at=at(400),
+      next_check_at=at(400), met_at=at(settled) if outcome == "met" else None,
+      last_checked_at=at(settled), resume_delivered_at=at(delivered),
+    ))
+  db.commit()
+
+  summaries = chat_waits_mod.terminal_wait_summaries_by_message_index(
+    db, chat_id, messages,
+  )
+  assert {i: [s["id"] for s in rows] for i, rows in summaries.items()} == {
+    1: ["original-ci"], 2: ["corrected-ci"],
+  }
+  assert all(not s["delivery_pending"] for rows in summaries.values() for s in rows)
+  assert all("wait_summaries" not in message for message in messages)
+  page = client.get(f"/api/chats/{chat_id}?limit=2", headers=auth).json()
+  assert [s["id"] for s in page["messages"][0]["wait_summaries"]] == ["corrected-ci"]
+  assert "wait_summaries" not in page["messages"][1]
+
+
+def test_wait_history_uses_first_visible_segment_of_the_receiving_run(
+  client, owner_token, db,
+):
+  chat_id = _owner_chat(client, owner_token)
+  base = now_naive_utc()
+  row = _command_wait(db, chat_id=chat_id, description="segmented result", command="true")
+  row.status = "met"
+  row.met_at = base
+  row.resume_delivered_at = base + timedelta(seconds=80)
+  db.add(models.ChatRun(
+    id="receiving", chat_id=chat_id, status="completed",
+    started_at=base, ended_at=base + timedelta(seconds=90),
+  ))
+  db.commit()
+
+  def answer(message_id, seconds, **kwargs):
+    return {
+      "role": "assistant", "id": message_id,
+      "ts": round((base + timedelta(seconds=seconds)).replace(tzinfo=UTC).timestamp() * 1000),
+      **kwargs,
+    }
+
+  messages = [
+    answer("receiving", 1, hidden=True),
+    answer("receiving:assistant:0", 2),  # Not a valid sink segment identity.
+    answer("receiving:assistant:1", 3),
+    answer("receiving:assistant:2", 60),
+    answer("next-answer", 100),
+  ]
+  summaries = chat_waits_mod.terminal_wait_summaries_by_message_index(db, chat_id, messages)
+  assert list(summaries) == [2]
+  assert summaries[2][0]["id"] == row.id
+
+
+def test_wait_history_cannot_borrow_a_receiving_run_from_another_chat(
+  client, owner_token, db,
+):
+  chat_id = _owner_chat(client, owner_token)
+  other_chat_id = _owner_chat(client, owner_token)
+  base = now_naive_utc()
+  row = _command_wait(db, chat_id=chat_id, description="local result", command="true")
+  row.status = "met"
+  row.met_at = base
+  row.resume_delivered_at = base + timedelta(seconds=80)
+  db.add(models.ChatRun(
+    id="foreign-run", chat_id=other_chat_id, status="completed",
+    started_at=base, ended_at=base + timedelta(seconds=90),
+  ))
+  db.commit()
+  messages = [
+    {"role": "assistant", "id": "foreign-run", "ts": round(base.replace(tzinfo=UTC).timestamp() * 1000)},
+    {"role": "assistant", "id": "local-answer", "ts": round((base + timedelta(seconds=100)).replace(tzinfo=UTC).timestamp() * 1000)},
+  ]
+  summaries = chat_waits_mod.terminal_wait_summaries_by_message_index(db, chat_id, messages)
+  assert list(summaries) == [1]
+
+
+def test_undelivered_history_does_not_claim_follow_up_completed(client, owner_token, db):
+  chat_id = _owner_chat(client, owner_token)
+  row = _command_wait(db, chat_id=chat_id, description="CI outcome", command="true")
+  row.status = "met"
+  row.met_at = now_naive_utc()
+  db.commit()
+  messages = [{"role": "assistant", "content": "Wait armed", "ts": int(row.created_at.replace(tzinfo=UTC).timestamp()*1000)}]
+  summary = chat_waits_mod.terminal_wait_summaries_by_message_index(db, chat_id, messages)[0][0]
+  assert summary["status"] == "met"
+  assert summary["delivery_pending"] is True
+  _a_turn_carrying_it_succeeds(db, chat_id, row.id)
+  assert chat_waits_mod.terminal_wait_summaries_by_message_index(db, chat_id, messages)[0][0]["delivery_pending"] is False

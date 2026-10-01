@@ -1137,9 +1137,6 @@ export const api = {
       `/projects/${encodeURIComponent(projectId)}/file?path=${encodeURIComponent(path)}`,
       { method: 'DELETE' },
     ),
-    downloadUrl: (projectId, path) => (
-      `${BASE}/api/projects/${encodeURIComponent(projectId)}/file?path=${encodeURIComponent(path)}&download=true`
-    ),
     // Rename or move a file/dir within the project tree. The backend confines
     // both paths, rejects symlink escape / dst-exists / into-descendant, and
     // maps an os.replace failure to a 4xx rather than a 500 (see the build spec).
@@ -1227,6 +1224,21 @@ export const api = {
       await apiFetch(`/local-services/${encodeURIComponent(slug)}/surface`),
       'Service surface request failed',
     ),
+  },
+  // The instance-wide GitHub account. Settings owns connect/disconnect;
+  // apps only read status through their own github_connect grant.
+  github: {
+    status: (options = {}) => apiFetch('/github/status', options),
+    connectStart: (privateRepos, options = {}) => apiFetch('/github/connect/start', {
+      ...options, method: 'POST', body: JSON.stringify({ private_repos: !!privateRepos }),
+    }),
+    connectPoll: (attemptId, options = {}) => apiFetch('/github/connect/poll', {
+      ...options, method: 'POST', body: JSON.stringify({ attempt_id: attemptId }),
+    }),
+    connectCancel: (attemptId, options = {}) => apiFetch('/github/connect/cancel', {
+      ...options, method: 'POST', body: JSON.stringify({ attempt_id: attemptId }),
+    }),
+    disconnect: (options = {}) => apiFetch('/github/connect', { ...options, method: 'DELETE' }),
   },
   settings: {
     get: () => apiFetch('/settings'),
@@ -1363,19 +1375,38 @@ export const api = {
     ),
   },
   notifications: {
-    // Cursor pagination: `before` is the last row id of the previous page.
-    list: ({ before, limit } = {}) => {
+    // Carry the last row's sort key so paging survives its deletion elsewhere.
+    list: ({ before, beforeAt, limit } = {}) => {
       const params = new URLSearchParams()
       if (before) params.set('before', String(before))
+      if (beforeAt) params.set('before_at', String(beforeAt))
       if (limit) params.set('limit', String(limit))
       const qs = params.toString()
       return apiFetch(`/notifications${qs ? `?${qs}` : ''}`)
     },
     unreadCount: () => apiFetch('/notifications/unread-count'),
-    // Seen-on-open: idempotent bulk mark-read (clears the bell badge).
-    readAll: () => apiFetch('/notifications/read-all', { method: 'POST' }),
-    // Owner action from the preview: remove all stored notifications.
-    clearAll: () => apiFetch('/notifications', { method: 'DELETE' }),
+    newCount: () => apiFetch('/notifications/new-count'),
+    // Opening acknowledges arrivals, but reading an item stays explicit.
+    seenAll: async () => jsonOrThrow(
+      await apiFetch('/notifications/seen-all', { method: 'POST' }),
+      'Could not acknowledge notifications:',
+    ),
+    readAll: async () => jsonOrThrow(
+      await apiFetch('/notifications/read-all', { method: 'POST' }),
+      'Could not mark notifications read:',
+    ),
+    read: async (notificationId) => jsonOrThrow(
+      await apiFetch(
+        `/notifications/${encodeURIComponent(notificationId)}/read`,
+        { method: 'POST' },
+      ),
+      'Could not mark notification read:',
+    ),
+    // Owner action from the preview: clear ordinary history, retaining active Undo receipts.
+    clearAll: async () => jsonOrThrow(
+      await apiFetch('/notifications', { method: 'DELETE' }),
+      'Could not clear notifications:',
+    ),
     // Per-item dismissal is limited by the server to ordinary notifications.
     dismiss: async (notificationId) => jsonOrThrow(
       await apiFetch(

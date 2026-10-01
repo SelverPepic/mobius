@@ -4,7 +4,6 @@ from tests.goal_fixtures import goal_run as make_goal_run
 
 import asyncio
 import importlib.util
-import types
 from pathlib import Path
 
 import pytest
@@ -31,15 +30,17 @@ def _control(monkeypatch, **env):
   return module
 
 
-def _fake_subagents(control, monkeypatch, *, enabled=True):
-  app = types.SimpleNamespace(
-    snapshot=lambda: {"app_id": 7, "providers": {
-      "claude": {"connected": True, "enabled": enabled, "default_effort": "medium"},
-      "codex": {"connected": True, "enabled": True, "default_effort": "low"},
+def _fake_capabilities(control, *, enabled=True):
+  control._test_capabilities = {
+    "connections": {name: {"configured": True} for name in ("claude", "codex", "mobius")},
+    "config": {"providers": {
+      "claude": {"enabled": enabled, "default_effort": "medium",
+                 "default_model": "claude-default"},
+      "codex": {"enabled": True, "default_effort": "low"},
     }},
-    _resolve_model=lambda provider, requested, state: requested or f"{provider}-default",
-  )
-  monkeypatch.setattr(control, "_subagents_app", lambda: app)
+    "models": {"claude": [{"id": "claude-default"}],
+               "mobius": [{"id": "spark"}]},
+  }
 
 
 def _capture_api(control, monkeypatch, responses):
@@ -47,6 +48,8 @@ def _capture_api(control, monkeypatch, responses):
 
   def fake(method, path, payload=None):
     calls.append((method, path, payload))
+    if path == "/api/delegations/capabilities":
+      return getattr(control, "_test_capabilities", {})
     for prefix, value in responses.items():
       if path.startswith(prefix):
         return value(payload) if callable(value) else value
@@ -67,7 +70,7 @@ def _row(**overrides):
 
 def test_spawn_starts_a_background_helper_with_subagents_defaults(monkeypatch):
   control = _control(monkeypatch, CHAT_ID="parent-1", MOBIUS_AGENT_PROVIDER="claude")
-  _fake_subagents(control, monkeypatch)
+  _fake_capabilities(control)
   calls = _capture_api(control, monkeypatch, {"/api/delegations": lambda body: _row(
     task_key=body["task_key"], provider=body["provider"], model=body["model"],
   )})
@@ -76,10 +79,10 @@ def test_spawn_starts_a_background_helper_with_subagents_defaults(monkeypatch):
     "name": "review", "task": "  Review the diff.  ",
   })
 
-  method, path, body = calls[0]
+  method, path, body = calls[-1]
   assert (method, path) == ("POST", "/api/delegations")
   assert body == {
-    "app_id": 7, "parent_chat_id": "parent-1", "task_key": "review",
+    "app_id": None, "parent_chat_id": "parent-1", "task_key": "review",
     "prompt": "Review the diff.", "provider": "claude", "model": "claude-default",
     "effort": "medium", "scope": "write", "notify_parent_on_complete": True,
   }
@@ -93,7 +96,7 @@ def test_spawn_starts_a_background_helper_with_subagents_defaults(monkeypatch):
 
 def test_spawn_honours_a_paused_provider_only_when_named(monkeypatch):
   control = _control(monkeypatch, CHAT_ID="parent-1", MOBIUS_AGENT_PROVIDER="claude")
-  _fake_subagents(control, monkeypatch, enabled=False)
+  _fake_capabilities(control, enabled=False)
   _capture_api(control, monkeypatch, {"/api/delegations": _row()})
 
   with pytest.raises(RuntimeError, match="paused"):
@@ -105,12 +108,12 @@ def test_spawn_honours_a_paused_provider_only_when_named(monkeypatch):
 
 def test_spawn_can_use_mobius_models_on_the_codex_harness(monkeypatch):
   control = _control(monkeypatch, CHAT_ID="parent-1")
-  _fake_subagents(control, monkeypatch)
+  _fake_capabilities(control)
   calls = _capture_api(control, monkeypatch, {"/api/delegations": _row()})
   control._call_spawn_agent({
     "name": "m", "task": "t", "provider": "mobius", "model": "spark",
   })
-  assert calls[0][2]["provider"] == "mobius" and calls[0][2]["model"] == "spark"
+  assert calls[-1][2]["provider"] == "mobius" and calls[-1][2]["model"] == "spark"
 
 
 def test_message_stop_and_list_address_helpers_by_name(monkeypatch):
@@ -319,7 +322,8 @@ def _steer_cut(parent_id, user_msgs, consume):
   )).result(timeout=5)
 
 
-def test_a_steered_result_is_delivered_at_the_steer_cut_once(db, monkeypatch):
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_a_steered_result_is_delivered_at_the_steer_cut_once(db, monkeypatch, provider):
   """A steered result travels as a queued carrier, like a peer note.
 
   Codex consumes that carrier at the steer cut. Until then the result
@@ -327,7 +331,7 @@ def test_a_steered_result_is_delivered_at_the_steer_cut_once(db, monkeypatch):
   nothing left to start.
   """
   parent_id, child_id, delegation_id = _running_parent(
-    db, "steer-yes", provider="codex",
+    db, "steer-yes", provider=provider,
   )
   steered = _live_parent(monkeypatch, accepted=True)
 
@@ -415,37 +419,47 @@ def test_claude_stop_does_not_wake_an_unread_helper_result(
   ).delegation_ids == (delegation_id,)
 
 
-def test_claude_helper_result_does_not_block_immediate_owner_steer(db):
-  """The helper cannot cut a command; a deliberate owner steer still can."""
+def test_claude_helper_result_does_not_block_owner_steer_admission(db):
+  """Both inputs enter the native queue without cutting work or claiming delivery."""
   from app.claude_sdk_runner import ActiveClaudeClient
   from app.chat_steering import steer_into_active_turn
   from app.runner_registry import registry
 
   parent_id, child_id, delegation_id = _running_parent(db, "owner-steer")
   interrupts = []
+  inputs = []
 
   class _Client:
+    async def query(self, prompt):
+      inputs.extend([item async for item in prompt])
+
     async def interrupt(self):
       interrupts.append("interrupt")
 
   async def settle_then_steer():
     handle = ActiveClaudeClient(_Client(), chat_id=parent_id)
-    handle.mark_generating()
+    handle.mark_ready()
     registry.register(handle)
     try:
       await delegations_mod.wake_parent_after_child_settled(child_id)
-      assert interrupts == []
       assert await steer_into_active_turn(
         "claude", parent_id, "The owner changed course.",
       ) is True
-      assert interrupts == ["interrupt"]
-      assert handle.pending_steer == ["The owner changed course."]
+      await asyncio.gather(*handle._send_tasks)
+      assert interrupts == []
+      assert [item["priority"] for item in inputs] == ["next", "next"]
+      assert "delegation_results" in inputs[0]["message"]["content"]
+      assert "The owner changed course." in inputs[1]["message"]["content"]
+      assert inputs[0]["uuid"] != inputs[1]["uuid"]
     finally:
+      handle.mark_finished()
       registry.unregister(parent_id, handle.kind)
 
   asyncio.run(settle_then_steer())
   db.expire_all()
-  assert db.get(models.Chat, parent_id).pending_messages == []
+  pending = db.get(models.Chat, parent_id).pending_messages
+  assert len(pending) == 1 and pending[0]["hidden"] is True
+  assert delegation_id in delegations_mod.carrier_results(db, pending[0])
   assert db.get(models.Delegation, delegation_id).delivered_run_id is None
 
 
@@ -514,14 +528,15 @@ def test_a_reopened_helper_result_is_steered_again_not_deduplicated(
   assert delegations_mod.available_delegation_results(db, parent_id) == []
 
 
+@pytest.mark.parametrize("provider", ["claude", "codex"])
 def test_a_refused_steer_leaves_the_result_queued_for_after_the_turn(
-  db, monkeypatch,
+  db, monkeypatch, provider,
 ):
   """A turn that ends before taking the steer (Codex refuses a second
   simultaneous steer; a closing turn refuses any) leaves the carrier queued,
   exactly like a peer note, and the result owed until a turn carries it."""
   parent_id, child_id, delegation_id = _running_parent(
-    db, "steer-no", provider="codex",
+    db, "steer-no", provider=provider,
   )
   _live_parent(monkeypatch, accepted=False)
 
@@ -534,11 +549,13 @@ def test_a_refused_steer_leaves_the_result_queued_for_after_the_turn(
   assert delegation_id in delegations_mod.carrier_results(db, carrier)
 
 
-def test_a_helper_finishing_during_claude_turn_wakes_after_it(db, monkeypatch):
-  """A saved helper result never cuts a Claude command or blocks owner input."""
+def test_a_helper_finishing_before_claude_is_ready_wakes_after_it(db, monkeypatch):
+  """Startup has no steerable handle yet; its result must remain durably owed."""
   parent_id, child_id, delegation_id = _running_parent(db, "tool-safe")
   monkeypatch.setattr(chat_mod, "is_chat_running", lambda _chat_id: True)
   steered = _live_parent(monkeypatch, accepted=True)
+  import app.chat_steering as steering
+  monkeypatch.setattr(steering, "has_live_steerable_turn", lambda *_a: False)
   asyncio.run(delegations_mod.wake_parent_after_child_settled(child_id))
   assert steered == []
   db.expire_all()

@@ -114,6 +114,27 @@
   color: var(--accent);
 }
 
+.md-project-download {
+  display: inline;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.md-project-download:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.md-project-download-error {
+  margin-left: 0.4em;
+  color: var(--danger);
+}
+
 .md-table-wrap {
   overflow-x: auto;
 }

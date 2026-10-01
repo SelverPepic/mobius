@@ -19,6 +19,7 @@ from pathlib import Path
 from fastapi import HTTPException, Request
 
 from app import storage_io
+from app.path_utils import has_overlong_segment
 
 
 READ_MAX = 10 * 1024 * 1024
@@ -72,6 +73,8 @@ def resolve_path(
   relative = Path((path or "").lstrip("/"))
   if relative.is_absolute() or any(part == ".." for part in relative.parts):
     raise InvalidWorkspacePath("Invalid path.")
+  if has_overlong_segment(relative):
+    raise InvalidWorkspacePath("A path name is too long.")
   if any(part in hidden_dirs for part in relative.parts):
     raise UnavailableWorkspacePath("Path is not available in this workspace.")
   candidate = root / relative

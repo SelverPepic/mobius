@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 from concurrent.futures import Future
 from datetime import UTC, datetime, timedelta
 import os
@@ -18,6 +19,20 @@ from app.chat_media import fix_forward_chat_media
 from app.chat_retention import purge_expired_chat_tombstones
 from app.config import get_settings
 from app.agent_activity import EMPTY_AGENT_ACTIVITY_BINDING
+
+
+def test_delivery_instruction_keeps_reports_in_chat_unless_a_file_is_requested(tmp_path):
+  directory = tmp_path / "deliverables" / "inbox"
+
+  instruction = gf.delivery_instruction(directory)
+
+  assert "Respond in chat by default, including reports, reviews, plans, and summaries." in instruction
+  assert "Create downloadable deliverables only when the owner explicitly requests" in instruction
+  assert "A request for a report or plan alone is not a request for an attachment" in instruction
+  assert "Do not also create a Markdown document or other downloadable copy" in instruction
+  assert f"When a deliverable is requested, save the finished file directly in {directory}." in instruction
+  assert "$MOBIUS_GENERATED_DIR" in instruction
+  assert "Keep temporary and source files outside it." in instruction
 
 
 def _write_row(db, chat, *, name, path, size=11, mime_type="application/pdf"):
@@ -62,6 +77,63 @@ def test_serve_generated_file_by_recorded_name(client, db, auth, chat):
   assert res.content == b"%PDF-1.4 fake"
   assert res.headers["content-disposition"] == 'attachment; filename="report.pdf"'
   assert res.headers["x-content-type-options"] == "nosniff"
+
+
+def test_final_generated_image_preview_checks_content_on_existing_route(client, db, auth, chat):
+  content = b"viewed-image"
+  stored = _stored_file(chat, name="frozen", content=content)
+  _write_row(db, chat, name="image_1.png", path=stored, mime_type="image/png")
+  url = f"/api/chats/{chat.id}/generated-files/image_1.png"
+  token = _media_token(client, auth, chat.id)
+  digest = hashlib.sha256(content).hexdigest()
+  matched = client.get(url, params={"token": token, "preview": True, "expected_sha256": digest})
+  assert matched.status_code == 200
+  assert matched.content == content
+  assert matched.headers["content-disposition"] == 'inline; filename="image_1.png"'
+  assert matched.headers["cache-control"] == "private, no-store"
+
+  changed = client.get(url, params={"token": token, "preview": True, "expected_sha256": "0" * 64})
+  assert changed.status_code == 404
+  (gf.stored_dir(get_settings().data_dir, chat.id) / stored).write_bytes(b"replacement")
+  assert client.get(
+    url, params={"token": token, "preview": True, "expected_sha256": digest},
+  ).status_code == 404
+  malformed = client.get(url, params={"token": token, "preview": True, "expected_sha256": "wrong"})
+  assert malformed.status_code == 400
+  assert client.get(f"/api/chats/{chat.id}/viewed-generated-images/old-tool", params={"token": token}).status_code == 404
+
+
+def test_viewed_image_digest_is_bound_to_exact_chat_inbox(tmp_path):
+  chat_id = "chat-123"
+  inbox = gf.output_dir(str(tmp_path), chat_id, create=True)
+  image = inbox / "image.png"
+  image.write_bytes(b"viewed")
+  expected = hashlib.sha256(b"viewed").hexdigest()
+  assert gf.viewed_inbox_sha256(str(tmp_path), chat_id, str(image)) == expected
+  assert gf.viewed_inbox_sha256(str(tmp_path), "other", str(image)) is None
+  assert gf.viewed_inbox_sha256(str(tmp_path), chat_id, str(inbox / "../image.png")) is None
+  image.write_bytes(b"overwritten")
+  assert gf.viewed_inbox_sha256(str(tmp_path), chat_id, str(image)) != expected
+  image.unlink()
+  image.symlink_to(tmp_path / "outside.png")
+  assert gf.viewed_inbox_sha256(str(tmp_path), chat_id, str(image)) is None
+def test_serve_generated_file_from_valid_non_v4_chat(client, db, auth):
+  chat_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "generated-file-test-chat"))
+  created = client.post(
+    "/api/chats", json={"id": chat_id, "title": "Test chat"}, headers=auth,
+  )
+  assert created.status_code == 200
+  chat = db.get(models.Chat, chat_id)
+  stored_name = _stored_file(chat)
+  _write_row(db, chat, name="report.pdf", path=stored_name)
+
+  res = client.get(
+    f"/api/chats/{chat_id}/generated-files/report.pdf",
+    params={"token": _media_token(client, auth, chat_id)},
+  )
+
+  assert res.status_code == 200
+  assert res.content == b"%PDF-1.4 fake"
 
 
 def test_safe_generated_file_preview_opens_inline(client, db, auth, chat):
@@ -277,6 +349,10 @@ def test_inbox_capture_is_immutable_across_same_name_regeneration(db, chat):
     "report.pdf", "report_1.pdf",
   ]
   assert all(file["previewable"] is True for file in block["files"])
+  assert [file["sha256"] for file in block["files"]] == [
+    hashlib.sha256(content).hexdigest()
+    for content in (b"first report", b"second report")
+  ]
   rows = db.query(models.GeneratedFile).filter_by(chat_id=chat.id).all()
   assert len(rows) == 2
   assert rows[0].path != rows[1].path
@@ -291,6 +367,10 @@ def test_inbox_capture_is_immutable_across_same_name_regeneration(db, chat):
   ]
   assert [file["name"] for file in file_blocks[0]["files"]] == [
     "report.pdf", "report_1.pdf",
+  ]
+  assert [file["sha256"] for file in file_blocks[0]["files"]] == [
+    hashlib.sha256(content).hexdigest()
+    for content in (b"first report", b"second report")
   ]
 
 
