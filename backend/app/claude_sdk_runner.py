@@ -76,6 +76,7 @@ from claude_agent_sdk.types import (
 )
 
 from app import activity, generated_files
+from app.memory_observability import cgroup_oom_kill_count, process_was_oom_killed
 from app.claude_events import (
   NativeContinuationTracker,
   _clip_task_text,
@@ -1144,6 +1145,7 @@ async def run_claude_sdk_turn(
   base_env["MOBIUS_GENERATED_DIR"] = str(generated_dir)
 
   # Keep the SDK callback for tool policy and skill-read observability.
+  # The pinned SDK owns input stream lifetime for permission callbacks.
   # Native owner-question tools are disabled on every launch, including resumes.
   async def can_use_tool(
     tool_name: str,
@@ -1181,15 +1183,6 @@ async def run_claude_sdk_turn(
       tool_use_id=getattr(context, "tool_use_id", None),
     )
     return PermissionResultAllow(updated_input=input_data)
-
-  # The SDK requires a PreToolUse hook to keep can_use_tool active.
-  async def keepalive_hook(
-    hook_input: dict[str, Any],
-    tool_use_id: str | None,
-    context: dict[str, Any],
-  ) -> dict[str, Any]:
-    del hook_input, tool_use_id, context
-    return {"continue_": True}
 
   # The Claude SDK fires PreCompact before it auto- or manually compacts the
   # running session. Möbius does not influence that memory-management action;
@@ -1296,8 +1289,14 @@ async def run_claude_sdk_turn(
   # Both are session-wide on the SDK but Möbius spawns one `query()`
   # per turn, so passing them here applies to *this* turn — which is
   # exactly the "apply on next turn" semantics the slash picker promises.
+  from app.providers import _model_belongs_to_other_provider, model_supports_effort
   _model = (agent_settings or {}).get("model") or None
   _effort = (agent_settings or {}).get("effort") or None
+  # A saved or global default effort must not reach a model that rejects the
+  # parameter (the picker hides the control, but defaults still carry one).
+  from app.config import get_settings
+  if not await model_supports_effort(get_settings().data_dir, _model):
+    _effort = None
   # The "ultracode" tier maps to xhigh effort for the SDK flag (which only
   # accepts low/medium/high/xhigh/max) and arms the Workflow-tool
   # orchestration via the keyword trigger appended to this turn's prompt.
@@ -1309,7 +1308,6 @@ async def run_claude_sdk_turn(
   # effective settings normally reject this before the SDK boundary. Keep the
   # boundary strict too: a legacy/corrupt value must never become an implicit
   # provider-chosen model.
-  from app.providers import _model_belongs_to_other_provider
   if _model and _model_belongs_to_other_provider(_model, "claude"):
     raise ValueError(
       f"Selected model {_model!r} does not belong to provider 'claude'."
@@ -1386,9 +1384,6 @@ async def run_claude_sdk_turn(
       "stderr": _capture_stderr,
       "hooks": {
         "UserPromptSubmit": [HookMatcher(matcher=None, hooks=[queued_prompt_hook])],
-        "PreToolUse": [
-          HookMatcher(matcher=None, hooks=[keepalive_hook]),
-        ],
         "PostToolUse": [
           HookMatcher(matcher="WebSearch", hooks=[websearch_sources_hook]),
           HookMatcher(matcher=None, hooks=[owner_card_end_hook]),
@@ -1481,6 +1476,7 @@ async def run_claude_sdk_turn(
     # them.
     helper_result: dict[str, Any] | None = None
 
+    oom_kills_before = cgroup_oom_kill_count()
     try:
       try:
         try:
@@ -1702,6 +1698,12 @@ async def run_claude_sdk_turn(
         **_helper_phase_spend(helper_result),
         "session_id": current_session_id,
         "error": _process_error_with_stderr_tail(exc, stderr_tail),
+        "oom_killed": (
+          not isinstance(exc, ResultError)
+          and process_was_oom_killed(
+            exc.exit_code, oom_kills_before=oom_kills_before,
+          )
+        ),
       }
     except Exception as exc:
       return {

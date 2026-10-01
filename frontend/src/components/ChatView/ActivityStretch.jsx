@@ -1,7 +1,7 @@
-import { useEffect, useId, useMemo, useRef, useState } from 'react'
+import { useId, useMemo, useRef, useState } from 'react'
 import { StandardMarkdown } from './markdown/BlockRenderer.jsx'
 import ToolBlock from './ToolBlock.jsx'
-import { apiFetch, jsonOrThrow } from '../../api/client.js'
+import useActivityDetails from './hooks/useActivityDetails.js'
 import {
   activityStreamState,
   activityDisplayState,
@@ -193,104 +193,36 @@ function GroupedActivityStretch({
   const userOpenRef = useRef(userOpen)
   const visibleOpenRef = useRef(false)
   const timelineId = useId()
-  const [detailEntries, setDetailEntries] = useState(null)
-  const [detailError, setDetailError] = useState(false)
+  const preserveRequestedOpenRef = useRef(false)
   const [detailAttempt, setDetailAttempt] = useState(0)
   const [detailRequested, setDetailRequested] = useState(userOpen)
   const compositeSegments = Array.isArray(detailSegments) ? detailSegments : null
-  const detailMessageIndex = detailRef?.message_index
-  const detailStart = detailRef?.start
-  const detailEnd = detailRef?.end
-  const detailKey = compositeSegments
-    ? compositeSegments.map(segment => {
-        const ref = segment.detail_ref
-        return ref
-          ? `${segment.key}:${ref.message_index}:${ref.start}:${ref.end}`
-          : `${segment.key}:inline`
-      }).join('|')
-    : detailRef
-      ? `${detailMessageIndex}:${detailStart}:${detailEnd}`
-      : ''
-  const needsDetail = compositeSegments
-    ? compositeSegments.some(segment => segment.detail_ref)
-    : Boolean(detailRef)
-
-  useEffect(() => {
-    setDetailEntries(null)
-    setDetailError(false)
-    setDetailRequested(userOpenRef.current)
-  }, [detailKey])
-
-  useEffect(() => {
-    if (
-      !detailRequested
-      || !needsDetail
-      || detailEntries
-      || detailError
-    ) return undefined
-    const controller = new AbortController()
-    let current = true
-    const loadSegment = segment => {
-      if (!segment.detail_ref) return Promise.resolve(segment.entries || [])
-      return apiFetch(activityDetailUrl(chatId, segment.detail_ref), {
-        signal: controller.signal,
-      }).then(res => jsonOrThrow(res, 'Activity detail failed'))
-        .then(data => {
-          const merged = mergePositionedActivityEntries(
-            Array.isArray(data.entries) ? data.entries : [],
-            segment.positioned_entries || [],
-          )
-          return merged.map(entry => ({
-            ...entry,
-            idx: `${segment.key}:${entry.idx}`,
-          }))
+  const urls = compositeSegments
+    ? compositeSegments.map(segment => segment.detail_ref
+        ? activityDetailUrl(chatId, segment.detail_ref)
+        : null)
+    : [detailRef ? activityDetailUrl(chatId, detailRef) : null]
+  const needsDetail = urls.some(Boolean)
+  const detail = useActivityDetails({
+    urls,
+    requested: detailRequested || userOpen,
+    attempt: detailAttempt,
+    onReady: revealBeforeReady,
+  })
+  // Presentation can change while a read is in flight (e.g. a helper settles).
+  // Project against current props without canceling the underlying range read.
+  const detailEntries = detail.entries === null ? null : restartCardActivityEntries(
+    compositeSegments
+      ? compositeSegments.flatMap((segment, index) => {
+          if (!segment.detail_ref) return segment.entries || []
+          return mergePositionedActivityEntries(
+            detail.entries[index], segment.positioned_entries || [],
+          ).map(entry => ({ ...entry, idx: `${segment.key}:${entry.idx}` }))
         })
-    }
-    const request = compositeSegments
-      ? Promise.all(compositeSegments.map(loadSegment)).then(results => results.flat())
-      : apiFetch(activityDetailUrl(chatId, {
-          message_index: detailMessageIndex,
-          start: detailStart,
-          end: detailEnd,
-        }), {
-          signal: controller.signal,
-        }).then(res => jsonOrThrow(res, 'Activity detail failed'))
-          .then(data => mergePositionedActivityEntries(
-            Array.isArray(data.entries) ? data.entries : [],
-            positionedEntries,
-          ))
-    request.then(entries => restartCardActivityEntries(
-      entries,
-      suppressLatestRestart,
-    )).then(entries => {
-        if (!current) return
-        revealBeforeReady()
-        setDetailEntries(entries)
-      })
-      .catch(error => {
-        if (!current || error?.name === 'AbortError') return
-        revealBeforeReady()
-        setDetailError(true)
-      })
-    return () => {
-      current = false
-      controller.abort()
-    }
-  }, [
-    chatId,
-    detailAttempt,
-    detailEntries,
-    detailError,
-    detailEnd,
-    detailKey,
-    detailMessageIndex,
-    detailStart,
-    detailRequested,
-    needsDetail,
-    compositeSegments,
-    positionedEntries,
+      : mergePositionedActivityEntries(detail.entries[0], positionedEntries),
     suppressLatestRestart,
-  ])
+  )
+  const detailError = detail.error
 
   const lastItem = entries[entries.length - 1]?.item
   const liveThinkingTail = live && lastItem?.type === 'thinking'
@@ -400,12 +332,16 @@ function GroupedActivityStretch({
   const launches = helperLaunches(timelineEntries || [])
 
   function revealBeforeReady() {
+    // Only a physical open/retry owns header-local compensation. Restored
+    // session-open detail belongs to the chat controller's reading anchor.
+    if (!preserveRequestedOpenRef.current) return
+    preserveRequestedOpenRef.current = false
     if (!userOpenRef.current || visibleOpenRef.current) return
     preserveTogglePosition(headerRef.current, timelineRef.current)
   }
 
   return (
-    <div className={
+    <div data-reading-layout-pending={opening ? 'true' : undefined} className={
       `chat__activity chat__activity--${displayState}`
       + (open ? ' chat__activity--open' : '')
     }>
@@ -427,13 +363,17 @@ function GroupedActivityStretch({
           const nextOpen = !userOpen
           if (nextOpen) {
             setDetailRequested(true)
+            preserveRequestedOpenRef.current = !detailReady
             if (detailReady) {
               preserveTogglePosition(headerRef.current, timelineRef.current)
             }
           } else if (open) {
             preserveTogglePosition(headerRef.current, timelineRef.current)
           }
-          if (!nextOpen) setDetailRequested(false)
+          if (!nextOpen) {
+            preserveRequestedOpenRef.current = false
+            setDetailRequested(false)
+          }
           userOpenRef.current = nextOpen
           setUserOpen(nextOpen)
         }}
@@ -457,7 +397,7 @@ function GroupedActivityStretch({
               className="chat__lazy-retry"
               onClick={() => {
                 preserveTogglePosition(headerRef.current, timelineRef.current)
-                setDetailError(false)
+                preserveRequestedOpenRef.current = true
                 setDetailAttempt(attempt => attempt + 1)
               }}
             >

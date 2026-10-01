@@ -10,6 +10,7 @@ import assert from 'node:assert/strict'
 // only come from the user, so a future edit that re-introduces derived-open trips
 // a red test rather than a scroll-displacement bug in production.
 
+const loader = readFileSync(new URL('../hooks/useActivityDetails.js', import.meta.url), 'utf8')
 const src = readFileSync(new URL('../ActivityStretch.jsx', import.meta.url), 'utf8')
 
 // Scan the function body only — the header comment deliberately QUOTES the old
@@ -47,11 +48,11 @@ test('the summary is the only open-state write and preserves position', () => {
 })
 
 test('interaction prepares detail without deriving or writing user intent', () => {
-  assert.match(src, /useEffect/,
+  assert.match(loader, /useEffect/,
     'historical activity detail is fetched only for the interacted row')
   assert.match(
-    body,
-    /!detailRequested\s*\|\| !needsDetail\s*\|\| detailEntries\s*\|\| detailError/,
+    loader,
+    /!requested \|\| !plan.some\(Boolean\) \|\| current/,
     'lazy detail stays network-free until pointer or keyboard activation requests it',
   )
   assert.match(body, /onPrepare=\{\(\) => setDetailRequested\(true\)\}/)
@@ -64,13 +65,13 @@ test('interaction prepares detail without deriving or writing user intent', () =
 
 test('cold detail settles before the hidden boundary flips', () => {
   assert.match(
-    body,
-    /revealBeforeReady\(\)\s*setDetailEntries\(/,
+    loader,
+    /readyRef.current\?\.\(\)\s*setResult\(\{ key: resultKey, entries, error: false/,
     'successful detail prepares scroll preservation immediately before readiness',
   )
   assert.match(
-    body,
-    /revealBeforeReady\(\)\s*setDetailError\(true\)/,
+    loader,
+    /readyRef.current\?\.\(\)\s*setResult\(\{ key: resultKey, entries: null, error: true/,
     'a terminal load error is also revealed as one final layout',
   )
   assert.doesNotMatch(body, /Loading activity…/,

@@ -21,6 +21,19 @@ _CHAT_ID_RE = re.compile(
 )
 
 
+# Linux filesystems cap one path component at 255 bytes; a longer name fails
+# with ENAMETOOLONG only once something tries to create it.
+NAME_MAX_BYTES = 255
+
+
+def has_overlong_segment(path: Path | str) -> bool:
+  """Whether any component of ``path`` exceeds the filesystem name limit."""
+  return any(
+    len(part.encode("utf-8", "surrogatepass")) > NAME_MAX_BYTES
+    for part in Path(path).parts
+  )
+
+
 def validate_chat_id(chat_id: str) -> None:
   """Raise HTTP 400 unless ``chat_id`` is a canonical dashed UUID string."""
   if not _CHAT_ID_RE.match(chat_id):

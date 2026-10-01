@@ -16,7 +16,7 @@ const { default: WaitHistoryCard } = await vite.ssrLoadModule(
 const { WaitCard } = await vite.ssrLoadModule(
   '/src/components/ChatView/WaitingChip.jsx',
 )
-const { waitHistoryViewModel } = await vite.ssrLoadModule(
+const { waitHistoryViewModel, waitWokeItsAnswer } = await vite.ssrLoadModule(
   '/src/components/ChatView/waitHistory.js',
 )
 
@@ -146,4 +146,55 @@ test('what started an answer leads it while live; a stopped wait trails the sett
 
   const settled = renderToStaticMarkup(createElement(MsgContent, { msg, isStreaming: false }))
   assert.ok(settled.indexOf('Picking up') < settled.indexOf('Wait stopped'))
+})
+
+
+test('finished-but-undelivered checks show the blocker, not expired polling promises', () => {
+  for (const [blocker, message] of [
+    ['platform_restart', 'waiting for platform restart'],
+    ['owner_input', 'waiting for your answer'],
+    ['manual_resume', 'waiting for Resume'],
+    ['provider_park', 'waiting for agent availability'],
+    ['restoring_edits', 'restoring local work'],
+    ['live_turn', 'waiting for current turn'],
+    ['resume_failed', 'follow-up needs attention'],
+  ]) {
+    const wait = {
+      id: 'owed-result', kind: 'command', status: 'met',
+      description: 'CI for exact reviewed head', delivery_pending: true,
+      resume_blocker: blocker, checks_count: 1, interval_secs: 60,
+      deadline_at: '2026-09-01T01:00:00', next_check_at: '2026-09-01T00:00:00',
+    }
+    const html = renderToStaticMarkup(createElement(WaitCard, {
+      wait, expanded: true, onToggle: () => {}, onCancel: () => {},
+    }))
+    assert.ok(html.includes(`Checks finished; ${message}`))
+    assert.match(html, /Original condition<\/dt><dd>CI for exact reviewed head/)
+    assert.match(html, /Finished · no more checks/)
+    assert.doesNotMatch(html, /next check|wakes to investigate at|Stop waiting/)
+  }
+})
+
+test('failed and deadline outcomes remain honest while their follow-up is blocked', () => {
+  for (const [status, expected] of [
+    ['failed', 'Check failed; waiting for platform restart'],
+    ['expired', 'Check reached its deadline; waiting for platform restart'],
+  ]) {
+    const html = renderToStaticMarkup(createElement(WaitCard, {
+      wait: { id: status, status, kind: 'command', description: 'CI', delivery_pending: true, resume_blocker: 'platform_restart' },
+      expanded: true, onToggle: () => {},
+    }))
+    assert.ok(html.includes(expected))
+    assert.doesNotMatch(html, /Checks finished/)
+  }
+})
+
+test('history distinguishes a saved result from the continuation it has not woken', () => {
+  const summary = { id: 'owed', description: 'Exact CI', status: 'met', delivery_pending: true }
+  assert.equal(waitWokeItsAnswer(summary), false)
+  assert.equal(waitHistoryViewModel(summary).kicker, 'Condition met · follow-up pending')
+  const html = renderToStaticMarkup(createElement(WaitHistoryCard, { summary }))
+  assert.doesNotMatch(html, /Wait completed/)
+  assert.match(html, /follow-up pending/)
+  assert.equal(waitWokeItsAnswer({ ...summary, delivery_pending: false }), true)
 })

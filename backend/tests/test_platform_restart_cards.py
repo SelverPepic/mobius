@@ -505,7 +505,7 @@ def test_restart_wait_hides_storage_deadline_from_owner_and_agent_context():
   with SessionLocal() as db:
     wait = db.get(models.ChatWait, wait_id)
     assert wait.deadline_at is not None  # Legacy shared-schema storage only.
-    assert serialize_wait(wait)["deadline_at"] is None
+    assert serialize_wait(wait, db=db)["deadline_at"] is None
     assert '"deadline_at":null' in build_active_waits_context(
       db, "restart-no-visible-expiry",
     )
@@ -1033,3 +1033,250 @@ def test_one_ready_boot_wakes_every_linked_restart_goal(
     assert db.get(models.ChatWait, w1).resume_delivered_at is not None
     assert db.get(models.ChatWait, w2).resume_delivered_at is not None
     assert db.get(models.ChatWait, w3).resume_delivered_at is not None
+
+
+def _save_restart_card(client, chat, db, *, objective=None) -> str:
+  run_id = f"request-disclosure-{chat.id}"
+  _submit(chat_writer.StartTurn(
+    chat_id=chat.id, run_token=run_id,
+    user_msg={"role": "user", "content": "Prepare", "ts": 1},
+  ))
+  sink = ChatEventSink(create_broadcast(chat.id), chat.id, run_token=run_id)
+  register_active_sink(chat.id, sink)
+  owner = db.query(models.Owner).first()
+  token = auth_mod.create_agent_token(
+    chat_id=chat.id, owner_username=owner.username,
+    token_epoch=owner.token_epoch, run_id=run_id,
+    expires_delta=timedelta(minutes=5),
+  )
+  try:
+    if objective is not None:
+      promoted = client.post(
+        f"/api/chats/{chat.id}/goal", json={"objective": objective},
+        headers={"Authorization": f"Bearer {token}"},
+      )
+      assert promoted.status_code == 200, promoted.text
+    saved = client.post(
+      f"/api/chats/{chat.id}/restart-request", json={},
+      headers={"Authorization": f"Bearer {token}"},
+    )
+  finally:
+    unregister_active_sink(chat.id, sink)
+  assert saved.status_code == 200, saved.text
+  if objective is not None:
+    from app import chat as chat_mod
+
+    async def finish():
+      with SessionLocal() as read:
+        await chat_mod._complete_turn(
+          bc=sink.bc, sink=sink, db=read, chat_id=chat.id, run_gen=None,
+          provider_id=chat.provider, cost_usd=0, close_browser=False,
+        )
+
+    asyncio.run(finish())
+  with SessionLocal() as read:
+    block = read.get(models.Chat, chat.id).messages[-1]["blocks"][-1]
+    return block["questions"][0]["question"]
+
+
+def test_each_chat_saves_its_own_restart_decision_without_a_shared_claim(
+  client, auth, db, monkeypatch,
+):
+  # The card registers this chat's follow-through, not ownership of the worker.
+  monkeypatch.setenv("MOBIUS_BOOT_ID", "boot-independent-cards")
+  saved = []
+  for title in ("Activate first fix", "Activate second fix"):
+    created = client.post("/api/chats", headers=auth, json={"title": title})
+    assert created.status_code == 200, created.text
+    chat_id = created.json()["id"]
+    _save_restart_card(client, db.get(models.Chat, chat_id), db)
+    with SessionLocal() as read:
+      row = read.get(models.Chat, chat_id)
+      qid = row.pending_question_id
+      card = row.messages[-1]["blocks"][-1]
+      wait = read.get(models.ChatWait, card["platform_action"]["wait_id"])
+      assert qid == card["question_id"]
+      assert wait.chat_id == chat_id
+      assert wait.linked_question_id == qid
+      assert wait.status == "armed"
+      assert wait.resume_delivered_at is None
+      saved.append((chat_id, qid, wait.id, wait.condition_json["action_id"]))
+    detail = client.get(f"/api/chats/{chat_id}", headers=auth)
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["pending_question_id"] == qid
+    assert [wait["kind"] for wait in detail.json()["waits"]] == [
+      "platform_activation",
+    ]
+  assert len({qid for _, qid, _, _ in saved}) == 2
+  assert len({wid for _, _, wid, _ in saved}) == 2
+  assert len({action for _, _, _, action in saved}) == 2
+  with SessionLocal() as read:
+    assert read.query(models.AgentWorkClaim).count() == 0
+    for chat_id, qid, _, _ in saved:
+      assert read.get(models.Chat, chat_id).pending_question_id == qid
+
+
+@pytest.mark.parametrize("selected", ["first", "second"])
+@pytest.mark.parametrize("also_click_other", [False, True])
+def test_any_restart_card_wakes_all_registered_chats_once_without_bypassing_input(
+  client, auth, db, monkeypatch, selected, also_click_other,
+):
+  from app import chat as chat_mod, chat_waits, restart_util
+
+  monkeypatch.setenv("MOBIUS_BOOT_ID", "boot-old")
+  participants = {}
+  for name in ("first", "second", "unrelated-input", "stopped"):
+    created = client.post("/api/chats", headers=auth, json={"title": name})
+    assert created.status_code == 200, created.text
+    chat_id = created.json()["id"]
+    _save_restart_card(client, db.get(models.Chat, chat_id), db,
+                       objective=f"Activate {name}")
+    with SessionLocal() as read:
+      row = read.get(models.Chat, chat_id)
+      card = row.messages[-1]["blocks"][-1]
+      wait = read.get(models.ChatWait, card["platform_action"]["wait_id"])
+      assert card["platform_action"]["version"] == 2
+      participants[name] = (chat_id, row.pending_question_id, wait.id,
+                            wait.root_run_id, wait.condition_json)
+    _submit(chat_writer.AppendPending(chat_id=chat_id, user_msg={
+      "role": "user", "content": "B", "cid": f"b-{chat_id}", "ts": 3,
+    }))
+  stopped_id, _, stopped_wait, _, _ = participants["stopped"]
+  assert _submit(CancelActivationWaits(chat_id=stopped_id)) == 1
+  input_id, input_qid, input_wait, _, _ = participants["unrelated-input"]
+  newer_qid = "unrelated-owner-decision"
+  with SessionLocal() as read:
+    row = read.get(models.Chat, input_id)
+    row.messages = [*row.messages, {"role": "assistant", "ts": 3, "blocks": [{
+      "type": "question", "question_id": newer_qid,
+      "questions": [{"id": "later", "question": "Keep the data?", "options": []}],
+    }]}]
+    row.pending_question_id = newer_qid
+    read.commit()
+
+  restarts = []
+  drains = []
+
+  class NoSignalTimer:
+    def __init__(self, *_args):
+      self.daemon = False
+
+    def start(self):
+      pass
+
+  async def drain():
+    drains.append(True)
+    return "boot-old", "shared-restart-nonce", []
+
+  monkeypatch.setattr(restart_util, "validate_restart_source", lambda: None)
+  monkeypatch.setattr(restart_util, "_drain_exact_restart", drain)
+  monkeypatch.setattr(restart_util.threading, "Timer", NoSignalTimer)
+  monkeypatch.setattr(
+    "app.restart_ledger.request_restart", lambda **kwargs: restarts.append(kwargs),
+  )
+  # No live shutdown path may escape this fixture, even on failure.
+  monkeypatch.setattr(restart_util.os, "kill", lambda *_args: pytest.fail("unexpected signal"))
+  selected_id, qid, _, _, _ = participants[selected]
+  with SessionLocal() as read:
+    card = read.get(models.Chat, selected_id).messages[-1]["blocks"][-1]
+    restart_id = card["platform_action"]["restart_option_id"]
+  body = {"content": "", "hidden": True, "question_id": qid,
+          "selected_options": {"restart": [restart_id]}}
+  answer = client.post(f"/api/chats/{selected_id}/messages", headers=auth, json=body)
+  retry = client.post(f"/api/chats/{selected_id}/messages", headers=auth, json=body)
+  assert answer.status_code == retry.status_code == 202
+  if also_click_other:
+    other_id, other_qid, _, _, _ = participants["second" if selected == "first" else "first"]
+    with SessionLocal() as read:
+      other_card = read.get(models.Chat, other_id).messages[-1]["blocks"][-1]
+      other_option = other_card["platform_action"]["restart_option_id"]
+    other_answer = client.post(f"/api/chats/{other_id}/messages", headers=auth, json={
+      "content": "", "hidden": True, "question_id": other_qid,
+      "selected_options": {"restart": [other_option]},
+    })
+    assert other_answer.status_code == 202, other_answer.text
+  assert len(drains) == len(restarts) == 1
+  with SessionLocal() as read:
+    created = max(read.get(models.ChatWait, item[2]).created_at for item in participants.values())
+    read.add(models.PlatformBootSnapshot(
+      boot_id="boot-one-ready", source_kind="platform", source_sha="d" * 40,
+      loaded_files_json={}, service_ready=True, captured_at=created + timedelta(seconds=1),
+    ))
+    read.commit()
+  scheduled = []
+  monkeypatch.setattr(chat_mod, "_schedule_continuation", lambda **kwargs: (
+    scheduled.append(kwargs) or True
+  ))
+  try:
+    for name, (chat_id, _, wait_id, _, _) in participants.items():
+      if name == "stopped":
+        assert asyncio.run(chat_waits._check_one(wait_id)) is False
+      else:
+        assert asyncio.run(chat_waits._check_one(wait_id)) is True
+      delivered = asyncio.run(chat_waits._deliver_resume(wait_id))
+      assert delivered is (name in ("first", "second"))
+      assert asyncio.run(chat_waits._deliver_resume(wait_id)) is False
+    assert {call["chat_id"] for call in scheduled} == {
+      participants["first"][0], participants["second"][0],
+    }
+    with SessionLocal() as read:
+      assert read.get(models.ChatWait, stopped_wait).status == "cancelled"
+      assert read.get(models.Chat, input_id).pending_question_id == newer_qid
+      assert read.get(models.ChatWait, input_wait).resume_delivered_at is None
+      for name in ("first", "second"):
+        chat_id, _, wait_id, root_id, _ = participants[name]
+        row = read.get(models.Chat, chat_id)
+        resumed = read.get(models.ChatRun, f"activation-resume-{wait_id}")
+        assert resumed.root_run_id == root_id
+        assert resumed.goal_id == root_id
+        assert row.pending_question_id is None
+        assert [m["content"] for m in row.pending_messages] == ["B"]
+        assert sum(m.get("cid") == f"activation-result-{wait_id}" for m in row.messages) == 1
+        card = next(block for message in row.messages for block in message.get("blocks", [])
+                    if block.get("question_id") == participants[name][1])
+        assert card["platform_action"]["status"] == "activated"
+        if name != selected and not also_click_other:
+          assert not card.get("answers")  # A ready boot is not manufactured consent.
+    _submit(AnswerQuestion(chat_id=input_id, question_id=newer_qid,
+                           answers={"Keep the data?": "Yes"}))
+    assert asyncio.run(chat_waits._deliver_resume(input_wait)) is True
+    assert asyncio.run(chat_waits._deliver_resume(input_wait)) is False
+    assert len(scheduled) == 3
+    with SessionLocal() as read:
+      assert read.get(models.Chat, input_id).pending_question_id is None
+      assert read.get(models.ChatWait, input_wait).resume_delivered_at is not None
+  finally:
+    for chat_id, *_ in participants.values():
+      chat_mod.discard_starting(chat_id)
+
+
+def test_fresh_restart_card_waits_for_a_new_boot_after_the_previous_shared_restart():
+  from copy import deepcopy
+  from app import chat_waits
+
+  chat_id = "restart-after-shared-boot"
+  _, wait_id, _, _ = _install(chat_id)
+  with SessionLocal() as db:
+    wait = db.get(models.ChatWait, wait_id)
+    requirement = {**wait.condition_json, "source_boot_id": "boot-already-ready"}
+    wait.condition_json = requirement
+    row = db.get(models.Chat, chat_id)
+    messages = deepcopy(row.messages)
+    messages[0]["blocks"][0]["platform_action"]["requirement"] = requirement
+    row.messages = messages
+    db.add(models.PlatformBootSnapshot(
+      boot_id="boot-already-ready", source_kind="platform", source_sha="e" * 40,
+      loaded_files_json={}, service_ready=True, captured_at=wait.created_at,
+    ))
+    db.commit()
+  assert asyncio.run(chat_waits._check_one(wait_id)) is False
+  with SessionLocal() as db:
+    wait = db.get(models.ChatWait, wait_id)
+    assert wait.status == "armed"
+    db.add(models.PlatformBootSnapshot(
+      boot_id="boot-later-ready", source_kind="platform", source_sha="f" * 40,
+      loaded_files_json={}, service_ready=True,
+      captured_at=wait.created_at + timedelta(seconds=1),
+    ))
+    db.commit()
+  assert asyncio.run(chat_waits._check_one(wait_id)) is True

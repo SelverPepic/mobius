@@ -74,6 +74,24 @@ def test_missing_anchor_fails_closed_to_the_ordinary_recent_page():
   assert page == messages[-20:]
 
 
+def test_before_cursor_is_clamped_to_the_transcript():
+  messages = [{"role": "user", "ts": index} for index in range(4)]
+
+  def window(before):
+    page, offset, _ = _chat_detail_window(
+      messages, limit=5, before=before, anchor_key=None,
+    )
+    return page, offset
+
+  # A negative cursor names nothing before the first message; it must not wrap
+  # around to Python's from-the-end slicing.
+  assert window(-3) == ([], 0)
+  assert window(0) == ([], 0)
+  assert window(2) == (messages[:2], 0)
+  # A cursor past the end is the tail, reported at a real offset.
+  assert window(99_999) == (messages, 0)
+
+
 def test_compacts_multi_step_activity_and_preserves_render_metadata():
   source = {"title": "Reference", "url": "https://example.com/reference"}
   messages = [{
@@ -352,6 +370,21 @@ def test_compact_route_folds_settled_activity_while_live_turn_waits_for_answer(
   ]
   assert "settled reasoning" not in response.text
   assert "settled output" not in response.text
+
+
+def test_inserted_goal_card_does_not_shift_question_twin_matching():
+  blocks = [
+    {"type": "tool", "tool": "Bash", "tool_use_id": "verify", "raw_index": 0},
+    {"type": "goal_history", "summary": {"id": "goal"}, "raw_index": None},
+    {"type": "tool", "tool": "request_user_input", "status": "done", "raw_index": 1},
+    {"type": "question", "question_id": "q1", "questions": [], "raw_index": 2},
+  ]
+  projected = compact_messages_for_detail(
+    [{"role": "assistant", "blocks": blocks}],
+    message_offset=0, binding=EMPTY_RECALL_BINDING,
+  )[0]["blocks"]
+  assert [b["type"] for b in projected] == ["tool", "goal_history", "question"]
+  assert projected[-1]["raw_index"] == 2
 
 
 def test_image_reads_stay_distinctive_and_question_twins_are_not_rendered():
@@ -804,6 +837,7 @@ def test_runtime_route_does_not_select_transcript_json(
     "runtime_revision": 0,
     "active_assistant_message_id": None,
     "recovery_run_id": None,
+    "continuation_wait": None,
     "active_goal_objective": None,
     "goal": None,
     "pending_messages": [],

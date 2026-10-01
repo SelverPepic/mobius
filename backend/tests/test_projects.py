@@ -1423,3 +1423,19 @@ def test_unavailable_page_catalog_does_not_hide_native_apps(client, auth, db, st
   assert listed.status_code == 200
   assert listed.json()["artifacts"] == []
   assert [row["id"] for row in listed.json()["apps"]] == [str(source_app.id)]
+
+
+def test_project_path_name_longer_than_the_filesystem_allows_is_rejected(
+  client, auth,
+):
+  project = client.post(
+    "/api/projects", headers=auth,
+    json={"name": "Long names", "template_id": "blank"},
+  ).json()
+  response = client.put(
+    f"/api/projects/{project['id']}/file?path=notes/{'a' * 300}.md",
+    headers=auth, json={"content": "x", "expected_revision": None},
+  )
+  assert response.status_code == 400, response.text
+  listing = client.get(f"/api/projects/{project['id']}/files", headers=auth).json()
+  assert listing["entries"] == []

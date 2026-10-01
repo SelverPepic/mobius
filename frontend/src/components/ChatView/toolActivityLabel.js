@@ -244,21 +244,37 @@ const CONTROL_CALLS = new Map([
   ['screenshot', ['Taking a screenshot of', 'Took a screenshot of', 'route']],
 ])
 
-function summaryValue(input, key) {
-  if (typeof input !== 'string' || !key) return ''
+function controlInputValue(input, key) {
+  if (typeof input !== 'string' || !key) return undefined
+  // Codex preserves JSON arguments; other providers use key=value summaries.
+  // Read both here, including saved historical rows.
+  try {
+    const args = JSON.parse(input)
+    if (args && typeof args === 'object' && !Array.isArray(args)) {
+      return Object.hasOwn(args, key) ? args[key] : undefined
+    }
+  } catch { /* A provider's plain-text summary is not JSON. */ }
   const match = input.match(new RegExp(`(?:^|, )${key}=([\\s\\S]*?)(?=, [a-z_]+=|$)`))
-  return match ? match[1].trim() : ''
+  return match ? match[1].trim() : undefined
+}
+
+function summaryValue(input, key) {
+  const value = controlInputValue(input, key)
+  return typeof value === 'string' ? value.trim() : ''
 }
 
 function withDetail(verb, detail) {
   return detail ? `${verb} ${detail}` : verb.replace(/:$/, '')
 }
 
-function goalCallLabel(input, running) {
-  const has = key => typeof input === 'string' && new RegExp(`(?:^|, )${key}=`).test(input)
-  if (has('complete')) return running ? 'Completing the Goal' : 'Completed the Goal'
-  if (has('tasks')) return running ? 'Updating the plan' : 'Updated the plan'
-  if (has('next_action')) return running ? 'Leaving the next step' : 'Left the next step'
+function goalCallLabel(tool) {
+  const running = tool.status === 'running'
+  const failed = !running && (tool.status === 'failed' || tool.output_exit_code > 0)
+  const has = key => controlInputValue(tool.input, key) != null
+  if (has('complete')) return running ? 'Completing the Goal' : failed ? 'Could not complete the Goal' : 'Completed the Goal'
+  if (has('tasks')) return running ? 'Updating the plan' : failed ? 'Could not update the plan' : 'Updated the plan'
+  if (has('next_action')) return running ? 'Leaving the next step' : failed ? 'Could not leave the next step' : 'Left the next step'
+  if (failed) return 'Could not read the plan'
   return running ? 'Reading the plan' : 'Read the plan'
 }
 
@@ -278,7 +294,7 @@ function controlCallLabel(tool) {
   if (!bare) return null
   const running = tool?.status === 'running'
   const input = tool?.input
-  if (bare === 'update_goal') return goalCallLabel(input, running)
+  if (bare === 'update_goal') return goalCallLabel(tool)
   const call = CONTROL_CALLS.get(bare)
   if (call) {
     let detail = summaryValue(input, call[2])
