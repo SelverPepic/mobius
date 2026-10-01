@@ -142,8 +142,8 @@ test('app discovery hands access review to Store and preserves the guide through
   await page.goto(BASE, { waitUntil: 'domcontentloaded' })
   const token = await page.evaluate(() => localStorage.getItem('token'))
   const { app: storeApp } = await applyApp(request, token, {
-    slug: 'store', sourceSlug: `store-onboarding-${randomUUID()}`,
-    name: 'App Store', jsxSource: STORE_FIXTURE,
+    slug: `store-onboarding-${randomUUID()}`, name: 'App Store',
+    manifest: { id: 'store' }, jsxSource: STORE_FIXTURE,
   })
   try {
     await page.route(/\/api\/proxy\?/, route => {
