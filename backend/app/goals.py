@@ -104,7 +104,11 @@ def update_goal_record(db, run, goal, expected_revision, *, checkpoint=None,
         "Goal plan is unreadable; replace it with a validated plan before completion"
       )
     if plan is not None and not plan["summary"]["can_complete"]:
-      raise GoalPlanError("Goal has unfinished tasks or active delegations")
+      blockers = plan["summary"]["completion_blockers"]
+      raise GoalPlanError(
+        "Goal has unfinished tasks or active delegations: " + ", ".join(blockers),
+        code="goal_completion_blocked", completion_blockers=blockers,
+      )
     if plan is None and active_goal_helpers(db, run, goal):
       # A Goal without a plan can still have helpers; Done waits for them too.
       raise GoalPlanError("Goal has active delegations")

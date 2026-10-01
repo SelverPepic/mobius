@@ -245,10 +245,12 @@ class GoalUpdateRequest(BaseModel):
     )
 
 
-def _goal_summary(goal) -> dict[str, Any]:
+def _goal_summary(db: Session, goal) -> dict[str, Any]:
+  from app.agent_work_claims import open_claim_keys
   return {
     "id": goal.id, "status": goal.status, "revision": goal.revision,
     "objective": goal.objective, "next_action": goal.next_action,
+    "held_work_keys": sorted(open_claim_keys(db, chat_id=goal.chat_id, goal_id=goal.id)),
   }
 
 
@@ -317,7 +319,7 @@ async def update_goal(
     rows = presented_goal_rows(db, chat_id)
     if rows is None:
       return {"goal": None, "plan": None}
-    return {"goal": _goal_summary(rows[1]), "plan": serialize_plan(db, *rows)}
+    return {"goal": _goal_summary(db, rows[1]), "plan": serialize_plan(db, *rows)}
   from app import chat_queue
   from app.goal_plans import edit_plan
   from app.goals import update_goal_record
@@ -358,4 +360,4 @@ async def update_goal(
     # wake claim followers and withdraw now-stale resume notices.
     from app.goals import settle_after_goal_completion
     await settle_after_goal_completion(chat_id)
-  return {"goal": _goal_summary(goal), "plan": plan}
+  return {"goal": _goal_summary(db, goal), "plan": plan}

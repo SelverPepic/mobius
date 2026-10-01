@@ -986,6 +986,7 @@ class PromotePending(_Command):
   # not turn-end handoffs and keep the clean default; drain_and_release passes
   # "failed" when the provider returned an error before queued work continues.
   ending_status: str = "completed"
+  ending_run_token: str = ""
 
 
 @dataclass
@@ -1050,6 +1051,71 @@ class PersistCompaction(_Command):
   summary: str = ""
   expected_provider: str = ""
   source_messages_hash: str = ""
+
+
+
+@dataclass
+class AdmitAgentWrites(_Command):
+  """Commit one authoritative item's intents before any external dispatch."""
+  chat_id: str = ""
+  run_token: str = ""
+  item_id: str = ""
+  fingerprint: str = ""
+  writes: tuple = ()
+
+
+@dataclass
+class AcknowledgeAgentWriteFailures(_Command):
+  """A successful authorized provider attempt consumed these exact reports."""
+  chat_id: str = ""
+  run_token: str = ""
+  reports: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass
+class ClaimAgentWrite(_Command):
+  """Commit executing for the next write; at most one worker owns this run."""
+  chat_id: str = ""
+  run_token: str = ""
+
+
+@dataclass
+class SettleAgentWrite(_Command):
+  """Record an observed outcome, even if Stop raced the external response."""
+  chat_id: str = ""
+  run_token: str = ""
+  operation_id: str = ""
+  status: str = ""
+  reason: str | None = None
+
+
+@dataclass
+class SealAgentWrites(_Command):
+  """Close intake before draining accepted work and finalizing its run."""
+  chat_id: str = ""
+  run_token: str = ""
+
+
+@dataclass
+class InterruptAgentWrites(_Command):
+  """Fence lost/stopped work; retain cancellations and ambiguous effects."""
+  chat_id: str = ""
+  run_token: str = ""
+
+
+@dataclass
+class RecordAgentWriteFailure(_Command):
+  """Durably explain a rejected frame without persisting private raw bytes."""
+  chat_id: str = ""
+  run_token: str = ""
+  stage: str = "protocol"
+  reason: str = "invalid_frame"
+
+
+@dataclass
+class ReadAgentWriteOutcomes(_Command):
+  chat_id: str = ""
+  run_token: str = ""
 
 
 @dataclass
@@ -2103,6 +2169,10 @@ class ChatWriterActor:
       return self._persist_compaction(db, cmd)
     if isinstance(cmd, AuthorizeCheckpoint):
       return self._authorize_checkpoint(db, cmd)
+    if isinstance(cmd, (AdmitAgentWrites, AcknowledgeAgentWriteFailures, ClaimAgentWrite, SettleAgentWrite,
+                        SealAgentWrites, InterruptAgentWrites, ReadAgentWriteOutcomes,
+                        RecordAgentWriteFailure)):
+      return self._agent_write_command(db, cmd)
     if isinstance(cmd, SwitchProviderWithCompaction):
       return self._switch_provider_with_compaction(db, cmd)
     if isinstance(cmd, PromotePending):
@@ -3131,6 +3201,9 @@ class ChatWriterActor:
         run_id=interrupted_ids[-1],
         failed_at=cmd.recovered_at,
       )
+    from app.agent_write_journal import interrupt as interrupt_agent_writes
+    interrupt_agent_writes(db, chat_id=cmd.chat_id,
+      run_ids=tuple(cmd.running_run_ids), reason="worker_lost_at_restart")
     if cmd.restart_run_id:
       restart_run = db.query(ChatRun).filter(
           ChatRun.chat_id == cmd.chat_id,
@@ -4518,15 +4591,53 @@ class ChatWriterActor:
       "agent_settings_json": chat.agent_settings_json,
     }
 
-  def _authorize_checkpoint(self, db, cmd: AuthorizeCheckpoint) -> dict:
-    chat = _active_chat(db, cmd.chat_id)
-    run = db.get(models.ChatRun, cmd.run_token) if cmd.run_token else None
+  def _owned_live_run(self, db, chat_id: str, run_token: str):
+    run = db.get(models.ChatRun, run_token) if run_token else None
     if (
-      chat is None or run is None or run.chat_id != cmd.chat_id
+      _active_chat(db, chat_id) is None or run is None or run.chat_id != chat_id
       or run.status != "running"
-      or self._run_token_owner.get(cmd.chat_id) != cmd.run_token
+      or self._run_token_owner.get(chat_id) != run_token
       or not self._run_is_latest(db, run)
     ):
+      return None
+    return run
+
+  def _agent_write_command(self, db, cmd):
+    from app import agent_write_journal as journal
+    if isinstance(cmd, (AdmitAgentWrites, ClaimAgentWrite, AcknowledgeAgentWriteFailures)):
+      run = self._owned_live_run(db, cmd.chat_id, cmd.run_token)
+    else:
+      # A completion is evidence, not renewed execution permission. Let the
+      # exact worker record a late result after Stop; never claim new work.
+      run = db.get(models.ChatRun, cmd.run_token)
+      if run is not None and (run.chat_id != cmd.chat_id or _active_chat(db, cmd.chat_id) is None):
+        run = None
+    if run is None:
+      db.rollback()
+      return {"status": "stale_run"}
+    if isinstance(cmd, AdmitAgentWrites):
+      return journal.admit(db, run, item_id=cmd.item_id,
+                           fingerprint=cmd.fingerprint, writes=cmd.writes)
+    if isinstance(cmd, AcknowledgeAgentWriteFailures):
+      return journal.acknowledge_failures(db, run, reports=cmd.reports)
+    if isinstance(cmd, ClaimAgentWrite):
+      return journal.claim(db, run)
+    if isinstance(cmd, SettleAgentWrite):
+      return journal.settle(db, run, operation_id=cmd.operation_id,
+                            status=cmd.status, reason=cmd.reason)
+    if isinstance(cmd, RecordAgentWriteFailure):
+      return journal.record_failure(db, run, stage=cmd.stage, reason=cmd.reason)
+    if isinstance(cmd, SealAgentWrites):
+      return journal.seal(db, run)
+    if isinstance(cmd, InterruptAgentWrites):
+      journal.interrupt(db, chat_id=cmd.chat_id, run_ids=(run.id,), reason="run_interrupted")
+      journal._commit(db)
+      return {"status": "interrupted"}
+    return journal.outcomes(db, run)
+
+  def _authorize_checkpoint(self, db, cmd: AuthorizeCheckpoint) -> dict:
+    chat = _active_chat(db, cmd.chat_id)
+    if self._owned_live_run(db, cmd.chat_id, cmd.run_token) is None:
       db.rollback()
       return {"status": "stale_run"}
     title_applied = bool(cmd.title and apply_generated_title(chat, cmd.title))
@@ -4706,6 +4817,9 @@ class ChatWriterActor:
       pending = runnable
       chat.pending_messages = pending
     if not pending:
+      repair = self._repair_quiet_writes(db, chat, cmd)
+      if repair is not None:
+        return repair
       if retired_control and not _commit_or_rollback(db):
         raise _PersistFailed("PromotePending could not retire stale control")
       return {"history": [], "promoted": None, "session_id": chat.session_id}
@@ -4855,6 +4969,92 @@ class ChatWriterActor:
       "promoted": returned_promoted,
       "session_id": chat.session_id,
     }
+
+  def _repair_quiet_writes(self, db, chat, cmd: PromotePending) -> dict | None:
+    """Failures alone earn one model continuation at the existing queue drain.
+
+    Owner input/cards/activation win above this seam. Stop, provider failure,
+    resource holds, and an armed Wait never create execution permission here.
+    Helpers retain the same immutable chat policy and logical root.
+    """
+    if cmd.ending_status != "completed" or not cmd.ending_run_token:
+      return None
+    prior = self._owned_live_run(db, chat.id, cmd.ending_run_token)
+    if prior is None or prior.provider_execution_admitted is not True:
+      return None
+    from app.delegations import delegation_recovery_allowed
+    if not delegation_recovery_allowed(db, child_chat_id=chat.id,
+                                       initiated_by_app_id=prior.initiated_by_app_id):
+      return None
+    stream = db.get(models.AgentWriteStream, prior.id)
+    if stream is None or not stream.sealed or db.query(models.AgentWriteIntent.operation_id).filter(
+      models.AgentWriteIntent.source_run_id == prior.id,
+      models.AgentWriteIntent.status.in_(("queued", "executing")),
+    ).first():
+      return None
+    from app.agent_write_journal import failure_report
+    if failure_report(db, prior) is None:
+      return None
+    from app.continuations import recovery_attempted
+    if recovery_attempted(db, prior, reason="quiet_write_failure"):
+      return None
+    from app.chat_waits import _FIRED_UNDELIVERED
+    if db.query(models.ChatWait.id).filter(models.ChatWait.chat_id == chat.id,
+      (models.ChatWait.status == "armed") | _FIRED_UNDELIVERED).first():
+      return None
+    goal = db.get(models.ChatGoal, prior.goal_id) if prior.goal_id else None
+    if ((prior.goal_id and (goal is None or goal.status != "open"))
+        or (goal is not None and chat.dismissed_goal_id == goal.id)):
+      # Retain the negative receipt for the next authorized turn. Removing the
+      # Goal from the repair would bypass a hold by creating goal-less work.
+      return None
+    return self._admit_clean_recovery(db, chat, prior,
+      goal=goal)
+
+  def _admit_clean_recovery(self, db, chat, prior, *, goal) -> dict:
+    """One actor-owned admission for bounded, provider-only clean recovery."""
+    from app.continuations import (
+      continuation_control_envelope, continuation_protocol_source,
+    )
+    token = "write-repair-" + hashlib.sha256(prior.id.encode()).hexdigest()[:48]
+    source = continuation_protocol_source(
+      reason="quiet_write_failure", control_id=token, run_token=token,
+      source_work_id=prior.id, goal_id=goal.id if goal else None,
+    )
+    source["ts"] = next_message_ts(list(chat.messages or []))
+    for key in ("viewport", "timezone"):
+      for message in reversed(chat.messages or []):
+        if message.get("role") == "user" and message.get(key) is not None:
+          source[key] = copy.deepcopy(message[key])
+          break
+    history = [schemas.ChatMessage(role=message.get("role", "user"),
+                                  content=message.get("content", "") or "")
+               for message in chat.messages or []]
+    history.append(schemas.ChatMessage(role="user", content=source["content"]))
+    now = datetime.now(UTC)
+    prior.status = "completed"
+    prior.ended_at = now
+    db.add(models.ChatRun(
+      id=token, chat_id=chat.id, status="running", provider=prior.provider,
+      root_run_id=prior.root_run_id or prior.id, started_at=now,
+      goal_id=goal.id if goal else None, goal_objective=goal.objective if goal else None,
+      initiated_by_app_id=prior.initiated_by_app_id,
+      continuation_json=continuation_control_envelope(
+        reason="quiet_write_failure", control_id=token, source_work_id=prior.id,
+        goal_id=goal.id if goal else None, supersedes_run_token=prior.id,
+      ),
+    ))
+    chat.live_assistant = {"id": token, "role": "assistant", "blocks": [],
+                           "ts": source["ts"]}
+    chat.active_assistant_message_id = token
+    chat.updated_at = now
+    if not _commit_or_rollback(db):
+      raise _PersistFailed("Clean recovery attempt did not persist")
+    self._run_token_owner[chat.id] = token
+    return {"history": history, "session_id": chat.session_id,
+            "promoted": {**source, "_messages": [], "_consumed_cids": [],
+                         "_goal_id": goal.id if goal else None,
+                         "_goal_objective": goal.objective if goal else None}}
 
   def _cancel_pending(self, db, cmd: CancelPending) -> dict:
     """Remove the queued message whose `cid` matches; return the remainder.
@@ -5034,6 +5234,8 @@ class ChatWriterActor:
     changed = False
     failed_run = None
     for run in q.order_by(ChatRun.started_at.asc(), ChatRun.id.asc()).all():
+      from app.agent_write_journal import interrupt as interrupt_agent_writes
+      interrupt_agent_writes(db, chat_id=chat_id, run_ids=(run.id,), reason="run_superseded")
       run.status = status
       if status == "stopped" and run.goal_id:
         goal = db.get(models.ChatGoal, run.goal_id)
@@ -5081,6 +5283,8 @@ class ChatWriterActor:
         ChatRun.chat_id == cmd.chat_id,
       ).first()
       if run is not None and run.status in models.NONTERMINAL_RUN_STATUSES:
+        from app.agent_write_journal import interrupt as interrupt_agent_writes
+        interrupt_agent_writes(db, chat_id=cmd.chat_id, run_ids=(run.id,), reason="run_finished")
         run.status = cmd.terminal_status
         run.ended_at = datetime.now(UTC)
         run.restart_nonce = None
@@ -5212,6 +5416,8 @@ class ChatWriterActor:
     )
     parks = cmd.parked_until is not None and run_is_current
     if run is not None and run.status == "running":
+      from app.agent_write_journal import interrupt as interrupt_agent_writes
+      interrupt_agent_writes(db, chat_id=cmd.chat_id, run_ids=(run.id,), reason="worker_lost")
       if parks:
         run.status = "parked"
         run.parked_until = cmd.parked_until
@@ -5359,6 +5565,8 @@ class ChatWriterActor:
             or run.restart_nonce == (cmd.restart_nonce or None)
           )
         )
+      from app.agent_write_journal import interrupt as interrupt_agent_writes
+      interrupt_agent_writes(db, chat_id=cmd.chat_id, run_ids=(run.id,), reason="run_parked")
       run_is_current = owner_is_ours and self._run_is_latest(db, run)
       if cmd.park_reason == "compaction":
         chat = _active_chat(db, cmd.chat_id)

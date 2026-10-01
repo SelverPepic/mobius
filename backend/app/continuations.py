@@ -42,6 +42,28 @@ PRODUCT_RESULT_MESSAGE_KINDS = frozenset({
 # Goal travels the same slot and resumes under that Goal's identity.
 PEER_MESSAGE_WAKE_KIND = "peer_message"
 
+def recovery_attempted(db, run, *, reason: str) -> bool:
+  """Exact predecessor controls bound recovery; manual owner Resume resets it."""
+  from app import models
+  seen = set()
+  while run is not None:
+    if run.id in seen:
+      return True
+    seen.add(run.id)
+    control = run.continuation_json or {}
+    if control.get("reason") == reason:
+      return True
+    if control.get("reason") == "manual":
+      return False
+    predecessor = control.get("supersedes_run_token")
+    if not predecessor:
+      return False
+    previous = db.get(models.ChatRun, predecessor)
+    if previous is None or previous.chat_id != run.chat_id or previous.goal_id != run.goal_id:
+      return True
+    run = previous
+  return False
+
 
 def pending_message_group_key(message: Mapping[str, Any]) -> tuple:
   """Return the causal turn boundary for one queued message."""
@@ -150,6 +172,14 @@ def continuation_protocol_source(
       "automatic size-recovery attempt for this logical turn."
     ),
     "model_capacity": "Resume the interrupted owner work now that the selected model may be available.",
+    "quiet_write_failure": (
+      "A result-independent write reported a failure or uncertain outcome. "
+      "This is one failure-only recovery, not another owner request. Inspect the attached "
+      "write failure reports and the owning saved state before repeating any side effect. "
+      "Repair within the original authority using ordinary result-bearing tools, or "
+      "report the concrete unresolved failure. Never assume an unknown write did not happen. "
+      "Do not repeat completed substantive work. This recovery will not automatically repeat."
+    ),
   }
   source = {
     "role": "user",

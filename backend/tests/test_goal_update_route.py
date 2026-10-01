@@ -82,11 +82,48 @@ def test_completion_refusal_says_the_task_edits_in_the_same_call_were_saved(
   assert refused.json()["detail"]["message"].startswith(
     "Task edits were saved, but",
   )
+  assert refused.json()["detail"]["code"] == "goal_completion_blocked"
+  assert refused.json()["detail"]["completion_blockers"] == ["build"]
+  assert "build" in refused.json()["detail"]["message"]
   db.expire_all()
   goal = db.get(models.ChatGoal, "goal-1")
   assert goal.status == "open"
   tasks = {task["id"]: task for task in goal.plan_json["tasks"]}
   assert tasks["inspect"]["status"] == "completed"
+
+
+def test_goal_returns_exact_held_work_keys_and_completion_settles_only_named_work(
+  client, owner_token, db,
+):
+  from app.agent_work_claims import claim_work
+
+  _, chat_id = _active_goal(client, owner_token, db)
+  owner_id = db.query(models.Owner.id).scalar()
+  for key in ("test:performed", "test:unneeded", "test:another-goal"):
+    claim_work(db, owner_id=owner_id, chat_id=chat_id, run_id="goal-root",
+               work_key=key, summary=key)
+  other = db.query(models.AgentWorkClaim).filter_by(work_key="test:another-goal").one()
+  other.owner_goal_id = "retained-goal"
+  db.commit()
+  read = _update(client, db, chat_id, {})
+  assert read.status_code == 200, read.text
+  assert read.json()["goal"]["held_work_keys"] == ["test:performed", "test:unneeded"]
+
+  refused = _update(client, db, chat_id, {
+    "complete": "Verified", "finished_claims": ["test:guessed"],
+  })
+  assert refused.status_code == 422
+  finished = _update(client, db, chat_id, {
+    "complete": "Verified", "finished_claims": ["test:performed"],
+  })
+  assert finished.status_code == 200, finished.text
+  assert finished.json()["goal"]["held_work_keys"] == []
+  claims = {row.work_key: row for row in db.query(models.AgentWorkClaim).all()}
+  assert claims["test:performed"].completed_at is not None
+  assert claims["test:unneeded"].released_at is not None
+  assert claims["test:unneeded"].completed_at is None
+  assert claims["test:another-goal"].completed_at is None
+  assert claims["test:another-goal"].released_at is None
 
 
 def test_the_final_task_edit_and_completion_can_share_one_call(

@@ -218,6 +218,7 @@ async def promote_pending_messages_locked(
   chat_id: str,
   run_token: str,
   ending_status: str = "completed",
+  ending_run_token: str = "",
 ) -> tuple[list[schemas.ChatMessage], dict | None, str | None]:
   """Inner promote logic. PRECONDITION: caller holds the per-chat
   queue lock.
@@ -260,6 +261,7 @@ async def promote_pending_messages_locked(
       chat_id=chat_id,
       run_token=run_token,
       ending_status=ending_status,
+      ending_run_token=ending_run_token,
     )
   )
   result = await await_ack(ack)
@@ -400,6 +402,7 @@ async def drain_and_release(
             chat_id,
             run_token,
             ending_status=ending_status,
+            ending_run_token=ending_run_token,
           )
         )
       except PendingAdmissionBlocksPromotion as hold:

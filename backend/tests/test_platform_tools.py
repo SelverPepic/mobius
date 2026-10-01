@@ -309,6 +309,27 @@ def test_update_goal_reports_compactly_and_rejects_unknown_arguments(monkeypatch
     control._call_update_goal({"owner": "x"})
 
 
+def test_goal_report_supplies_completion_keys_without_bloating_progress_updates():
+  control = _control_module()
+  payload = {
+    "goal": {"status": "open", "revision": 1, "held_work_keys": ["test:verified"]},
+    "plan": {"tasks": [], "summary": {"can_complete": False, "completion_blockers": ["verify"]}},
+  }
+  compact = control._goal_report(payload, full=False)
+  assert "test:verified" not in compact
+  full = control._goal_report(payload, full=True)
+  assert "Completion blocked by: verify" in full
+  assert "test:verified" in full
+  payload["plan"]["summary"]["can_complete"] = True
+  ready = control._goal_report(payload, full=False)
+  assert "Ready to complete after verification" in ready
+  assert "test:verified" in ready
+  payload["goal"]["status"] = "completed"
+  settled = control._goal_report(payload, full=True)
+  assert "Ready to complete" not in settled
+  assert "test:verified" not in settled
+
+
 def test_a_settled_goal_does_not_offer_its_old_next_action(monkeypatch):
   control = _control_module()
   monkeypatch.setenv("CHAT_ID", "chat-1")
@@ -329,10 +350,13 @@ def test_platform_control_tools_are_marked_always_loaded(monkeypatch):
   tools = control._tools_list_result()["tools"]
 
   assert tools and all(
-    tool["_meta"] == {"anthropic/alwaysLoad": True} for tool in tools
+    tool["_meta"]["anthropic/alwaysLoad"] is True for tool in tools
   )
   # The meta is added to the listing, not baked into the shared definition.
   assert "_meta" not in control._TOOL_DEFINITIONS[control.PROMOTE_GOAL_TOOL]
+  quiet = [tool["name"] for tool in tools
+           if tool["_meta"].get("mobius/resultIndependent")]
+  assert quiet == ["checkpoint_chat"]
 
 
 def test_promote_goal_tool_preserves_helper_rejection(monkeypatch):
@@ -398,6 +422,15 @@ def test_control_protocol_advertises_every_run_bound_tool(monkeypatch):
     wait_schema["properties"]["condition_owner"]["description"]
   )
   assert wait_schema["additionalProperties"] is False
+  # Expose the owning route's existing limits before an agent spends a call
+  # discovering them in a 422 (condition_owner was previously unbounded here).
+  for name, length in (("description", 500), ("condition_owner", 160), ("command", 4000)):
+    assert wait_schema["properties"][name]["maxLength"] == length
+  for name, minimum, maximum in (("delay_secs", 60, 604800),
+                                  ("interval_secs", 60, 86400),
+                                  ("deadline_secs", 1, 604800)):
+    assert wait_schema["properties"][name]["minimum"] == minimum
+    assert wait_schema["properties"][name]["maximum"] == maximum
   assert "server restarts" in tools[platform_tools.WAIT_TOOL_NAME]["description"]
   assert "silent exit 1" in tools[platform_tools.WAIT_TOOL_NAME]["description"]
   assert "Never use a wait for an approval" in (
@@ -489,6 +522,18 @@ def test_constitution_routes_each_agent_network_to_its_owner():
   assert "other Möbius chats" in core
   assert core.index("`list_agent_peers`") < core.index("`send_agent_message`")
   assert "ordinary chat-message API" in core
+
+
+def test_bookkeeping_batch_guidance_preserves_durability_and_card_isolation():
+  core = (
+    Path(__file__).resolve().parents[2] / "skill" / "core.md"
+  ).read_text(encoding="utf-8")
+  assert "batch independent informational" in core
+  assert "already-needed tool work in the same model step" in core
+  assert "Await every\n  result and handle failures" in core
+  assert "never delay a required save just to form a batch" in core
+  assert "Owner-input cards remain separate and last" in core
+  assert "measure saved model calls and input/cache tokens" in core
 
 
 def test_delegated_control_server_advertises_only_peer_and_ownership_tools(monkeypatch):
@@ -843,10 +888,13 @@ def test_control_stdio_process_survives_tool_errors_and_keeps_serving():
   )
 
   responses = [json.loads(line) for line in completed.stdout.splitlines()]
-  assert [response["id"] for response in responses] == [1, 2, 3]
-  assert responses[1]["result"]["isError"] is True
-  assert "missing environment" in responses[1]["result"]["content"][0]["text"]
-  assert responses[2]["result"] == {}
+  # Independent requests may finish out of order; ids, not line position,
+  # associate each response with its request. Errors must not lose the ping.
+  assert sorted(response["id"] for response in responses) == [1, 2, 3]
+  by_id = {response["id"]: response for response in responses}
+  assert by_id[2]["result"]["isError"] is True
+  assert "missing environment" in by_id[2]["result"]["content"][0]["text"]
+  assert by_id[3]["result"] == {}
   assert completed.stderr == ""
 
 
@@ -1163,6 +1211,15 @@ def test_screenshot_returns_the_image_and_the_owner_embed_line(monkeypatch, tmp_
   assert "![screenshot](/api/chats/c/media/shot.png)" in note["text"]
   refused = control._call_tool({"name": "screenshot", "arguments": {"route": "https://x"}})
   assert refused["isError"] is True
+  direct = control._call_tool({"name": "screenshot", "arguments": {"app_id": 42}})
+  assert direct["isError"] is False
+  assert calls[-1][-1] == "/shell/?app=42"
+  before = len(calls)
+  for arguments in ({}, {"route": "/", "app_id": 42}, {"app_id": "memory"},
+                    {"app_id": True}, {"app_id": 0}):
+    invalid = control._call_tool({"name": "screenshot", "arguments": arguments})
+    assert invalid["isError"] is True
+  assert len(calls) == before
 
 
 def test_screenshot_in_a_read_only_sandbox_says_why_it_cannot_capture(monkeypatch):
