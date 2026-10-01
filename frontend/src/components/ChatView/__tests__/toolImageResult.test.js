@@ -6,6 +6,7 @@ import {
   generatedImageReference,
   imagePathFromInput,
   inlineImageReference,
+  scratchImageReference,
   servedImageReference,
   temporaryImageReference,
   toolImageReference,
@@ -118,6 +119,19 @@ test('a historical image view without a fingerprint cannot claim a preview', () 
   assert.equal(generatedImageReference(path, 'chat-123', { files, completed: true }), null)
 })
 
+test('a viewed agent-scratch image resolves only for the same chat', () => {
+  const path = '/data/agent-scratch/chat-123/renders/preview one.png'
+  assert.deepEqual(scratchImageReference(path, 'chat-123'), {
+    kind: 'scratch',
+    chatId: 'chat-123',
+    filename: 'renders/preview one.png',
+  })
+  assert.deepEqual(servedImageReference(JSON.stringify({ path }), 'chat-123'),
+    scratchImageReference(path, 'chat-123'))
+  assert.equal(scratchImageReference(path, 'another-chat'), null)
+  assert.equal(scratchImageReference(path, ''), null)
+  assert.equal(scratchImageReference('/data/agent-scratch-other/chat-123/a.png', 'chat-123'), null)
+})
 test('a base64 image result is an explicit fallback for non-chat paths', () => {
   const output = JSON.stringify({
     type: 'image',

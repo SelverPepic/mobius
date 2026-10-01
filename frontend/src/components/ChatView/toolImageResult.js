@@ -3,6 +3,7 @@
 const CHAT_IMAGE_PATH = /^\/data\/chats\/([A-Za-z0-9_-]+)\/(uploads|media)\/([^/]+)$/
 const GENERATED_IMAGE_PATH = /^\/data\/chats\/([A-Za-z0-9_-]+)\/deliverables\/inbox\/([^/]+)$/
 const TMP_IMAGE_PATH = /^\/tmp\/(.+)$/
+const SCRATCH_IMAGE_PATH = /^\/data\/agent-scratch\/([^/]+)\/(.+)$/
 const INLINE_IMAGE_TYPES = new Set([
   'image/png',
   'image/jpeg',
@@ -85,11 +86,20 @@ export function generatedImageReference(input, chatId, {
   }
 }
 
+/** Agent scratch is per-chat and expires; this previews its current file only. */
+export function scratchImageReference(input, chatId) {
+  if (!chatId) return null
+  const match = imagePathFromInput(input).match(SCRATCH_IMAGE_PATH)
+  if (!match || match[1] !== chatId) return null
+  return { kind: 'scratch', chatId, filename: match[2] }
+}
+
 /** References that can render through an existing protected route without
  * loading the image tool's much larger base64 sidecar. */
 export function servedImageReference(input, chatId, generated = {}) {
   return chatImageReference(input)
     || temporaryImageReference(input, chatId)
+    || scratchImageReference(input, chatId)
     || generatedImageReference(input, chatId, generated)
 }
 
