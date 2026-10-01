@@ -545,6 +545,8 @@ class Delegation(Base):
   startup_prompt = Column(Text, nullable=True, default=None)
   created_at = Column(DateTime, nullable=False, default=lambda: now_naive_utc())
   cancelled_at = Column(DateTime, nullable=True, default=None)
+  # Unfinished legacy read helpers stay in history but cannot resume as trusted work.
+  interrupted_at = Column(DateTime, nullable=True, default=None)
   # Opt-in: the parent explicitly waits for this result and may receive one
   # non-message activity checkpoint after the child settles. Off by default so
   # pre-existing rows and pure-poll submitters never get a surprise turn.

@@ -3187,12 +3187,12 @@ def _swap_position(repo: Path, record: PreparedUpdate, head: str) -> str:
   """Where the checkout stands after a swap: the booted update awaiting its
   late edits (``pending``), those edits merged back (``replayed``), the saved
   previous state (``not_swapped``), or something else."""
-  if head == record["prepared"]:
-    return "pending"
   if record["replayed"]:
     if head == record["replayed"] or _is_ancestor(repo, record["replayed"], head):
       return "replayed"
-  elif _is_ancestor(repo, record["prepared"], head):
+  if head == record["prepared"]:
+    return "pending"
+  if not record["replayed"] and _is_ancestor(repo, record["prepared"], head):
     # Nothing but the merge-back moves the checkout between the swap and the
     # first started server, so a descendant of the update is its result even
     # if the process died before recording it.

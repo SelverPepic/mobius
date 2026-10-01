@@ -53,13 +53,13 @@ def test_spawn_defaults_to_actual_calling_turn_and_no_app_owner(monkeypatch):
     return {"id": "child", "task_key": "review"}
   monkeypatch.setattr(control, "_agent_api_call", api)
   result = control._call_tool({"name": "spawn_agent", "arguments": {
-    "name": "review", "task": "Review", "access": "read",
+    "name": "review", "task": "Review",
   }})
   assert result["isError"] is False
   assert calls[0][2] == {
     "app_id": None, "parent_chat_id": "parent", "task_key": "review",
     "prompt": "Review", "provider": "codex", "model": "gpt-current",
-    "effort": "high", "scope": "read", "notify_parent_on_complete": True,
+    "effort": "high", "scope": "write", "notify_parent_on_complete": True,
   }
 
 
@@ -127,7 +127,7 @@ def test_spawn_forwards_an_explicit_goal_task_without_guessing(
     return {"id": "child", "task_key": "review"}
   monkeypatch.setattr(control, "_agent_api_call", api)
   arguments = {
-    "name": "review", "task": "Review", "access": "read",
+    "name": "review", "task": "Review",
   }
   control._call_spawn_agent({**arguments, "plan_task": " verify "})
   assert sent[-1][2]["plan_task"] == "verify"
@@ -1250,4 +1250,7 @@ def test_builtin_delegation_guidance_is_available_without_an_app():
   assert "calling turn" in text
   assert "Never poll" in text
   assert "provider CLI" in text
+  assert "no `access` selector" in text
+  assert "State read-only limits in the task" in text
+  assert "read-only children" not in text
   assert "complete `delegation`" in (root / "claude.md").read_text()

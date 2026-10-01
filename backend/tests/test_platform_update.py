@@ -6249,3 +6249,12 @@ def test_a_shallow_clone_judges_packages_by_the_recorded_release(clone_env, monk
   _record_image_inputs(platform, image_lock)
   with pytest.raises(pu.BootTransactionError, match="newer release"):
     pu.settle_prepared_update_for_this_image(platform)
+
+
+def test_accepted_working_edit_replay_is_not_pending_when_head_equals_prepared(clone_env):
+  """Uncommitted restoration can leave HEAD equal to the prepared update;
+  its accepted replay must still win over the unstarted-swap check."""
+  _origin, platform = clone_env
+  head = _served_sha(platform)
+  record = {"prepared": head, "replayed": head, "late": None, "late_committed": None}
+  assert pu._swap_position(platform, record, head) == "replayed"

@@ -27,7 +27,7 @@ def _parent_with_run(client, owner_token, db):
 def _submit(client, auth, parent, *, name="review", app_id=None):
   return client.post("/api/delegations", json={
     "app_id": app_id, "parent_chat_id": parent, "task_key": name,
-    "prompt": "Review one bounded task.", "provider": "codex", "scope": "read",
+    "prompt": "Review one bounded task.", "provider": "codex", "scope": "write",
   }, headers=auth)
 
 
@@ -65,11 +65,11 @@ def test_core_submit_attaches_without_app_and_nested_child_inherits_none(
   assert nested.status_code == 201, nested.text
   assert nested.json()["app_id"] is None
   assert db.query(models.Delegation).count() == 2
-  denied = client.post("/api/delegations", json={
-    "parent_chat_id": child, "task_key": "write", "prompt": "Write.",
-    "provider": "codex", "scope": "write",
+  retired = client.post("/api/delegations", json={
+    "parent_chat_id": child, "task_key": "legacy-read", "prompt": "Inspect.",
+    "provider": "codex", "scope": "read",
   }, headers=child_auth)
-  assert denied.status_code == 403
+  assert retired.status_code == 422
 
 
 def test_app_owned_nested_submission_inherits_app_but_core_remains_core(
@@ -215,7 +215,7 @@ def test_legacy_owner_attachment_pins_root_while_waiting_for_admission(
     )
     body = DelegationSubmit(
       parent_chat_id=parent, task_key="review",
-      prompt="Review one bounded task.", provider="codex", scope="read",
+      prompt="Review one bounded task.", provider="codex", scope="write",
     )
     async with lock:
       task = asyncio.create_task(submit_or_attach(
