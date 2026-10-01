@@ -351,6 +351,7 @@ def goal_attempt_root_ids(db: Session, chat_id: str, goal_id: str) -> set[str]:
 
 def _delegation_tree(
   db: Session, physical: models.ChatRun, root: models.ChatGoal,
+  *, all_attempts: bool = False,
 ) -> list[dict[str, Any]]:
   """Project durable immediate-child ownership without copying transcripts."""
   from app.delegations import derived_status
@@ -365,7 +366,7 @@ def _delegation_tree(
   # Workflows history rather than appearing twice (or disagreeing with the
   # compact rail) in the Goal tree.
   roots_by_task = {row.task_key: row for row in root_rows}
-  roots = list(roots_by_task.values())
+  roots = root_rows if all_attempts else list(roots_by_task.values())
   children_by_parent: dict[str, list[models.Delegation]] = {}
   frontier = [row.child_chat_id for row in roots]
   seen_rows = {row.id for row in roots}
@@ -377,7 +378,7 @@ def _delegation_tree(
     latest_by_owner_and_task = {
       (child.parent_chat_id, child.task_key): child for child in child_rows
     }
-    for child in latest_by_owner_and_task.values():
+    for child in (child_rows if all_attempts else latest_by_owner_and_task.values()):
       if child.id in seen_rows:
         continue
       seen_rows.add(child.id)
@@ -451,7 +452,9 @@ def active_goal_helpers(
   """Task keys of this Goal's helpers still working, with or without a plan."""
   return [
     _helper_key(node)
-    for node in _active_helper_nodes(_delegation_tree(db, physical, root))
+    # Presentation folds superseded attempts, but settlement cannot abandon
+    # an older child merely because a newer attempt used the same task key.
+    for node in _active_helper_nodes(_delegation_tree(db, physical, root, all_attempts=True))
   ]
 
 
@@ -584,7 +587,10 @@ def _goal_presentation(
   if root.status == "stopped":
     from app.goals import goal_hold
     hold = goal_hold(root)
-    presentation["pause_reason"] = hold["actor"] if hold else "unknown"
+    if hold and hold["cause"] == "deferred":
+      presentation.update(pause_reason="deferred", hold_reason=hold["reason"])
+    else:
+      presentation["pause_reason"] = hold["actor"] if hold else "unknown"
   presentation["handoff"] = _goal_handoff(db, physical, root)
   return presentation
 
@@ -595,6 +601,8 @@ def _goal_handoff(db: Session, physical: models.ChatRun, goal: models.ChatGoal) 
   if goal.status == "stopped":
     from app.goals import goal_hold
     hold = goal_hold(goal)
+    if hold and hold["cause"] == "deferred":
+      return none
     actor = hold["actor"] if hold else "unknown"
     if actor == "owner":
       return {"kind": "owner_hold", "reason": "owner"}

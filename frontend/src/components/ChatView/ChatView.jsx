@@ -5875,10 +5875,11 @@ export default function ChatView({
           }
         : {}),
       icon: <Flag width={14} height={14} aria-hidden="true" />,
-      ...(planForGoal(activeGoalPlan, actionableGoalPresentation) || actionableGoalPresentation?.result
+      ...(planForGoal(activeGoalPlan, actionableGoalPresentation) || actionableGoalPresentation?.result || actionableGoalPresentation?.hold_reason
         ? { details: <GoalPlanDetails
             plan={planForGoal(activeGoalPlan, actionableGoalPresentation)}
             result={actionableGoalPresentation?.result}
+            holdReason={actionableGoalPresentation?.hold_reason}
           /> }
         : {}),
     }

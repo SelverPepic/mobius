@@ -13,8 +13,12 @@ def goal_hold(goal):
   keys = ("cause", "actor", "source_id", "run_id", "actor_id", "at")
   if not isinstance(hold, dict) or any(key not in hold for key in keys):
     return None
-  if hold["cause"] not in ("stop", "quiet_answer") or hold["actor"] not in ("owner", "agent", "unknown"):
+  if hold["cause"] not in ("stop", "quiet_answer", "deferred") or hold["actor"] not in ("owner", "agent", "unknown"):
     return None
+  if hold["cause"] == "deferred":
+    if hold["actor"] != "agent" or not isinstance(hold.get("reason"), str) or not hold["reason"].strip():
+      return None
+    keys += ("reason",)
   if any(not isinstance(hold[key], str) or not hold[key].strip() for key in ("source_id", "at")):
     return None
   if any(hold[key] is not None and (not isinstance(hold[key], str) or not hold[key].strip())
@@ -29,12 +33,21 @@ def goal_hold(goal):
   return {key: hold[key] for key in keys}
 
 
+def _new_hold(*, cause, actor, source_id, run_id=None, actor_id=None, reason=None):
+  """One representation for explicit interruption and deliberate deferral."""
+  record = {"cause": cause, "actor": actor, "source_id": source_id,
+            "run_id": run_id, "actor_id": actor_id, "at": datetime.now(UTC).isoformat()}
+  if reason is not None:
+    record["reason"] = reason
+  return record
+
+
 def stage_goal_hold(goal, *, cause, actor, source_id, run_id=None, actor_id=None) -> bool:
   """Stage explicit intent in the writer's transaction, never replace a hold."""
   if goal.status != "open":
     return False
-  goal.hold_json = {"cause": cause, "actor": actor, "source_id": source_id,
-                    "run_id": run_id, "actor_id": actor_id, "at": datetime.now(UTC).isoformat()}
+  goal.hold_json = _new_hold(cause=cause, actor=actor, source_id=source_id,
+                             run_id=run_id, actor_id=actor_id)
   goal.status = "stopped"
   goal.revision += 1
   return True
@@ -127,7 +140,9 @@ def resume_context(db, run_id):
     "Complete only after verifying the entire Goal. An owner-action or approval "
     "gate leaves the Goal open with a saved card; a genuinely unreachable "
     "outcome first needs an actionable owner decision on a saved card, then a "
-    "specific cannot_complete record if that limitation is accepted, not silent scope reduction.\n"
+    "specific cannot_complete record if that limitation is accepted, not silent scope reduction. "
+    "If the owner defers a step, continue other authorized work. When none can proceed, "
+    "record update_goal(defer='reason') and end normally, without another question or automatic retry.\n"
     "<mobius_goal>" + json.dumps(scoped_goal_context(db, goal), ensure_ascii=False,
                                 separators=(",", ":")) + "</mobius_goal>"
   )
@@ -149,14 +164,14 @@ async def settle_after_goal_completion(chat_id: str) -> None:
 
 def update_goal_record(db, run, goal, expected_revision, *, checkpoint=None,
                        next_action=None, result=None, cannot_complete=None,
-                       cancel=None, tasks=None, finished_claims=()):
+                       cancel=None, defer=None, tasks=None, finished_claims=()):
   from app.goal_plans import (
     GoalPlanConflict, GoalPlanError, active_goal_helpers, normalize_tasks,
     staged_task_edits,
   )
   outcomes = [result is not None, cannot_complete is not None, cancel is not None]
-  if sum(outcomes) > 1 or (any(outcomes) and next_action is not None):
-    raise GoalPlanError("Choose exactly one Goal outcome or a next action")
+  if sum(outcomes + [defer is not None, next_action is not None]) > 1:
+    raise GoalPlanError("Choose one Goal outcome, deferral, or next action")
   if finished_claims and result is None:
     raise GoalPlanError("Only verified completion may name finished claims")
   status = ("completed" if result is not None else
@@ -175,7 +190,15 @@ def update_goal_record(db, run, goal, expected_revision, *, checkpoint=None,
     outcome_text = result.strip() if isinstance(result, str) else cancel.strip() if isinstance(cancel, str) else None
   if status and not outcome_text:
     raise GoalPlanError("A Goal outcome needs a specific explanation")
-  if (goal.status == status and status is not None and goal.result == outcome_text
+  if defer is not None and (not isinstance(defer, str) or not defer.strip()):
+    raise GoalPlanError("A Goal deferral needs a specific explanation")
+  defer_reason = defer.strip() if defer is not None else None
+  hold = goal_hold(goal) if goal.status == "stopped" else None
+  defer_replay = bool(defer_reason is not None and hold
+    and hold["cause"] == "deferred" and hold["run_id"] == run.id
+    and hold["reason"] == defer_reason)
+  outcome_replay = goal.status == status and status is not None and goal.result == outcome_text
+  if ((outcome_replay or defer_replay)
       and goal.revision in {expected_revision, expected_revision + 1}):
     # A lost tool receipt may be retried with the freshly read revision. Only
     # the same settled checklist and already-completed claims are a replay;
@@ -200,7 +223,7 @@ def update_goal_record(db, run, goal, expected_revision, *, checkpoint=None,
   consumed_waits = 0
   if tasks is not None:
     document = staged_task_edits(goal, tasks)
-    if status is None and next_action is None and checkpoint is None:
+    if status is None and defer is None and next_action is None and checkpoint is None:
       try:
         saved = normalize_tasks(goal.plan_json["tasks"])
       except (GoalPlanError, KeyError, TypeError):
@@ -218,7 +241,31 @@ def update_goal_record(db, run, goal, expected_revision, *, checkpoint=None,
     values["plan_json"] = document
   else:
     document = goal.plan_json
-  if status is not None:
+  if defer_reason is not None:
+    # A deliberate hold must not silently abandon a real handoff. Resolve its
+    # owner first; this operation never cancels helpers, cards, or Waits.
+    from app.chat_waits import _goal_waits, _FIRED_UNDELIVERED
+    from app.delegations import _self_resuming_helper_rows
+    from app.goal_plans import goal_attempt_root_ids
+    blockers = active_goal_helpers(db, run, goal)
+    roots = goal_attempt_root_ids(db, goal.chat_id, goal.id)
+    blockers += ["helper:" + row.id
+      for row, _status in _self_resuming_helper_rows(db, {goal.chat_id})
+      if row.parent_root_run_id in roots]
+    blockers += ["wait:" + row.id for row in _goal_waits(db, goal.chat_id, goal.id).filter(
+      (models.ChatWait.status == "armed") | _FIRED_UNDELIVERED,
+    ).all()]
+    if db.query(models.Chat.pending_question_id).filter(models.Chat.id == goal.chat_id).scalar():
+      blockers.append("owner_question")
+    if blockers:
+      blockers = list(dict.fromkeys(blockers))
+      raise GoalPlanError("Resolve existing handoffs before deferring: " + ", ".join(blockers),
+                          code="goal_deferral_blocked", deferral_blockers=blockers)
+    values.update(status="stopped", next_action=None, hold_json=_new_hold(
+      cause="deferred", actor="agent", source_id=run.id,
+      run_id=run.id, actor_id=run.id, reason=defer_reason,
+    ))
+  elif status is not None:
     if document is not None and not isinstance(document, dict):
       raise GoalPlanError(
         "Goal plan is unreadable; replace it with a validated plan before settlement"
@@ -266,14 +313,14 @@ def update_goal_record(db, run, goal, expected_revision, *, checkpoint=None,
   if changed.rowcount != 1:
     db.rollback()
     raise GoalPlanConflict("Goal changed; fetch it and retry")
-  if status is not None:
+  if status is not None or defer_reason is not None:
     # Completion settles the Goal's still-open exact-action claims in the same
     # commit: the ones it names as finished complete with the verified result,
     # the rest are released, so a declined action never reads as done.
     from app.agent_work_claims import stage_settle_goal_claims
     stage_settle_goal_claims(
-      db, chat_id=goal.chat_id, goal_id=goal.id, status=status,
-      result=values["result"], finished_keys=finished_claims,
+      db, chat_id=goal.chat_id, goal_id=goal.id, status=values["status"],
+      result=outcome_text or defer_reason, finished_keys=finished_claims,
     )
   db.commit()
   db.refresh(goal)

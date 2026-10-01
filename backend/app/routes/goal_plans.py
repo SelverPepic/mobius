@@ -236,14 +236,15 @@ class GoalUpdateRequest(BaseModel):
   complete: str | None = Field(default=None, min_length=1, max_length=4000)
   cannot_complete: CannotCompleteOutcome | None = None
   cancel: str | None = Field(default=None, min_length=1, max_length=4000)
+  defer: str | None = Field(default=None, min_length=1, max_length=2000)
   finished_claims: list[str] = Field(default_factory=list, max_length=50)
 
   @model_validator(mode="after")
   def one_record_operation(self) -> "GoalUpdateRequest":
     if sum(value is not None for value in (
-      self.complete, self.cannot_complete, self.cancel, self.next_action,
+      self.complete, self.cannot_complete, self.cancel, self.defer, self.next_action,
     )) > 1:
-      raise ValueError("Choose one outcome or a next action.")
+      raise ValueError("Choose one outcome, deferral, or next action.")
     if self.finished_claims and self.complete is None:
       raise ValueError("Only a completion can name finished claims.")
     return self
@@ -253,7 +254,7 @@ class GoalUpdateRequest(BaseModel):
     return any(
       value is not None
       for value in (self.goal_id, self.tasks, self.next_action, self.complete,
-                    self.cannot_complete, self.cancel)
+                    self.cannot_complete, self.cancel, self.defer)
     )
 
 
@@ -270,7 +271,7 @@ def _goal_summary(db: Session, goal) -> dict[str, Any]:
 
 
 async def _attach_run_to_goal(db: Session, chat_id: str, principal: Principal,
-                              goal_id: str | None):
+                              goal_id: str | None, *, deferring: bool = False):
   """Return this attempt's Goal rows, attaching the attempt when needed.
 
   An ordinary turn that resumes unfinished work is not yet bound to the Goal
@@ -280,7 +281,7 @@ async def _attach_run_to_goal(db: Session, chat_id: str, principal: Principal,
   rows = active_goal_rows(db, chat_id)
   if (
     rows is not None and rows[0].id == principal.run_id
-    and rows[0].status == "running" and rows[1].status != "stopped"
+    and rows[0].status == "running" and (rows[1].status != "stopped" or deferring)
     and (goal_id is None or rows[1].id == goal_id)
   ):
     return rows
@@ -343,10 +344,11 @@ async def update_goal(
   record = None
   async with chat_queue.get_transition_lock(chat_id):
     db.rollback()
-    run, goal = await _attach_run_to_goal(db, chat_id, principal, body.goal_id)
+    run, goal = await _attach_run_to_goal(db, chat_id, principal, body.goal_id,
+                                         deferring=body.defer is not None)
     try:
       if any(value is not None for value in (
-        body.tasks, body.next_action, body.complete, body.cannot_complete, body.cancel,
+        body.tasks, body.next_action, body.complete, body.cannot_complete, body.cancel, body.defer,
       )):
         record = update_goal_record(
           db, run, goal, goal.revision,
@@ -354,7 +356,7 @@ async def update_goal(
           checkpoint="Plan saved." if body.next_action is not None else None,
           next_action=body.next_action, result=body.complete,
           cannot_complete=(body.cannot_complete.model_dump() if body.cannot_complete else None),
-          cancel=body.cancel,
+          cancel=body.cancel, defer=body.defer,
           finished_claims=body.finished_claims,
         )
         db.refresh(goal)
@@ -372,4 +374,7 @@ async def update_goal(
     # wake claim followers and withdraw now-stale resume notices.
     from app.goals import settle_after_goal_completion
     await settle_after_goal_completion(chat_id)
+  elif record is not None and record.get("status") == "stopped":
+    from app.agent_coordination import settle_claims_with_owner
+    await settle_claims_with_owner(chat_id)
   return {"goal": _goal_summary(db, goal), "plan": plan}

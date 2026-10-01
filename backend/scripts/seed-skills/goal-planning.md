@@ -74,6 +74,16 @@ refresh context, select the next task, or ask the owner to discover Unpause.
 - **External work:** a durable Wait (read `waiting.md`) or a wake-enabled helper
   owns automatic continuation only when its actual condition/result can wake
   this chat. Never promise a wake for an unarmed condition or manual hold.
+- **Deferred work:** an answered **Not now** defers that step, not every other
+  authorized task. Record its reason, then continue independent work without
+  retrying the declined action. When nothing useful can proceed, call
+  `update_goal(defer: 'What was deferred and why', tasks: [...])` and end normally.
+  This records **On hold**, preserves the original outcome and checklist, and
+  releases this Goal's claims without calling them completed. It does not stop
+  your reply or require another question. Resolve existing helpers, questions
+  and undelivered Waits before holding; do not abandon a real handoff. A later
+  explicit owner continuation resumes the same Goal. Never use deferral to
+  conceal a crash, claim completion, or decide on the owner's behalf to stop.
 - **Completed:** verify the original promised outcome. Update obsolete internal
   steps explicitly with a reason, without cancelling unmet requirements to
   fake success. Call `update_goal` with `complete: 'Verified evidence'`, plus
@@ -95,7 +105,7 @@ saved. No outcome closes while helpers are active; non-success outcomes retain
 explicit unmet-task reasons rather than converting them to green. A settled
 checklist alone does not close the Goal.
 
-A clean execution accidentally ending without an outcome/card/registered wake
+A clean execution accidentally ending without an outcome/card/registered wake/explicit hold
 gets one targeted settlement continuation in the existing runner. It must not
 redo verified work, invent questions, narrow scope or burn unlimited turns. If
 that pass also fails to hand off or settle, a visible technical recovery

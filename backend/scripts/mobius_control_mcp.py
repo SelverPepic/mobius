@@ -122,6 +122,10 @@ UPDATE_GOAL_DESCRIPTION = (
   "next_action records the exact next step. complete records only the verified "
   "original outcome. If unreachable, first ask the owner an actionable question; "
   "a temporary owner action or approval keeps the Goal open with its saved card. "
+  "If the owner defers a step, continue other authorized work. When none can "
+  "proceed, use defer with the reason and end normally: no repeat question, "
+  "automatic retry, or failed outcome. This holds the original Goal and releases "
+  "its claims; resolve existing helpers, cards and Waits first. "
   "Only a genuinely unreachable outcome uses cannot_complete with reason, "
   "efforts/partial results, and unmet_outcome; cancel means the owner called it "
   "off. Settle every task honestly and wait for helpers before any outcome. "
@@ -523,7 +527,7 @@ def _goal_report(payload: dict[str, Any], *, full: bool) -> str:
     line += f": {summary.get('completed', 0)}/{summary.get('total', 0)} tasks complete"
   lines = [line + "."]
   for label, key in (("Running", "running"), ("Ready", "ready")):
-    if summary.get(key):
+    if goal.get("status") == "open" and summary.get(key):
       lines.append(f"{label}: {', '.join(summary[key])}.")
   if goal.get("status") == "open":
     if summary.get("can_complete"):
@@ -535,6 +539,9 @@ def _goal_report(payload: dict[str, Any], *, full: bool) -> str:
         "Held work_keys (finished_claims accepts only these; name only work performed): "
         + ", ".join(goal["held_work_keys"]) + "."
       )
+  elif isinstance(goal.get("hold"), dict) and goal["hold"].get("cause") == "deferred":
+    lines.append("On hold: " + goal["hold"]["reason"])
+    lines.append("End normally. Resume only when the owner asks to continue; no automatic retry.")
   elif goal.get("result"):
     lines.append("Outcome: " + goal["result"] + ".")
   if full:
@@ -554,7 +561,7 @@ def _goal_report(payload: dict[str, Any], *, full: bool) -> str:
 
 
 def _call_update_goal(arguments: dict[str, Any]) -> str:
-  allowed = {"tasks", "next_action", "complete", "cannot_complete", "cancel", "finished_claims", "goal_id"}
+  allowed = {"tasks", "next_action", "complete", "cannot_complete", "cancel", "defer", "finished_claims", "goal_id"}
   unknown = set(arguments) - allowed
   if unknown:
     raise ValueError(f"update_goal does not take: {', '.join(sorted(unknown))}")
@@ -1566,6 +1573,8 @@ _TOOL_DEFINITIONS = {
         },
         "cancel": {"type": "string", "minLength": 1, "maxLength": 4000,
                    "description": "Owner-called-off reason, not an unreachable-work shortcut."},
+        "defer": {"type": "string", "minLength": 1, "maxLength": 2000,
+                  "description": "Why remaining work is deferred, after other authorized work is done. Quietly holds this Goal, not an outcome or a new question; tasks may share this atomic call. Do not combine with next_action or outcomes."},
         "finished_claims": {
           "type": "array", "items": {"type": "string"}, "maxItems": 50,
           "description": "With complete only: exact held work_keys this Goal performed, not claim ids or invented names. Other held claims are released.",

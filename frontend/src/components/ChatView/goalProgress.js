@@ -93,8 +93,10 @@ export function normalizeGoalPresentation(goal) {
     objective,
     status: goal.status,
     resumable: goal.status === 'paused',
-    ...(goal.status === 'paused' && ['owner', 'agent', 'unknown'].includes(goal.pause_reason)
+    ...(goal.status === 'paused' && ['owner', 'agent', 'unknown', 'deferred'].includes(goal.pause_reason)
       ? { pause_reason: goal.pause_reason } : {}),
+    ...(goal.status === 'paused' && goal.pause_reason === 'deferred' && typeof goal.hold_reason === 'string'
+      ? { hold_reason: goal.hold_reason } : {}),
     ...(goal.handoff?.kind ? { handoff: goal.handoff } : {}),
     ...(goal.result ? { result: goal.result } : {}),
   }
@@ -111,7 +113,7 @@ export function goalStatusLabel(goal) {
   if (terminal) return terminal
   if (goal.status === 'paused') {
     const paused = {
-      owner: 'Paused by you', agent: 'Paused by agent', unknown: 'Interrupted',
+      owner: 'Paused by you', agent: 'Paused by agent', unknown: 'Interrupted', deferred: 'On hold',
     }[goal.pause_reason]
     if (paused) return paused
   }
@@ -220,7 +222,7 @@ export function goalPresentationAtRunStart(text, messages, current = null) {
   }
   const normalizedCurrent = normalizeGoalPresentation(current)
   if (isContinue(text) && normalizedCurrent?.status === 'paused') {
-    const { pause_reason: _pauseReason, handoff: _handoff, ...continuingGoal } = normalizedCurrent
+    const { pause_reason: _pauseReason, hold_reason: _holdReason, handoff: _handoff, ...continuingGoal } = normalizedCurrent
     return { ...continuingGoal, status: 'active', resumable: false }
   }
   return normalizedCurrent

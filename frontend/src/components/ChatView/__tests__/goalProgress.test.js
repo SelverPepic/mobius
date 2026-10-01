@@ -293,6 +293,7 @@ test('retained pauses survive unrelated cards, working turns, reconnect and manu
     ['owner', 'Paused by you', { kind: 'owner_hold', reason: 'owner' }],
     ['agent', 'Paused by agent', { kind: 'recovery', reason: 'agent_pause' }],
     ['unknown', 'Interrupted', { kind: 'recovery', reason: 'unknown_stop' }],
+    ['deferred', 'On hold', { kind: 'none', reason: null }],
     [undefined, 'Interrupted', undefined],
   ]) {
     let goal = normalizeGoalPresentation({ id: 'retained', revision: 7, objective: 'Ship it', status: 'paused', pause_reason, handoff })
@@ -322,6 +323,27 @@ test('retained pauses survive unrelated cards, working turns, reconnect and manu
     assert.equal(goalStatusLabel(resumed), null)
     assert.equal(canResumeGoal(resumed), false)
   }
+})
+
+test('deliberate deferral preserves its explanation without implying an error or an owner question', () => {
+  const held = normalizeGoalPresentation({
+    id: 'original', revision: 8, objective: 'Verify the original outcome',
+    status: 'paused', pause_reason: 'deferred', hold_reason: 'Owner deferred the remaining tests.',
+    handoff: { kind: 'none', reason: null },
+  })
+  const hydrated = goalPresentationFromRuntime({ running: false, goal: held })
+  assert.deepEqual(hydrated, held)
+  assert.equal(goalStatusLabel(held), 'On hold')
+  assert.equal(canResumeGoal(held), true)
+  assert.equal(held.hold_reason, 'Owner deferred the remaining tests.')
+  const rail = progressRailViewModel(held, [], { summary: { completed: 2, total: 3 } })[0]
+  assert.match(rail.label, /On hold · 2\/3/)
+  assert.match(rail.ariaLabel, /On hold/)
+  assert.doesNotMatch(rail.label, /Interrupted|Failed|Waiting for you/)
+  const resumed = goalPresentationAtRunStart('continue', [], held)
+  assert.equal(resumed.hold_reason, undefined)
+  assert.equal(resumed.pause_reason, undefined)
+  assert.equal(resumed.status, 'active')
 })
 
 test('Resume respects exact Goal waits and terminal outcomes without requiring a recovery card', () => {

@@ -341,6 +341,23 @@ def test_a_settled_goal_does_not_offer_its_old_next_action(monkeypatch):
     assert ("Next action: Run the probe" in control._call_update_goal({})) is shown
 
 
+def test_defer_tool_records_a_quiet_hold_not_ready_work_or_a_terminal_outcome(monkeypatch):
+  control = _control_module()
+  monkeypatch.setenv("CHAT_ID", "chat-1")
+  sent = []
+  def record(method, path, body):
+    sent.append(body)
+    return {"goal": {"status": "stopped", "revision": 5,
+      "hold": {"cause": "deferred", "reason": "Tests deferred by owner"}},
+      "plan": {"tasks": [], "summary": {"ready": ["later"], "running": []}}}
+  monkeypatch.setattr(control, "_agent_api_call", record)
+  receipt = control._call_update_goal({"defer": "Tests deferred by owner"})
+  assert sent == [{"defer": "Tests deferred by owner"}]
+  assert "On hold: Tests deferred by owner" in receipt and "End normally" in receipt
+  assert "Ready:" not in receipt and "Outcome:" not in receipt
+  assert "defer" in control._TOOL_DEFINITIONS[control.UPDATE_GOAL_TOOL]["inputSchema"]["properties"]
+
+
 def test_platform_control_tools_are_marked_always_loaded(monkeypatch):
   """Claude Code defers MCP tools behind a search round trip by default, so the
   control tools every owner turn is told to use carry the always-load meta."""
