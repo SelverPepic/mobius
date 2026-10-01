@@ -1041,14 +1041,12 @@
 }
 
 /* ── Recents / Archived tabs ──────────────────────── */
-/* A text switch in the drawer heading's place and type scale:
-   "Recents / Archived". The selected list uses the primary text colour
-   (white in dark themes); the other stays muted until hovered. */
+/* A text switch in the section heading's place: the tablist carries
+   .drawer__label, so it shares the "Pinned" heading's font, size (including
+   its desktop step), weight and line height. The selected list uses the
+   primary text colour; the other stays muted until hovered. */
 .drawer__tabs {
-  display: flex;
-  align-items: center;
   gap: 2px;
-  margin: 12px 0 4px;
   padding: 0 6px;
 }
 
@@ -1063,9 +1061,6 @@
   background: transparent;
   color: var(--muted);
   font: inherit;
-  font-size: 14px;
-  font-weight: 600;
-  line-height: 20px;
   cursor: pointer;
 }
 
@@ -1084,9 +1079,6 @@
 
 .drawer__tab-separator {
   color: var(--border);
-  font-size: 14px;
-  font-weight: 400;
-  line-height: 20px;
   user-select: none;
 }
 

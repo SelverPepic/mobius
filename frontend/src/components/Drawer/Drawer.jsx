@@ -1349,7 +1349,7 @@ export default function Drawer({
                 aria-label="Chats"
               >
                 <div
-                  className="drawer__tabs"
+                  className="drawer__label drawer__tabs"
                   role="tablist"
                   aria-label="Chat lists"
                   onKeyDown={(event) => {
