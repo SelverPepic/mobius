@@ -1434,12 +1434,13 @@ def test_compact_park_handoff_never_selects_chat_transcript(chat, db):
   db.add(make_goal_run(db, id="compact-park", chat_id=chat.id, status="parked",
     provider="codex", park_reason="storage", started_at=datetime.now(UTC)))
   db.commit()
+  chat_id = chat.id
   queries = []
   def capture(_conn, _cursor, statement, _parameters, _context, _many):
     queries.append(statement)
   event.listen(db.bind, "before_cursor_execute", capture)
   try:
-    assert continuation_handoff_for_chat(db, chat.id)["kind"] == "automatic"
+    assert continuation_handoff_for_chat(db, chat_id)["kind"] == "automatic"
   finally:
     event.remove(db.bind, "before_cursor_execute", capture)
   chat_reads = [query for query in queries if "FROM chats" in query]
