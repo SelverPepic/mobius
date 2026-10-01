@@ -22,7 +22,9 @@ async function sourceForReference(reference) {
     .join('/')
   const path = reference.kind === 'tmp'
     ? `/api/chats/${encodeURIComponent(reference.chatId)}/tmp-images/${encodedFilename}`
-    : `/api/chats/${encodeURIComponent(reference.chatId)}/${reference.collection}/${encodedFilename}`
+    : reference.kind === 'scratch'
+      ? `/api/chats/${encodeURIComponent(reference.chatId)}/scratch-images/${encodedFilename}`
+      : `/api/chats/${encodeURIComponent(reference.chatId)}/${reference.collection}/${encodedFilename}`
   return `${BASE}${path}${tokenParam}`
 }
 

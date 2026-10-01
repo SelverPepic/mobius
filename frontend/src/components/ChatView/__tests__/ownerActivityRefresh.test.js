@@ -66,7 +66,7 @@ test('a deferred steer refreshes again at its authoritative transcript cut', () 
     'onSteeredIntoTurn: ({',
     '// System run activity is a structured sequence',
   )
-  const commit = cut.indexOf('commitMessages(prev => insertMessageBatchByTs')
+  const commit = cut.indexOf('followingMessages: steeredMessages')
   const refresh = cut.indexOf('onOwnerActivityRef.current?.()')
   assert.ok(commit >= 0 && refresh > commit,
     'drawer refresh must follow the committed steer event, not predict its cut')

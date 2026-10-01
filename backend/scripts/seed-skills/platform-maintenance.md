@@ -61,15 +61,27 @@ Review the exact changed paths and use the smallest matching action:
    version. New processes can use the install immediately. A long-running
    backend needs one approved server restart only when it must load the new
    package itself.
-3. If shipped behavior depends on the package, record the same resolution in
-   the owning manifest and lockfile, plus the Dockerfile only when image wiring
-   is needed. These declarations are durability metadata, not an activation
-   action. Container replacement installs the official image, so a declaration
-   becomes durable only through the release that contains it: prepare it as an
-   upstream contribution. Committed only locally, it never reaches an image;
-   updates keep it in the checkout, report it as inactive, and never wait on
-   it.
-4. Treat a container rebuild as a last resort, not an ordinary closeout step.
+3. If shipped platform behavior depends on the package, record the same
+   resolution in the owning manifest and lockfile, plus the Dockerfile only
+   when image wiring is needed, and contribute it upstream. These declarations
+   are durability metadata, not an activation action: they reach installations
+   through the release that contains them. Committed only locally, they never
+   reach an image and never block updates.
+4. To keep a local or app install across container replacements, declare a
+   setup step: `{"setup":{"steps":["restore.sh"],"apt":["poppler-utils (>= 25)"]}}`
+   in the app's accepted `mobius.json` (ship scripts through `source_files`,
+   then Apply) or in `/data/customizations/mobius.json` for the instance. A
+   step script gets `check` (exit 0 ready, 1 needs apply, 2 conflict) or an
+   idempotent `apply`, runs as `mobius` from its manifest's directory (sudo as needed),
+   and writes persistent output under `/data`. Version syntax belongs to the
+   underlying manager; all `apt` entries are solved together by
+   `apt-get satisfy`, never forcing removals. Restoration runs after readiness
+   and update settlement on every boot and accepted declaration, and never
+   holds up boot or updates. `GET /api/setup` shows each step's state and the
+   running one; `POST /api/setup/rerun` cancels it and starts a fresh pass.
+   A root script can still disrupt the platform: this is restoration, not a
+   sandbox.
+5. Treat a container rebuild as a last resort, not an ordinary closeout step.
    Require it now only when the change genuinely cannot activate live, or when
    the partner explicitly asks to validate the image.
 
@@ -157,6 +169,17 @@ because `/data/platform` is the persistent served clone. The baked
    response continues the conversation without restarting. Do not use
    `request_approval` or Codex's
    `request_user_input` for platform restart permission.
+
+   Every chat that still owes activation and verification calls
+   `request_restart` itself, even if another chat already has a Restart card.
+   Each card saves that chat's visible owner decision and post-restart
+   continuation. These are separate chat handoffs, not duplicate restart
+   executors: selecting any card requests one platform-owned restart, and a
+   later ready boot resumes every still-registered chat independently. Each
+   agent then verifies its own changes before completing its Goal. Do not
+   substitute a peer note, shared work claim, or monitor of the owner's
+   decision for your own card. Stop or a written response cancels only that
+   chat's activation wait; unrelated owner-input and recovery holds still apply.
 
    If the tool is absent, the same saved-card operation is available through:
 

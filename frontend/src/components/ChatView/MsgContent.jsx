@@ -156,6 +156,7 @@ function MsgContentInner({
   // button. Compared in the memo below, so pass a stable reference.
   onResume,
   resumeState,
+  continuationWait = null,
   onInternalNav,
   autoResumeEnabled,
   autoResumeAvailable,
@@ -303,6 +304,9 @@ function MsgContentInner({
     // are folded into an ActivityStretch below; this renders only the `single`
     // nodes — text, question, error, and provider context compaction.
     const renderBlock = (block, i) => {
+      if (block.type === 'goal_history') {
+        return <GoalHistoryCard key={`goal-${block.summary.id}`} summary={block.summary} />
+      }
       if (block.type === 'activity' && Array.isArray(block.entries)) {
         // Cold, very long turns can reach this renderer with their adjacent
         // tools already folded into an activity block. Filter the platform
@@ -515,6 +519,7 @@ function MsgContentInner({
           <ErrorCard
             key={assistantBlockKey(block, i)}
             block={block}
+            continuationWait={recoveryOwner ? continuationWait : null}
             autoResume={automaticContinuation}
             resetElapsed={!!limitResetElapsed}
             recoveryCredit={recoveryCredit}
@@ -557,7 +562,7 @@ function MsgContentInner({
                   : undefined}
               >
                 {resumeState?.pending ? 'Resuming…' : resumeState?.unavailable ? 'Reconnecting…' : parked
-                  ? limitResetElapsed ? 'Continue now' : (recoveryCredit?.actionLabel || 'Try now')
+                  ? limitResetElapsed ? 'Try now' : (recoveryCredit?.actionLabel || 'Try now')
                   : 'Resume'}
               </button>
             )}
@@ -703,6 +708,7 @@ export default memo(MsgContentInner, (prev, next) => {
     && prev.onQuestionSubmitCancel === next.onQuestionSubmitCancel
     && prev.onResume === next.onResume
     && prev.resumeState === next.resumeState
+    && prev.continuationWait === next.continuationWait
     && prev.onInternalNav === next.onInternalNav
     && prev.autoResumeEnabled === next.autoResumeEnabled
     && prev.autoResumeAvailable === next.autoResumeAvailable

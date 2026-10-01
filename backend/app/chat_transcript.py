@@ -588,12 +588,15 @@ def compact_messages_for_detail(
             next_raw.append(raw_index)
       run.clear()
 
-    for raw_index, block in enumerate(blocks):
+    for projected_index, block in enumerate(blocks):
+      # Read-side lifecycle cards have no stored ordinal; passthrough activity
+      # keeps its original address even when such a card precedes it.
+      raw_index = block.get("raw_index", projected_index) if isinstance(block, dict) else projected_index
       activity = (
         isinstance(block, dict)
         and block.get("type") in {"tool", "thinking"}
       )
-      if activity and raw_index in redundant_tool_indexes:
+      if activity and projected_index in redundant_tool_indexes:
         flush()
         changed = True
         continue

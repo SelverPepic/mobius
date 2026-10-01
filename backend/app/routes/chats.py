@@ -37,8 +37,8 @@ from app.chat_visibility import (
 from app.chat_event_sink import active_sink_assistant_message_id
 from app.chat_activity import chat_activity_page
 from app.chat_waits import (
-  armed_wait_chat_ids,
-  armed_waits_for_chat,
+  outstanding_wait_chat_ids,
+  outstanding_waits_for_chat,
   serialize_wait,
 )
 from app.config import get_settings
@@ -50,6 +50,7 @@ from app.chat import (
   recover_chat_generation,
   stop_chat_for,
   usage_limit_waiting_chat_ids,
+  continuation_wait_for_chat,
 )
 from app.broadcast import get_system_broadcast
 from app.recovery_notifications import (
@@ -92,6 +93,7 @@ from app.run_state import (
 )
 from app.schemas import ChatCompactRequest, ChatPatch, ChatProviderSwitch
 from app.timeutil import now_naive_utc, SOFT_DELETE_TTL
+from app.platform_restart import restart_observation_key
 from app.tool_output_storage import (
   TOOL_OUTPUT_STORAGE_PREFIX,
   decode_tool_output,
@@ -560,8 +562,12 @@ def _chat_detail_window(
     start = max(0, total - limit)
     return messages[start:], start, False
   if before is not None:
-    start = max(0, before - limit)
-    return messages[start:before], start, None
+    # `before` is an absolute index cursor. Clamp it to the transcript so a
+    # negative value can't wrap to Python's from-the-end slicing, and an
+    # out-of-range one can't report an offset past the last message.
+    end = min(max(before, 0), total)
+    start = max(0, end - limit)
+    return messages[start:end], start, None
   start = max(0, total - limit)
   return messages[start:], start, None
 
@@ -619,6 +625,39 @@ def _chat_detail_response(
     db=db,
     live_message=live_message,
   )
+  from app.goal_plans import terminal_goal_summaries_by_message_index
+  summaries_by_index = terminal_goal_summaries_by_message_index(
+    db, chat.id, all_msgs, message_start=start, message_end=start + len(page),
+  )
+  # Insert read-side lifecycle blocks before activity compaction. The completion
+  # call then ends its stretch, and later prose/tools cannot drag the card down.
+  # The durable Goal remains the single owner; Chat.messages is untouched.
+  if summaries_by_index:
+    next_page = list(page)
+    for relative_index, message in enumerate(page):
+      summaries = summaries_by_index.get(start + relative_index)
+      if not summaries:
+        continue
+      anchored = {s["completion_tool_use_id"]: s for s in summaries
+                  if s.get("completion_tool_use_id")}
+      blocks = []
+      placed = set()
+      for raw_index, block in enumerate(message.get("blocks") or []):
+        # Compacted disclosures and positioned activity retain the coordinates
+        # of the stored transcript, not these inserted read-side cards.
+        blocks.append({**block, "raw_index": raw_index} if isinstance(block, dict) else block)
+        tool_id = block.get("tool_use_id") if isinstance(block, dict) else None
+        if tool_id in anchored:
+          blocks.append({"type": "goal_history", "summary": anchored[tool_id], "raw_index": None})
+          placed.add(anchored[tool_id]["id"])
+      projected_message = dict(message)
+      if placed:
+        projected_message["blocks"] = blocks
+      unplaced = [s for s in summaries if s["id"] not in placed]
+      if unplaced:
+        projected_message["goal_summaries"] = unplaced
+      next_page[relative_index] = projected_message
+    page = next_page
   candidate_tool_ids = historical_tool_output_ids(
     page,
     live_message=live_message,
@@ -654,22 +693,6 @@ def _chat_detail_response(
     chat_id=chat.id,
     data_dir=get_settings().data_dir,
   )
-  from app.goal_plans import terminal_goal_summaries_by_message_index
-  summaries_by_index = terminal_goal_summaries_by_message_index(
-    db, chat.id, all_msgs,
-    message_start=start,
-    message_end=start + len(page),
-  )
-  if summaries_by_index:
-    next_page = list(page)
-    for relative_index, message in enumerate(page):
-      summaries = summaries_by_index.get(start + relative_index)
-      if not summaries:
-        continue
-      projected_message = dict(message)
-      projected_message["goal_summaries"] = summaries
-      next_page[relative_index] = projected_message
-    page = next_page
   from app.chat_waits import terminal_wait_summaries_by_message_index
   wait_summaries_by_index = terminal_wait_summaries_by_message_index(
     db, chat.id, all_msgs,
@@ -684,19 +707,21 @@ def _chat_detail_response(
       projected_message["wait_summaries"] = summaries
       next_page[relative_index] = projected_message
     page = next_page
-  from app.continuations import recovery_reasons_by_run_id
-  recovery_reasons = recovery_reasons_by_run_id(db, chat.id, [
-    message["id"] for message in page
-    if message.get("role") == "assistant" and isinstance(message.get("id"), str)
-  ])
+  from app.continuations import recovery_reasons_by_message_index
+  recovery_reasons = recovery_reasons_by_message_index(
+    db, chat.id, all_msgs, message_start=start, message_end=start + len(page),
+  )
   if recovery_reasons:
     next_page = list(page)
     for relative_index, message in enumerate(page):
-      reason = recovery_reasons.get(message.get("id"))
+      reason = recovery_reasons.get(start + relative_index)
       if message.get("role") != "assistant" or reason is None:
         continue
       next_page[relative_index] = {**message, "continuation_reason": reason}
     page = next_page
+
+  from app.platform_restart import project_restart_observations
+  page = project_restart_observations(db, chat.id, page)
 
   settings_obj = _coerce_agent_settings(chat.agent_settings_json) or None
   # The picker's current model must match what a message would actually use. A
@@ -729,6 +754,7 @@ def _chat_detail_response(
     # already fetches them from their durable sidecar on demand. Live turns
     # retain excerpts so the in-progress surface remains self-contained.
     "messages": page,
+    "restart_observation_key": restart_observation_key(db, chat.id),
     "pending_messages": list(chat.pending_messages or []),
     "total": total,
     "offset": start,
@@ -738,6 +764,7 @@ def _chat_detail_response(
     "runtime_revision": runtime_revision,
     "active_assistant_message_id": _active_assistant_message_id(chat),
     "recovery_run_id": _recovery_run_id(db, chat.id),
+    "continuation_wait": continuation_wait_for_chat(db, chat.id),
     "active_goal_objective": active_goal_objective,
     "goal": goal,
     "pending_question_id": _open_question_id_for(chat),
@@ -765,7 +792,7 @@ def _chat_detail_response(
     # an embedded app frame has no business reading (same boundary as
     # session_id).
     "waits": [
-      serialize_wait(row) for row in armed_waits_for_chat(db, chat.id)
+      serialize_wait(row, db=db) for row in outstanding_waits_for_chat(db, chat.id)
     ] if expose_session else [],
     "background_helpers": (
       serialize_background_helpers(db, chat.id)
@@ -867,7 +894,7 @@ def list_chats(
     chats = [c for c in chats if _visible_in_owner_drawer(c)]
   durable_running = running_chat_ids(db, (chat.id for chat in chats))
   durable_waiting = (
-    armed_wait_chat_ids(db)
+    outstanding_wait_chat_ids(db)
     | background_helper_chat_ids(db, (chat.id for chat in chats))
     | usage_limit_waiting_chat_ids(db, (chat.id for chat in chats))
   )
@@ -1733,18 +1760,20 @@ def get_chat_runtime(
   run_id, run_status, runtime_revision = _latest_run_snapshot(db, chat.id)
   return {
     "running": running,
+    "restart_observation_key": restart_observation_key(db, chat.id),
     "run_id": run_id,
     "run_status": "running" if running and run_id else run_status,
     "runtime_revision": runtime_revision,
     "active_assistant_message_id": _active_assistant_message_id(chat),
     "recovery_run_id": _recovery_run_id(db, chat.id),
+    "continuation_wait": continuation_wait_for_chat(db, chat.id),
     "active_goal_objective": running_goal_objective(db, chat.id),
     "goal": presented_goal(db, chat.id),
     "pending_messages": list(chat.pending_messages or []),
     "pending_question_id": _open_question_id_for(chat),
     "updated_at": chat.updated_at.isoformat() if chat.updated_at else None,
     "waits": [
-      serialize_wait(row) for row in armed_waits_for_chat(db, chat.id)
+      serialize_wait(row, db=db) for row in outstanding_waits_for_chat(db, chat.id)
     ] if principal.scope != "chat_embed" else [],
     "background_helpers": (
       serialize_background_helpers(db, chat.id)

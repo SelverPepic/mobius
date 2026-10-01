@@ -7,6 +7,7 @@ stay addressable for in-flight jobs; Apply and startup reclaim obsolete trees.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import fcntl
 import hashlib
@@ -346,17 +347,26 @@ def migrate_legacy_job_declarations(db) -> tuple[int, list[str]]:
   return migrated, warnings
 
 
-def hold_runtime(app_id: int):
+def hold_runtime(app_id: int, *, nonblocking: bool = False):
   """Pin accepted runtime files while any reader is still using them."""
   parent = Path(get_settings().data_dir) / "run" / "app-runtime-readers"
   parent.mkdir(parents=True, exist_ok=True)
   handle = (parent / f"{int(app_id)}.lock").open("a")
   try:
-    fcntl.flock(handle, fcntl.LOCK_SH)
+    fcntl.flock(handle, fcntl.LOCK_SH | (fcntl.LOCK_NB if nonblocking else 0))
     return handle
   except BaseException:
     handle.close()
     raise
+
+
+async def hold_runtime_async(app_id: int):
+  """Wait for a read pin without blocking the event loop or a worker thread."""
+  while True:
+    try:
+      return hold_runtime(app_id, nonblocking=True)
+    except BlockingIOError:
+      await asyncio.sleep(0.05)
 
 
 def prune_runtime(app, *, previous_revision: str | None = None) -> int:

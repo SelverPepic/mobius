@@ -328,6 +328,8 @@ async def _sync_accepted_app_side_effects(
     except Exception as exc:
       log.exception("app apply: cron sync failed post-commit")
       warnings.append(f"cron: registration failed — {exc!r}")
+  from app import app_setup
+  app_setup.request_run()
   warnings.extend(await _sync_accepted_app_skills(db, app, manifest))
   return tuple(warnings)
 

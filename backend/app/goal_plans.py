@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import UTC, datetime
+import json
 import re
 from typing import Any
 
@@ -11,6 +12,7 @@ from sqlalchemy import or_, update
 from sqlalchemy.orm import Session, load_only
 
 from app import models
+from app.chat_message_identity import assistant_message_run_id
 
 
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -593,6 +595,45 @@ def paused_goal_run(db: Session, chat_id: str) -> models.ChatRun | None:
   return rows[0]
 
 
+def _goal_completion_anchor(messages, run_ids, result):
+  """Locate the successful completion receipt, never a refused attempt.
+
+  Modern tool rows carry exact execution identity. Historical provider input
+  summaries clip arguments, so their successful receipt supplies the verdict.
+  Goal state still owns completion; this only locates its transcript position.
+  """
+  if not isinstance(result, str) or not result:
+    return None
+  for index in range(len(messages) - 1, -1, -1):
+    message = messages[index]
+    if not isinstance(message, dict) or message.get("role") != "assistant":
+      continue
+    if assistant_message_run_id(message.get("id")) not in run_ids:
+      continue
+    for block in reversed(message.get("blocks") or []):
+      if (not isinstance(block, dict) or block.get("type") != "tool"
+          or block.get("tool") not in {
+            "mobius_control:update_goal", "mcp__mobius_control__update_goal",
+          } or block.get("status") != "done"
+          or block.get("output_exit_code") != 0 or not block.get("tool_use_id")):
+        continue
+      raw = block.get("input")
+      if not isinstance(raw, str):
+        continue
+      try:
+        args = json.loads(raw)
+      except ValueError:
+        # Summarized arguments cannot prove the exact result; the successful
+        # server receipt can. A plain read must never become the anchor.
+        if (re.search(r"(?:^|, )complete=", raw)
+            and "Goal completed, revision " in str(block.get("output") or "")):
+          return index, block["tool_use_id"]
+      else:
+        if isinstance(args, dict) and args.get("complete") == result:
+          return index, block["tool_use_id"]
+  return None
+
+
 def terminal_goal_summaries_by_message_index(
   db: Session,
   chat_id: str,
@@ -601,15 +642,15 @@ def terminal_goal_summaries_by_message_index(
   message_start: int = 0,
   message_end: int | None = None,
 ) -> dict[int, list[dict[str, Any]]]:
-  """Project completed/failed Goals beside their final assistant message.
+  """Project terminal Goals at their completion receipt, or legacy final answer.
 
-  Goal history already belongs to ``ChatRun`` rows; copying it into
+  Goal history already belongs to ``ChatGoal`` and its attempt rows; copying it into
   ``Chat.messages`` would create a second persistence mechanism and make plan
   revisions race transcript settlement. This read-side projection keeps one
   durable owner while giving paginated chat history a stable place to render
-  each terminal Goal. A summary travels only with the assistant row that
-  concluded its final physical run, so ordinary message pagination naturally
-  paginates Goal cards too. Find that row in the complete transcript before
+  each terminal Goal. A summary travels with its successful completion call,
+  or the final answer for legacy history without that receipt. Ordinary message
+  pagination naturally paginates Goal cards too. Find that row before
   filtering to the requested half-open window; searching only the page would
   move a resumed Goal's card onto an earlier answer. Plans and handoffs for
   off-page Goals are never hydrated.
@@ -669,23 +710,11 @@ def terminal_goal_summaries_by_message_index(
     # Modern assistant segments carry the exact physical-run identity. Prefer
     # it so clock skew cannot attach a Goal card to an unrelated answer. The
     # bounded timestamp fallback is reserved for genuinely id-less legacy rows.
-    assistant_id = latest.id
-    segment_prefix = f"{assistant_id}:assistant:"
     candidate_index = next((
       index for index in range(len(messages) - 1, -1, -1)
       if isinstance(messages[index], dict)
       and messages[index].get("role") == "assistant"
-      and (
-        messages[index].get("id") == assistant_id
-        or (
-          isinstance(messages[index].get("id"), str)
-          and messages[index]["id"].startswith(segment_prefix)
-          and re.fullmatch(
-            r"[1-9][0-9]*",
-            messages[index]["id"][len(segment_prefix):],
-          ) is not None
-        )
-      )
+      and assistant_message_run_id(messages[index].get("id")) == latest.id
     ), None)
     if candidate_index is None:
       candidate_index = next((
@@ -693,13 +722,18 @@ def terminal_goal_summaries_by_message_index(
         if message_id is None
         and started_ms - 1000 <= ts <= ended_ms + 1000
       ), None)
+    physical, root = _goal_rows_for_physical(db, latest)
+    anchor = _goal_completion_anchor(
+      messages, {row.id for row in rows}, root.result,
+    ) if root.status == "completed" else None
+    if anchor is not None:
+      candidate_index = anchor[0]
     if (
       candidate_index is None
       or candidate_index < message_start
       or (message_end is not None and candidate_index >= message_end)
     ):
       continue
-    physical, root = _goal_rows_for_physical(db, latest)
     plan = serialize_plan(db, physical, root)
     presentation = _goal_presentation(db, physical, root, plan)
     if presentation["status"] not in {"completed", "failed"}:
@@ -711,6 +745,7 @@ def terminal_goal_summaries_by_message_index(
       "completed_at": latest.ended_at.isoformat(),
       "duration_seconds": max(0, round((ended_ms - started_ms) / 1000)),
       "plan": plan,
+      **({"completion_tool_use_id": anchor[1]} if anchor else {}),
     })
   return projected
 

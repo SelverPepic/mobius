@@ -1,4 +1,5 @@
 import asyncio
+import os
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -414,7 +415,7 @@ def test_quota_prunes_regenerable_cache_before_profile(tmp_path):
   now = datetime.now(UTC).replace(tzinfo=None)
   result = enforce_browser_profile_quota(
     tmp_path,
-    {old: {"activity_at": now - timedelta(days=40),
+    {old: {"activity_at": now - timedelta(days=10),
            "deleted_at": None, "running": False}},
     set(),
     now=now,
@@ -461,7 +462,7 @@ def test_quota_prunes_recent_closed_cache_before_old_durable_profile(tmp_path):
     {
       recent: {"activity_at": now - timedelta(days=1),
                "deleted_at": None, "running": False},
-      old: {"activity_at": now - timedelta(days=90),
+      old: {"activity_at": now - timedelta(days=20),
             "deleted_at": None, "running": False},
     },
     set(),
@@ -575,6 +576,88 @@ def test_quota_reports_when_live_profiles_alone_exceed_the_budget(tmp_path):
   assert result["max_bytes"] == 50
   assert result["low_water_bytes"] == 25
   assert result["over_quota_bytes"] == 50
+
+
+def test_idle_chat_profile_retires_without_byte_pressure(monkeypatch, tmp_path):
+  monkeypatch.delenv("AGENT_BROWSER_PROFILE_INACTIVE_DAYS", raising=False)
+  idle = "aaaaaaaa-0000-0000-0000-000000000001"
+  recent = "aaaaaaaa-0000-0000-0000-000000000002"
+  idle_profile = _profile(tmp_path, idle, cache_bytes=10, durable_bytes=10)
+  recent_profile = _profile(tmp_path, recent, cache_bytes=10, durable_bytes=10)
+  now = datetime.now(UTC).replace(tzinfo=None)
+
+  result = enforce_browser_profile_quota(
+    tmp_path,
+    {
+      idle: {"activity_at": now - timedelta(days=3),
+             "deleted_at": None, "running": False},
+      recent: {"activity_at": now - timedelta(days=1),
+               "deleted_at": None, "running": False},
+    },
+    set(),
+    now=now,
+    max_bytes=10**9,
+    low_water_bytes=10**9,
+    active_profile_names=set(),
+  )
+
+  assert not idle_profile.exists()
+  assert (recent_profile / "Default" / "Cache" / "cache.bin").exists()
+  assert result["profiles_pruned"] == 1
+  assert result["cache_dirs_pruned"] == 0
+  assert result["bytes_after"] == 20
+
+
+def test_deleted_and_stale_orphan_chat_profiles_retire_without_byte_pressure(tmp_path):
+  deleted = "bbbbbbbb-0000-0000-0000-000000000001"
+  orphan = "bbbbbbbb-0000-0000-0000-000000000002"
+  live = "bbbbbbbb-0000-0000-0000-000000000003"
+  deleted_profile = _profile(tmp_path, deleted, cache_bytes=0, durable_bytes=5)
+  orphan_profile = _profile(tmp_path, orphan, cache_bytes=0, durable_bytes=5)
+  fresh_orphan = "bbbbbbbb-0000-0000-0000-000000000004"
+  fresh_orphan_profile = _profile(
+    tmp_path, fresh_orphan, cache_bytes=0, durable_bytes=5,
+  )
+  stale = (datetime.now(UTC) - timedelta(days=3)).timestamp()
+  os.utime(orphan_profile, (stale, stale))
+  live_profile = _profile(tmp_path, live, cache_bytes=0, durable_bytes=5)
+  now = datetime.now(UTC).replace(tzinfo=None)
+
+  result = enforce_browser_profile_quota(
+    tmp_path,
+    {
+      deleted: {"activity_at": now, "deleted_at": now, "running": False},
+      live: {"activity_at": now - timedelta(days=90),
+             "deleted_at": None, "running": True},
+    },
+    set(),
+    now=now,
+    max_bytes=10**9,
+    low_water_bytes=10**9,
+    inactive_days=2,
+    active_profile_names=set(),
+  )
+
+  assert not deleted_profile.exists()
+  assert not orphan_profile.exists()
+  assert fresh_orphan_profile.exists()
+  assert live_profile.exists()
+  assert result["profiles_pruned"] == 2
+
+
+def test_named_profile_outlives_the_chat_idle_horizon(tmp_path):
+  profile = _named_profile(
+    tmp_path, "atlas-touch", cache_bytes=0, durable_bytes=20,
+  )
+  now = datetime.now(UTC).replace(tzinfo=None) + timedelta(days=10)
+
+  result = enforce_browser_profile_quota(
+    tmp_path, {}, set(), now=now, max_bytes=10, low_water_bytes=0,
+    inactive_days=2, active_profile_names=set(),
+  )
+
+  assert profile.exists()
+  assert result["profiles_pruned"] == 0
 
 
 def test_quota_counts_and_prunes_cache_from_closed_named_profile(tmp_path):

@@ -31,7 +31,12 @@ _CACHE_PATHS = (
 )
 _DEFAULT_MAX_BYTES = 2 * 1024**3
 _DEFAULT_LOW_WATER_BYTES = _DEFAULT_MAX_BYTES * 3 // 4
-_DEFAULT_INACTIVE_DAYS = 30
+# Per-chat profiles only mirror the owner's warm PWA state for a chat's own
+# repeated screenshots; after this idle horizon re-warming costs one capture.
+_DEFAULT_INACTIVE_DAYS = 2
+# Deliberately named profiles (e.g. a long-lived touch session) are not
+# per-chat caches and yield only to byte pressure after this grace.
+_NAMED_PROFILE_GRACE_DAYS = 30
 _DEFAULT_SWEEP_SECONDS = 60 * 60
 _status = {
   "last_run_at": None,
@@ -167,6 +172,11 @@ def chat_activity_snapshot(db: Session) -> dict[str, dict]:
   }
 
 
+def _remove_profile(path: Path) -> bool:
+  shutil.rmtree(path, ignore_errors=True)
+  return not path.exists()
+
+
 def enforce_browser_profile_quota(
   data_dir: str | Path,
   chats: dict[str, dict],
@@ -178,15 +188,16 @@ def enforce_browser_profile_quota(
   inactive_days: int | None = None,
   active_profile_names: set[str] | None = None,
 ) -> dict:
-  """Prune caches, then inactive chat profiles to honor the byte budget.
+  """Retire expired chat profiles, then honor the byte budget.
 
-  ``inactive_days`` is a preferred retention window, not permission for the
-  ordinary per-chat tree to grow past ``max_bytes``. Deleted, missing, and
-  expired chat profiles yield first. If those cannot restore the low-water
-  mark, the oldest remaining inactive chat profiles yield too. Live sessions
-  never do, and deliberately named sessions retain their full inactivity grace.
-  Any protected overage is reported rather than mislabelled as reclaimed.
-
+  This is the only retention owner for agent-browser profiles. Every sweep
+  deletes each closed chat profile whose chat is deleted, or whose chat (for
+  an orphan, the profile itself) has been idle for ``inactive_days``. If the
+  remaining tree still exceeds ``max_bytes``, caches go first, then the oldest
+  inactive chat profiles, until the low-water mark. Live sessions never yield,
+  and deliberately named sessions yield only to pressure after their full
+  grace. Any protected overage is reported rather than mislabelled as
+  reclaimed.
   """
   root = Path(data_dir) / "agent-browser-profiles"
   now = now or datetime.now(UTC).replace(tzinfo=None)
@@ -206,6 +217,7 @@ def enforce_browser_profile_quota(
     "AGENT_BROWSER_PROFILE_INACTIVE_DAYS", _DEFAULT_INACTIVE_DAYS,
   )
   cutoff_seconds = inactive_days * 86400
+  named_cutoff_seconds = _NAMED_PROFILE_GRACE_DAYS * 86400
   active_profile_names = (
     _active_profile_names(root)
     if active_profile_names is None else active_profile_names
@@ -223,7 +235,9 @@ def enforce_browser_profile_quota(
       if activity is not None and activity.tzinfo is not None:
         activity = activity.astimezone(UTC).replace(tzinfo=None)
       try:
-        fallback_activity = datetime.fromtimestamp(path.stat().st_mtime)
+        fallback_activity = datetime.fromtimestamp(
+          path.stat().st_mtime, UTC,
+        ).replace(tzinfo=None)
       except OSError:
         fallback_activity = now
       activity = activity or fallback_activity
@@ -238,11 +252,12 @@ def enforce_browser_profile_quota(
         # pruning, but their durable state receives the full inactivity grace.
         # Named sessions are deliberately long-lived; unlike ordinary chat
         # profiles, a recent one never joins the pressure fallback.
-        retire_first = not active and age_seconds >= cutoff_seconds
+        retire_first = not active and age_seconds >= named_cutoff_seconds
       else:
+        # A profile with no chat row ages by its own mtime, so one minted just
+        # before its chat becomes visible is never mistaken for an orphan.
         retire_first = not active and (
-          chat is None
-          or chat.get("deleted_at") is not None
+          bool(chat and chat.get("deleted_at") is not None)
           or age_seconds >= cutoff_seconds
         )
       profiles.append({
@@ -256,21 +271,30 @@ def enforce_browser_profile_quota(
 
   bytes_before = sum(profile["size"] for profile in profiles)
   total = bytes_before
-  pressure_triggered = total > max_bytes
   cache_dirs_pruned = 0
   profiles_pruned = 0
+  retained = []
+  for profile in profiles:
+    if profile["chat_id"] is not None and profile["retire_first"]:
+      if _remove_profile(profile["path"]):
+        total = max(0, total - profile["size"])
+        profiles_pruned += 1
+        continue
+    retained.append(profile)
+
+  pressure_triggered = total > max_bytes
   if pressure_triggered:
     # Chromium caches are disposable even for recently used chats. Prune them
     # from every CLOSED profile before considering deletion of any durable
     # profile state. Active profiles are excluded because Chromium may have
     # cache files mapped or locked while a turn is running.
     cache_candidates = sorted(
-      (profile for profile in profiles if not profile["active"]),
+      (profile for profile in retained if not profile["active"]),
       key=lambda profile: profile["activity"],
     )
     profile_candidates = sorted(
       (
-        profile for profile in profiles
+        profile for profile in retained
         if not profile["active"]
         and (
           profile["chat_id"] is not None
@@ -300,8 +324,7 @@ def enforce_browser_profile_quota(
         if not profile["path"].exists():
           continue
         before = _tree_bytes(profile["path"])
-        shutil.rmtree(profile["path"], ignore_errors=True)
-        if not profile["path"].exists():
+        if _remove_profile(profile["path"]):
           total = max(0, total - before)
           profiles_pruned += 1
         if total <= low_water_bytes:

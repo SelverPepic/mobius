@@ -60,6 +60,25 @@ above. Origin-bound facilities such as cookies, service workers and durable
 origin storage still require a host provider or a separate service origin; a
 raw general shell-origin bridge would recreate the authority opacity removed.
 
+### Named secret reads for supervised jobs
+
+An app may declare `permissions.job_secret_read`, up to 16 unique names from
+its own encrypted secret store. The accepted capability contract includes the
+names in owner review. Omitted or empty means no job read access; ordinary app
+frames still cannot read secret values. Only the owner-authorized supervised-job
+mint includes a signed `job_secrets` claim, bounded by the accepted names at
+mint time. Every read also checks the current accepted names, app installation
+nonce, owner epoch and token expiry. Removing a grant denies future reads;
+adding names does not expand an already-running job's token. Applying a manifest
+without the grant revokes it. The existing owner/service behavior is unchanged.
+
+This is not a process sandbox: reviewed jobs already run as trusted local code.
+They must not log, persist unencrypted, or expose these values through browser
+responses. A compromised permitted job could leak its own keys; denial cannot
+retract a key already read. Keep provider transport and secret handling in the
+app, not in new platform proxy routes. No grant implies permission to activate
+bots, send messages or make paid calls.
+
 ## Manifest contract
 
 Runtime capabilities live in the root `capabilities` object:
@@ -175,7 +194,7 @@ source, listed in `source_files`. It must include everything the app imports,
 since nothing is borrowed from the platform, and every package must have a
 wheel. Apply, Store install, and Store update build a virtual environment
 without system site-packages, published at `/data/app-envs/<app id>/<key>`,
-where the key combines the interpreter/ABI with the lock's SHA-256. The build
+where the key combines the interpreter/ABI and the lock's SHA-256. The build
 installs hash-checked wheels only, so no package build code runs. pip reads no
 configuration file and inherits only index, certificate, and proxy settings,
 and URL credentials are removed from any diagnostics returned. The build then
@@ -206,9 +225,20 @@ that changes the interpreter, the key no longer matches, and an accepted
 revision whose manifest cannot be read is treated the same way. A revision
 with no `mobius.json` at all is deliberately undeclared, because accepted
 revisions may legitimately lack one. Service calls
-answer 503 and the app's jobs log a failure until Apply rebuilds the
-environment, which needs network. Environments that no retained runtime
+answer 503 and the app's jobs log a failure until the background setup runner
+rebuilds from the accepted lock after boot and update settlement. This may
+need network; failures and explicit retries are available at `/api/setup`. Environments that no retained runtime
 revision references are removed with those revisions.
+
+Apps may also declare `"setup": {"steps": ["restore.sh"], "apt": ["foo (>= 2)"]}`.
+Scripts ship through `source_files`, need a shebang, and support `check` (exit
+0 ready, 1 needs apply, 2 conflict) and idempotent `apply`. The background
+runner uses accepted source as cwd, runs as `mobius` after readiness/update
+settlement, and combines all APT requirements. It does not gate app launches.
+Instance declarations use `/data/customizations/mobius.json`. Owner-authenticated
+`GET /api/setup` shows status/running steps; `POST /api/setup/rerun` cancels
+the running step and starts a fresh pass. Instance scripts need no `source_files`. See the
+platform-maintenance skill for setup guidance. No UI or ad-hoc install capture.
 
 Same-app calls use `/api/apps/{app_id}/service/{path}`. An app can expose a
 reviewed service to other installed apps at `/api/services/{service_id}/{path}`
