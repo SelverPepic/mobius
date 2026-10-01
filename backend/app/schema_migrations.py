@@ -5552,6 +5552,19 @@ def _record_schedule_provenance(eng) -> None:
     os.replace(tmp, target)
 
 
+def _add_notification_seen_at(eng) -> None:
+  """Keep old history, but do not count pre-upgrade rows as new arrivals."""
+  from sqlalchemy import inspect as sa_inspect, text
+
+  if "notifications" not in sa_inspect(eng).get_table_names():
+    return
+  if "seen_at" in {c["name"] for c in sa_inspect(eng).get_columns("notifications")}:
+    return
+  with eng.begin() as conn:
+    conn.execute(text("ALTER TABLE notifications ADD COLUMN seen_at DATETIME NULL"))
+    conn.execute(text("UPDATE notifications SET seen_at = sent_at WHERE seen_at IS NULL"))
+
+
 def _allow_chat_owned_delegations(eng) -> None:
   """Allow core helpers without inventing an installed app.
 
@@ -5697,6 +5710,7 @@ _SCHEMA_MIGRATIONS = (
   ("0072_owner_timezone", _add_owner_timezone),
   ("0073_schedule_provenance", _record_schedule_provenance),
   ("0074_chat_owned_delegations", _allow_chat_owned_delegations),
+  ("0075_notification_seen_at", _add_notification_seen_at),
 )
 
 
