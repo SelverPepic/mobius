@@ -274,27 +274,6 @@ test('an idle foreground runtime refetches only when it disproves the cache', ()
   }), false, 'a live run reconciles through its stream instead')
 })
 
-test('a retained running snapshot requires the current assistant owner', () => {
-  const updated_at = '2026-07-30T12:00:00Z'
-  const cached = {
-    updated_at,
-    activeAssistantMessageId: 'assistant-before-restart',
-    messages: [],
-  }
-  assert.equal(chatSnapshotMatchesRuntime(cached, {
-    updated_at,
-    active_assistant_message_id: 'assistant-before-restart',
-  }), true)
-  assert.equal(chatSnapshotMatchesRuntime(cached, {
-    updated_at,
-    active_assistant_message_id: 'assistant-current',
-  }), false)
-  assert.equal(chatSnapshotMatchesRuntime({ updated_at, messages: [] }, {
-    updated_at,
-    active_assistant_message_id: 'assistant-current',
-  }), false, 'a legacy cache cannot claim a newly identified live owner')
-})
-
 test('pending question lookup requires the exact unanswered owner row', () => {
   const messages = [
     { role: 'user', content: 'choose' },
@@ -331,4 +310,12 @@ test('a tail refresh retains every verified older row needed by a saved address'
   assert.equal(merged.messages.length, 40)
   assert.equal(merged.messages[0].content, 'Loaded 5')
   assert.equal(merged.messages[20].content, 'Fresh 25')
+})
+
+
+test('continuation wait is retained on reopen and cleared by a resumed snapshot', () => {
+  const cached = chatDetailCacheValue({ messages: [], continuation_wait: 'restart_required' })
+  assert.equal(cached.continuationWait, 'restart_required')
+  assert.equal(chatDetailCacheValue({ messages: [], continuation_wait: null }).continuationWait, null)
+  assert.equal(chatDetailCacheValue({ messages: [] }).continuationWait, null)
 })

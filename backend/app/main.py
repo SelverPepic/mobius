@@ -39,6 +39,7 @@ from starlette.concurrency import run_in_threadpool
 from app.config import get_settings
 from app.database import (
   Base,
+  IntegerOutOfRange,
   SessionLocal,
   engine,
   reset_database_request_label,
@@ -386,6 +387,11 @@ app = FastAPI(
 
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+@app.exception_handler(IntegerOutOfRange)
+async def _integer_out_of_range_handler(_request: Request, exc: IntegerOutOfRange):
+  return JSONResponse(status_code=422, content={"detail": str(exc)})
 
 
 @app.exception_handler(ParentIsFile)

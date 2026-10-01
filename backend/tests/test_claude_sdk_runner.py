@@ -15,6 +15,7 @@ import json
 import os
 import pathlib
 import tempfile
+import time
 from collections import deque
 from types import SimpleNamespace
 from typing import Any
@@ -173,6 +174,65 @@ async def _run_turn(
     bc=_ChatBus() if bc is None else bc,
     **kwargs,
   )
+
+
+@pytest.mark.asyncio
+async def test_sdk_permission_callback_keeps_input_open_without_dummy_hook():
+  """Exercise the pinned SDK's stream lifetime, not a mocked runner client."""
+  from claude_agent_sdk._internal.query import Query
+
+  writes = []
+  written = asyncio.Event()
+  closed = asyncio.Event()
+
+  async def write(message):
+    assert not closed.is_set()
+    writes.append(json.loads(message))
+    written.set()
+
+  async def end_input():
+    closed.set()
+
+  async def allow(tool, input_data, context):
+    assert tool == "Read"
+    return PermissionResultAllow(updated_input=input_data)
+
+  async def read_messages():
+    yield {"type": "result", "subtype": "success", "is_error": False}
+    await closed.wait()
+
+  query = Query(
+    transport=SimpleNamespace(
+      write=write, end_input=end_input, read_messages=read_messages,
+    ),
+    is_streaming_mode=True, can_use_tool=allow,
+  )
+
+  async def prompt():
+    yield {"type": "user", "message": {"role": "user", "content": "Read"}}
+
+  task = asyncio.create_task(query.stream_input(prompt()))
+  try:
+    await asyncio.wait_for(written.wait(), timeout=1)
+    assert not task.done()
+    assert not closed.is_set()
+    await query._handle_control_request({
+      "type": "control_request", "request_id": "permission-1",
+      "request": {"subtype": "can_use_tool", "tool_name": "Read",
+                  "input": {"file_path": "example.txt"}},
+    })
+    assert writes[-1]["response"]["response"] == {
+      "behavior": "allow", "updatedInput": {"file_path": "example.txt"},
+    }
+    assert not closed.is_set()
+    await asyncio.wait_for(query._read_messages(), timeout=1)
+    await asyncio.wait_for(task, timeout=1)
+    assert closed.is_set()
+  finally:
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    await query._message_send.aclose()
+    await query._message_receive.aclose()
 
 
 @pytest.mark.asyncio
@@ -1250,7 +1310,11 @@ def test_native_continuation_defers_only_a_result_not_seen_while_active():
   assert slow.observe_result() is False
 
 
-def _interrupt_result(session_id: str = "sess-1") -> ResultMessage:
+def _interrupt_result(
+  session_id: str = "sess-1", *,
+  stop_reason: str | None = "interrupt",
+  terminal_reason: str | None = None,
+) -> ResultMessage:
   """The terminal an SDK interrupt produces — error_during_execution."""
   return ResultMessage(
     subtype="error_during_execution",
@@ -1259,13 +1323,19 @@ def _interrupt_result(session_id: str = "sess-1") -> ResultMessage:
     is_error=True,
     num_turns=1,
     session_id=session_id,
-    stop_reason="interrupt",
+    stop_reason=stop_reason,
+    terminal_reason=terminal_reason,
     total_cost_usd=0.01,
     usage={"input_tokens": 1, "output_tokens": 2},
   )
 
 
-async def _run_claude_stop_outcome(monkeypatch, mode: str, *, owned: bool):
+async def _run_claude_stop_outcome(
+  monkeypatch, mode: str, *, owned: bool,
+  stop_reason: str | None = "interrupt",
+  terminal_reason: str | None = None,
+  exit_code: int | None = None,
+):
   """Run one fake response stream, with an owner Stop in flight when `owned`.
 
   The Stop goes through the public `interrupt()`: it records ownership before
@@ -1273,9 +1343,12 @@ async def _run_claude_stop_outcome(monkeypatch, mode: str, *, owned: bool):
   so the stream resumes once the client has seen the interrupt and the Stop
   task is collected after the turn resolves `_finished`.
   """
+  process_exit_code = exit_code if exit_code is not None else (
+    1 if mode == "process_failure" else -15
+  )
   process_error = ProcessError(
-    f"Command failed with exit code {'1' if mode == 'process_failure' else '-15'}",
-    exit_code=1 if mode == "process_failure" else -15,
+    f"Command failed with exit code {process_exit_code}",
+    exit_code=process_exit_code,
     stderr="Check stderr output for details",
   )
   stops: list[asyncio.Task] = []
@@ -1293,7 +1366,9 @@ async def _run_claude_stop_outcome(monkeypatch, mode: str, *, owned: bool):
         while not self.interrupts:
           await asyncio.sleep(0)
       if mode == "terminal":
-        yield _interrupt_result()
+        yield _interrupt_result(
+          stop_reason=stop_reason, terminal_reason=terminal_reason,
+        )
         return
       if mode == "resultless":
         return
@@ -1377,6 +1452,33 @@ async def test_owner_stop_turns_claude_interrupt_result_into_clean_terminal(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_reason", ["aborted_streaming", "aborted_tools"])
+async def test_owner_stop_uses_structured_claude_terminal_reason(
+  monkeypatch, terminal_reason,
+):
+  result = await _run_claude_stop_outcome(
+    monkeypatch, "terminal", owned=True,
+    stop_reason="tool_use", terminal_reason=terminal_reason,
+  )
+
+  assert result["error"] is None
+  assert result["terminal_status"] == "interrupted"
+
+
+@pytest.mark.asyncio
+async def test_unowned_claude_abort_stays_an_error_with_structured_reason(
+  monkeypatch,
+):
+  result = await _run_claude_stop_outcome(
+    monkeypatch, "terminal", owned=False,
+    stop_reason="tool_use", terminal_reason="aborted_tools",
+  )
+
+  assert result["error"] == "Execution interrupted."
+  assert result.get("terminal_status") is None
+
+
+@pytest.mark.asyncio
 async def test_interrupt_result_we_never_issued_stays_an_error(monkeypatch):
   # No steer or Stop of ours issued an interrupt, so a `stop_reason ==
   # "interrupt"` terminal (a CLI/provider-side abort mapped to the same
@@ -1435,6 +1537,28 @@ async def test_unrequested_claude_process_exit_stays_an_error(monkeypatch):
 
   assert "Command failed with exit code -15" in result["error"]
   assert result.get("terminal_status") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_code, before, after, owned, expected", [
+  (-9, 3, 4, False, True),
+  (-9, 4, 4, False, False),
+  (-15, 3, 4, False, False),
+  (1, 3, 4, False, False),
+  (-9, None, 4, False, False),
+  (-9, 3, 4, True, False),
+])
+async def test_claude_oom_requires_unrequested_process_kill_in_this_attempt(
+  monkeypatch, exit_code, before, after, owned, expected,
+):
+  monkeypatch.setattr(claude_sdk_runner, "cgroup_oom_kill_count", lambda: before)
+  monkeypatch.setattr("app.memory_observability.cgroup_oom_kill_count", lambda: after)
+  result = await _run_claude_stop_outcome(
+    monkeypatch, "process_error", owned=owned, exit_code=exit_code,
+  )
+  assert bool(result.get("oom_killed")) is expected
+  if not owned:
+    assert f"exit code {exit_code}" in result["error"]
 
 
 @pytest.mark.asyncio
@@ -1761,6 +1885,54 @@ async def test_claude_new_and_resumed_turns_exclude_native_owner_questions(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("effort", ["high", "ultracode"])
+async def test_saved_effort_never_reaches_a_model_that_rejects_it(
+  monkeypatch, effort,
+):
+  # A global or saved effort still rides along after the owner picks a model
+  # without an effort setting; the API rejects the parameter on such a model.
+  # The runner reads Claude's capability without discovering other providers,
+  # so a live-only effortless model is covered even on the first turn after boot.
+  from app import providers
+
+  monkeypatch.setitem(providers._model_registry_cache, "claude", (time.monotonic(), [
+      {"id": "claude-live-no-effort", "effort_levels": []},
+      {"id": "claude-live-default"},
+  ]))
+  monkeypatch.setattr(providers, "list_models", lambda *_a, **_kw: pytest.fail(
+    "a Claude turn must not fetch provider catalogs"
+  ))
+  clients = _install_fake_client(monkeypatch)
+
+  for model in ("claude-live-no-effort", "claude-haiku-4-5-20251001"):
+    await _run_turn(
+      f"chat-no-effort-{model}", bc=_Bus(), cwd="/data",
+      agent_settings={"model": model, "effort": effort},
+    )
+  await _run_turn(
+    "chat-default-effort", bc=_Bus(), cwd="/data",
+    agent_settings={"model": "claude-live-default", "effort": "high"},
+  )
+
+  assert [client.options.effort for client in clients] == [None, None, "high"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("session_id", [None, "sess-1"])
+@pytest.mark.parametrize("prompt", ["Review this text: @private-file", "/compact"])
+async def test_claude_chat_prompts_are_literal_on_new_and_resumed_turns(
+  monkeypatch, session_id, prompt,
+):
+  """Quoted paths and slash text must not invoke Claude Code shortcuts."""
+  clients = _install_fake_client(monkeypatch)
+
+  await _run_turn("literal-chat", prompt=prompt, session_id=session_id)
+
+  assert clients[0].options.verbatim_prompts is True
+  assert clients[0].queries == [prompt]
+
+
+@pytest.mark.asyncio
 async def test_run_claude_sdk_turn_requests_summarized_thinking(monkeypatch):
   clients = _install_fake_client(monkeypatch)
 
@@ -1779,6 +1951,7 @@ async def test_run_claude_sdk_turn_requests_summarized_thinking(monkeypatch):
     claude_sdk_runner._system_prompt_with_register("system")
   )
   assert "$MOBIUS_GENERATED_DIR" in options.system_prompt
+  assert "Create downloadable deliverables only when the owner explicitly requests" in options.system_prompt
   assert options.system_prompt.startswith("system")
   assert "# Concise register" in options.system_prompt
   assert "# Execution lifetimes in Möbius" in options.system_prompt

@@ -1912,3 +1912,16 @@ def test_full_size_content_pages_deliver_every_body_in_few_requests(
     "content" not in entry for name, entry in seen.items()
     if name.endswith(".diff")
   )
+
+
+def test_overlong_path_name_is_rejected_without_creating_folders(
+  client, auth, owner_token,
+):
+  """A name past the 255-byte filesystem limit is a 400, not a 500."""
+  app_id = _make_app(client, owner_token)
+  r = client.put(
+    f"/api/storage/apps/{app_id}/fresh/{'a' * 300}.json", json={}, headers=auth,
+  )
+  assert r.status_code == 400
+  listing = client.get(f"/api/storage/apps-list/{app_id}/", headers=auth).json()
+  assert [entry["name"] for entry in listing["entries"]] == []
