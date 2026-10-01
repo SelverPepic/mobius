@@ -141,7 +141,7 @@ export default function ErrorCard({
         ) : vm.benign ? (
           <>
             <div className="chat__recovery-title chat__recovery-title--paused">
-              {vm.label}
+              {vm.resourceWait && !automaticHandoff ? 'Recovery needed' : vm.label}
             </div>
             <div className="chat__recovery-copy">
               {vm.modelCapacityExhausted
@@ -161,7 +161,9 @@ export default function ErrorCard({
                         : 'Möbius will continue automatically when the restart is complete.'
                   : (block.message || 'This response is paused.')
                 : vm.resourceWait
-                  ? (block.message || 'Möbius will continue automatically when resources free up.')
+                  ? automaticHandoff
+                    ? (block.message || 'Möbius will continue automatically when resources free up.')
+                    : 'Automatic resource recovery is unavailable. Your work is saved; Resume to continue.'
                   : (block.message || 'Möbius will continue automatically.')}
             </div>
           </>

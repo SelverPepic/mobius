@@ -522,10 +522,12 @@ function MsgContentInner({
           && handoff?.kind === 'automatic' && !!autoResumeEnabled
         // A resource wait owns its automatic retry. Offering Resume while the
         // same measured pressure remains only launches a turn admission will
-        // re-park, so it is a false action rather than useful recovery.
+        // re-park. Once the scheduler reports manual recovery, expose the
+        // existing recovery action instead of leaving the owner at a dead end.
         // Auto-continue schedules the next attempt; it does not remove the
         // owner's explicit retry after adding credits or changing providers.
-        const manualResumeAvailable = recoveryOwner && !resourceWait && !modelCapacity
+        const manualResumeAvailable = recoveryOwner
+          && ((!resourceWait && !modelCapacity) || handoff?.kind === 'recovery')
         return (
           <ErrorCard
             key={assistantBlockKey(block, i)}
