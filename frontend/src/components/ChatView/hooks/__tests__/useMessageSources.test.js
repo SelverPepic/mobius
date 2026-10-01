@@ -79,3 +79,18 @@ test('chat changes and canceled disclosure reads cannot publish stale source pag
  assert.equal(hook.result.current.sources.length, 0)
  hook.unmount()
 })
+
+
+test('new inline sources do not cancel or discard the same reply’s lazy source pages', async () => {
+ const { calls, request } = reader()
+ const props = { chatId: 'chat', groups: [], refs: [ref(1)], open: true, request }
+ const hook = renderHook(useMessageSources, props)
+ hook.rerender({ ...props, groups: [[{ type: 'tool', sources: [source('https://inline.example')] }]] })
+ assert.equal(calls.length, 1)
+ assert.equal(calls[0].options.signal.aborted, false)
+ calls[0].resolve(response([source('https://saved.example')]))
+ await flush()
+ assert.deepEqual(hook.result.current.sources.map(s => s.url), ['https://inline.example', 'https://saved.example'])
+ assert.equal(hook.result.current.complete, true)
+ hook.unmount()
+})

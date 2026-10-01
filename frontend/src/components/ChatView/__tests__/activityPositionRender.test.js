@@ -6,7 +6,7 @@ import { renderWithModels } from './modelRegistryRender.js'
 import { createServer } from 'vite'
 globalThis.window = { location: { origin: 'http://localhost', href: 'http://localhost/shell/' }, innerWidth: 420 }
 const vite = await createServer({ appType: 'custom', logLevel: 'error', server: { middlewareMode: true, hmr: false, ws: false }, ssr: { noExternal: ['@openai/apps-sdk-ui'] } })
-const { default: Active } = await vite.ssrLoadModule('/src/components/ChatView/ActiveAssistantSurface.jsx')
+const { default: Active } = await vite.ssrLoadModule('/src/components/ChatView/AssistantReply.jsx')
 const { assistantReplyGroups } = await vite.ssrLoadModule('/src/components/ChatView/assistantReplies.js')
 const { default: Message } = await vite.ssrLoadModule('/src/components/ChatView/MsgContent.jsx')
 const { PeerTimelineRows } = await vite.ssrLoadModule('/src/components/ChatView/PeerTimeline.jsx')
@@ -337,3 +337,31 @@ for (const isStreaming of [true, false]) {
     assert.match(html, /data-key="reply:assistant:1"/)
   })
 }
+
+
+test('one reply owns its final References, including a folded source row', () => {
+  const first = { role: 'assistant', id: 'reference-reply', blocks: [{ type: 'text', content: 'First section' }], source_ref: { message_index: 0, count: 1 } }
+  const tail = { role: 'assistant', id: 'reference-reply:assistant:1', blocks: [
+    { type: 'thinking', thinking_id: 'thinking', content: 'Considering the new information' },
+    { type: 'text', content: 'First section continued after thinking' },
+  ] }
+  const folded = { role: 'assistant', id: 'reference-reply:assistant:2', hidden: true,
+    blocks: [{ type: 'tool', sources: [{ url: 'https://folded.example', title: 'Folded source' }] }],
+    source_ref: { message_index: 4, count: 1 } }
+  const carrier = { role: 'user', steered: true, hidden: true }
+  const group = assistantReplyGroups([first, carrier, tail, carrier, folded]).get(0)
+  _resetDisclosureStateForTests()
+  persistDisclosureOpen('reply-fixture', `${tail.id}:references`, true)
+  const html = render(Active, { replyGroup: group, activeRowIndex: -1,
+    activeMirrorMsg: folded, useDbActivePayload: true, chatId: 'reply-fixture' },
+  { tools: new Map(), positions: new Map() })
+  assert.equal((html.match(/class="chat__reply"/g) || []).length, 1)
+  assert.equal((html.match(/class="chat__sources(?: |")/g) || []).length, 1)
+  assert.ok(html.indexOf('First section') < html.indexOf('chat__activity'))
+  assert.ok(html.indexOf('chat__activity') < html.indexOf('continued after thinking'))
+  assert.ok(html.indexOf('continued after thinking') < html.indexOf('chat__sources'))
+  assert.match(html, /href="https:\/\/folded.example"/)
+  assert.match(html, /data-key="reference-reply"/)
+  assert.match(html, /data-key="reference-reply:assistant:1"/)
+  assert.doesNotMatch(html, /data-key="reference-reply:assistant:2"/)
+})

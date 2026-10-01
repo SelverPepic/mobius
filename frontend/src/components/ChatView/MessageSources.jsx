@@ -18,22 +18,20 @@ function sourceMark(host) {
 }
 
 // Web references that informed an answer. Historical chat payloads carry only
-// sourceRef; the link metadata is read when this disclosure first opens.
+// source indices; the link metadata is read when this disclosure first opens.
 // A just-completed live answer already has the same bounded metadata in its
 // tool blocks, so it can expand without an unnecessary round trip.
 export default function MessageSources({
-  blocks,
   chatId,
-  sourceRef = null,
-  sourceRefs,
-  sourceGroups,
+  groups,
+  refs,
   disclosureKey,
 }) {
   const [open, setOpen] = useDisclosureState(chatId, disclosureKey)
   const { sources, hasSources, count, failed, complete, retry } = useMessageSources({
     chatId,
-    groups: sourceGroups || [blocks],
-    refs: sourceRefs || (sourceRef ? [sourceRef] : []),
+    groups,
+    refs,
     open,
   })
   const toggleRef = useRef(null)

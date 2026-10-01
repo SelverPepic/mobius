@@ -61,7 +61,7 @@ for (const [label, overrides, kind] of [
 // promote-to-block, and the shared ErrorCard renderer. MsgContent owns the
 // block tree for BOTH persisted and live data, so those sources cannot diverge.
 const msgContent = readFileSync(new URL('../MsgContent.jsx', import.meta.url), 'utf8')
-const streamingMessage = readFileSync(new URL('../StreamingMessage.jsx', import.meta.url), 'utf8')
+const streamingMessage = readFileSync(new URL('../AssistantReply.jsx', import.meta.url), 'utf8')
 const errorCard = readFileSync(new URL('../ErrorCard.jsx', import.meta.url), 'utf8')
 const resetTime = readFileSync(new URL('../resetTime.js', import.meta.url), 'utf8')
 const promotion = readFileSync(new URL('../streamPromotion.js', import.meta.url), 'utf8')
@@ -222,8 +222,8 @@ for (const [continuationWait, title, explanation] of [
 
 test('the one block renderer owns ErrorCard for both active sources', () => {
   // The live/catch-up surface once hardcoded a red "Error" card, so a benign
-  // pause flashed red until promotion. StreamingMessage is now only the stable
-  // <li> shell and delegates all blocks to MsgContent.
+  // pause flashed red until promotion. AssistantReply owns the stable
+  // source rows and delegates all blocks to MsgContent.
   assert.match(msgContent, /import ErrorCard(?:, \{[^}]*\})? from '\.\/ErrorCard\.jsx'/,
     'MsgContent must consume the shared ErrorCard')
   assert.match(streamingMessage, /import MsgContent from '\.\/MsgContent\.jsx'/,

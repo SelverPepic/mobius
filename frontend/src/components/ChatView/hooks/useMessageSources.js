@@ -8,9 +8,8 @@ export default function useMessageSources({ chatId, groups, refs, open, request 
     .filter(ref => Number.isInteger(ref?.message_index) && ref.count > 0)
     .map(ref => [ref.message_index, ref])).values()])
   const plan = useMemo(() => JSON.parse(refsKey), [refsKey])
-  const inlineKey = JSON.stringify((groups || []).map(messageSources))
-  const inline = useMemo(() => combineMessageSources(JSON.parse(inlineKey)), [inlineKey])
-  const key = JSON.stringify([chatId, refsKey, inlineKey])
+  const inline = combineMessageSources((groups || []).map(messageSources))
+  const key = JSON.stringify([chatId, refsKey])
   const cacheRef = useRef(null)
   if (cacheRef.current?.key !== key) cacheRef.current = { key, pages: new Map(), failed: new Set() }
   const cache = cacheRef.current

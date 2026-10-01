@@ -67,8 +67,8 @@ test('multiple hidden carriers keep timeline notes; a folded source cannot swall
  assert.equal(group.rows.length, 3)
  assert.deepEqual(group.rows[1].notes, notes)
  const shown = presentAssistantReply(group.rows)
- assert.deepEqual(shown[1].message.reply_sources.refs.map(ref => ref.message_index), [0, 5])
- assert.equal(shown[2].message.hide_reply_sources, true)
+ assert.deepEqual(group.rows.flatMap(row => row.message.source_ref ? [row.message.source_ref.message_index] : []), [0, 5])
+ assert.equal(shown[2].message.hidden, true)
 })
 
 test('live prefix replay never hides the original and divergence reveals its entire text', () => {
@@ -144,12 +144,24 @@ test('unsafe Markdown preserves complete source and genuine paragraphs survive f
  assert.equal(text(safe[0]), 'First\n\nSecond continues.\n\nThird.')
 })
 
-test('references belong to the last segment, retain original indices and dedupe inline URLs', () => {
+test('reply projection preserves original source indices and inline metadata', () => {
  const tool = url => ({ type: 'tool', sources: [{ url }] })
  const messages = [assistant('First', 0, { blocks: [tool('https://a.example'), { type: 'text', content: 'First' }], source_ref: { message_index: 7, count: 2 } }), carrier(), assistant('First continued', 1, { blocks: [{ type: 'text', content: 'First continued' }, tool('https://a.example'), tool('https://b.example')], source_ref: { message_index: 9, count: 2 } })]
  const shown = presentAssistantReply(rows(messages))
- assert.equal(shown[0].message.hide_reply_sources, true)
- assert.deepEqual(shown[1].message.reply_sources.refs.map(ref => ref.message_index), [7, 9])
- assert.equal(new Set(shown[1].message.reply_sources.groups.flatMap(messageSources).map(s => s.url)).size, 2)
+ assert.deepEqual(shown.map(row => row.message.source_ref.message_index), [7, 9])
+ assert.equal(new Set(shown.flatMap(row => messageSources(row.message.blocks)).map(s => s.url)).size, 2)
  assert.equal(shown[0].message.blocks[0], messages[0].blocks[0], 'original tool addressing survives')
+})
+
+
+test('message-level outcome and wake cards remain between the original and continued prose', () => {
+ for (const [before, after] of [
+  [{ goal_summaries: [{ id: 'goal' }] }, {}],
+  [{ wait_summaries: [{ id: 'stopped-wait' }] }, {}],
+  [{}, { continuation_reason: 'recovery' }],
+  [{}, { wait_summaries: [{ id: 'wake' }] }],
+ ]) {
+  const shown = presentAssistantReply(rows([assistant('Prefix', 0, before), carrier(), assistant('Prefix suffix', 1, after)]))
+  assert.deepEqual(shown.map(text), ['Prefix', ' suffix'])
+ }
 })

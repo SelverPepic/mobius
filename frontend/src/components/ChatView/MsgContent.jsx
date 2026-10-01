@@ -17,7 +17,6 @@ import { foldAppActivityOperations } from './activityGrouping.js'
 import QuestionCard from './QuestionCard.jsx'
 import { isDurableRestartOffer } from './restartCard.js'
 import SecureInputCard from './SecureInputCard.jsx'
-import MessageSources from './MessageSources.jsx'
 import Attachments from './Attachments.jsx'
 import CompactionCard from './CompactionCard.jsx'
 import ContinuationCard from './ContinuationCard.jsx'
@@ -194,7 +193,6 @@ function MsgContentInner({
   suppressedQuestionKeys,
   activityMessageId,
   activitySourceBlocks,
-  hideReferences = false,
 }) {
   const positionedNotes = usePositionedPeerNotes(activityMessageId || msg.id)
   // Build a stable per-render answerable predicate that closes over the
@@ -634,18 +632,6 @@ function MsgContentInner({
             ? <Attachments attachments={allFiles} chatId={chatId} />
             : null
         })()}
-        {/* Web sources collected from the turn's tool blocks and shown once
-            after the answer. Memory keeps its own richer lookup card inline. */}
-        {msg.role === 'assistant' && !isStreaming && !hideReferences && !msg.hide_reply_sources && (
-          <MessageSources
-            blocks={msg.blocks}
-            sourceGroups={msg.reply_sources?.groups}
-            chatId={chatId}
-            sourceRef={msg.source_ref}
-            sourceRefs={msg.reply_sources?.refs}
-            disclosureKey={`${messageKey}:references`}
-          />
-        )}
         {!isStreaming && <GoalHistory msg={msg} />}
         {!isStreaming && <StoppedWaits msg={msg} />}
       </AssistantCopySurface>
@@ -734,7 +720,6 @@ export default memo(MsgContentInner, (prev, next) => {
     && prev.resumeCardRef === next.resumeCardRef
     && prev.isActiveAnswer === next.isActiveAnswer
     && prev.isStreaming === next.isStreaming
-    && prev.hideReferences === next.hideReferences
     // suppressedQuestionKeys is a Set (new reference each render) or null.
     // Compare by size + content when both are Sets; treat null vs Set as unequal.
     // This is intentionally conservative — a false inequality triggers a

@@ -201,10 +201,12 @@
 
 /* ── Empty state ───────────────────────────────────── */
 
-/* Source rows stay addressable through hidden reply cuts, but use the same
-   compact rhythm as adjacent blocks rather than a full conversation gap. */
-.chat__msg--reply-fragment { margin-top: -16px; }
-.chat__msg--reply-empty:has(> .chat__assistant-copy-surface:empty) { margin-top: -24px; }
+/* A reply is one conversation item; source rows keep their anchors and
+   compact block spacing without cancelling the surrounding conversation gap. */
+.chat__reply-rows { list-style: none; padding: 0; margin: 0; }
+.chat__reply-rows > .chat__msg + .chat__msg:not(:has(> .chat__assistant-copy-surface:empty)) {
+  margin-top: 8px;
+}
 
 .chat__empty {
   display: flex;

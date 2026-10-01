@@ -69,6 +69,8 @@ export function presentAssistantReply(rows, { activeIndex = -1, positions = new 
     const terminal = before[terminalIndex]
     const canJoin = replay && replay.text.startsWith(replay.prefix)
       && replay.textIndex === 0 && terminal?.type === 'text'
+      && !previous.goal_summaries?.length && !previous.wait_summaries?.length
+      && !current.continuation_reason && !current.wait_summaries?.length
       && !rows[index].notes.length
       && !hasTextPosition(positions.get(previous.id), terminal, terminalIndex)
       && !hasTextPosition(positions.get(current.id), after[0], 0)
@@ -94,26 +96,5 @@ export function presentAssistantReply(rows, { activeIndex = -1, positions = new 
       textOwner = null
     }
   }
-  if (presented.length > 1) {
-    const lastVisible = presented.findLastIndex(row => !row.message.hidden)
-    const references = {
-      groups: rows.map(row => sourceBlocks(row.message)),
-      refs: rows.flatMap(row => row.message.source_ref ? [row.message.source_ref] : []),
-    }
-    for (let index = 0; index < presented.length; index += 1) {
-      const message = presented[index].message
-      presented[index].message = {
-        ...message,
-        reply_sources: index === lastVisible ? references : null,
-        hide_reply_sources: index !== lastVisible,
-      }
-    }
-  }
   return presented
-}
-
-/** Empty source rows remain zero-height anchors, not extra paragraph gaps. */
-export function replyRowHasContent(message) {
-  return sourceBlocks(message).some(block => block.type !== 'text' || block.content?.trim())
-    || message.goal_summaries?.length || message.wait_summaries?.length
 }

@@ -91,7 +91,7 @@ import ProgressRail from './ProgressRail.jsx'
 import GoalPlanDetails from './GoalPlanDetails.jsx'
 import GoalDraftChip from './GoalDraftChip.jsx'
 import WaitingChip from './WaitingChip.jsx'
-import ActiveAssistantSurface from './ActiveAssistantSurface.jsx'
+import AssistantReply from './AssistantReply.jsx'
 import QueuedMessages from './QueuedMessages.jsx'
 import {
   chatChangesActionIsCurrent,
@@ -141,7 +141,6 @@ import {
   updateChatRuntimeCache,
 } from './chatRuntimeCache.js'
 import {
-  assistantAnchorKey,
   chatCacheEntryState,
   chatDetailCacheValue,
   chatSnapshotMatchesRuntime,
@@ -5913,7 +5912,7 @@ export default function ChatView({
       === assistantReplyRoot({ role: 'assistant', id: activeAssistantMessageId || streamAssistantMessageId }))
     const tail = group.rows.at(-1)
     const last = active || group.end === lastVisibleMessageIndex
-    return <ActiveAssistantSurface
+    return <AssistantReply
       key={group.rows[0].key}
       replyGroup={group}
       activeRowIndex={activeIndex}
@@ -5923,9 +5922,9 @@ export default function ChatView({
       hasLivePayload={active && hasLiveAssistantPayload}
       streamItems={active ? streamItems : null}
       chatId={chatId}
-      onAnswer={doSendSilent}
-      onPrepareAnswer={prepareQuestionSubmission}
-      onCancelAnswer={cancelQuestionSubmission}
+      onQuestionAnswer={doSendSilent}
+      onQuestionSubmitIntent={prepareQuestionSubmission}
+      onQuestionSubmitCancel={cancelQuestionSubmission}
       onResume={activeAssistantIsStreaming && active ? undefined : handleResume}
       resumeState={resumeState}
       onInternalNav={internalNav}
@@ -6124,45 +6123,9 @@ export default function ChatView({
               : projectedMsg
             const continuationMarker = isContinuationMessage(msg)
             const renderedEndIndex = ownerBatch?.end ?? i
-            const isLastMsg = renderedEndIndex === lastVisibleMessageIndex
-            // DB and stream payloads occupy the same identity-owned row,
-            // including when a committed steer already follows that row.
-            // A question is answerable while the runner is parked on it,
-            // waiting for the answer. The runner BLOCKS the turn on the
-            // AskUserQuestion future until it is answered, so an unanswered
-            // question that is still the TAIL of the last assistant message
-            // means the runner is parked right there — nothing follows it
-            // until the answer arrives.
-            //
-            // That invariant is fully DURABLE: it reads only the persisted
-            // message blocks, so it survives a reload AND Möbius's
-            // kill-on-question `done` (the SSE closes the moment a question
-            // fires, but the runner keeps waiting). It must NOT gate on the
-            // live stream: `isStreaming` flips false on that `done`, which
-            // would leave the card disabled forever. `liveQuestionId`, when
-            // the live stream handed it to us, is an extra precision filter;
-            // after a reload we may never have seen it, and then the
-            // tail-unanswered invariant stands on its own.
-            //
-            // MsgContent enforces the "tail block" half (the question is the
-            // LAST block). Recovery may insert an interruption note before a
-            // still-open question, but once the turn truly moves on and any
-            // block follows the question, that older card becomes transcript
-            // history. Double-submit is prevented by QuestionCard's own
-            // `submitted` state + doSendSilent's synchronous sendingRef flip.
-            //
-            // isLastMsg + liveQuestionId are passed as stable scalars so
-            // MsgContent's memo can skip non-last messages on every streaming
-            // tick. The inline-arrow form (isQuestionAnswerable) created a
-            // fresh function identity every render and defeated memo entirely.
-            // Stable per-message DOM key for the scroll state machine.
-            // data-key is queried by applyMode when restoring an
-            // ANCHOR_AT mode. msg.id (server-assigned UUID) is ideal;
-            // fall back to role+ts which is also stable across renders.
+            // Assistant replies have already been handled above. Owner and
+            // product rows retain their existing scroll and metadata identity.
             const dataKey = messageKey(msg, offset + i)
-            const anchorKey = msg.role === 'assistant'
-              ? assistantAnchorKey(offset + i)
-              : null
             // User rows key + pin on the stable cid so the optimistic→confirm
             // display-ts update never remounts the row (which would drop the
             // pin target mid-swap). data-ts stays for the revealed metadata row.
@@ -6177,7 +6140,6 @@ export default function ChatView({
               tabIndex={-1}
               ref={renderedEndIndex === lastUserIdx ? setLastUserMsgRef : null}
               data-key={dataKey}
-              data-anchor-key={anchorKey === dataKey ? undefined : anchorKey}
               data-cid={userCid || undefined}
               data-ts={ownerUserMessage && renderedMsg.ts ? String(renderedMsg.ts) : undefined}
               onClick={hasMessageMeta
@@ -6188,36 +6150,7 @@ export default function ChatView({
                 msg={renderedMsg}
                 chatId={chatId}
                 messageKey={dataKey}
-                onQuestionAnswer={doSendSilent}
-                onQuestionSubmitIntent={prepareQuestionSubmission}
-                onQuestionSubmitCancel={cancelQuestionSubmission}
-                onResume={handleResume}
-                resumeState={resumeState}
-                continuationWait={isLastMsg ? continuationWait : null}
                 onInternalNav={internalNav}
-                autoResumeEnabled={
-                  isLastMsg && autoResumeEnabled
-                }
-                autoResumeAvailable={
-                  isLastMsg && showAutoResumeControl
-                }
-                autoResumeSaving={isLastMsg && autoResumeSaving}
-                autoResumeError={
-                  isLastMsg && autoResumeErrorSource === 'card'
-                    ? autoResumeError
-                    : ''
-                }
-                onAutoResumeChange={
-                  isLastMsg ? handleAutoResumeChange : undefined
-                }
-                limitResetElapsed={isLastMsg && limitResetElapsed}
-                recoveryCredit={isLastMsg ? pendingLimitRecoveryCredit : null}
-                submissionBlocked={providerSwitching}
-                isLastMsg={isLastMsg}
-                liveQuestionId={answerableQuestionId}
-                suppressedQuestionKeys={streamItemQuestionKeys}
-                pendingQuestionRef={pendingQuestionRef}
-                resumeCardRef={resumeCardRef}
               />
               <MessageMetaRow
                 timestamp={ownerUserMessage ? renderedMsg.ts : null}
