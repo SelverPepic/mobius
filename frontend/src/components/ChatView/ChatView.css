@@ -4269,6 +4269,8 @@
     align-self: flex-start;
   }
 }
+.chat__goal-result { margin: 0 10px 8px; color: var(--text); font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
+
 .chat__goal-plan {
   flex: 1 0 100%;
   display: flex;
@@ -4301,6 +4303,8 @@
 }
 
 .chat__goal-history--failed { --lifecycle-tone: var(--danger); }
+.chat__goal-history--cancelled { --lifecycle-tone: var(--muted); }
+.chat__goal-history-reason { color: var(--text); font-size: 12px; line-height: 1.4; }
 .chat__wait-history { --lifecycle-tone: var(--accent); }
 .chat__wait-history--attention { --lifecycle-tone: var(--warning, #d8922f); }
 .chat__wait-history--stopped { --lifecycle-tone: var(--muted); }
@@ -4428,9 +4432,13 @@
   color: var(--green);
 }
 
-.chat__goal-task--failed .chat__goal-task-marker,
-.chat__goal-task--blocked .chat__goal-task-marker {
+.chat__goal-task--failed .chat__goal-task-marker {
   border-color: var(--danger);
+}
+
+.chat__goal-task--blocked .chat__goal-task-marker {
+  border-color: var(--muted);
+  border-style: dashed;
 }
 
 .chat__goal-task--cancelled {

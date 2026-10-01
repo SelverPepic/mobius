@@ -285,7 +285,7 @@ for (const [continuationWait, title, explanation] of [
       message: 'Selected model is at capacity.',
       pause: { kind: 'model_capacity', resets_at: '2026-09-04T09:00:00Z' },
     }] }
-    const props = { msg, isLastMsg: true, onResume() {}, continuationWait }
+    const props = { msg, isLastMsg: true, onResume() {}, continuationWait, handoff: { kind: 'automatic', reason: 'model_capacity' } }
     const blocked = renderToStaticMarkup(createElement(MsgContent, props))
     assert.ok(blocked.includes(title))
     assert.ok(blocked.includes(explanation))
@@ -500,9 +500,9 @@ test('a benign pause (no reset time) renders the calm "Paused" family, not red E
 test('resource parks appear in the standard Waiting surface', () => {
   assert.match(chatView, /const resourcePause = isResourcePause\(pendingResumeBlock\)/,
     'the durable tail pause must drive the live waiting presentation')
-  assert.match(chatView, /chatHasSelfResumingHandoff\(\{[\s\S]*resourcePause,[\s\S]*\}\)/,
+  assert.match(chatView, /classifyChatHandoff\(\{[\s\S]*resourcePause: pendingResumeBlock,[\s\S]*authoritativeHandoff: serverHandoff,[\s\S]*\}\)/,
     'resource waits must share the self-resuming handoff visibility rule')
-  assert.match(chatView, /<WaitingChip[\s\S]*resourcePause=\{resourcePause\}/,
+  assert.match(chatView, /<WaitingChip[\s\S]*resourcePause=\{resourcePause \|\| \(modelCapacityPause/,
     'the standard Waiting component must receive the resource handoff')
   assert.match(waitingChip, /function ResourceCard/,
     'the shared Waiting surface should explain resource ownership and wake-up')
@@ -572,6 +572,7 @@ for (const [continuationWait, expected] of [
     }] }
     const html = renderToStaticMarkup(createElement(MsgContent, {
       msg, isLastMsg: true, onResume() {}, continuationWait,
+      handoff: { kind: 'automatic', reason: 'restart' },
     }))
     assert.match(html, expected)
     assert.doesNotMatch(html, /chat__recovery-title[^>]*>Error/)

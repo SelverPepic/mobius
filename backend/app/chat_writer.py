@@ -990,6 +990,8 @@ class PromotePending(_Command):
   # not turn-end handoffs and keep the clean default; drain_and_release passes
   # "failed" when the provider returned an error before queued work continues.
   ending_status: str = "completed"
+  # Only the actual terminal drain may recover an unhanded Goal. Queue
+  # sweeps and ordinary promotions carry no finishing-attempt authority.
   ending_run_token: str = ""
 
 
@@ -2488,6 +2490,25 @@ class ChatWriterActor:
         raise AnswerConflict("This question is no longer open.")
       require_quiet_close_holds_no_claim(db, chat, cmd.question_id)
       metadata = {"answer_turn": "none", "selected_options": cmd.selected_options}
+      # An explicit no-reply answer remains no-reply. It is deliberate owner
+      # pause of the card's exact Goal, not a normal unattended open ending.
+      # Locate ownership from the card's physical reply, never the latest Goal.
+      from app.chat_message_identity import assistant_message_run_id
+      card_message = next((message for message in reversed(chat.messages or [])
+                           if message.get("role") == "assistant"
+                           and any(block.get("type") == "question"
+                                   and block.get("question_id") == cmd.question_id
+                                   for block in message.get("blocks") or [])), None)
+      owner_id = assistant_message_run_id(card_message.get("id")) if card_message else None
+      owner_run = db.get(models.ChatRun, owner_id) if owner_id else None
+      owner_goal = db.get(models.ChatGoal, owner_run.goal_id) if (
+        owner_run is not None and owner_run.chat_id == chat.id and owner_run.goal_id
+      ) else None
+      if owner_goal is not None and owner_goal.status == "open":
+        owner_goal.status = "stopped"
+        owner_goal.revision += 1
+        owner_goal.checkpoint = "Owner chose to close the saved question without continuing."
+        _settle_ended_goal_claims(db, owner_goal)
     applied = apply_answers_to_last_question(
       chat, cmd.answers, cmd.question_id, metadata=metadata,
     )
@@ -4266,7 +4287,7 @@ class ChatWriterActor:
       return {"status": "cleared", "goal_id": goal_id}
     chat.dismissed_goal_id = goal_id
     goal = db.get(models.ChatGoal, goal_id)
-    if goal is not None and goal.status != "completed":
+    if goal is not None and goal.status not in {"completed", "cannot_complete", "cancelled"}:
       goal.status = "dismissed"
       goal.revision += 1
       _settle_ended_goal_claims(db, goal)
@@ -4938,8 +4959,11 @@ class ChatWriterActor:
       repair = self._repair_quiet_writes(db, chat, cmd)
       if repair is not None:
         return repair
+      settlement = self._settle_unhanded_goal(db, chat, cmd)
+      if settlement is not None:
+        return settlement
       if (retired_control or rejected_changed) and not _commit_or_rollback(db):
-        raise _PersistFailed("PromotePending could not settle rejected queue rows")
+        raise _PersistFailed("PromotePending could not retire stale control")
       return {"history": [], "promoted": None, "session_id": chat.session_id}
     existing = list(chat.messages or [])
     from app.continuations import (
@@ -5095,6 +5119,114 @@ class ChatWriterActor:
       "promoted": returned_promoted,
       "session_id": chat.session_id,
     }
+
+  def _settle_unhanded_goal(self, db, chat, cmd: PromotePending) -> dict | None:
+    """Keep exact clean Goal responsibility, bounded to one settlement pass.
+
+    This is attempt admission at the existing queue drain, not a Goal worker
+    or a reconstruction of promises from prose. Owner queue/card barriers win
+    before this seam. Physical failure, Stop, parks and unrelated turns never
+    grant it authority. The control is provider-only, not synthetic owner speech.
+    """
+    if cmd.ending_status != "completed" or not cmd.ending_run_token:
+      return None
+    from app.run_state import latest_run
+    prior = db.get(models.ChatRun, cmd.ending_run_token)
+    current = latest_run(db, chat.id)
+    if (
+      prior is None or prior.chat_id != chat.id or prior.status != "running"
+      or current is None or current.id != prior.id
+      or prior.initiated_by_app_id is not None or not prior.goal_id
+      or prior.provider_execution_admitted is not True
+    ):
+      return None
+    from fastapi import HTTPException
+    try:
+      _require_browser_grant(db, prior.browser_grant_id, prior.browser_grant_epoch)
+    except (HTTPException, _PersistFailed):
+      return None
+    goal = db.get(models.ChatGoal, prior.goal_id)
+    if (
+      goal is None or goal.chat_id != chat.id or goal.status != "open"
+      or chat.dismissed_goal_id == goal.id
+    ):
+      return None
+    from app.chat_waits import _goal_waits, _FIRED_UNDELIVERED
+    if _goal_waits(db, chat.id, goal.id).filter(
+      (models.ChatWait.status == "armed") | _FIRED_UNDELIVERED,
+    ).first() is not None:
+      return None
+    from app.delegations import _self_resuming_helper_rows
+    from app.goal_plans import goal_attempt_root_ids
+    helper_roots = goal_attempt_root_ids(db, chat.id, goal.id)
+    if any(
+      row.parent_root_run_id in helper_roots
+      for row, _status in _self_resuming_helper_rows(db, {chat.id})
+    ):
+      return None
+    from app.continuations import goal_settlement_attempted, GOAL_SETTLEMENT_UNFINISHED_MESSAGE
+    if goal_settlement_attempted(db, prior):
+      # A broken execution is not a declaration that the owner's outcome is
+      # impossible. Preserve intent and surface technical recovery, with no
+      # unlimited provider loop and no manufactured success/capitulation.
+      note = GOAL_SETTLEMENT_UNFINISHED_MESSAGE
+      from app.chat_message_identity import assistant_message_run_id
+      messages = copy.deepcopy(list(chat.messages or []))
+      target = next((message for message in reversed(messages)
+                     if message.get("role") == "assistant"
+                     and assistant_message_run_id(message.get("id")) == prior.id), None)
+      if target is None:
+        raise _PersistFailed("Goal settlement has no exact terminal reply")
+      blocks = list(target.get("blocks") or [])
+      if not any(block.get("code") == "goal_settlement_unfinished" for block in blocks):
+        blocks.append({"type": "error", "message": note, "resumable": True,
+                       "code": "goal_settlement_unfinished"})
+      target["blocks"] = blocks
+      chat.messages = messages
+      if not _commit_or_rollback(db):
+        raise _PersistFailed("Goal settlement recovery note did not persist")
+      return {"history": [], "promoted": None, "session_id": chat.session_id,
+              "settlement_error": note}
+    from app.continuations import (
+      continuation_control_envelope, continuation_protocol_source,
+    )
+    token = "goal-settlement-" + hashlib.sha256(prior.id.encode()).hexdigest()[:48]
+    source = continuation_protocol_source(
+      reason="goal_settlement", control_id=token, run_token=token,
+      source_work_id=prior.id, goal_id=goal.id,
+    )
+    source["ts"] = next_message_ts(list(chat.messages or []))
+    for key in ("viewport", "timezone"):
+      for message in reversed(chat.messages or []):
+        if message.get("role") == "user" and message.get(key) is not None:
+          source[key] = copy.deepcopy(message[key])
+          break
+    history = [schemas.ChatMessage(role=message.get("role", "user"),
+                                  content=message.get("content", "") or "")
+               for message in chat.messages or []]
+    history.append(schemas.ChatMessage(role="user", content=source["content"]))
+    now = datetime.now(UTC)
+    prior.status = "completed"
+    prior.ended_at = now
+    new_run = models.ChatRun(
+      id=token, chat_id=chat.id, status="running", provider=prior.provider,
+      root_run_id=prior.root_run_id or prior.id, started_at=now,
+      goal_id=goal.id, goal_objective=goal.objective,
+      browser_grant_id=prior.browser_grant_id,
+      browser_grant_epoch=prior.browser_grant_epoch,
+      continuation_json=continuation_control_envelope(
+        reason="goal_settlement", control_id=token, source_work_id=prior.id,
+        goal_id=goal.id, supersedes_run_token=prior.id,
+      ),
+    )
+    chat.updated_at = now
+    self._commit_admitted_run_start(
+      db, chat, new_run, source["ts"],
+      failure_message="Goal settlement attempt did not persist",
+    )
+    return {"history": history, "session_id": chat.session_id,
+            "promoted": {**source, "_messages": [], "_consumed_cids": [],
+                         "_goal_id": goal.id, "_goal_objective": goal.objective}}
 
   def _repair_quiet_writes(self, db, chat, cmd: PromotePending) -> dict | None:
     """Failures alone earn one model continuation at the existing queue drain.

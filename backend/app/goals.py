@@ -65,14 +65,17 @@ def resume_context(db, run_id):
     "to get another task or refresh context. update_goal with no arguments "
     "shows the full plan. Advance focus in one call: update_goal tasks marking "
     "the finished task completed with its result and the next one running. "
-    "Complete only after verifying the entire Goal.\n"
+    "Complete only after verifying the entire Goal. An owner-action or approval "
+    "gate leaves the Goal open with a saved card; a genuinely unreachable "
+    "outcome first needs an actionable owner decision on a saved card, then a "
+    "specific cannot_complete record if that limitation is accepted, not silent scope reduction.\n"
     "<mobius_goal>" + json.dumps(scoped_goal_context(db, goal), ensure_ascii=False,
                                 separators=(",", ":")) + "</mobius_goal>"
   )
 
 
 async def settle_after_goal_completion(chat_id: str) -> None:
-  """Finish what a committed Goal completion leaves for other owners.
+  """Finish what a committed terminal Goal outcome leaves for other owners.
 
   Resume notices queued for Waits the completion took delivery of are
   withdrawn, so they cannot start a turn for the finished Goal, and claim
@@ -86,34 +89,100 @@ async def settle_after_goal_completion(chat_id: str) -> None:
 
 
 def update_goal_record(db, run, goal, expected_revision, *, checkpoint=None,
-                       next_action=None, result=None, finished_claims=()):
+                       next_action=None, result=None, cannot_complete=None,
+                       cancel=None, tasks=None, finished_claims=()):
   from app.goal_plans import (
-    GoalPlanConflict, GoalPlanError, active_goal_helpers, serialize_plan,
+    GoalPlanConflict, GoalPlanError, active_goal_helpers, normalize_tasks,
+    staged_task_edits,
   )
-  if (goal.status == "completed" and result is not None
-      and goal.result == result.strip() and goal.revision == expected_revision + 1):
+  outcomes = [result is not None, cannot_complete is not None, cancel is not None]
+  if sum(outcomes) > 1 or (any(outcomes) and next_action is not None):
+    raise GoalPlanError("Choose exactly one Goal outcome or a next action")
+  if finished_claims and result is None:
+    raise GoalPlanError("Only verified completion may name finished claims")
+  status = ("completed" if result is not None else
+            "cannot_complete" if cannot_complete is not None else
+            "cancelled" if cancel is not None else None)
+  if cannot_complete is not None:
+    if not isinstance(cannot_complete, dict) or any(
+      not isinstance(cannot_complete.get(key), str) or not cannot_complete[key].strip()
+      for key in ("reason", "efforts", "unmet_outcome")
+    ):
+      raise GoalPlanError("cannot_complete needs reason, efforts, and unmet_outcome text")
+    outcome_text = "Reason: {reason}\nEfforts and partial results: {efforts}\nUnmet outcome: {unmet_outcome}".format(
+      **{key: cannot_complete[key].strip() for key in ("reason", "efforts", "unmet_outcome")}
+    )
+  else:
+    outcome_text = result.strip() if isinstance(result, str) else cancel.strip() if isinstance(cancel, str) else None
+  if status and not outcome_text:
+    raise GoalPlanError("A Goal outcome needs a specific explanation")
+  if (goal.status == status and status is not None and goal.result == outcome_text
+      and goal.revision in {expected_revision, expected_revision + 1}):
+    # A lost tool receipt may be retried with the freshly read revision. Only
+    # the same settled checklist and already-completed claims are a replay;
+    # a matching result cannot disguise a new mutation of a closed Goal.
+    if tasks is not None:
+      document = staged_task_edits(goal, tasks)
+      saved = normalize_tasks(goal.plan_json["tasks"]) if goal.plan_json else []
+      if document["tasks"] != saved:
+        raise GoalPlanConflict("A settled Goal checklist cannot change")
+    if finished_claims:
+      completed_keys = {row[0] for row in db.query(models.AgentWorkClaim.work_key).filter(
+        models.AgentWorkClaim.owner_chat_id == goal.chat_id,
+        models.AgentWorkClaim.owner_goal_id == goal.id,
+        models.AgentWorkClaim.completed_at.is_not(None),
+      ).all()}
+      if set(finished_claims) - completed_keys:
+        raise GoalPlanError("A replay cannot finish new work claims")
     return {"goal_id": goal.id, "status": goal.status, "revision": goal.revision}
   if goal.status != "open":
     raise GoalPlanConflict("Goal is not open")
   values = {"revision": expected_revision + 1}
   consumed_waits = 0
-  if result is not None:
-    plan = serialize_plan(db, run, goal)
-    if goal.plan_json is not None and plan is None:
+  if tasks is not None:
+    document = staged_task_edits(goal, tasks)
+    if status is None and next_action is None and checkpoint is None:
+      try:
+        saved = normalize_tasks(goal.plan_json["tasks"])
+      except (GoalPlanError, KeyError, TypeError):
+        saved = None
+      if saved == document["tasks"]:
+        unchanged = db.execute(update(models.ChatGoal).where(
+          models.ChatGoal.id == goal.id, models.ChatGoal.revision == expected_revision,
+          models.ChatGoal.status == "open",
+        ).values(revision=expected_revision))
+        if unchanged.rowcount != 1:
+          db.rollback()
+          raise GoalPlanConflict("Goal changed; fetch it and retry")
+        db.commit()
+        return {"goal_id": goal.id, "status": goal.status, "revision": goal.revision}
+    values["plan_json"] = document
+  else:
+    document = goal.plan_json
+  if status is not None:
+    if document is not None and not isinstance(document, dict):
       raise GoalPlanError(
-        "Goal plan is unreadable; replace it with a validated plan before completion"
+        "Goal plan is unreadable; replace it with a validated plan before settlement"
       )
-    if plan is not None and not plan["summary"]["can_complete"]:
-      blockers = plan["summary"]["completion_blockers"]
+    try:
+      plan_tasks = normalize_tasks(document["tasks"]) if document is not None else []
+    except (GoalPlanError, KeyError, TypeError) as exc:
+      raise GoalPlanError("Goal plan is unreadable; replace it with a validated plan before settlement") from exc
+    allowed = {"completed", "cancelled"} if status == "completed" else {
+      "completed", "failed", "blocked", "cancelled",
+    }
+    blockers = [task["id"] for task in plan_tasks if task["status"] not in allowed]
+    if status != "completed":
+      blockers += [task["id"] for task in plan_tasks if task["status"] in {
+        "failed", "blocked", "cancelled",
+      } and not (task.get("note") or task.get("result"))]
+    blockers += active_goal_helpers(db, run, goal)
+    blockers = list(dict.fromkeys(blockers))
+    if blockers:
       raise GoalPlanError(
-        "Goal has unfinished tasks or active delegations: " + ", ".join(blockers),
+        "Goal has unfinished tasks, unexplained settlements, or active delegations: " + ", ".join(blockers),
         code="goal_completion_blocked", completion_blockers=blockers,
       )
-    if plan is None and active_goal_helpers(db, run, goal):
-      # A Goal without a plan can still have helpers; Done waits for them too.
-      raise GoalPlanError("Goal has active delegations")
-    if not result.strip():
-      raise GoalPlanError("Completion requires a verification result")
     from app.agent_work_claims import held_claims_hint, open_claim_keys
     held = open_claim_keys(db, chat_id=goal.chat_id, goal_id=goal.id)
     unknown = set(finished_claims) - held
@@ -124,10 +193,13 @@ def update_goal_record(db, run, goal, expected_revision, *, checkpoint=None,
       )
     from app.chat_waits import stage_consume_fired_goal_waits
     consumed_waits = stage_consume_fired_goal_waits(db, goal.chat_id, goal.id)
-    values.update(status="completed", result=result.strip(),
+    values.update(status=status, result=outcome_text, next_action=None,
                   completed_at=datetime.now(UTC))
   else:
-    values.update(checkpoint=checkpoint, next_action=next_action)
+    if checkpoint is not None:
+      values["checkpoint"] = checkpoint
+    if next_action is not None:
+      values["next_action"] = next_action
   changed = db.execute(update(models.ChatGoal).where(
     models.ChatGoal.id == goal.id, models.ChatGoal.revision == expected_revision,
     models.ChatGoal.status == "open",
@@ -135,13 +207,13 @@ def update_goal_record(db, run, goal, expected_revision, *, checkpoint=None,
   if changed.rowcount != 1:
     db.rollback()
     raise GoalPlanConflict("Goal changed; fetch it and retry")
-  if result is not None:
+  if status is not None:
     # Completion settles the Goal's still-open exact-action claims in the same
     # commit: the ones it names as finished complete with the verified result,
     # the rest are released, so a declined action never reads as done.
     from app.agent_work_claims import stage_settle_goal_claims
     stage_settle_goal_claims(
-      db, chat_id=goal.chat_id, goal_id=goal.id, status="completed",
+      db, chat_id=goal.chat_id, goal_id=goal.id, status=status,
       result=values["result"], finished_keys=finished_claims,
     )
   db.commit()

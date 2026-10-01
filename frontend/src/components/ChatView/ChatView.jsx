@@ -137,7 +137,7 @@ import {
 } from './composerFocusPolicy.js'
 import { shouldDismissComposerKeyboardOnSubmit } from './composerKeyboardPolicy.js'
 import {
-  chatHasSelfResumingHandoff,
+  classifyChatHandoff,
   normalizeBackgroundHelpers,
   updateChatRuntimeCache,
 } from './chatRuntimeCache.js'
@@ -260,6 +260,7 @@ import {
   newestGoalPlan,
   normalizeGoalPresentation,
   progressRailViewModel,
+  planForGoal,
 } from './goalProgress.js'
 import './ChatView.css'
 
@@ -766,6 +767,7 @@ export default function ChatView({
   // truth arrives with every chat detail/runtime read; wait-change events and
   // run lifecycle reconciliation keep an already-mounted view current.
   const [armedWaits, setArmedWaits] = useState(() => cached?.waits || [])
+  const [serverHandoff, setServerHandoff] = useState(() => cached?.handoff || null)
   const [backgroundHelpers, setBackgroundHelpers] = useState(() => (
     normalizeBackgroundHelpers(cached?.background_helpers)
   ))
@@ -851,20 +853,22 @@ export default function ChatView({
     // A pane can reuse ChatView for a different chat. Reset immediately to the
     // destination cache so the prior chat's wait never flashes during fetch.
     setArmedWaits(Array.isArray(runtime?.waits) ? runtime.waits : [])
+    setServerHandoff(runtime?.handoff || null)
     setBackgroundHelpers(normalizeBackgroundHelpers(runtime?.background_helpers))
   }, [chatId, queryClient, setGoalPresentationLocalState])
 
   useEffect(() => {
     let cancelled = false
+    setActiveGoalPlan(null)
     if (!activeGoalObjective) {
-      setActiveGoalPlan(null)
       return () => { cancelled = true }
     }
     apiFetch(`/chats/${chatId}/goal-plan`, { timeoutMs: CHAT_FETCH_TIMEOUT_MS })
       .then(response => response.ok ? response.json() : null)
       .then(payload => {
         if (!cancelled) {
-          setActiveGoalPlan(current => newestGoalPlan(current, payload?.plan || null))
+          const matchingPlan = planForGoal(payload?.plan, goalPresentationRef.current)
+          setActiveGoalPlan(current => newestGoalPlan(current, matchingPlan))
         }
       })
       .catch(() => {})
@@ -1512,6 +1516,7 @@ export default function ChatView({
       }
       setLiveQuestionId(data.pending_question_id || null)
       if (Array.isArray(data.waits)) setArmedWaits(data.waits)
+      setServerHandoff(data.handoff || null)
       setBackgroundHelpers(normalizeBackgroundHelpers(data.background_helpers))
       updateChatRuntimeCache(queryClient, chatMessagesQueryKey(chatId), {
         running: !!data.running,
@@ -1520,6 +1525,7 @@ export default function ChatView({
         runtimeRevision: data.runtime_revision,
         recoveryRunId: data.recovery_run_id || null,
         continuationWait: data.continuation_wait || null,
+        handoff: data.handoff || null,
         goal: runtimeGoal,
         activeGoalObjective: runtimeGoal?.status === 'active'
           ? runtimeGoal.objective
@@ -1716,6 +1722,7 @@ export default function ChatView({
       const pendingQuestionId = runtime.pendingQuestionId
       setLiveQuestionId(pendingQuestionId)
       if (Array.isArray(data.waits)) setArmedWaits(data.waits)
+      setServerHandoff(data.handoff || null)
       setBackgroundHelpers(normalizeBackgroundHelpers(data.background_helpers))
       updateChatRuntimeCache(queryClient, chatMessagesQueryKey(chatId), {
         running: !!data.running,
@@ -1724,6 +1731,7 @@ export default function ChatView({
         runtimeRevision: data.runtime_revision,
         recoveryRunId: data.recovery_run_id || null,
         continuationWait: data.continuation_wait || null,
+        handoff: data.handoff || null,
         goal: runtimeGoal,
         activeGoalObjective: runtimeGoal?.status === 'active'
           ? runtimeGoal.objective
@@ -2627,6 +2635,7 @@ export default function ChatView({
       hadMessagesRef.current = visibleMessages.length > 0
       setLiveQuestionId(runtime.pending_question_id || null)
       setArmedWaits(Array.isArray(runtime.waits) ? runtime.waits : [])
+      setServerHandoff(runtime.handoff || null)
       setBackgroundHelpers(normalizeBackgroundHelpers(runtime.background_helpers))
       setBridgeMountInputs({
         runningAtMount: running,
@@ -2767,6 +2776,7 @@ export default function ChatView({
           runtimeRevision: runtime.runtime_revision,
           recoveryRunId: runtime.recovery_run_id || null,
           continuationWait: runtime.continuation_wait || null,
+          handoff: runtime.handoff || null,
           activeAssistantMessageId:
             runtime.active_assistant_message_id || null,
           goal: runtimeGoal,
@@ -5780,29 +5790,37 @@ export default function ChatView({
     }
     return 'Turn paused — Resume available.'
   })()
-  const actionableGoalPresentation = ['active', 'paused'].includes(goalPresentation?.status)
-    ? goalPresentation
-    : null
-  // Who moves next is chat state, not Goal state: an open card, or a Wait or
-  // helper that will resume this chat. An idle Goal otherwise is your turn.
-  const showWaitingHandoff = chatHasSelfResumingHandoff({
+  const actionableGoalPresentation = goalPresentation
+  // Chat surfaces retain all work, but Goal labels use only its exact owners.
+  const chatHandoff = classifyChatHandoff({
     turnActive,
+    ownerInput: hasPendingQuestion,
     waits: armedWaits,
     backgroundHelpers,
-    resourcePause,
+    resourcePause: pendingResumeBlock,
+    autoResumeEnabled,
+    authoritativeHandoff: serverHandoff,
   })
+  const goalHandoff = actionableGoalPresentation?.handoff?.kind || 'none'
+  const showWaitingHandoff = goalHandoff === 'automatic'
   const goalWaitState = {
-    ownerActionRequired: hasPendingQuestion,
+    ownerActionRequired: goalHandoff === 'owner_input',
     monitoring: showWaitingHandoff,
+    manualRecovery: goalHandoff === 'recovery',
   }
   const goalAriaStatus = actionableGoalPresentation
-    ? goalWaitState.ownerActionRequired
-      ? `Goal needs your answer: ${activeGoalObjective}. Question available.`
+    ? ['completed', 'cannot_complete', 'cancelled'].includes(actionableGoalPresentation.status)
+      ? `Goal ${actionableGoalPresentation.status.replace('_', ' ')}: ${activeGoalObjective}.`
+      : goalWaitState.ownerActionRequired
+      ? `Goal waiting for you: ${activeGoalObjective}. Saved input available.`
       : goalWaitState.monitoring
         ? `Goal waiting: ${activeGoalObjective}. This chat will resume automatically.`
         : {
             active: `Following goal: ${activeGoalObjective}.`,
-            paused: `Goal: ${activeGoalObjective}. Your turn.`,
+            paused: `Goal: ${activeGoalObjective}. ${actionableGoalPresentation.pause_reason === 'owner' ? 'Paused by you.' : goalWaitState.manualRecovery ? 'Recovery needed.' : 'Paused.'}`,
+            completed: `Goal completed: ${activeGoalObjective}.`,
+            cannot_complete: `Goal cannot complete: ${activeGoalObjective}.`,
+            cancelled: `Goal cancelled: ${activeGoalObjective}.`,
           }[actionableGoalPresentation.status]
     : null
   const ariaStatus = goalWaitState.ownerActionRequired && goalAriaStatus
@@ -5824,7 +5842,7 @@ export default function ChatView({
   const progressRail = progressRailViewModel(
     actionableGoalPresentation,
     buildPhaseRail,
-    activeGoalPlan,
+    planForGoal(activeGoalPlan, actionableGoalPresentation),
     goalWaitState,
   ).map(item => {
     if (item.key !== 'goal') return item
@@ -5841,17 +5859,35 @@ export default function ChatView({
         ? `Confirm clear goal: ${visibleGoalObjective}`
         : 'Confirm clear goal',
       ...(goalClearError ? { clearError: goalClearError } : {}),
-      ...(hasPendingQuestion
+      ...(hasPendingQuestion && goalHandoff === 'owner_input' && ['active', 'paused'].includes(actionableGoalPresentation?.status)
         ? {
             actionKind: 'owner-question',
             actionLabel: 'View question',
             actionAriaLabel: `Answer question for goal: ${visibleGoalObjective}`,
             actionIcon: <Chat width={13} height={13} aria-hidden="true" />,
           }
+        : actionableGoalPresentation?.status === 'paused'
+            && !turnActive
+            && (hasPendingResume || actionableGoalPresentation.pause_reason === 'owner')
+            && !goalWaitState.monitoring
+            && !goalWaitState.ownerActionRequired
+            && !hasPendingQuestion
+            && chatHandoff !== 'automatic'
+        ? {
+            actionKind: 'resume',
+            actionLabel: resumeState.pending ? 'Resuming…' : resumeState.unavailable ? 'Reconnecting…' : 'Resume',
+            actionDisabled: resumeState.pending || resumeState.unavailable || providerSwitching,
+            actionError: resumeState.error,
+            actionAriaLabel: `${resumeState.pending ? 'Resuming' : resumeState.unavailable ? 'Reconnecting' : 'Resume'} goal: ${visibleGoalObjective}`,
+            actionIcon: <Play width={13} height={13} aria-hidden="true" />,
+          }
         : {}),
       icon: <Flag width={14} height={14} aria-hidden="true" />,
-      ...(activeGoalPlan
-        ? { details: <GoalPlanDetails plan={activeGoalPlan} /> }
+      ...(planForGoal(activeGoalPlan, actionableGoalPresentation) || actionableGoalPresentation?.result
+        ? { details: <GoalPlanDetails
+            plan={planForGoal(activeGoalPlan, actionableGoalPresentation)}
+            result={actionableGoalPresentation?.result}
+          /> }
         : {}),
     }
   })
@@ -6160,6 +6196,13 @@ export default function ChatView({
                 msg={renderedMsg}
                 chatId={chatId}
                 messageKey={dataKey}
+                onQuestionAnswer={doSendSilent}
+                onQuestionSubmitIntent={prepareQuestionSubmission}
+                onQuestionSubmitCancel={cancelQuestionSubmission}
+                onResume={handleResume}
+                resumeState={resumeState}
+                continuationWait={isLastMsg ? continuationWait : null}
+                handoff={isLastMsg ? serverHandoff : null}
                 onInternalNav={internalNav}
               />
               <MessageMetaRow
@@ -6315,17 +6358,19 @@ export default function ChatView({
         </div>
         <ProgressRail
           items={progressRail}
-          resetKey={activeGoalPlan?.root_run_id || goalPresentation?.id || visibleGoalObjective || 'build-progress'}
+          resetKey={goalPresentation?.id || visibleGoalObjective || 'build-progress'}
           ariaLabel={visibleGoalObjective ? 'Goal progress' : 'Build progress'}
           onClearItem={handleClearGoal}
           onActionItem={handleGoalRailAction}
         />
         {draftGoal !== null && <GoalDraftChip objective={draftGoal} />}
-        {showWaitingHandoff && (
+        {!turnActive && (armedWaits.length > 0 || backgroundHelpers.count > 0 || resourcePause || modelCapacityPause || pendingLimitPark) && (
           <WaitingChip
             waits={armedWaits}
             backgroundHelpers={backgroundHelpers}
-            resourcePause={resourcePause}
+            resourcePause={resourcePause || (modelCapacityPause || pendingLimitPark ? pendingResumeBlock : null)}
+            autoResumeEnabled={autoResumeEnabled}
+            handoff={serverHandoff}
             onCancel={handleCancelWait}
           />
         )}

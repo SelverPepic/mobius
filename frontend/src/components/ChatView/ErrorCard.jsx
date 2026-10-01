@@ -58,6 +58,7 @@ export default function ErrorCard({
   block,
   autoResume = false,
   continuationWait = null,
+  automaticHandoff = true,
   resetElapsed = false,
   recoveryCredit = null,
   cardRef,
@@ -72,7 +73,9 @@ export default function ErrorCard({
   const recoveryTitle = busyModelHold
     ? (continuationWait === 'restart_required' ? 'Waiting for a server restart' : 'Waiting for the platform update')
     : vm.modelCapacity
-    ? (vm.checkLabel ? `Trying again ${vm.checkLabel}` : 'Trying again shortly')
+    ? automaticHandoff
+      ? (vm.checkLabel ? `Trying again ${vm.checkLabel}` : 'Trying again shortly')
+      : 'Model recovery needs attention'
     : vm.parked
     ? autoResume
       ? (vm.checkLabel ? `Queued to retry ${vm.checkLabel}` : 'Queued to retry')
@@ -85,7 +88,9 @@ export default function ErrorCard({
       ? 'Your work is saved. Automatic retries are paused until a server restart loads the restored work. Möbius will retry after those changes are loaded.'
       : 'Your work is saved. Automatic retries are paused while the update restores unfinished work. Möbius will retry once that work is restored and loaded.')
     : vm.modelCapacity
-    ? 'Your work is safe. Möbius will retry with increasing pauses, up to five times. If the model stays busy, you can choose another model and Resume.'
+    ? automaticHandoff
+      ? 'Your work is safe. Möbius will retry with increasing pauses, up to five times. If the model stays busy, you can choose another model and Resume.'
+      : 'Automatic model recovery is unavailable. Choose another model and Resume your saved work.'
     : vm.parked
     ? autoResume
       ? `Your work is safe. ${recoveryCredit?.label ? `${recoveryCredit.label}. ` : ''}Möbius will check again${vm.checkLabel ? ` ${vm.checkLabel}` : ' automatically'}; the provider may still be limited.`
@@ -147,6 +152,8 @@ export default function ErrorCard({
                 ? block.resumable
                   ? block.pause.manual
                     ? 'Your work is saved. Resume to continue.'
+                    : !automaticHandoff
+                      ? 'This restart needs manual recovery. Your work is saved; Resume to continue.'
                     : continuationWait === 'restart_required'
                       ? 'Waiting for a server restart to load the restored work. This chat will continue after those changes are loaded.'
                       : continuationWait === 'restoring_edits'

@@ -156,6 +156,7 @@ function MsgContentInner({
   onResume,
   resumeState,
   continuationWait = null,
+  handoff = null,
   onInternalNav,
   autoResumeEnabled,
   autoResumeAvailable,
@@ -517,7 +518,8 @@ function MsgContentInner({
           questionOwnsTurn,
         })
         const { parked, resourceWait, modelCapacity } = errorCardViewModel(block)
-        const automaticContinuation = recoveryOwner && parked && !!autoResumeEnabled
+        const automaticContinuation = recoveryOwner && parked
+          && handoff?.kind === 'automatic' && !!autoResumeEnabled
         // A resource wait owns its automatic retry. Offering Resume while the
         // same measured pressure remains only launches a turn admission will
         // re-park, so it is a false action rather than useful recovery.
@@ -529,6 +531,7 @@ function MsgContentInner({
             key={assistantBlockKey(block, i)}
             block={block}
             continuationWait={recoveryOwner ? continuationWait : null}
+            automaticHandoff={recoveryOwner && handoff?.kind === 'automatic'}
             autoResume={automaticContinuation}
             resetElapsed={!!limitResetElapsed}
             recoveryCredit={recoveryCredit}
@@ -720,6 +723,7 @@ export default memo(MsgContentInner, (prev, next) => {
     && prev.onResume === next.onResume
     && prev.resumeState === next.resumeState
     && prev.continuationWait === next.continuationWait
+    && prev.handoff === next.handoff
     && prev.onInternalNav === next.onInternalNav
     && prev.autoResumeEnabled === next.autoResumeEnabled
     && prev.autoResumeAvailable === next.autoResumeAvailable

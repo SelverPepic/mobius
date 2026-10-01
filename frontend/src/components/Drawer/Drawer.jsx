@@ -1674,7 +1674,22 @@ const DrawerRow = memo(function DrawerRow({
   const label = kind === 'chat' ? item.title : item.name
   const projectChip = recentsProjectChip(kind, item)
   const pinned = !!item.pinned_at
-  const waiting = kind === 'chat' && !!item.waiting
+  const waiting = kind === 'chat' && item.handoff?.kind === 'automatic'
+  const recovery = kind === 'chat' && item.handoff?.kind === 'recovery'
+  const ownerRequired = needsOwnerInput || (kind === 'chat' && item.handoff?.kind === 'owner_input')
+  const recoveryLabel = item.handoff?.reason === 'restart_required'
+    ? 'Server restart needed to load restored work'
+    : item.handoff?.reason === 'restart_manual'
+    ? 'Restart recovery needs Resume'
+    : item.handoff?.reason === 'model_retry_exhausted'
+      ? 'Model retries exhausted; choose another model and Resume'
+      : item.handoff?.reason === 'resume_failed'
+        ? 'Automatic follow-up failed; Resume to inspect saved work'
+        : item.handoff?.reason === 'app_attributed_work'
+          ? 'App-attributed work blocks automatic continuation'
+          : item.handoff?.reason === 'delegation_barrier'
+            ? 'Delegation no longer owns automatic recovery'
+            : 'Manual recovery needed'
   const slug = item.slug
   const wrapRef = useRef(null)
   const inputRef = useRef(null)
@@ -2270,7 +2285,7 @@ const DrawerRow = memo(function DrawerRow({
         {/* Status dot. Sits before the text so the user's eye
             picks it up alongside the label rather than at the row's
             edge (where the pin lives). aria-label exposes the state. */}
-        {needsOwnerInput ? (
+        {ownerRequired ? (
           <span
             className="drawer__attention-diamond drawer__owner-input-dot"
             role="img"
@@ -2292,6 +2307,13 @@ const DrawerRow = memo(function DrawerRow({
           >
             <Pause width={8} height={8} aria-hidden="true" />
           </span>
+        ) : recovery ? (
+          <span
+            className="drawer__recovery-icon"
+            role="img"
+            aria-label={recoveryLabel}
+            title={recoveryLabel}
+          ><Pause width={8} height={8} aria-hidden="true" /></span>
         ) : failed ? (
           <span
             className="drawer__failure-dot"

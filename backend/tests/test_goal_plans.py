@@ -593,12 +593,8 @@ def test_completed_plan_clear_dismisses_without_interrupting_final_response(
   assert persisted_run.ended_at is None
 
 
-def test_idle_goal_presentation_reports_only_its_own_lifecycle(db, chat):
-  """Who moves next is chat state the client already has, not Goal state.
-
-  An open card, an armed Wait, or a running helper must not change how the
-  Goal itself presents: idle unfinished work is simply paused.
-  """
+def test_idle_goal_lifecycle_is_stable_while_exact_handoffs_are_projected(db, chat):
+  """A handoff describes the next move without rewriting Goal lifecycle."""
   from app.chat_waits import declare_wait
   from app.goal_plans import presented_goal
 
@@ -612,6 +608,7 @@ def test_idle_goal_presentation_reports_only_its_own_lifecycle(db, chat):
   expected = {
     "id": "idle-goal-id", "objective": "Ship it", "status": "paused",
     "resumable": True,
+    "handoff": {"kind": "none", "reason": None},
   }
   assert presented_goal(db, chat.id) == expected
 
@@ -621,7 +618,53 @@ def test_idle_goal_presentation_reports_only_its_own_lifecycle(db, chat):
     delay_secs=60, created_by_run_id=goal_run.id,
   )
   db.commit()
-  assert presented_goal(db, chat.id) == expected
+  assert presented_goal(db, chat.id) == {
+    **expected, "handoff": {"kind": "owner_input", "reason": "saved_card"},
+  }
+
+
+def test_retained_goal_does_not_inherit_unrelated_question_wait_or_park(db, chat):
+  from app.chat_waits import declare_wait
+  from app.goal_plans import presented_goal
+  base = datetime.now(UTC)
+  db.add(make_goal_run(db, id="retained-source", chat_id=chat.id,
+    goal_id="retained", goal_objective="Original outcome", status="completed",
+    provider="codex", started_at=base))
+  db.add(make_goal_run(db, id="unrelated-source", chat_id=chat.id,
+    status="completed", provider="codex", started_at=base + timedelta(seconds=1)))
+  chat.pending_question_id = "unrelated-card"
+  db.commit()
+  declare_wait(db, chat_id=chat.id, created_by_run_id="unrelated-source",
+    description="Unrelated work", kind="timer", delay_secs=60)
+  assert presented_goal(db, chat.id)["handoff"] == {"kind": "none", "reason": None}
+  source = db.get(models.ChatRun, "unrelated-source")
+  source.status, source.park_reason = "parked", "memory"
+  db.commit()
+  assert presented_goal(db, chat.id)["handoff"]["kind"] == "none"
+  goal = db.get(models.ChatGoal, "retained")
+  goal.status = "stopped"
+  db.commit()
+  held = presented_goal(db, chat.id)
+  assert held["pause_reason"] == "owner"
+  assert held["handoff"] == {"kind": "owner_hold", "reason": "owner"}
+
+
+def test_exact_goal_wait_does_not_borrow_an_unrelated_question_action(db, chat):
+  from app.chat_waits import declare_wait
+  from app.goal_plans import presented_goal
+  base = datetime.now(UTC)
+  db.add(make_goal_run(db, id="original-source", chat_id=chat.id, goal_id="original",
+    goal_objective="Original outcome", status="completed", provider="codex", started_at=base))
+  db.add(make_goal_run(db, id="other-source", chat_id=chat.id,
+    status="completed", provider="codex", started_at=base + timedelta(seconds=1)))
+  db.commit()
+  wait = declare_wait(db, chat_id=chat.id, created_by_run_id="original-source",
+    description="Original work", kind="timer", delay_secs=60)
+  assert presented_goal(db, chat.id)["handoff"]["kind"] == "automatic"
+  wait.status = "met"
+  chat.pending_question_id = "other-card"
+  db.commit()
+  assert presented_goal(db, chat.id)["handoff"] == {"kind": "blocked", "reason": "other_work"}
 
 
 def test_legacy_queued_goal_clear_is_retired_without_opening_a_turn(db, chat):

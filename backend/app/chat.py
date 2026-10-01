@@ -22,8 +22,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import Text, cast, literal_column, or_, text
-from sqlalchemy.orm import Session
+from sqlalchemy import Text, cast, func, literal_column, or_, text
+from sqlalchemy.orm import Session, load_only
 from starlette.concurrency import run_in_threadpool
 
 from app import (
@@ -365,61 +365,89 @@ def _future_auto_resuming_limit_park_for_chat(
   return run if run.parked_until > current else None
 
 
-def _latest_run_is_usage_park(db: Session, chat_id: str) -> bool:
-  """Whether the chat's LATEST run is a usage-limit park awaiting resume.
+def continuation_handoff_for_chat(db: Session, chat_id: str) -> dict:
+  """Read the latest park's scheduler eligibility without admitting a turn.
 
-  Latest-run-wins, exactly like `_parked_until_for_chat`: a fresh turn inserts a
-  newer running row, so a superseded park never keeps the mark. Query failures
-  read as not-waiting — this only feeds a passive drawer indicator.
+  This is a presentation projection. The sweep and `_auto_resume_chat` still
+  re-check every condition under their transition locks at claim time.
   """
-  try:
-    run = (
-      db.query(models.ChatRun.status, models.ChatRun.park_reason)
-      .filter(models.ChatRun.chat_id == chat_id)
-      .order_by(
-        models.ChatRun.started_at.desc(),
-        models.ChatRun.id.desc(),
-      )
-      .first()
-    )
-  except Exception:
-    return False
+  run = _latest_continuation_park(db, chat_id)
   if run is None:
-    return False
-  status, park_reason = run
-  return status in ("parked", "resume_pending") and park_reason == "usage_limit"
+    return {"kind": "none", "reason": None}
+  chat = db.query(models.Chat).options(load_only(
+    models.Chat.id, models.Chat.deleted_at, models.Chat.pending_question_id,
+    models.Chat.auto_resume_on_limit, models.Chat.auto_resume_on_restart,
+    models.Chat.pending_messages,
+  )).filter(models.Chat.id == chat_id).first()
+  if chat is None or chat.deleted_at is not None:
+    return {"kind": "none", "reason": None}
+  if _has_unanswered_question(chat):
+    return {"kind": "owner_input", "reason": "question"}
+  if any(
+    isinstance(msg, dict) and msg.get("_initiated_by_app_id") is not None
+    for msg in list(chat.pending_messages or [])
+  ):
+    return {"kind": "recovery", "reason": "app_attributed_work"}
+  from app.delegations import delegation_recovery_allowed, limit_resume_delegation
+  if not delegation_recovery_allowed(
+    db, child_chat_id=chat_id, initiated_by_app_id=run.initiated_by_app_id,
+  ):
+    return {"kind": "recovery", "reason": "delegation_barrier"}
+  reason = run.park_reason
+  restart = reason == "restart"
+  auto_retry = reason in AUTO_RETRY_PARK_REASONS
+  delegated = None
+  if not restart and not auto_retry:
+    delegated = limit_resume_delegation(
+      db, child_chat_id=chat_id, run_token=run.id,
+      initiated_by_app_id=run.initiated_by_app_id,
+    )
+  if reason == "model_capacity" and _model_capacity_retry_exhausted(db, run):
+    return {"kind": "recovery", "reason": "model_retry_exhausted"}
+  if run.initiated_by_app_id is not None and not restart and not auto_retry and delegated is None:
+    return {"kind": "recovery", "reason": "app_attributed_work"}
+  if not (_park_continues_automatically(chat, run) or delegated is not None):
+    return {"kind": "recovery", "reason": "manual_resume"}
+  if restart:
+    from app.restart_ledger import authorized_restart_nonce
+    try:
+      nonce = authorized_restart_nonce()
+    except Exception:
+      nonce = None
+    if not nonce or not run.restart_nonce or nonce != run.restart_nonce:
+      return {"kind": "recovery", "reason": "restart_manual"}
+  from app.platform_update import late_edits_pending, read_prepared_update
+  if late_edits_pending():
+    update = read_prepared_update()
+    if update and update["replayed"]:
+      return {"kind": "recovery", "reason": "restart_required"}
+    return {"kind": "automatic", "reason": "restoring_edits"}
+  return {"kind": "automatic", "reason": reason}
+
+
+def _latest_run_is_waiting_park(db: Session, chat_id: str) -> bool:
+  return continuation_handoff_for_chat(db, chat_id)["kind"] == "automatic"
 
 
 def usage_limit_waiting_chat_ids(
   db: Session,
   chat_ids: Iterable[str],
 ) -> set[str]:
-  """Chat ids parked on a provider usage limit, awaiting resume.
-
-  A usage-limit park can sit for hours until the provider reset (or a manual /
-  credit-driven Resume) with no other running signal, so the drawer marks it as
-  "waiting" — the same passive indicator armed Waits and background helpers use.
-  Bounded to the caller's chat set and confirmed latest-run-wins so a formerly
-  parked chat that has since moved on clears the mark.
-  """
+  """Chats whose latest resource/provider/restart park owns an eligible wake."""
   bounded = tuple(dict.fromkeys(chat_ids))
   if not bounded:
     return set()
   try:
-    rows = (
-      db.query(models.ChatRun.chat_id)
-      .filter(
-        models.ChatRun.chat_id.in_(bounded),
-        models.ChatRun.status.in_(("parked", "resume_pending")),
-        models.ChatRun.park_reason == "usage_limit",
-      )
-      .distinct()
-      .all()
-    )
+    rows = db.query(models.ChatRun.chat_id).filter(
+      models.ChatRun.chat_id.in_(bounded),
+      models.ChatRun.status.in_(("parked", "resume_pending")),
+    ).distinct().all()
   except Exception:
     return set()
-  candidates = {str(row[0]) for row in rows}
-  return {cid for cid in candidates if _latest_run_is_usage_park(db, cid)}
+  return {
+    str(row[0]) for row in rows
+    if _latest_run_is_waiting_park(db, str(row[0]))
+  }
 
 
 def continuation_wait_for_chat(db: Session, chat_id: str) -> str | None:
@@ -3052,7 +3080,8 @@ async def clear_goal_for(chat_id: str, expected_goal_id: str) -> dict:
       return {"status": "conflict", "goal_id": current_goal["id"]}
 
     plan_complete = bool(
-      current_plan is not None and current_plan["summary"]["can_complete"]
+      current_goal["status"] in {"completed", "cannot_complete", "cancelled"}
+      or (current_plan is not None and current_plan["summary"]["can_complete"])
     )
     if not plan_complete:
       handles = registry.get_handles(chat_id)
@@ -4254,8 +4283,10 @@ async def _complete_turn(
        silent loss is worse than a visible "couldn't save" error.
     2. On success: allocate the CONTINUATION's run_token, drain the queue
        under ONE bounded lock (`drain_and_release`). The drain returns the
-       exact unfinished Goal to execution first when no durable handoff owns
-       it; this decision is made after Finalize has saved any question card.
+       exact unfinished Goal to one targeted settlement pass when the queue
+       is empty and no durable handoff owns it; this decision is made after
+       Finalize has saved any question card. A second unhanded ending is a
+       visible technical recovery failure, not an endless loop or capitulation.
        Otherwise the drain returns the ordinary
        disposition: `CONTINUATION_PROMOTED` (a head was promoted — marker
        stays set, schedule the continuation), `EMPTY_TERMINAL_CLEARED` (the
@@ -4592,6 +4623,14 @@ async def _complete_turn(
     db.close()
     return chat_queue.TerminalDisposition.FAILED_LEAVE_MARKER
 
+  if disposition is chat_queue.TerminalDisposition.GOAL_SETTLEMENT_FAILED:
+    # The writer saved this note before the exact failed terminal closed.
+    # Publish only: another sink write could overwrite its committed block.
+    from app.continuations import GOAL_SETTLEMENT_UNFINISHED_MESSAGE
+    bc.publish({
+      "type": "error", "code": "goal_settlement_unfinished", "resumable": True,
+      "message": GOAL_SETTLEMENT_UNFINISHED_MESSAGE,
+    })
   if next_user:
     get_system_broadcast().publish({
       "type": "chat_run_started",
@@ -4972,6 +5011,7 @@ _MEMORY_RECLAIM_DISPOSITIONS = frozenset({
   chat_queue.TerminalDisposition.LIMIT_PARKED,
   chat_queue.TerminalDisposition.QUESTION_PARKED,
   chat_queue.TerminalDisposition.ACTIVATION_PARKED,
+  chat_queue.TerminalDisposition.GOAL_SETTLEMENT_FAILED,
 })
 
 

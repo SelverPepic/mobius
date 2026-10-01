@@ -1,8 +1,7 @@
-"""An ended Goal turn needs no handoff: nothing checks it, nothing continues it.
+"""A Goal keeps responsibility until an explicit outcome or durable handoff.
 
-Replaces the retired owner-handoff settlement (``goal_terminal_handoff`` and
-the "Goal needs reconciliation" card). A Goal moves only through what already
-wakes a chat; an idle unfinished Goal is simply the owner's turn.
+One targeted clean-ending settlement pass replaces unattended normal idleness.
+It never fabricates owner questions, shrinks scope or recovers physical failure.
 """
 
 from tests.goal_fixtures import goal_run as make_goal_run
@@ -39,6 +38,7 @@ def _add_goal_run(db, chat, run_id="goal-run", *, goal_id="goal-run", plan=UNFIN
     goal_id=goal_id,
     goal_plan_json=plan,
     goal_plan_revision=1,
+    provider_execution_admitted=True,
   ))
   db.commit()
 
@@ -58,10 +58,10 @@ def _question_blocks(chat):
   "I'll wait for you to say how you want to split the work.",
   "The reviewed change is ready; Send PR in Contribute is the next step.",
 ])
-async def test_a_goal_turn_ending_in_plain_text_posts_no_card_and_starts_nothing(
+async def test_clean_goal_ending_keeps_exact_responsibility_in_one_settlement_pass(
   db, chat, monkeypatch, closing_text,
 ):
-  """The real endings that used to raise "Goal needs reconciliation"."""
+  """Prose claims of completion or owner dependence are not saved outcomes."""
   from app import chat as chat_mod, chat_queue
   from app.broadcast import create_broadcast, remove_broadcast
   from app.chat_event_sink import ChatEventSink
@@ -83,17 +83,23 @@ async def test_a_goal_turn_ending_in_plain_text_posts_no_card_and_starts_nothing
   finally:
     remove_broadcast(chat.id)
 
-  assert disposition is chat_queue.TerminalDisposition.EMPTY_TERMINAL_CLEARED
-  assert scheduled == []
+  assert disposition is chat_queue.TerminalDisposition.CONTINUATION_PROMOTED
+  assert len(scheduled) == 1
   db.expire_all()
   saved = db.get(models.Chat, chat.id)
   assert saved.pending_question_id is None
   assert saved.pending_messages in (None, [])
   assert _question_blocks(saved) == []
   assert db.get(models.ChatGoal, "goal-run").status == "open"
+  runs = db.query(models.ChatRun).filter_by(chat_id=chat.id).all()
+  recovery = next(run for run in runs if run.id != "goal-run")
+  assert recovery.goal_id == "goal-run"
+  assert recovery.continuation_json["reason"] == "goal_settlement"
+  assert recovery.status == "running"
+  assert not any(message.get("kind") == "continuation" for message in saved.messages)
 
 
-def test_terminal_promotion_never_manufactures_a_goal_successor(db, chat):
+def test_queue_promotion_without_exact_ending_authority_never_starts_a_goal(db, chat):
   _add_goal_run(db, chat)
 
   result = get_writer().submit(PromotePending(
@@ -104,6 +110,176 @@ def test_terminal_promotion_never_manufactures_a_goal_successor(db, chat):
   db.expire_all()
   assert db.get(models.Chat, chat.id).pending_messages in (None, [])
   assert db.get(models.ChatRun, "successor") is None
+
+
+@pytest.mark.parametrize("terminal", ["failed", "stopped", "interrupted"])
+def test_physical_failure_or_owner_stop_never_authorizes_goal_settlement(db, chat, terminal):
+  _add_goal_run(db, chat)
+  response = get_writer().submit(PromotePending(
+    chat_id=chat.id, run_token="not-authorized", ending_run_token="goal-run",
+    ending_status=terminal,
+  )).result(timeout=5)
+  assert response["promoted"] is None
+  assert db.get(models.ChatRun, "not-authorized") is None
+
+
+def test_provider_free_ending_never_reenters_unavailable_provider(db, chat):
+  _add_goal_run(db, chat)
+  db.get(models.ChatRun, "goal-run").provider_execution_admitted = False
+  db.commit()
+  response = get_writer().submit(PromotePending(
+    chat_id=chat.id, run_token="not-authorized", ending_run_token="goal-run",
+  )).result(timeout=5)
+  assert response["promoted"] is None
+
+
+def test_real_owner_queue_wins_over_automatic_goal_settlement(db, chat):
+  _add_goal_run(db, chat)
+  chat.pending_messages = [{"role": "user", "cid": "new-owner-input",
+                            "content": "A separate question", "ts": 3}]
+  db.commit()
+  response = get_writer().submit(PromotePending(
+    chat_id=chat.id, run_token="ordinary-reply", ending_run_token="goal-run",
+  )).result(timeout=5)
+  assert response["promoted"]["content"] == "A separate question"
+  db.expire_all()
+  assert db.get(models.ChatRun, "ordinary-reply").goal_id is None
+  assert db.get(models.ChatGoal, "goal-run").status == "open"
+
+
+def test_armed_exact_goal_wait_owns_handoff_without_another_executor(db, chat):
+  from app import chat_waits
+  _add_goal_run(db, chat)
+  chat_waits.declare_wait(db, chat_id=chat.id, created_by_run_id="goal-run",
+                          description="Accepted external work", kind="timer", delay_secs=60)
+  response = get_writer().submit(PromotePending(
+    chat_id=chat.id, run_token="not-needed", ending_run_token="goal-run",
+  )).result(timeout=5)
+  assert response["promoted"] is None
+
+
+def test_an_unrelated_wait_is_not_a_handoff_for_this_goal(db, chat):
+  from datetime import datetime
+  from app import chat_waits
+  _add_goal_run(db, chat)
+  db.add(models.ChatRun(id="separate-work", chat_id=chat.id, status="completed",
+                        started_at=datetime(2000, 1, 1)))
+  db.commit()
+  chat_waits.declare_wait(db, chat_id=chat.id, created_by_run_id="separate-work",
+                          description="Independent monitor", kind="timer", delay_secs=60)
+  response = get_writer().submit(PromotePending(
+    chat_id=chat.id, run_token="provisional", ending_run_token="goal-run",
+  )).result(timeout=5)
+  assert response["promoted"]["continuation_reason"] == "goal_settlement"
+
+
+def test_wake_enabled_exact_goal_helper_owns_handoff(db, chat, monkeypatch):
+  from types import SimpleNamespace
+  from app import delegations
+  _add_goal_run(db, chat)
+  monkeypatch.setattr(delegations, "_self_resuming_helper_rows", lambda *_: [
+    (SimpleNamespace(parent_root_run_id="goal-run"), "running"),
+  ])
+  response = get_writer().submit(PromotePending(
+    chat_id=chat.id, run_token="not-needed", ending_run_token="goal-run",
+  )).result(timeout=5)
+  assert response["promoted"] is None
+
+
+def test_helper_from_an_earlier_attempt_of_this_goal_keeps_its_handoff(db, chat, monkeypatch):
+  from datetime import datetime
+  from types import SimpleNamespace
+  from app import delegations
+  _add_goal_run(db, chat)
+  db.add(models.ChatRun(id="middle-attempt", root_run_id="middle-root",
+                        chat_id=chat.id, goal_id="goal-run", status="completed",
+                        started_at=datetime(2000, 1, 1)))
+  db.commit()
+  monkeypatch.setattr(delegations, "_self_resuming_helper_rows", lambda *_: [
+    (SimpleNamespace(parent_root_run_id="middle-root"), "running"),
+  ])
+  response = get_writer().submit(PromotePending(
+    chat_id=chat.id, run_token="not-needed", ending_run_token="goal-run",
+  )).result(timeout=5)
+  assert response["promoted"] is None
+
+
+def test_unrelated_live_reply_cannot_reactivate_retained_goal(db, chat):
+  _add_goal_run(db, chat)
+  db.get(models.ChatRun, "goal-run").status = "completed"
+  db.add(models.ChatRun(id="ordinary-reply", chat_id=chat.id, status="running",
+                        provider_execution_admitted=True))
+  db.commit()
+  response = get_writer().submit(PromotePending(
+    chat_id=chat.id, run_token="not-authorized", ending_run_token="ordinary-reply",
+  )).result(timeout=5)
+  assert response["promoted"] is None
+
+
+def test_stale_ending_identity_does_not_take_newer_goal_execution(db, chat):
+  _add_goal_run(db, chat)
+  db.add(make_goal_run(db, id="newer-goal", chat_id=chat.id, status="running",
+                        goal_objective="Different work", provider_execution_admitted=True))
+  db.commit()
+  response = get_writer().submit(PromotePending(
+    chat_id=chat.id, run_token="not-authorized", ending_run_token="goal-run",
+  )).result(timeout=5)
+  assert response["promoted"] is None
+
+
+@pytest.mark.asyncio
+async def test_second_unhanded_ending_preserves_goal_and_records_durable_recovery(db, chat, monkeypatch):
+  from app import chat as chat_mod, chat_queue
+  from app.broadcast import create_broadcast, remove_broadcast
+  from app.chat_event_sink import ChatEventSink
+  _add_goal_run(db, chat)
+  first = get_writer().submit(PromotePending(
+    chat_id=chat.id, run_token="provisional", ending_run_token="goal-run",
+  )).result(timeout=5)
+  token = first["promoted"]["_run_token"]
+  db.expire_all()
+  db.get(models.ChatRun, token).provider_execution_admitted = True
+  db.commit()
+  scheduled = []
+  monkeypatch.setattr(chat_mod, "_schedule_continuation", lambda **kw: scheduled.append(kw))
+  monkeypatch.setattr(chat_mod, "_publish_chat_run_finished", lambda *_: None)
+  bc = create_broadcast(chat.id)
+  sink = ChatEventSink(bc, chat.id, run_token=token)
+  sink.publish({"type": "text", "content": "Still not settled."})
+  try:
+    disposition = await chat_mod._complete_turn(
+      bc=bc, sink=sink, db=db, chat_id=chat.id, run_gen=None,
+      provider_id="codex", cost_usd=0, close_browser=False,
+    )
+  finally:
+    remove_broadcast(chat.id)
+  assert disposition is chat_queue.TerminalDisposition.GOAL_SETTLEMENT_FAILED
+  assert scheduled == []
+  db.expire_all()
+  assert db.get(models.ChatGoal, "goal-run").status == "open"
+  assert db.get(models.ChatRun, token).status == "failed"
+  assert any(block.get("code") == "goal_settlement_unfinished"
+             for message in db.get(models.Chat, chat.id).messages
+             for block in message.get("blocks") or [])
+
+
+def test_resource_and_restart_recovery_cannot_reset_the_settlement_budget(db, chat):
+  from app.continuations import goal_settlement_attempted
+  _add_goal_run(db, chat)
+  first = get_writer().submit(PromotePending(
+    chat_id=chat.id, run_token="provisional", ending_run_token="goal-run",
+  )).result(timeout=5)
+  token = first["promoted"]["_run_token"]
+  db.expire_all()
+  db.get(models.ChatRun, token).status = "completed"
+  recovered = models.ChatRun(id="resource-recovery", chat_id=chat.id, goal_id="goal-run",
+    status="running", continuation_json={"reason": "restart", "supersedes_run_token": token})
+  db.add(recovered)
+  db.commit()
+  assert goal_settlement_attempted(db, recovered) is True
+  recovered.continuation_json = {"reason": "manual", "supersedes_run_token": token}
+  db.commit()
+  assert goal_settlement_attempted(db, recovered) is False
 
 
 @pytest.mark.asyncio

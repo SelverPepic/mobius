@@ -119,9 +119,14 @@ UPDATE_GOAL_DESCRIPTION = (
   "Advance this chat's Goal in one call. tasks edits the plan as one "
   "revision: a known id changes only the fields given (for example status "
   "completed with a result, and the next task running), a new id adds a task. "
-  "next_action records the exact next step. complete "
-  "records the verified outcome and closes the Goal; it is refused while "
-  "tasks or helpers are unfinished. With no arguments it returns the current "
+  "next_action records the exact next step. complete records only the verified "
+  "original outcome. If unreachable, first ask the owner an actionable question; "
+  "a temporary owner action or approval keeps the Goal open with its saved card. "
+  "Only a genuinely unreachable outcome uses cannot_complete with reason, "
+  "efforts/partial results, and unmet_outcome; cancel means the owner called it "
+  "off. Settle every task honestly and wait for helpers before any outcome. "
+  "Tasks and outcome commit atomically; refusal saves neither. No proof-of-prose "
+  "approval validator substitutes for the agent's judgment. With no arguments it returns the current "
   "plan. goal_id attaches to a named retained Goal instead of the presented one."
 )
 DECLARE_WAIT_DESCRIPTION = (
@@ -528,6 +533,8 @@ def _goal_report(payload: dict[str, Any], *, full: bool) -> str:
         "Held work_keys (finished_claims accepts only these; name only work performed): "
         + ", ".join(goal["held_work_keys"]) + "."
       )
+  elif goal.get("result"):
+    lines.append("Outcome: " + goal["result"] + ".")
   if full:
     lines.insert(0, f"Objective: {goal.get('objective')}")
     for task in (plan or {}).get("tasks") or []:
@@ -545,7 +552,7 @@ def _goal_report(payload: dict[str, Any], *, full: bool) -> str:
 
 
 def _call_update_goal(arguments: dict[str, Any]) -> str:
-  allowed = {"tasks", "next_action", "complete", "finished_claims", "goal_id"}
+  allowed = {"tasks", "next_action", "complete", "cannot_complete", "cancel", "finished_claims", "goal_id"}
   unknown = set(arguments) - allowed
   if unknown:
     raise ValueError(f"update_goal does not take: {', '.join(sorted(unknown))}")
@@ -1546,6 +1553,17 @@ _TOOL_DEFINITIONS = {
           "type": "string", "maxLength": 4000,
           "description": "Verified evidence that the whole outcome holds. Do not combine with next_action; final task edits may share this call.",
         },
+        "cannot_complete": {
+          "type": "object", "additionalProperties": False,
+          "required": ["reason", "efforts", "unmet_outcome"],
+          "properties": {
+            "reason": {"type": "string", "minLength": 1, "maxLength": 1500},
+            "efforts": {"type": "string", "minLength": 1, "maxLength": 2000},
+            "unmet_outcome": {"type": "string", "minLength": 1, "maxLength": 1000},
+          },
+        },
+        "cancel": {"type": "string", "minLength": 1, "maxLength": 4000,
+                   "description": "Owner-called-off reason, not an unreachable-work shortcut."},
         "finished_claims": {
           "type": "array", "items": {"type": "string"}, "maxItems": 50,
           "description": "With complete only: exact held work_keys this Goal performed, not claim ids or invented names. Other held claims are released.",

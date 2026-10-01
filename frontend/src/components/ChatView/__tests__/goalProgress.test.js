@@ -14,6 +14,7 @@ import {
   latestGoalObjective,
   newestGoalPlan,
   normalizeGoalPresentation,
+  planForGoal,
   progressRailViewModel,
   visibleGoalTasks,
 } from '../goalProgress.js'
@@ -188,7 +189,7 @@ test('who moves next comes from chat state, not a per-Goal owner field', () => {
     id: 'goal-1', objective: 'Finish the review', status: 'paused',
     resumable: true,
   })
-  assert.match(chatView, /ownerActionRequired: hasPendingQuestion,/)
+  assert.match(chatView, /ownerActionRequired: goalHandoff === 'owner_input',/)
   assert.match(chatView, /monitoring: showWaitingHandoff,/)
   assert.doesNotMatch(chatView, /wait_kind/)
 })
@@ -246,53 +247,41 @@ test('the goal reuses the progress rail and stays as context for build phases', 
   )
 })
 
-test('only actionable Goals remain in the composer progress rail', () => {
-  const plan = {
-    summary: { completed: 2, total: 3 },
-    tasks: [{ id: 'verify', title: 'Verify', status: 'running' }],
+test('terminal Goals remain visible and paused Goals do not invent an owner turn', () => {
+  const plan = { summary: { completed: 2, total: 3 }, tasks: [] }
+  assert.match(progressRailViewModel({ objective: 'Ship it', status: 'paused' }, [], plan)[0].label,
+    /Goal · Paused/)
+  for (const [status, label] of [
+    ['completed', 'Completed'], ['cannot_complete', 'Cannot complete'], ['cancelled', 'Cancelled'],
+  ]) {
+    assert.match(progressRailViewModel({ objective: 'Ship it', status }, [], plan)[0].label,
+      new RegExp(`Goal · ${label}`))
   }
-  assert.equal(progressRailViewModel({
-    objective: 'Ship it', status: 'paused',
-  }, [], plan)[0].label, 'Goal · Your turn · 2/3 · Verify')
-  assert.deepEqual(progressRailViewModel({
-    objective: 'Ship it', status: 'completed',
-  }, [], {
-    ...plan,
-    summary: { completed: 3, total: 3 },
-  }), [])
-  assert.deepEqual(progressRailViewModel({
-    objective: 'Ship it', status: 'failed',
-  }, [], plan), [])
 })
 
-test('an idle Goal is your turn unless a card or a Wait owns the next move', () => {
+test('Goal handoff labels distinguish saved input, automatic wake, and recovery', () => {
   const goal = { objective: 'Ship it', status: 'paused' }
-  const plan = {
-    summary: { completed: 2, total: 3 },
-    tasks: [{ id: 'verify', title: 'Verify', status: 'running' }],
-  }
-  const ownerWait = progressRailViewModel(goal, [], plan, {
-    ownerActionRequired: true,
-    monitoring: true,
-  })[0]
-  assert.equal(ownerWait.label, 'Goal · Needs your answer · 2/3 · Verify')
-  assert.equal(
-    ownerWait.ariaLabel,
-    'Goal: Ship it. Needs your answer; 2 of 3 complete',
-  )
+  const owner = progressRailViewModel(goal, [], { summary: { completed: 0, total: 1 } }, { ownerActionRequired: true, monitoring: true })[0]
+  assert.match(owner.label, /Waiting for you/)
+  assert.match(owner.ariaLabel, /Waiting for you/)
+  assert.match(progressRailViewModel(goal, [], null, { monitoring: true })[0].label, /Waiting/)
+  assert.match(progressRailViewModel(goal, [], null, { manualRecovery: true })[0].label, /Recovery needed/)
+  assert.match(progressRailViewModel(goal, [], null, {})[0].label, /Paused/)
+  const held = normalizeGoalPresentation({ ...goal, pause_reason: 'owner' })
+  assert.equal(held.pause_reason, 'owner')
+  assert.match(progressRailViewModel(held, [], null, {})[0].label, /Paused by you/)
+  assert.match(progressRailViewModel(held, [], null, { ownerActionRequired: true, monitoring: true })[0].label, /Paused by you/)
+  assert.match(chatView, /const goalHandoff = actionableGoalPresentation\?\.handoff\?\.kind \|\| 'none'/)
+  assert.match(chatView, /hasPendingQuestion && goalHandoff === 'owner_input'/)
+  assert.match(chatView, /hasPendingResume \|\| actionableGoalPresentation.pause_reason === 'owner'/)
+})
 
-  const monitoredWait = progressRailViewModel(goal, [], plan, {
-    monitoring: true,
-  })[0]
-  assert.equal(monitoredWait.label, 'Goal · Waiting · 2/3 · Verify')
-  assert.equal(
-    monitoredWait.ariaLabel,
-    'Goal: Ship it. Waiting; 2 of 3 complete',
-  )
-
-  const yourTurn = progressRailViewModel(goal, [], plan, {})[0]
-  assert.equal(yourTurn.label, 'Goal · Your turn · 2/3 · Verify')
-  assert.equal(yourTurn.ariaLabel, 'Goal: Ship it. Your turn; 2 of 3 complete')
+test('a fetched plan never crosses Goal identity even when its revision is newer', () => {
+  const goal = { id: 'b', objective: 'New goal', status: 'active' }
+  const old = { goal_id: 'a', root_run_id: 'root-a', revision: 99, tasks: [{ id: 'stale' }] }
+  assert.equal(planForGoal(old, goal), null)
+  assert.equal(planForGoal({ ...old, goal_id: 'b' }, goal)?.goal_id, 'b')
+  assert.match(chatView, /planForGoal\(activeGoalPlan, actionableGoalPresentation\)/)
 })
 
 test('stale plan data cannot show tasks after the active goal has ended', () => {
@@ -582,8 +571,22 @@ test('the goal rail confirms and clears directly, sourced domain-neutrally', () 
     'the armed clear control must turn into a confirm check')
   assert.match(progressRail, /item\.clearConfirmLabel \|\| 'Confirm clear'/,
     'the confirmation label must be item-supplied with a neutral fallback')
-  assert.doesNotMatch(chatView, /actionKind: 'resume'/,
-    'an idle Goal is your turn: you reply instead of pressing a Goal Resume')
+  assert.match(
+    chatView,
+    /actionLabel: resumeState\.pending \? 'Resuming…' : resumeState\.unavailable \? 'Reconnecting…' : 'Resume'/,
+    'execution recovery and explicit owner pauses share the acknowledged Resume action',
+  )
+  assert.match(chatView, /actionIcon: <Play width=\{13\} height=\{13\}/,
+    'the Goal Resume action should spend only icon-sized visual space')
+  assert.match(chatView, /actionableGoalPresentation\?\.status === 'paused'\s*&& !turnActive\s*&& \(hasPendingResume \|\| actionableGoalPresentation\.pause_reason === 'owner'\)\s*&& !goalWaitState\.monitoring\s*&& !goalWaitState\.ownerActionRequired/,
+    'only idle recovery or an explicit owner hold may Resume; never compete with a wake or saved question')
+  assert.match(
+    chatView,
+    /handleResumeGoal[\s\S]{0,180}handleResume\(\)/,
+    'Goal and recovery-card Resume share the acknowledged lifecycle action, not a composer send',
+  )
+  assert.match(chatView, /if \(item\?\.actionKind === 'resume'\) handleResumeGoal\(\)/,
+    'the rail routes the Goal Resume action to its owner')
   assert.match(chatView, /actionKind: 'owner-question'[\s\S]*?actionLabel: 'View question'/,
     'an owner-required Goal should expose the existing question surface')
   assert.match(chatView, /revealPendingQuestion\(pendingQuestionEl\)/,

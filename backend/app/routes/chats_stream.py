@@ -1044,6 +1044,10 @@ async def _send_message_impl(
         log.warning("Quiet answer did not persist chat_id=%s: %s", chat_id, exc)
         raise HTTPException(503, detail="Could not save your answer; please try again.") from exc
       if quiet_answer:
+        # The exact Goal's deliberate owner hold can release its work claims;
+        # notify followers off the lifecycle locks after the answer committed.
+        from app.agent_coordination import schedule_claim_settlement
+        schedule_claim_settlement(chat_id)
         from app.chat_event_sink import get_active_sink
         event = {"type": "answers_applied", "question_id": body.question_id,
                  "answers": body.answers, "answer_turn": "none"}

@@ -24,6 +24,7 @@ test('Goal history summarizes a terminal outcome and its plan', () => {
     ariaLabel: 'Completed goal: Ship the Goal experience',
     metadata: '3 of 3 steps complete · 2m 5s',
     hasPlan: true,
+    reason: '',
   })
 })
 
@@ -34,9 +35,19 @@ test('Goal history rejects active snapshots and labels failed outcomes', () => {
   }), {
     objective: 'Needs repair',
     completed: false,
-    kicker: 'Goal needs attention',
-    ariaLabel: 'Goal needing attention: Needs repair',
+    kicker: 'Goal cannot complete',
+    ariaLabel: 'Goal cannot complete: Needs repair',
+    reason: '',
     metadata: '',
     hasPlan: false,
   })
+})
+
+test('terminal Goal outcomes retain their honest result in history', () => {
+  const cancelled = goalHistoryViewModel({ objective: 'Ship', status: 'cancelled', result: { reason: 'Owner stopped it' } })
+  assert.equal(cancelled.kicker, 'Goal cancelled')
+  assert.equal(cancelled.reason, 'Owner stopped it')
+  const impossible = goalHistoryViewModel({ objective: 'Ship', status: 'cannot_complete', result: 'Dependency unavailable' })
+  assert.equal(impossible.kicker, 'Goal cannot complete')
+  assert.equal(impossible.reason, 'Dependency unavailable')
 })

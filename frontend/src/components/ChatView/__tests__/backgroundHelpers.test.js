@@ -83,3 +83,47 @@ test('a platform resource park uses the same visible Waiting handoff', () => {
     'This chat resumes automatically when pressure clears',
   )
 })
+
+test('only eligible handoffs claim an automatic Goal wake', async () => {
+  const { classifyChatHandoff } = await import('../chatRuntimeCache.js')
+  for (const blocker of ['manual_resume', 'resume_failed', 'restart']) {
+    assert.equal(classifyChatHandoff({ waits: [{ delivery_pending: true, resume_blocker: blocker }] }), 'recovery')
+  }
+  assert.equal(classifyChatHandoff({ waits: [{ delivery_pending: true, resume_blocker: 'owner_input' }] }), 'owner_input')
+  assert.equal(classifyChatHandoff({ waits: [{ kind: 'timer', delivery_pending: false }] }), 'automatic')
+  assert.equal(classifyChatHandoff({ resourcePause: { pause: { kind: 'model_capacity' } } }), 'none')
+  assert.equal(classifyChatHandoff({ resourcePause: { pause: { kind: 'rate_limit' } } }), 'none')
+  assert.equal(classifyChatHandoff({ resourcePause: { pause: { kind: 'rate_limit' } }, autoResumeEnabled: true }), 'automatic')
+  assert.equal(classifyChatHandoff({ backgroundHelpers: { count: 1 }, turnActive: true }), 'working')
+})
+
+test('a delivered wait with no blocker is eligible, but server eligibility wins', async () => {
+  const { classifyChatHandoff } = await import('../chatRuntimeCache.js')
+  const fired = { delivery_pending: true, resume_blocker: null }
+  assert.equal(classifyChatHandoff({ waits: [fired] }), 'automatic')
+  assert.equal(classifyChatHandoff({
+    waits: [fired], authoritativeHandoff: { kind: 'recovery', reason: 'manual_resume' },
+  }), 'recovery')
+  assert.equal(classifyChatHandoff({
+    waits: [fired], authoritativeHandoff: { kind: 'automatic', reason: null },
+  }), 'automatic')
+  assert.equal(classifyChatHandoff({
+    waits: [fired], ownerInput: true,
+    authoritativeHandoff: { kind: 'automatic', reason: null },
+  }), 'owner_input')
+})
+
+test('resource card promises only the backend-confirmed park recovery', () => {
+  const model = { pause: { kind: 'model_capacity' } }
+  assert.match(resourcePausePresentation(model).wakeUp, /choose another model and Resume/)
+  assert.match(resourcePausePresentation(model, false, {
+    kind: 'automatic', reason: 'model_capacity',
+  }).wakeUp, /retries this model automatically/)
+  assert.match(resourcePausePresentation({ pause: { kind: 'memory' } }, false, {
+    kind: 'owner_input', reason: 'saved_card',
+  }).wakeUp, /Answer the saved card/)
+  const limit = { pause: { kind: 'rate_limit' } }
+  assert.match(resourcePausePresentation(limit, true, {
+    kind: 'recovery', reason: 'app_attributed_work',
+  }).wakeUp, /blocked/)
+})

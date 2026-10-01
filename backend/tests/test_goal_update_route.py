@@ -67,7 +67,17 @@ def test_a_new_task_id_is_added_and_an_unknown_field_is_refused(
   assert "owner" in unknown.json()["detail"]["message"]
 
 
-def test_completion_refusal_says_the_task_edits_in_the_same_call_were_saved(
+def test_identical_task_edit_does_not_manufacture_a_revision(
+  client, owner_token, db,
+):
+  _, chat_id = _active_goal(client, owner_token, db)
+  seeded = _seed_plan(client, db, chat_id)
+  repeat = _update(client, db, chat_id, {"tasks": [{"id": "inspect", "title": "Inspect"}]})
+  assert repeat.status_code == 200, repeat.text
+  assert repeat.json()["goal"]["revision"] == seeded["goal"]["revision"]
+
+
+def test_completion_refusal_rolls_back_task_edits_in_the_same_call(
   client, owner_token, db,
 ):
   _, chat_id = _active_goal(client, owner_token, db)
@@ -79,9 +89,7 @@ def test_completion_refusal_says_the_task_edits_in_the_same_call_were_saved(
   })
 
   assert refused.status_code == 422
-  assert refused.json()["detail"]["message"].startswith(
-    "Task edits were saved, but",
-  )
+  assert "Task edits were saved" not in refused.json()["detail"]["message"]
   assert refused.json()["detail"]["code"] == "goal_completion_blocked"
   assert refused.json()["detail"]["completion_blockers"] == ["build"]
   assert "build" in refused.json()["detail"]["message"]
@@ -89,7 +97,112 @@ def test_completion_refusal_says_the_task_edits_in_the_same_call_were_saved(
   goal = db.get(models.ChatGoal, "goal-1")
   assert goal.status == "open"
   tasks = {task["id"]: task for task in goal.plan_json["tasks"]}
-  assert tasks["inspect"]["status"] == "completed"
+  assert tasks["inspect"]["status"] == "pending"
+
+
+def test_cannot_complete_settles_reasoned_unmet_tasks_without_shrinking_objective(
+  client, owner_token, db,
+):
+  _, chat_id = _active_goal(client, owner_token, db)
+  _seed_plan(client, db, chat_id)
+  before = db.get(models.ChatGoal, "goal-1").revision
+  response = _update(client, db, chat_id, {
+    "tasks": [
+      {"id": "inspect", "status": "failed", "note": "Vendor API permanently unavailable"},
+      {"id": "build", "status": "blocked", "note": "Needs the vendor API"},
+    ],
+    "cannot_complete": {
+      "reason": "Vendor removed the API and owner has no replacement",
+      "efforts": "Inspected integration; preserved current build",
+      "unmet_outcome": "The original live integration is not delivered",
+    },
+  })
+  assert response.status_code == 200, response.text
+  goal = response.json()["goal"]
+  assert goal["status"] == "cannot_complete"
+  assert goal["revision"] == before + 1
+  db.expire_all()
+  saved = db.get(models.ChatGoal, "goal-1")
+  assert saved.objective != "The original live integration is not delivered"
+  assert "Unmet outcome:" in saved.result
+
+
+def test_cannot_complete_refuses_unexplained_or_pending_tasks_atomically(
+  client, owner_token, db,
+):
+  _, chat_id = _active_goal(client, owner_token, db)
+  _seed_plan(client, db, chat_id)
+  original = db.get(models.ChatGoal, "goal-1").revision
+  outcome = {"reason": "No access", "efforts": "Tried", "unmet_outcome": "Not shipped"}
+  refused = _update(client, db, chat_id, {
+    "tasks": [{"id": "inspect", "status": "failed"}],
+    "cannot_complete": outcome,
+  })
+  assert refused.status_code == 422
+  db.expire_all()
+  saved = db.get(models.ChatGoal, "goal-1")
+  assert saved.revision == original
+  assert saved.plan_json["tasks"][0]["status"] == "pending"
+
+
+def test_cancel_requires_reasoned_settled_checklist(client, owner_token, db):
+  _, chat_id = _active_goal(client, owner_token, db)
+  _seed_plan(client, db, chat_id)
+  refused = _update(client, db, chat_id, {"cancel": "Owner called off this goal"})
+  assert refused.status_code == 422
+  ended = _update(client, db, chat_id, {
+    "tasks": [
+      {"id": "inspect", "status": "cancelled", "note": "Owner called off"},
+      {"id": "build", "status": "cancelled", "note": "Owner called off"},
+    ],
+    "cancel": "Owner called off this goal",
+  })
+  assert ended.status_code == 200, ended.text
+  assert ended.json()["goal"]["status"] == "cancelled"
+
+
+def test_cannot_complete_retry_is_idempotent_at_record_boundary(
+  client, owner_token, db,
+):
+  from app.goals import update_goal_record
+
+  _, chat_id = _active_goal(client, owner_token, db)
+  run = db.get(models.ChatRun, "goal-root")
+  goal = db.get(models.ChatGoal, "goal-1")
+  outcome = {"reason": "No source", "efforts": "Looked", "unmet_outcome": "Not shipped"}
+  first = update_goal_record(db, run, goal, goal.revision,
+                             cannot_complete=outcome)
+  again = update_goal_record(db, run, goal, first["revision"] - 1,
+                             cannot_complete=outcome)
+  assert again == first
+
+
+def test_outcome_tool_receipt_retry_is_idempotent_but_cannot_edit_settled_work(
+  client, owner_token, db,
+):
+  _, chat_id = _active_goal(client, owner_token, db)
+  _seed_plan(client, db, chat_id)
+  body = {
+    "tasks": [
+      {"id": "inspect", "status": "completed", "result": "Checked"},
+      {"id": "build", "status": "completed", "result": "Verified"},
+    ],
+    "complete": "Original outcome verified",
+  }
+  first = _update(client, db, chat_id, body)
+  assert first.status_code == 200, first.text
+  again = _update(client, db, chat_id, body)
+  assert again.status_code == 200, again.text
+  assert again.json()["goal"] == first.json()["goal"]
+  changed = _update(client, db, chat_id, {
+    **body, "tasks": [{"id": "build", "result": "Different claim"}],
+  })
+  assert changed.status_code == 409
+  opposite = _update(client, db, chat_id, {"cancel": "Actually cancelled"})
+  assert opposite.status_code == 409
+  guessed = _update(client, db, chat_id, {**body, "finished_claims": ["not-performed"]})
+  assert guessed.status_code == 422
+  assert _update(client, db, chat_id, {}).json()["goal"] == first.json()["goal"]
 
 
 def test_goal_returns_exact_held_work_keys_and_completion_settles_only_named_work(

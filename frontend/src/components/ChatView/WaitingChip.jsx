@@ -30,6 +30,7 @@ function HandoffCard({
   meta,
   rows,
   children,
+  stateLabel = 'Waiting',
 }) {
   return (
     <div className={`chat__wait-card${expanded ? ' chat__wait-card--expanded' : ''}`}>
@@ -44,7 +45,7 @@ function HandoffCard({
       >
         <span className="chat__wait-text">
           <span className="chat__progress-identity" aria-hidden="true"><Clock width={14} height={14} /></span>
-          Waiting · {text}
+          {stateLabel} · {text}
         </span>
         <span className="chat__wait-meta">{meta}</span>
       </button>
@@ -70,10 +71,11 @@ export function WaitCard({ wait, expanded, onToggle, onCancel }) {
     <HandoffCard
       expanded={expanded}
       onToggle={onToggle}
-      ariaLabel={`waiting details: ${presentation.condition}`}
+      ariaLabel={`handoff details: ${presentation.condition}`}
       title={`${presentation.condition} — ${presentation.summary}`}
       text={presentation.condition}
       meta={presentation.summary}
+      stateLabel={wait.delivery_pending && ['manual_resume', 'resume_failed', 'owner_input', 'restart'].includes(wait.resume_blocker) ? 'Needs action' : 'Waiting'}
       rows={[
         { label: 'Waiting for', value: presentation.condition, primary: true },
         ...(wait.delivery_pending ? [{ label: 'Original condition', value: wait.description, primary: true }] : []),
@@ -122,13 +124,20 @@ function HelperCard({ backgroundHelpers, expanded, onToggle }) {
   )
 }
 
-function ResourceCard({ resourcePause, expanded, onToggle }) {
-  const presentation = resourcePausePresentation(resourcePause)
+function ResourceCard({ resourcePause, autoResumeEnabled, handoff, expanded, onToggle }) {
+  const presentation = resourcePausePresentation(resourcePause, autoResumeEnabled, handoff)
+  const kind = resourcePause?.pause?.kind
+  const manual = handoff && handoff.kind !== 'automatic'
+    ? true
+    : kind === 'model_capacity' || ['rate_limit', 'usage_limit', 'limit'].includes(kind)
+      ? !(handoff?.kind === 'automatic' && handoff.reason === kind)
+      : false
   return (
     <HandoffCard
       expanded={expanded}
       onToggle={onToggle}
-      ariaLabel="resource waiting details"
+      ariaLabel="resource handoff details"
+      stateLabel={manual ? 'Needs action' : 'Waiting'}
       title={`${presentation.summary} — ${presentation.next}`}
       text={presentation.summary}
       meta={presentation.next}
@@ -146,6 +155,8 @@ export default function WaitingChip({
   waits = [],
   backgroundHelpers,
   resourcePause,
+  autoResumeEnabled = false,
+  handoff = null,
   onCancel,
 }) {
   const helperCount = Number(backgroundHelpers?.count) || 0
@@ -154,10 +165,12 @@ export default function WaitingChip({
 
   const toggle = key => setExpandedKey(current => current === key ? null : key)
   return (
-    <section className="chat__waits" aria-label="Waiting handoffs">
+    <section className="chat__waits" aria-label="Handoffs">
       {resourcePause && (
         <ResourceCard
           resourcePause={resourcePause}
+          autoResumeEnabled={autoResumeEnabled}
+          handoff={handoff}
           expanded={expandedKey === 'resource'}
           onToggle={() => toggle('resource')}
         />

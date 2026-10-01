@@ -43,21 +43,37 @@ export function isResourcePause(block) {
   return !!block && RESOURCE_PAUSE_KINDS.has(block.pause?.kind)
 }
 
-export function resourcePausePresentation(block) {
+export function resourcePausePresentation(block, autoResumeEnabled = false, handoff = null) {
   const kind = block?.pause?.kind
   const next = clockLabel(pauseTiming(block?.pause).checkAt)
   const storage = kind === 'storage'
+  const memory = kind === 'memory'
+  const limit = ['rate_limit', 'usage_limit', 'limit'].includes(kind)
+  const automatic = handoff?.kind === 'automatic' && handoff.reason === kind
+  const blocked = handoff && handoff.kind !== 'automatic'
   return {
-    summary: storage
-      ? 'Waiting for storage headroom'
-      : 'Waiting for memory to settle',
-    next: next ? `checks again ${next}` : 'checks again automatically',
-    owner: 'Möbius resource monitor',
-    pressure: storage
-      ? 'Storage reached its measured critical boundary'
-      : 'Memory reached its measured critical boundary',
-    wakeUp: 'This chat resumes automatically when pressure clears',
-    usage: 'No model tokens while waiting · one turn when it resumes',
+    summary: storage ? 'Waiting for storage headroom'
+      : memory ? 'Waiting for memory to settle'
+        : limit ? 'Provider usage limit' : 'Model capacity',
+    next: handoff?.kind === 'owner_input' ? 'answer needed'
+      : blocked || ((kind === 'model_capacity' || limit) && !automatic)
+      ? 'manual recovery' : next ? `checks again ${next}` : 'checks again automatically',
+    owner: storage || memory ? 'Möbius resource monitor' : 'Provider availability',
+    pressure: storage ? 'Storage reached its measured critical boundary'
+      : memory ? 'Memory reached its measured critical boundary'
+        : limit ? 'Provider usage limit reached' : 'Model capacity unavailable',
+    wakeUp: blocked && handoff.kind === 'owner_input' ? 'Answer the saved card before this chat can continue'
+      : blocked && ['memory', 'storage'].includes(kind) ? 'Automatic resource recovery is blocked; inspect the saved recovery card'
+      : kind === 'model_capacity' && !automatic ? 'Automatic retries are unavailable; choose another model and Resume'
+      : limit && !automatic ? handoff?.reason === 'manual_resume'
+        ? 'Enable automatic continuation or choose another model and Resume'
+        : 'Automatic continuation is blocked; inspect the saved recovery card'
+        : kind === 'model_capacity' ? 'Möbius retries this model automatically while eligible'
+          : limit ? 'Automatic continuation is enabled; this chat retries when eligible'
+          : 'This chat resumes automatically when pressure clears',
+    usage: blocked || ((kind === 'model_capacity' || limit) && !automatic)
+      ? 'No model tokens while parked · one turn after recovery'
+      : 'No model tokens while waiting · one turn when it resumes',
   }
 }
 

@@ -52,27 +52,53 @@ change; outcomes may not. Settled tasks do not close the Goal. To work on a
 retained unfinished Goal other than the one shown, pass its `goal_id`; that
 attaches this attempt and cannot reopen closed work.
 
-### When your turn ends
+### Responsibility, handoffs and outcomes
 
-A Goal never continues by itself. When your turn ends, the chat is the
-owner's turn unless something you armed will wake it: a durable Wait (read
-`waiting.md`) for an observable condition, or a helper whose result returns
-here. A decision or approval only the owner can give goes on its saved card; a
-`blocked` task only records that gate.
+Work in-run; turns are not a budget. An unfinished Goal remains your
+responsibility until a truthful outcome or real handoff. Do not end merely to
+refresh context, select the next task, or ask the owner to discover Unpause.
 
-Work in-run; turns are not a budget. Do not end a run merely to refresh context
-or select the next task, and never promise to continue later without arming
-what will wake you. Otherwise end with an honest, plain status.
+- **Owner action:** give concrete instructions, explain the dependency, then
+  save a question or approval card as your last action. Its answer resumes
+  the same work. For a task the owner must perform elsewhere, choices such as
+  **Done — verify and continue** and **I need help** make it actionable. A
+  `blocked` task only records the gate; it is not a handoff. Do not offer
+  `on_answer: "close"` for routine Goal blockers: that explicit no-reply choice
+  pauses the card's Goal by owner choice, rather than continuing its work.
+- **External work:** a durable Wait (read `waiting.md`) or a wake-enabled helper
+  owns automatic continuation only when its actual condition/result can wake
+  this chat. Never promise a wake for an unarmed condition or manual hold.
+- **Completed:** verify the original promised outcome. Update obsolete internal
+  steps explicitly with a reason, without cancelling unmet requirements to
+  fake success. Call `update_goal` with `complete: 'Verified evidence'`, plus
+  final `tasks` edits and `finished_claims` for exact actions performed.
+- **Cannot complete:** when the original outcome is genuinely unreachable,
+  explain the obstacle, what you tried, partial results and what is missing.
+  First seek an actionable owner choice on a saved card—access, a feasible
+  alternative, accepting the limitation, or calling off the work. Keep the
+  Goal open while that decision is outstanding. A temporary approval gate or
+  outage is not capitulation. After that choice, record `cannot_complete:
+  {reason: '...', efforts: '...', unmet_outcome: '...'}`; never silently narrow
+  the objective or mark unachieved requirements successful.
+- **Cancelled:** when the owner calls off or redirects the outcome, reconcile
+  unfinished tasks honestly with reasons and record `cancel: 'Owner called off:
+  reason'`. Cancellation is not successful completion.
 
-After verifying the original outcome, call `update_goal` with `complete:
-'Verified evidence'` (plus `finished_claims` for exact claimed actions this Goal
-performed). It validates and records completion and is refused while tasks or
-helpers are unfinished; a green plan or ended attempt leaves the Goal open.
+Task edits and an outcome settle in one atomic revision: if refused, none is
+saved. No outcome closes while helpers are active; non-success outcomes retain
+explicit unmet-task reasons rather than converting them to green. A settled
+checklist alone does not close the Goal.
 
-When the owner calls off or redirects a Goal, do what they asked instead, set
-its unfinished tasks to `cancelled` with `update_goal`, then call it with
-`complete: 'Owner called off: reason'`. Never settle a Goal by stopping the
-chat: that presses this chat's own Stop, ends your run at once, cuts off
-anything after it, and leaves the Goal paused. Only when the owner explicitly
-asks you to stop, summarize, then honor it last with
+A clean execution accidentally ending without an outcome/card/registered wake
+gets one targeted settlement continuation in the existing runner. It must not
+redo verified work, invent questions, narrow scope or burn unlimited turns. If
+that pass also fails to hand off or settle, a visible technical recovery
+failure preserves the Goal; it is not **Cannot complete**. Resource/restart
+recovery retains this bound. Stop and arbitrary process crashes never grant
+automatic continuation; the owner's deliberate Resume can recover execution.
+
+Never settle a Goal by stopping the chat: that presses this chat's own Stop,
+ends your run at once and cuts off anything after it. Stop remains a
+recoverable interruption, distinct from owner cancellation of the outcome.
+Only when the owner explicitly asks you to stop, summarize, then honor it last with
 `mapi -X POST /api/chat/stop -d "{\"chat_id\":\"$CHAT_ID\"}"`.

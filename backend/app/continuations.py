@@ -42,6 +42,42 @@ PRODUCT_RESULT_MESSAGE_KINDS = frozenset({
 # Goal travels the same slot and resumes under that Goal's identity.
 PEER_MESSAGE_WAKE_KIND = "peer_message"
 
+GOAL_SETTLEMENT_UNFINISHED_MESSAGE = (
+  "The Goal is still unfinished: the agent ended without recording an "
+  "outcome or saving its next handoff. Automatic settlement stopped "
+  "after one recovery attempt. Resume to recover this execution; "
+  "the Goal has not been declared impossible."
+)
+
+
+def goal_settlement_attempted(db, run) -> bool:
+  """A resource/restart recovery retains its settlement budget; owner Resume resets it.
+
+  Follow only exact physical recovery controls, never transcript prose or Goal
+  revisions. A fresh owner/result attempt has no predecessor control, so it
+  starts its own bounded responsibility. Cyclic/corrupt controls fail closed.
+  """
+  from app import models
+  seen = set()
+  while run is not None:
+    if run.id in seen:
+      return True
+    seen.add(run.id)
+    control = run.continuation_json or {}
+    if control.get("reason") == "goal_settlement":
+      return True
+    if control.get("reason") == "manual":
+      return False
+    predecessor = control.get("supersedes_run_token")
+    if not predecessor:
+      return False
+    previous = db.get(models.ChatRun, predecessor)
+    if previous is None or previous.chat_id != run.chat_id or previous.goal_id != run.goal_id:
+      return True
+    run = previous
+  return False
+
+
 def recovery_attempted(db, run, *, reason: str) -> bool:
   """Exact predecessor controls bound recovery; manual owner Resume resets it."""
   from app import models
@@ -179,6 +215,16 @@ def continuation_protocol_source(
       "Repair within the original authority using ordinary result-bearing tools, or "
       "report the concrete unresolved failure. Never assume an unknown write did not happen. "
       "Do not repeat completed substantive work. This recovery will not automatically repeat."
+    ),
+    "goal_settlement": (
+      "The exact Goal remains open after a clean execution ended without an outcome or durable handoff. "
+      "This is one targeted settlement recovery, not permission to redo verified work or shrink the objective. "
+      "Read the saved Goal and reconcile its checklist. Complete only if the original promised outcome is verified. "
+      "Otherwise continue necessary authorized work in this run, or save a concrete owner question/approval "
+      "with instructions and meaningful choices. If unreachable, explain why, efforts and partial results, "
+      "and seek actionable owner input before declaring Cannot complete. Use a durable Wait/helper only "
+      "when it actually owns continuation. Do not end with optional Unpause or a prose promise. "
+      "This recovery will not automatically repeat."
     ),
   }
   source = {

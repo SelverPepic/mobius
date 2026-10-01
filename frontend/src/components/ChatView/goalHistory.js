@@ -13,8 +13,11 @@ export function formatGoalDuration(seconds) {
 
 export function goalHistoryViewModel(summary) {
   const objective = String(summary?.objective || '').trim()
-  if (!objective || !['completed', 'failed'].includes(summary?.status)) return null
+  if (!objective || !['completed', 'cannot_complete', 'cancelled', 'failed'].includes(summary?.status)) return null
   const completed = summary.status === 'completed'
+  const cancelled = summary.status === 'cancelled'
+  const reason = typeof summary.result === 'string' ? summary.result.trim()
+    : String(summary.result?.reason || summary.result?.summary || '').trim()
   const done = summary?.plan?.summary?.completed
   const total = summary?.plan?.summary?.total
   const progress = Number.isInteger(done) && Number.isInteger(total)
@@ -27,8 +30,9 @@ export function goalHistoryViewModel(summary) {
   return {
     objective,
     completed,
-    kicker: completed ? 'Goal completed' : 'Goal needs attention',
-    ariaLabel: `${completed ? 'Completed goal' : 'Goal needing attention'}: ${objective}`,
+    kicker: completed ? 'Goal completed' : cancelled ? 'Goal cancelled' : 'Goal cannot complete',
+    ariaLabel: `${completed ? 'Completed goal' : cancelled ? 'Cancelled goal' : 'Goal cannot complete'}: ${objective}`,
+    reason,
     metadata: [progress, duration].filter(Boolean).join(' · '),
     hasPlan: Array.isArray(summary?.plan?.tasks) && summary.plan.tasks.length > 0,
   }

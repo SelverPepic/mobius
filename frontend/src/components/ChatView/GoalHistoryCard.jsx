@@ -10,15 +10,16 @@ export default function GoalHistoryCard({ summary }) {
 
   return (
     <aside
-      className={`chat__goal-history chat__goal-history--${view.completed ? 'completed' : 'failed'}`}
+      className={`chat__goal-history chat__goal-history--${view.completed ? 'completed' : summary.status === 'cancelled' ? 'cancelled' : 'failed'}`}
       aria-label={view.ariaLabel}
     >
       <LifecycleIcon kind="goal" />
       <div className="chat__goal-history-copy">
         <span className="chat__goal-history-kicker">
-          <LifecycleOutcome tone={view.completed ? 'completed' : 'attention'} />{view.kicker}
+          <LifecycleOutcome tone={view.completed ? 'completed' : summary.status === 'cancelled' ? 'stopped' : 'attention'} />{view.kicker}
         </span>
         <strong className="chat__goal-history-objective">{view.objective}</strong>
+        {view.reason && <span className="chat__goal-history-reason">{view.reason}</span>}
         {view.metadata && <span className="chat__goal-history-meta">{view.metadata}</span>}
         {view.hasPlan && (
           <details className="chat__goal-history-details">
