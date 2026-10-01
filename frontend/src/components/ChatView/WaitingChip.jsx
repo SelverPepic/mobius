@@ -1,81 +1,29 @@
-/* WaitingChip renders every self-resuming handoff above the composer. The
-   collapsed row stays glanceable; expansion explains ownership and cost. */
+/* WaitingChip renders compact in-conversation waits with their existing condition and recovery owners. */
 
 import { useState } from 'react'
-import { Clock, X } from '@openai/apps-sdk-ui/components/Icon'
+import CompactHandoff from './CompactHandoff.jsx'
 import {
   helperPresentation,
   resourcePausePresentation,
   waitPresentation,
 } from './waitingPresentation.js'
 
-function DetailRow({ label, children, primary = false }) {
-  return (
-    <div className={`chat__wait-detail-row${primary ? ' chat__wait-detail-row--primary' : ''}`}>
-      <dt>{label}</dt>
-      <dd>{children}</dd>
-    </div>
-  )
-}
-
-// One shell for every handoff card: a Waiting tag, text + meta in the summary
-// row, and `rows` ([{ label, value, primary }]) behind the expander. `children`
-// is the slot for card-specific actions below the rows.
-function HandoffCard({
-  expanded,
-  onToggle,
-  ariaLabel,
-  title,
-  text,
-  meta,
-  rows,
-  children,
-  stateLabel = 'Waiting',
-}) {
-  return (
-    <div className={`chat__wait-card${expanded ? ' chat__wait-card--expanded' : ''}`}>
-      <button
-        type="button"
-        className="chat__wait-summary"
-        aria-expanded={expanded}
-        aria-label={`${expanded ? 'Collapse' : 'Expand'} ${ariaLabel}`}
-        title={title}
-        onPointerDown={(event) => event.preventDefault()}
-        onClick={onToggle}
-      >
-        <span className="chat__wait-text">
-          <span className="chat__progress-identity" aria-hidden="true"><Clock width={14} height={14} /></span>
-          {stateLabel} · {text}
-        </span>
-        <span className="chat__wait-meta">{meta}</span>
-      </button>
-      {expanded && (
-        <div className="chat__wait-details">
-          <dl className="chat__wait-detail-list">
-            {rows.map(row => (
-              <DetailRow key={row.label} label={row.label} primary={!!row.primary}>
-                {row.value}
-              </DetailRow>
-            ))}
-          </dl>
-          {children}
-        </div>
-      )}
-    </div>
-  )
-}
-
-export function WaitCard({ wait, expanded, onToggle, onCancel }) {
+export function WaitCard({ wait, expanded, onToggle, onCancel, onRevealRecovery }) {
   const presentation = waitPresentation(wait)
+  const needsRecovery = wait.delivery_pending && ['manual_resume', 'resume_failed', 'restart'].includes(wait.resume_blocker)
+  const cancellable = wait.kind !== 'platform_activation' && !wait.delivery_pending
   return (
-    <HandoffCard
+    <CompactHandoff
       expanded={expanded}
       onToggle={onToggle}
       ariaLabel={`handoff details: ${presentation.condition}`}
       title={`${presentation.condition} — ${presentation.summary}`}
       text={presentation.condition}
       meta={presentation.summary}
-      stateLabel={wait.delivery_pending && ['manual_resume', 'resume_failed', 'owner_input', 'restart'].includes(wait.resume_blocker) ? 'Needs action' : 'Waiting'}
+      stateLabel={wait.delivery_pending && ['manual_resume', 'resume_failed', 'owner_input', 'restart'].includes(wait.resume_blocker) ? 'Needs you' : 'Waiting'}
+      action={needsRecovery && onRevealRecovery
+        ? { label: 'View recovery', onClick: onRevealRecovery }
+        : cancellable && onCancel ? { label: 'Stop waiting', onClick: () => onCancel(wait.id) } : null}
       rows={[
         { label: 'Waiting for', value: presentation.condition, primary: true },
         ...(wait.delivery_pending ? [{ label: 'Original condition', value: wait.description, primary: true }] : []),
@@ -85,24 +33,14 @@ export function WaitCard({ wait, expanded, onToggle, onCancel }) {
         { label: presentation.timeoutLabel, value: presentation.timeout },
         { label: 'Agent usage', value: presentation.usage },
       ]}
-    >
-      {wait.kind !== 'platform_activation' && !wait.delivery_pending && <button
-        type="button"
-        className="chat__wait-cancel"
-        onPointerDown={(event) => event.preventDefault()}
-        onClick={() => onCancel?.(wait.id)}
-      >
-        <X width={14} height={14} aria-hidden="true" />
-        Stop waiting
-      </button>}
-    </HandoffCard>
+    />
   )
 }
 
 function HelperCard({ backgroundHelpers, expanded, onToggle }) {
   const presentation = helperPresentation(backgroundHelpers)
   return (
-    <HandoffCard
+    <CompactHandoff
       expanded={expanded}
       onToggle={onToggle}
       ariaLabel="helper waiting details"
@@ -124,7 +62,7 @@ function HelperCard({ backgroundHelpers, expanded, onToggle }) {
   )
 }
 
-function ResourceCard({ resourcePause, autoResumeEnabled, handoff, expanded, onToggle }) {
+function ResourceCard({ resourcePause, autoResumeEnabled, handoff, expanded, onToggle, onRevealRecovery }) {
   const presentation = resourcePausePresentation(resourcePause, autoResumeEnabled, handoff)
   const kind = resourcePause?.pause?.kind
   const manual = handoff && handoff.kind !== 'automatic'
@@ -133,11 +71,12 @@ function ResourceCard({ resourcePause, autoResumeEnabled, handoff, expanded, onT
       ? !(handoff?.kind === 'automatic' && handoff.reason === kind)
       : false
   return (
-    <HandoffCard
+    <CompactHandoff
       expanded={expanded}
       onToggle={onToggle}
       ariaLabel="resource handoff details"
-      stateLabel={manual ? 'Needs action' : 'Waiting'}
+      action={manual && onRevealRecovery ? { label: 'View recovery', onClick: onRevealRecovery } : null}
+      stateLabel={manual ? 'Needs you' : 'Waiting'}
       title={`${presentation.summary} — ${presentation.next}`}
       text={presentation.summary}
       meta={presentation.next}
@@ -158,6 +97,7 @@ export default function WaitingChip({
   autoResumeEnabled = false,
   handoff = null,
   onCancel,
+  onRevealRecovery,
 }) {
   const helperCount = Number(backgroundHelpers?.count) || 0
   const [expandedKey, setExpandedKey] = useState(null)
@@ -171,6 +111,7 @@ export default function WaitingChip({
           resourcePause={resourcePause}
           autoResumeEnabled={autoResumeEnabled}
           handoff={handoff}
+          onRevealRecovery={onRevealRecovery}
           expanded={expandedKey === 'resource'}
           onToggle={() => toggle('resource')}
         />
@@ -189,6 +130,7 @@ export default function WaitingChip({
           expanded={expandedKey === wait.id}
           onToggle={() => toggle(wait.id)}
           onCancel={onCancel}
+          onRevealRecovery={onRevealRecovery}
         />
       ))}
     </section>

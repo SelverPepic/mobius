@@ -143,8 +143,9 @@ test('restart recovery waits for a durable run identity instead of showing a fal
     'the interrupted-turn card explains the short restart handoff')
   assert.match(msgContent, /resumeState\?\.pending \|\| resumeState\?\.unavailable/,
     'the recovery action cannot be invoked before its identity is durable')
-  assert.match(chatView, /goalResumeState\.unavailable \? 'Reconnecting…' : 'Resume'/,
-    'the Goal rail follows the same unavailable-recovery contract')
+  const goalHandoff = readFileSync(new URL('../GoalHandoff.jsx', import.meta.url), 'utf8')
+  assert.match(goalHandoff, /resumeState\.pending \|\| resumeState\.unavailable/,
+    'the compact exact-Goal control cannot run before its identity is durable')
 })
 
 test('MsgContent memo compares onResume so a stable ref skips re-render', () => {
@@ -311,8 +312,8 @@ test('ariaStatus announces the recovery state instead of "Response ready."', () 
     'an automatic park announces the bounded retry check')
   assert.match(chatView, /Ready to retry; availability is not confirmed\./,
     'an elapsed manual park announces a retry, not restored quota')
-  assert.match(chatView, /resumeStatus\s*\n?\s*\?\?/,
-    'the recovery status takes precedence over the "Response ready." fallback')
+  assert.match(chatView, /recoveryStatus: resumeStatus/,
+    'the shared current-work announcement receives recovery before its ready fallback')
 })
 
 test('message equality compares the error-card fields (stale-red-card guard)', () => {

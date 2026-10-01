@@ -282,8 +282,8 @@ test('Goal labels and announcements share exact pause provenance and handoff', (
     assert.equal(normalized.pause_reason, undefined)
     assert.notEqual(goalStatusLabel(normalized), 'Paused by you')
   }
-  assert.match(chatView, /const goalLabel = goalStatusLabel\(actionableGoalPresentation\)/)
-  assert.match(chatView, /`Goal: \$\{activeGoalObjective\}\. \$\{goalLabel\}\.`/)
+  assert.match(chatView, /goal: actionableGoalPresentation/,
+    'the current announcement receives exact Goal provenance without giving history priority')
   assert.match(chatView, /hasPendingQuestion && goalHandoff === 'owner_input'/)
 })
 
@@ -559,8 +559,8 @@ test('ChatView retains settled goals independently of transport liveness', () =>
   assert.match(progressRail, /useEffect\(\(\) => setDetailsKey\(null\), \[resetKey\]\)/)
   assert.match(
     chatView,
-    /`Following goal: \$\{activeGoalObjective\}\.`/,
-    'screen readers should receive the same active-goal status',
+    /const ariaStatus = currentChatAnnouncement\(/,
+    'screen readers should receive current work status rather than a retained terminal Goal',
   )
   assert.match(progressRail, /chat__progress-rail/)
   assert.match(progressRail, /aria-expanded=\{expanded\}/)
@@ -654,26 +654,19 @@ test('the goal rail confirms and clears directly, sourced domain-neutrally', () 
     'the confirmation label must be item-supplied with a neutral fallback')
   assert.match(
     chatView,
-    /actionLabel: goalResumeState\.pending \? 'Resuming…' : goalResumeState\.unavailable \? 'Reconnecting…' : 'Resume'/,
-    'execution recovery and explicit owner pauses share the acknowledged Resume action',
-  )
-  assert.match(chatView, /actionIcon: <Play width=\{13\} height=\{13\}/,
-    'the Goal Resume action should spend only icon-sized visual space')
-  assert.match(chatView, /canResumeGoal\(actionableGoalPresentation, \{ turnActive, hasPendingQuestion, chatHandoff \}\)/,
-    'Goal Resume must obey actual chat activity and conflicts regardless of pause reason')
-  assert.match(
-    chatView,
     /resume: handleResumeGoal, state: goalResumeState[\s\S]{0,200}goalId: actionableGoalPresentation\?\.id,[\s\S]{0,100}goalRevision: actionableGoalPresentation\?\.revision/,
     'Goal Resume targets its exact revision through the acknowledged lifecycle action',
   )
-  assert.match(chatView, /if \(item\?\.actionKind === 'resume'\) handleResumeGoal\(\)/,
-    'the rail routes the Goal Resume action to its owner')
+  assert.match(chatView, /onContinue=\{handleResumeGoal\}/,
+    'the compact handoff routes Continue to the exact Goal Resume owner')
+  assert.doesNotMatch(chatView, /actionKind: 'resume'/,
+    'the rail must not add a second continuation action')
   assert.match(chatView, /actionKind: 'owner-question'[\s\S]*?actionLabel: 'View question'/,
     'an owner-required Goal should expose the existing question surface')
   assert.match(chatView, /revealPendingQuestion\(pendingQuestionEl\)/,
     'the Goal question action must reveal the real pending question card')
-  assert.match(chatView, /const ariaStatus = goalHandoff === 'owner_input' && goalAriaStatus/,
-    'screen readers must hear the owner handoff before generic turn activity')
+  assert.match(chatView, /const ariaStatus = currentChatAnnouncement\(/,
+    'screen readers use the shared current-responsibility projection, tested for saved-card precedence')
   assert.match(chatView, /onActionItem=\{handleGoalRailAction\}/,
     'the rail must route the owner-question action through its owner')
   assert.match(progressRail, /className="chat__progress-action"/,

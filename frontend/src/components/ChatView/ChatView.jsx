@@ -17,7 +17,7 @@ import { flushSync } from 'react-dom'
 import { useQueryClient } from '@tanstack/react-query'
 import Check from 'lucide-react/dist/esm/icons/check.mjs'
 import ArrowDown from 'lucide-react/dist/esm/icons/arrow-down.mjs'
-import { Chat, Flag, Play } from '@openai/apps-sdk-ui/components/Icon'
+import { Chat, Flag } from '@openai/apps-sdk-ui/components/Icon'
 import { api, apiFetch, getAuthHeaders, getToken, jsonOrThrow, BASE } from '../../api/client.js'
 import { sharedRuntimeRead } from './runtimeReads.js'
 import {
@@ -93,6 +93,9 @@ import GoalDraftChip from './GoalDraftChip.jsx'
 import WaitingChip from './WaitingChip.jsx'
 import AssistantReply from './AssistantReply.jsx'
 import ArchivedChatNotice from './ArchivedChatNotice.jsx'
+import GoalHandoff from './GoalHandoff.jsx'
+import { RetainedGoalContext } from './retainedGoalContext.js'
+import { currentChatAnnouncement, currentProgressGoal, goalContinuationHandoff } from './chatHandoffPresentation.js'
 import QueuedMessages from './QueuedMessages.jsx'
 import {
   chatChangesActionIsCurrent,
@@ -254,7 +257,6 @@ import {
 import {
   canResumeGoal,
   compactGoalObjective,
-  goalStatusLabel,
   draftGoalObjective,
   goalPresentationAtRunStart,
   goalPresentationFromRuntime,
@@ -5757,6 +5759,7 @@ export default function ChatView({
   // Resume card to fall back on.
   const resumeStatus = (() => {
     if (!pendingResumeBlock) return null
+    if (serverHandoff?.kind === 'recovery') return 'This chat needs recovery. Review the saved recovery card.'
     if (resourcePause) {
       return resourcePause.pause?.kind === 'storage'
         ? 'Waiting for storage headroom. This chat will resume automatically.'
@@ -5813,33 +5816,28 @@ export default function ChatView({
     if (item?.actionKind === 'owner-question') {
       revealPendingQuestion(pendingQuestionEl)
     }
-    if (item?.actionKind === 'resume') handleResumeGoal()
-  }, [handleResumeGoal, pendingQuestionEl, revealPendingQuestion])
+  }, [pendingQuestionEl, revealPendingQuestion])
 
-  const goalLabel = goalStatusLabel(actionableGoalPresentation)
-  const goalAriaStatus = actionableGoalPresentation
-    ? goalLabel
-      ? `Goal: ${activeGoalObjective}. ${goalLabel}.`
-      : `Following goal: ${activeGoalObjective}.`
-    : null
-  const ariaStatus = goalHandoff === 'owner_input' && goalAriaStatus
-    ? goalAriaStatus
-    : turnActive
-      ? (actionableGoalPresentation?.status === 'active'
-          ? goalAriaStatus
-          : 'Assistant is responding…')
-    : (goalAriaStatus
-        ?? resumeStatus
-        ?? (messages.length > 0
-            && messages[messages.length - 1]?.role === 'assistant'
-              ? 'Response ready.'
-              : ''))
+  const ariaStatus = currentChatAnnouncement({
+    turnActive, hasPendingQuestion, chatHandoff,
+    goal: actionableGoalPresentation,
+    recoveryStatus: resumeStatus,
+    hasAnswer: messages.length > 0 && messages.at(-1)?.role === 'assistant',
+  })
+  const continuationHandoff = goalContinuationHandoff(actionableGoalPresentation, {
+    turnActive, hasPendingQuestion, hasPendingResume: !!pendingResumeBlock, chatHandoff,
+  })
+  const retainedGoalControls = useMemo(() => ({
+    id: actionableGoalPresentation?.id, onClear: handleClearGoal, error: goalClearError,
+  }), [actionableGoalPresentation?.id, handleClearGoal, goalClearError])
+  const [handoffEl, handoffRef] = useNudgeTargetRef()
+  const handoffOffscreen = useOffscreenNudge(scrollRef, !!continuationHandoff, handoffEl)
   const buildPhaseRail = buildPhaseRailViewModel(buildPhases)
   // Goal ownership comes from explicit run boundaries and authoritative
   // runtime reconciliation, never a momentary browser transport signal.
   const visibleGoalObjective = activeGoalObjective
   const progressRail = progressRailViewModel(
-    actionableGoalPresentation,
+    currentProgressGoal(actionableGoalPresentation, { turnActive }),
     buildPhaseRail,
     planForGoal(activeGoalPlan, actionableGoalPresentation),
   ).map(item => {
@@ -5863,15 +5861,6 @@ export default function ChatView({
             actionLabel: 'View question',
             actionAriaLabel: `Answer question for goal: ${visibleGoalObjective}`,
             actionIcon: <Chat width={13} height={13} aria-hidden="true" />,
-          }
-        : canResumeGoal(actionableGoalPresentation, { turnActive, hasPendingQuestion, chatHandoff })
-        ? {
-            actionKind: 'resume',
-            actionLabel: goalResumeState.pending ? 'Resuming…' : goalResumeState.unavailable ? 'Reconnecting…' : 'Resume',
-            actionDisabled: goalResumeState.pending || goalResumeState.unavailable || providerSwitching,
-            actionError: goalResumeState.error,
-            actionAriaLabel: `${goalResumeState.pending ? 'Resuming' : goalResumeState.unavailable ? 'Reconnecting' : 'Resume'} goal: ${visibleGoalObjective}`,
-            actionIcon: <Play width={13} height={13} aria-hidden="true" />,
           }
         : {}),
       icon: <Flag width={14} height={14} aria-hidden="true" />,
@@ -6146,6 +6135,7 @@ export default function ChatView({
             elastic min-height out of the spacer formula at all times. */}
         <LocalAnswersContext.Provider value={localAnswerIntents}>
         <PeerTimelineContext.Provider value={peerTimeline}>
+        <RetainedGoalContext.Provider value={retainedGoalControls}>
         <ul className="chat__list" style={{ minHeight: 0 }}>
           {displayedMessages.flatMap((msg, i) => {
             const peerRows = <PeerTimelineRows key={`peer-slot-${msg.cid || msg.id || msg.ts || i}`} notes={peerTimeline.slots.get(i)} chatId={chatId} onInternalNav={internalNav} />
@@ -6260,7 +6250,29 @@ export default function ChatView({
               </li>
             )
           })()}
+          {continuationHandoff && <li className="chat__handoff-slot" data-key={continuationHandoff.key} ref={handoffRef}>
+            <GoalHandoff
+              key={continuationHandoff.key}
+              handoff={continuationHandoff}
+              goal={actionableGoalPresentation}
+              resumeState={goalResumeState}
+              onContinue={handleResumeGoal}
+              disabled={providerSwitching}
+            />
+          </li>}
+          {!hasPendingQuestion && !turnActive && (armedWaits.length > 0 || backgroundHelpers.count > 0 || resourcePause || modelCapacityPause || pendingLimitPark) && <li className="chat__handoff-slot" data-key="current-waiting-handoff">
+            <WaitingChip
+              waits={armedWaits}
+              backgroundHelpers={backgroundHelpers}
+              resourcePause={resourcePause || (modelCapacityPause || pendingLimitPark ? pendingResumeBlock : null)}
+              autoResumeEnabled={autoResumeEnabled}
+              handoff={serverHandoff}
+              onCancel={handleCancelWait}
+              onRevealRecovery={resumeCardEl ? () => revealPendingQuestion(resumeCardEl) : undefined}
+            />
+          </li>}
         </ul>
+        </RetainedGoalContext.Provider>
         </PeerTimelineContext.Provider>
         </LocalAnswersContext.Provider>
 
@@ -6283,9 +6295,9 @@ export default function ChatView({
               Contribution state lives in Changes so it can never cover the
               composer or an unanswered question. */}
           {connectionError !== 'disconnected'
-            && offscreenControlsVisible && (
+            && (offscreenControlsVisible || handoffOffscreen) && (
             <div className="chat__floating-transients">
-              {offscreenControlsVisible && (
+              {(offscreenControlsVisible || handoffOffscreen) && (
                 <div className="chat__offscreen-nudges">
                   {/* Touches use the keyboard-safe path; mouse and keyboard retain
                       the native click path. */}
@@ -6325,7 +6337,13 @@ export default function ChatView({
                           : 'Turn paused — tap to resume'}
                     </button>
                   )}
-                  {jumpToLatestVisible && (
+                  {handoffOffscreen && !questionNudgeShown && !resumeNudgeShown && (
+                    <button type="button" className="chat__resume-nudge"
+                      {...composerAdjacentActionProps(() => revealPendingQuestion(handoffEl), { activateOnTouchEnd: true })}>
+                      {continuationHandoff?.label} · View next step
+                    </button>
+                  )}
+                  {jumpToLatestVisible && !handoffOffscreen && (
                     <button
                       type="button"
                       className="chat__jump-latest"
@@ -6351,16 +6369,6 @@ export default function ChatView({
           onActionItem={handleGoalRailAction}
         />
         {draftGoal !== null && <GoalDraftChip objective={draftGoal} />}
-        {!turnActive && (armedWaits.length > 0 || backgroundHelpers.count > 0 || resourcePause || modelCapacityPause || pendingLimitPark) && (
-          <WaitingChip
-            waits={armedWaits}
-            backgroundHelpers={backgroundHelpers}
-            resourcePause={resourcePause || (modelCapacityPause || pendingLimitPark ? pendingResumeBlock : null)}
-            autoResumeEnabled={autoResumeEnabled}
-            handoff={serverHandoff}
-            onCancel={handleCancelWait}
-          />
-        )}
         {archived && !provisionalNewChat && (
           <ArchivedChatNotice onRestore={onRestoreArchived} />
         )}

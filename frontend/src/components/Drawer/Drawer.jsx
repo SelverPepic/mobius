@@ -1676,6 +1676,7 @@ const DrawerRow = memo(function DrawerRow({
   const pinned = !!item.pinned_at
   const waiting = kind === 'chat' && item.handoff?.kind === 'automatic'
   const recovery = kind === 'chat' && item.handoff?.kind === 'recovery'
+  const onHold = kind === 'chat' && item.handoff?.kind === 'on_hold'
   const ownerRequired = needsOwnerInput || (kind === 'chat' && item.handoff?.kind === 'owner_input')
   const recoveryLabel = item.handoff?.reason === 'restart_required'
     ? 'Server restart needed to load restored work'
@@ -2305,6 +2306,11 @@ const DrawerRow = memo(function DrawerRow({
             aria-label="Waiting to resume"
             title="Waiting to resume"
           >
+            <Pause width={8} height={8} aria-hidden="true" />
+          </span>
+        ) : onHold ? (
+          <span className="drawer__waiting-icon" role="img" aria-label="On hold — continue when ready"
+            title={item.handoff?.hold_reason || 'On hold — continue when ready'}>
             <Pause width={8} height={8} aria-hidden="true" />
           </span>
         ) : recovery ? (

@@ -1,10 +1,15 @@
 /* GoalHistoryCard shows a terminal Goal's outcome at its completion step. */
 
+import { useContext, useState } from 'react'
+import { RetainedGoalContext } from './retainedGoalContext.js'
 import GoalPlanDetails from './GoalPlanDetails.jsx'
 import LifecycleIcon, { LifecycleOutcome } from './LifecycleIcon.jsx'
 import { goalHistoryViewModel } from './goalHistory.js'
 
 export default function GoalHistoryCard({ summary }) {
+  const retained = useContext(RetainedGoalContext)
+  const [clearConfirmed, setClearConfirmed] = useState(false)
+  const canClear = retained?.id === summary?.id && Boolean(retained?.onClear)
   const view = goalHistoryViewModel(summary)
   if (!view) return null
 
@@ -27,6 +32,13 @@ export default function GoalHistoryCard({ summary }) {
             <GoalPlanDetails plan={summary.plan} />
           </details>
         )}
+        {canClear && <>
+          <button type="button" className="chat__goal-history-clear"
+            onClick={() => clearConfirmed ? retained.onClear({ goalId: summary.id }) : setClearConfirmed(true)}>
+            {clearConfirmed ? 'Confirm clear Goal' : 'Clear retained Goal'}
+          </button>
+          {retained.error && <span role="alert">{retained.error}</span>}
+        </>}
       </div>
     </aside>
   )
