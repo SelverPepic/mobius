@@ -77,7 +77,6 @@ def _normalize_path(path: str) -> str:
 # its next invocation, so classifying the whole directory as image-bound turns
 # ordinary maintenance work into unnecessary container replacements.
 IMAGE_BOOTSTRAP_SCRIPTS = (
-  "backend/scripts/agent-browser-profile-cleanup.py",
   "backend/scripts/agent_sudo.sh",
   "backend/scripts/entrypoint.sh",
   "backend/scripts/init-cron-scaffold.sh",

@@ -441,6 +441,43 @@ def test_tool_completed_events_emit_output_before_end():
   ]
 
 
+@pytest.mark.parametrize("status", ["completed", "failed"])
+def test_mcp_completion_preserves_result_body_even_when_tool_refuses(status):
+  """Real SDK failures may have result.content but no transport error."""
+  v2 = pytest.importorskip("openai_codex.generated.v2_all")
+  result = {"content": [{"type": "text", "text":
+    "Task edits were saved, but no open claims are held by this Goal."}]}
+  item = v2.McpToolCallThreadItem.model_validate({
+    "type": "mcpToolCall", "id": "goal-refusal", "server": "mobius_control",
+    "tool": "update_goal", "arguments": {"complete": "Verified"},
+    "status": status, "error": None, "result": result,
+  })
+  sdk = {name: getattr(v2, name) for name in (
+    "CommandExecutionThreadItem", "FileChangeThreadItem", "McpToolCallThreadItem",
+  )}
+  events = codex_events._tool_completed_events(item, sdk)
+  assert events[-1] == {"type": "tool_end"}
+  output = events[0]
+  assert output["output_complete"] is True
+  assert output["output_exit_code"] == (1 if status == "failed" else 0)
+  assert "Task edits were saved" in output["content"]
+
+
+def test_mcp_transport_error_is_preserved_without_a_result():
+  v2 = pytest.importorskip("openai_codex.generated.v2_all")
+  item = v2.McpToolCallThreadItem.model_validate({
+    "type": "mcpToolCall", "id": "transport-error", "server": "mobius_control",
+    "tool": "update_goal", "arguments": {}, "status": "failed",
+    "error": {"message": "Connection closed"}, "result": None,
+  })
+  sdk = {name: getattr(v2, name) for name in (
+    "CommandExecutionThreadItem", "FileChangeThreadItem", "McpToolCallThreadItem",
+  )}
+  output = codex_events._tool_completed_events(item, sdk)[0]
+  assert output["output_exit_code"] == 1
+  assert "Connection closed" in output["content"]
+
+
 def test_dynamic_tool_completion_marks_its_authoritative_result():
   class DynamicToolCallThreadItem:
     def __init__(self, status="completed"):
@@ -3140,20 +3177,20 @@ def test_upstream_stream_stall_explains_the_stop_and_keeps_the_detail():
   assert "No next token received for 60000ms" in message
 
 
-def test_mobius_gateway_out_of_credit_points_to_mobius_you():
-  # The gateway's 402 body; the same wording applies whenever a turn has
-  # nothing left to spend, before the first token or mid-answer.
+def test_mobius_gateway_max_request_cost_points_to_mobius_you():
+  # The gateway's 402 body names the maximum request cost; it does not prove
+  # the account has no remaining credit.
   error = (
     "unexpected status 402 Payment Required: {\"error\":{\"message\":"
     "\"not enough credits for the maximum request cost\",\"type\":"
     "\"insufficient_credits\",\"code\":\"insufficient_credits\"}}"
   )
 
-  from app.codex_events import MOBIUS_NO_CREDIT_MESSAGE
+  from app.codex_events import MOBIUS_MAX_REQUEST_COST_MESSAGE
 
   message = codex_sdk_runner._codex_user_error(error)
 
-  assert message == MOBIUS_NO_CREDIT_MESSAGE
+  assert message == MOBIUS_MAX_REQUEST_COST_MESSAGE
   assert "[Open Möbius · You](/shell/?app=identity)" in message
 
 
@@ -4450,6 +4487,9 @@ def test_run_codex_sdk_turn_controls_prompt_layers(monkeypatch, session_id):
     "FROZEN CONSTITUTION SNAPSHOT"
   )
   assert "$MOBIUS_GENERATED_DIR" in (
+    captured["thread_options"]["base_instructions"]
+  )
+  assert "Create downloadable deliverables only when the owner explicitly requests" in (
     captured["thread_options"]["base_instructions"]
   )
   assert captured["thread_options"]["developer_instructions"] == ""

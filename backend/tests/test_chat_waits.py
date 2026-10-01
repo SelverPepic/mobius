@@ -1895,6 +1895,7 @@ def test_a_resume_whose_start_fails_is_re_woken_once_then_rides_the_next_turn(
   assert db.get(models.ChatWait, row.id).resume_delivered_at is None
   assert asyncio.run(chat_waits_mod._deliver_resume(row.id)) is False
   assert len(scheduled) == 2
+  assert chat_waits_mod.serialize_wait(db.get(models.ChatWait, row.id), db=db)["resume_blocker"] == "resume_failed"
 
   start_fails = False
   owner_run = f"owner-after-failed-resume-{provider_id}"
@@ -2000,3 +2001,91 @@ def test_a_turn_whose_prompt_was_never_sent_acknowledges_nothing(
   assert db.get(models.ChatWait, row.id).resume_delivered_at is None
   run = db.get(models.ChatRun, run_token)
   assert run.peer_message_through_id is None
+
+
+@pytest.mark.parametrize("outcome", ["met", "failed", "expired"])
+def test_finished_wait_stays_visible_until_result_delivery_not_just_check_success(
+  client, owner_token, db, monkeypatch, outcome,
+):
+  """The completion promise outlives polling, including a held deadline alarm."""
+  from app import platform_update
+
+  auth = {"Authorization": f"Bearer {owner_token}"}
+  chat_id = _owner_chat(client, owner_token)
+  row = _command_wait(db, chat_id=chat_id, description="Exact reviewed CI", command="true")
+  row.status = outcome
+  row.met_at = now_naive_utc() if outcome == "met" else None
+  row.last_checked_at = now_naive_utc()
+  row.deadline_at = now_naive_utc() - timedelta(minutes=30)
+  db.commit()
+  monkeypatch.setattr(platform_update, "late_edits_pending", lambda: True)
+  monkeypatch.setattr(platform_update, "read_prepared_update", lambda: {"replayed": "restored-sha"})
+
+  def visible():
+    detail = client.get(f"/api/chats/{chat_id}", headers=auth).json()
+    listing = client.get("/api/chats", headers=auth).json()
+    waits = client.get(f"/api/chat-waits?chat_id={chat_id}", headers=auth).json()["waits"]
+    return detail, next(c for c in listing if c["id"] == chat_id), waits
+
+  detail, listed, waits = visible()
+  assert listed["waiting"] is True
+  assert [wait["id"] for wait in waits] == [row.id]
+  assert detail["waits"] == waits
+  runtime = client.get(f"/api/chats/{chat_id}/runtime", headers=auth).json()
+  assert runtime["waits"] == waits
+  assert waits[0]["status"] == outcome
+  assert waits[0]["delivery_pending"] is True
+  assert waits[0]["resume_blocker"] == "platform_restart"
+  assert waits[0]["resume_delivered_at"] is None
+  assert build_active_waits_context(db, chat_id) == ""  # Do not repeat finished checks.
+  assert asyncio.run(sweep_due_waits()) == 0
+  db.expire_all()
+  assert db.get(models.ChatWait, row.id).checks_count == 0
+  _a_turn_carrying_it_succeeds(db, chat_id, row.id)
+  detail, listed, waits = visible()
+  assert detail["waits"] == waits == []
+  assert listed["waiting"] is False
+
+
+def test_loaded_restart_releases_visible_wait_once_without_rechecking_ci(
+  client, owner_token, db, monkeypatch,
+):
+  from app import platform_update
+
+  chat_id = _owner_chat(client, owner_token)
+  row = _command_wait(
+    db, chat_id=chat_id, description="CI finishes", command="true",
+    created_by_run_id=_seed_declaring_run(db, chat_id),
+  )
+  starts = _capture_starts(monkeypatch, running=False)
+  hold = [True]
+  monkeypatch.setattr(platform_update, "late_edits_pending", lambda: hold[0])
+  monkeypatch.setattr(platform_update, "read_prepared_update", lambda: {"replayed": "restored-sha"})
+  assert asyncio.run(sweep_due_waits()) == 0
+  db.expire_all()
+  row = db.get(models.ChatWait, row.id)
+  assert chat_waits_mod.serialize_wait(row, db=db)["resume_blocker"] == "platform_restart"
+  # The receipt is persisted, not owned by a monitor in the old turn.
+  db.expire_all()
+  hold[0] = False
+  assert asyncio.run(sweep_due_waits()) == 1
+  assert len(starts) == 1
+  _a_turn_carrying_it_succeeds(db, chat_id, row.id)
+  assert asyncio.run(sweep_due_waits()) == 0
+  assert db.get(models.ChatWait, row.id).checks_count == 1
+  assert chat_waits_mod.outstanding_waits_for_chat(db, chat_id) == []
+  assert len(starts) == 1
+
+
+def test_undelivered_history_does_not_claim_follow_up_completed(client, owner_token, db):
+  chat_id = _owner_chat(client, owner_token)
+  row = _command_wait(db, chat_id=chat_id, description="CI outcome", command="true")
+  row.status = "met"
+  row.met_at = now_naive_utc()
+  db.commit()
+  messages = [{"role": "assistant", "content": "Wait armed", "ts": int(row.created_at.replace(tzinfo=UTC).timestamp()*1000)}]
+  summary = chat_waits_mod.terminal_wait_summaries_by_message_index(db, chat_id, messages)[0][0]
+  assert summary["status"] == "met"
+  assert summary["delivery_pending"] is True
+  _a_turn_carrying_it_succeeds(db, chat_id, row.id)
+  assert chat_waits_mod.terminal_wait_summaries_by_message_index(db, chat_id, messages)[0][0]["delivery_pending"] is False

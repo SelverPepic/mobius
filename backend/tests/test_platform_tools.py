@@ -1065,3 +1065,20 @@ def test_a_settled_goal_does_not_offer_its_old_next_action(monkeypatch):
       "goal": {**goal, "status": status}, "plan": None,
     })
     assert ("Next action: Run the probe" in control._call_update_goal({})) is shown
+
+
+def test_restart_guidance_registers_each_chat_without_duplicating_the_executor():
+  control = _control_module()
+  description = control._TOOL_DEFINITIONS[control.REQUEST_RESTART_TOOL]["description"]
+  assert "Create this chat's own card even when another chat has one" in description
+  assert "One later ready restart resumes every still-registered chat" in description
+  assert "one restart per worker" in description
+  root = Path(__file__).resolve().parents[2]
+  core = (root / "skill/core.md").read_text()
+  maintenance = (root / "backend/scripts/seed-skills/platform-maintenance.md").read_text()
+  assert "Each chat whose work needs a restart publishes its own Restart card" in core
+  assert "not a second restart executor" in core
+  assert "Do not replace your\n  card with a peer handoff" in core
+  assert "Every chat that still owes activation and verification calls" in maintenance
+  assert "even if another chat already has a Restart card" in maintenance
+  assert "not duplicate restart\n   executors" in maintenance

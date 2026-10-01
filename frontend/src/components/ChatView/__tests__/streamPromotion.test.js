@@ -404,6 +404,22 @@ test('ordinary queued rows remain after the completed assistant despite older se
   ])
 })
 
+test('a live steer commits the visible paragraph before its owner row in one list revision', () => {
+  const before = [{ role: 'user', ts: 10, cid: 'first', content: 'start' }]
+  const steered = { role: 'user', ts: 20, cid: 'steer', steered: true, content: 'Please add this constraint.' }
+
+  const after = promoteAssistantStreamWithFollowingMessages(before, {
+    assistantMessageId: 'active-assistant',
+    items: [{ type: 'text', content: 'I am writing the first paragraph.' }],
+    followingMessages: [steered],
+  })
+
+  assert.equal(before.length, 1, 'the pre-cut list is not partially mutated')
+  assert.deepEqual(after.map(message => message.role), ['user', 'assistant', 'user'])
+  assert.equal(after[1].content, 'I am writing the first paragraph.')
+  assert.equal(after[2], steered)
+})
+
 test('promoteAssistantStream carries persisted question answers by identity', () => {
   const messages = [{
     role: 'assistant',

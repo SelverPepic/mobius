@@ -127,13 +127,31 @@ test('the cut hands the steered rows off the tray and into the transcript', () =
   )
   assert.match(
     handler,
-    /promoteStreamToMessages\(\{[\s\S]*?keepTurnOpen: true,[\s\S]*?items: sealedItems,[\s\S]*?assistantMessageId,[\s\S]*?\}\)/,
-    'the cut promotes the server-sealed segment and its assistant identity',
+    /promoteStreamToMessages\(\{[\s\S]*?keepTurnOpen: true,[\s\S]*?items: sealedItems,[\s\S]*?assistantMessageId,[\s\S]*?followingMessages: steeredMessages,[\s\S]*?\}\)/,
+    'the cut commits the sealed assistant and steered row in one transcript update',
+  )
+  assert.doesNotMatch(
+    handler,
+    /commitMessages\(/,
+    'a second transcript commit can briefly paint the steered row before its assistant',
   )
   assert.match(
     handler,
     /pendingQueue\.cancelByCid\(cid\)/,
     'the cut is when the rows genuinely leave chat.pending_messages',
+  )
+})
+
+test('an empty pre-steer segment still commits its owner row', () => {
+  const promote = sliceBranch(
+    chatViewSource,
+    'function promoteStreamToMessages({',
+    '\n  // Text changes through input',
+  )
+  assert.match(
+    promote,
+    /if \(keepTurnOpen && !streamItemsHaveRenderableContent\(items\)\) \{[\s\S]*?commitMessages\(prev => insertMessageBatchByTs\(prev, following\)\)/,
+    'a steer before the first assistant token must not make its message disappear',
   )
 })
 
@@ -246,7 +264,10 @@ function runSteerCut(messages) {
   const scope = {
     cidOf: m => m?.cid ?? null,
     takeSendIntent: () => null,
-    promoteStreamToMessages: () => { state.seals++ },
+    promoteStreamToMessages: ({ followingMessages }) => {
+      state.seals++
+      state.rows = followingMessages
+    },
     setActiveAssistantMessageId: id => { state.assistantId = id },
     isFirstVisibleUserMessage: () => false,
     landSentMessage: cid => state.pins.push(cid),

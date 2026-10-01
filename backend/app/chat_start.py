@@ -179,7 +179,7 @@ async def start_programmatic_chat_continuation(
     discard_starting,
     is_chat_running,
     mark_starting,
-    programmatic_start_blocked,
+    programmatic_start_blocker,
   )
   from app.chat_writer import (
     FinishRun,
@@ -211,7 +211,7 @@ async def start_programmatic_chat_continuation(
             # Fresh machine work cannot release an owner-input, usage, or
             # manual restart hold. An already committed continuation keeps
             # its idempotent attachment/recovery path below.
-            if existing is None and programmatic_start_blocked(
+            if existing is None and programmatic_start_blocker(
               db, chat_id, activation_wait_id=activation_wait_id,
             ):
               return False
@@ -369,7 +369,7 @@ async def start_programmatic_activity_continuation(
     discard_starting,
     is_chat_running,
     mark_starting,
-    programmatic_start_blocked,
+    programmatic_start_blocker,
   )
   from app.chat_writer import (
     FinishRun,
@@ -394,7 +394,7 @@ async def start_programmatic_activity_continuation(
               models.ChatRun.id == run_token,
               models.ChatRun.chat_id == chat_id,
             ).first()
-            if existing is None and programmatic_start_blocked(db, chat_id):
+            if existing is None and programmatic_start_blocker(db, chat_id):
               return False
             if existing is not None:
               if (

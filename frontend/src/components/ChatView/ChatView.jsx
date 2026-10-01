@@ -481,6 +481,7 @@ export default function ChatView({
   // the first authoritative detail read.
   const cached = queryClient.getQueryData(chatMessagesQueryKey(chatId))
   const [recoveryRunId, setRecoveryRunId] = useState(cached?.recoveryRunId || null)
+  const [continuationWait, setContinuationWait] = useState(cached?.continuationWait || null)
   const transcriptCacheKey = useMemo(() => chatMessagesQueryKey(chatId), [chatId])
   const {
     messages,
@@ -1490,6 +1491,7 @@ export default function ChatView({
       const refreshedChatInfo = chatDetailCacheValue(data).chatInfo
       setGoalPresentationLocalState(runtimeGoal)
       setRecoveryRunId(data.recovery_run_id || null)
+      setContinuationWait(data.continuation_wait || null)
       if (embedded) setEmbeddedRunActive(!!data.running)
       const adoptAssistantOwner = shouldAdoptRuntimeAssistantOwner({
         runtimeRunning: !!data.running,
@@ -1508,6 +1510,7 @@ export default function ChatView({
         runStatus: data.run_status || null,
         runtimeRevision: data.runtime_revision,
         recoveryRunId: data.recovery_run_id || null,
+        continuationWait: data.continuation_wait || null,
         goal: runtimeGoal,
         activeGoalObjective: runtimeGoal?.status === 'active'
           ? runtimeGoal.objective
@@ -1664,6 +1667,7 @@ export default function ChatView({
       }
       commitRuntimeSnapshot(runtimeTransition)
       setRecoveryRunId(data.recovery_run_id || null)
+      setContinuationWait(data.continuation_wait || null)
       // A finalized reply can advance while this client holds an idle warm
       // cache with no stream left to reconcile it. Foreground runtime reads
       // already carry the durable version; when it disproves the cache, use
@@ -1710,6 +1714,7 @@ export default function ChatView({
         runStatus: data.run_status || null,
         runtimeRevision: data.runtime_revision,
         recoveryRunId: data.recovery_run_id || null,
+        continuationWait: data.continuation_wait || null,
         goal: runtimeGoal,
         activeGoalObjective: runtimeGoal?.status === 'active'
           ? runtimeGoal.objective
@@ -2000,9 +2005,10 @@ export default function ChatView({
       // including when Stop is pressed with a queued message): the backend has
       // sealed the assistant text streamed up to the split, persisted the user
       // message after it, and reset for the continuation. Mirror that exact
-      // shape locally: first promote the current live stream segment into
-      // `messages`, then append the steered user row, then let future text
-      // deltas build a fresh streaming assistant block.
+      // shape locally in one transcript commit: seal the current assistant
+      // segment directly before the steered row, then let future text deltas
+      // build a fresh streaming assistant block. Separate commits can briefly
+      // paint the row ahead of the paragraph that was already visible.
       //
       // The split is owned by the live provider handle through the sink, so
       // this event always arrives AFTER the last block belonging to the sealed
@@ -2043,6 +2049,7 @@ export default function ChatView({
         keepTurnOpen: true,
         items: sealedItems,
         assistantMessageId,
+        followingMessages: steeredMessages,
         authoritativeCut: true,
       })
       // The sealed segment was promoted under the previous owner above. The
@@ -2071,11 +2078,6 @@ export default function ChatView({
         // applied its pin/hold, before allowing keyboard geometry to change.
         setCommittedSteerKeyboardDismiss(keyboardDismissRequest)
       }
-      // Dedup by ts so a reconnect's catch-up replay of the same event
-      // can't double-insert the steered user message. Insert by transcript ts
-      // instead of blindly appending: if a fetch/replay already committed the
-      // post-steer assistant row, the steered user still belongs before it.
-      commitMessages(prev => insertMessageBatchByTs(prev, steeredMessages))
       // The rows have now genuinely left `chat.pending_messages`, so retire the
       // tray entries the deferred-cut window kept durably queued but hidden.
       // The cut is the one place that owns the hand-off for both providers.
@@ -2368,6 +2370,11 @@ export default function ChatView({
     // REAL token ("I ") is renderable and still seals — we only skip when there
     // is nothing worth keeping.
     if (keepTurnOpen && !streamItemsHaveRenderableContent(items)) {
+      // Even an empty assistant segment has a real owner-message boundary.
+      // Commit that row here, not in a second render after stream retirement.
+      if (following.length > 0) {
+        commitMessages(prev => insertMessageBatchByTs(prev, following))
+      }
       clearStreamItems?.()
       return
     }
@@ -2507,6 +2514,7 @@ export default function ChatView({
     // this chat's cache (or ordinary absence) before any early surface can
     // paint, so a failed cold read cannot expose the previous chat's provider.
     setChatInfo(activationCache?.chatInfo ?? null)
+    setContinuationWait(activationCache?.continuationWait || null)
     const savedAnchorKey = savedReadingAnchorKey(chatId)
     const searchAnchorKey = searchReveal?.anchorKey || null
     // A search selection is a deliberate one-shot navigation, so it wins over
@@ -2594,6 +2602,7 @@ export default function ChatView({
       activationRecoveryRef.current.attempts = 0
       const running = !!runtime.running
       setRecoveryRunId(runtime.recovery_run_id || null)
+      setContinuationWait(runtime.continuation_wait || null)
       const attachesToStream = shouldAttachRunningStream({
         running,
         pendingQuestionId: runtime.pending_question_id,
@@ -2748,6 +2757,7 @@ export default function ChatView({
           runStatus: runtime.run_status || null,
           runtimeRevision: runtime.runtime_revision,
           recoveryRunId: runtime.recovery_run_id || null,
+          continuationWait: runtime.continuation_wait || null,
           activeAssistantMessageId:
             runtime.active_assistant_message_id || null,
           goal: runtimeGoal,
@@ -2857,7 +2867,11 @@ export default function ChatView({
       // ~90ms on-device reflow). This keeps switching responsive at the layer that
       // owns the transcript, without deferring the shell's nav dispatch — which
       // raced chat bootstrap/materialization and double-created starter chats.
-      if (activationCacheReusable && cacheCoversSavedAnchor && !anchorRetired) {
+      // Nested-coordinate validation does not make a complete mounted window
+      // cold. Slicing its replacement would destroy retained expanded details
+      // and clamp the reader through each prefix. Runtime reuse/fallback still
+      // requires the stronger activationCacheReusable proof above.
+      if (activationCacheEntryState !== 'missing' && !anchorRetired) {
         startTransition(() => {
           applyMessagesToView(refreshed.messages, refreshed.offset)
           settleRuntime(runtime, refreshed.messages)
@@ -3291,7 +3305,7 @@ export default function ChatView({
       clearComposerFilesForSend()
       if (inputRef.current) {
         resetComposerTextarea(inputRef.current)
-        // Drop the multi-line `.chat__pill--tall` class so send/mic
+        // Drop the multi-line `data-composer-tall` attribute so send/mic
         // re-center vertically. Without this, the pill stays in
         // flex-end alignment after a send-from-tall and the freshly
         // empty textarea renders pinned to the bottom — text appears
@@ -3587,7 +3601,7 @@ export default function ChatView({
     clearComposerFilesForSend()
     if (inputRef.current) {
       resetComposerTextarea(inputRef.current)
-      // Drop the multi-line `.chat__pill--tall` class — see queue-path
+      // Drop the multi-line `data-composer-tall` attribute — see queue-path
       // comment above for the full rationale.
     }
     setSending(true)
@@ -5094,16 +5108,6 @@ export default function ChatView({
     }
   }, [freezeForegroundReturn, turnActive])
 
-  // Reconnect catch-up and authoritative compact reads are the two atomic
-  // transcript-source handoffs. Either can re-settle row geometry without
-  // changing the message count. Re-apply the mode already owned by the scroll
-  // controller in the same pre-paint commit; before reveal, hide-then-reveal
-  // already owns the position and reapplyActiveMode deliberately no-ops.
-  useLayoutEffect(() => {
-    if (catchUpCommitSeq === 0 && transcriptReconcileSeq === 0) return
-    reapplyActiveMode()
-  }, [catchUpCommitSeq, transcriptReconcileSeq, reapplyActiveMode])
-
   // Promotion and this sequence update share one React batch, so the terminal
   // pin decision runs after the settled assistant DOM is committed and before
   // paint. This avoids racing a concurrent commit from the stream callback.
@@ -5837,6 +5841,12 @@ export default function ChatView({
     streamItems,
     showActiveAssistantSurface ? activeMirrorMsgIdx : -1,
   )
+  // Activity projection is a transcript-source commit too: peer rows may
+  // arrive after the first reveal without changing message count. Keep all
+  // source handoffs in the controller's same pre-paint transaction.
+  useLayoutEffect(() => {
+    reapplyActiveMode()
+  }, [catchUpCommitSeq, transcriptReconcileSeq, peerTimeline.activityEvents, reapplyActiveMode])
   const projectedActiveMirrorMsg = activeMirrorMsg?.id
     ? peerTimeline.messages.find(message => message.id === activeMirrorMsg.id)
       || activeMirrorMsg
@@ -5860,6 +5870,54 @@ export default function ChatView({
   const reservedSteerMessage = combineOwnerMessagesForDisplay(
     pendingQueue.steerReservedMessages,
   )
+
+  // A DB refresh may commit the steer before its cut reaches this socket.
+  // Keep the identity-owned active row in its transcript slot through that
+  // handoff; moving it to the tail would paint the owner message above it.
+  const activeAssistantSurface = showActiveAssistantSurface ? (
+    <ActiveAssistantSurface
+      key={streamingDataKey}
+      activeMirrorMsg={projectedActiveMirrorMsg}
+      activityMessageId={activeAssistantMessageId}
+      activitySourceBlocks={activeMirrorMsg?.blocks}
+      useDbActivePayload={useDbActivePayload}
+      hasLivePayload={hasLiveAssistantPayload}
+      streamItems={streamItems}
+      dataKey={streamingDataKey}
+      chatId={chatId}
+      onAnswer={doSendSilent}
+      onPrepareAnswer={prepareQuestionSubmission}
+      onCancelAnswer={cancelQuestionSubmission}
+      onResume={activeAssistantIsStreaming ? undefined : handleResume}
+      resumeState={resumeState}
+      onInternalNav={internalNav}
+      autoResumeEnabled={autoResumeEnabled}
+      autoResumeAvailable={showAutoResumeControl}
+      autoResumeSaving={autoResumeSaving}
+      autoResumeError={
+        autoResumeErrorSource === 'card' ? autoResumeError : ''
+      }
+      onAutoResumeChange={handleAutoResumeChange}
+      limitResetElapsed={limitResetElapsed}
+      recoveryCredit={pendingLimitRecoveryCredit}
+      submissionBlocked={providerSwitching}
+      liveQuestionId={answerableQuestionId}
+      // Same publication channel as the durable rows above: while the
+      // turn is live THIS surface owns the pending question card, so
+      // the offscreen observer follows the handoff automatically.
+      pendingQuestionRef={pendingQuestionRef}
+      resumeCardRef={resumeCardRef}
+      // Liveness for the ACTIVE surface follows the TURN, not the
+      // payload source: when a richer DB partial wins source selection
+      // (useDbActivePayload, e.g. through the reconnect catch-up
+      // window) the turn is still running, and its trailing activity
+      // must keep the in-progress face — shimmer, progressive tense,
+      // ", in progress" — instead of settling early. Source selection
+      // still gates resume/question routing above (review 2026-07-17).
+      isStreaming={activeAssistantIsStreaming || turnActive}
+      sealedSteerAssistant={sealedSteerAssistant}
+    />
+  ) : null
 
   return (
     <div
@@ -6031,13 +6089,12 @@ export default function ChatView({
             const continuationMarker = isContinuationMessage(msg)
             const renderedEndIndex = ownerBatch?.end ?? i
             const isLastMsg = renderedEndIndex === lastVisibleMessageIndex
-            // The mirrored DB row is rendered below by the SAME active
-            // MsgContent instance that consumes live payloads. Suppress only
-            // that row; unrelated assistant history remains in this map.
+            // DB and stream payloads occupy the same identity-owned row,
+            // including when a committed steer already follows that row.
             if (i === activeMirrorMsgIdx
                 && msg.role === 'assistant'
                 && showActiveAssistantSurface) {
-              return [peerRows]
+              return [peerRows, activeAssistantSurface]
             }
             // A question is answerable while the runner is parked on it,
             // waiting for the answer. The runner BLOCKS the turn on the
@@ -6105,6 +6162,7 @@ export default function ChatView({
                 onQuestionSubmitCancel={cancelQuestionSubmission}
                 onResume={handleResume}
                 resumeState={resumeState}
+                continuationWait={isLastMsg ? continuationWait : null}
                 onInternalNav={internalNav}
                 autoResumeEnabled={
                   isLastMsg && autoResumeEnabled
@@ -6137,52 +6195,9 @@ export default function ChatView({
               />
             </li>
           )]
-          })}
-
-          {showActiveAssistantSurface && (
-            <ActiveAssistantSurface
-              key={streamingDataKey}
-              activeMirrorMsg={projectedActiveMirrorMsg}
-              activityMessageId={activeAssistantMessageId}
-              activitySourceBlocks={activeMirrorMsg?.blocks}
-              useDbActivePayload={useDbActivePayload}
-              hasLivePayload={hasLiveAssistantPayload}
-              streamItems={streamItems}
-              dataKey={streamingDataKey}
-              chatId={chatId}
-              onAnswer={doSendSilent}
-              onPrepareAnswer={prepareQuestionSubmission}
-              onCancelAnswer={cancelQuestionSubmission}
-              onResume={activeAssistantIsStreaming ? undefined : handleResume}
-              resumeState={resumeState}
-              onInternalNav={internalNav}
-              autoResumeEnabled={autoResumeEnabled}
-              autoResumeAvailable={showAutoResumeControl}
-              autoResumeSaving={autoResumeSaving}
-              autoResumeError={
-                autoResumeErrorSource === 'card' ? autoResumeError : ''
-              }
-              onAutoResumeChange={handleAutoResumeChange}
-              limitResetElapsed={limitResetElapsed}
-              recoveryCredit={pendingLimitRecoveryCredit}
-              submissionBlocked={providerSwitching}
-              liveQuestionId={answerableQuestionId}
-              // Same publication channel as the durable rows above: while the
-              // turn is live THIS surface owns the pending question card, so
-              // the offscreen observer follows the handoff automatically.
-              pendingQuestionRef={pendingQuestionRef}
-              resumeCardRef={resumeCardRef}
-              // Liveness for the ACTIVE surface follows the TURN, not the
-              // payload source: when a richer DB partial wins source selection
-              // (useDbActivePayload, e.g. through the reconnect catch-up
-              // window) the turn is still running, and its trailing activity
-              // must keep the in-progress face — shimmer, progressive tense,
-              // ", in progress" — instead of settling early. Source selection
-              // still gates resume/question routing above (review 2026-07-17).
-              isStreaming={activeAssistantIsStreaming || turnActive}
-              sealedSteerAssistant={sealedSteerAssistant}
-            />
-          )}
+          }).concat(activeMirrorMsgIdx < 0 && activeAssistantSurface
+            ? [activeAssistantSurface]
+            : [])}
 
           {turnActive && streamItems.length === 0 && !loading && !showActiveAssistantSurface && (
             <li className="chat__msg chat__msg--assistant">

@@ -1543,8 +1543,8 @@ const AppCanvas = forwardRef(function AppCanvas({
             style={{ opacity: loaded ? 1 : 0 }}
             src={serviceSurfaceFrameUrl(serviceSurface.url, serviceSurface.correlation)}
             title={appName || serviceSurface.slug}
-            sandbox="allow-scripts allow-forms allow-popups allow-downloads allow-same-origin allow-top-navigation-by-user-activation"
-            allow="clipboard-read; clipboard-write; fullscreen"
+            sandbox="allow-scripts allow-forms allow-pointer-lock allow-popups allow-downloads allow-same-origin allow-top-navigation-by-user-activation"
+            allow="clipboard-read; clipboard-write; fullscreen; gamepad"
           />
         )}
         {!loaded && (
@@ -1681,7 +1681,15 @@ const AppCanvas = forwardRef(function AppCanvas({
             // withholds it.
             data-app-id={isLive ? appId : undefined}
             data-frame-version={v}
-            allow="clipboard-write; fullscreen"
+            // The app document is sandboxed to an opaque origin, so a bare
+            // `allow="feature"` (which targets only the src origin) never
+            // reaches it: delegated features must name `*`, which still
+            // reaches only this frame and what it nests. An explicit
+            // `fullscreen` entry overrides `allowFullScreen`, so it needs `*`
+            // too. `clipboard-write` stays bare because apps copy through the
+            // host clipboard broker. Pointer lock is a sandbox flag in the
+            // frame's response CSP (backend `app_frame_csp`), not a feature.
+            allow="clipboard-write; fullscreen *; gamepad *"
             allowFullScreen
             onLoad={() => handleFrameLoad(v)}
           />

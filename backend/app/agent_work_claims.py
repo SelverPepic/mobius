@@ -28,9 +28,15 @@ def clean_work_key(value: str) -> str:
 
 
 def _goal_id(db: Session, chat_id: str, run_id: str) -> str | None:
-  return db.query(models.ChatRun.goal_id).filter(
+  # A turn may offer a new approval after completing its Goal. The new action
+  # is chat-owned, not old work for that Goal's settlement to release.
+  return db.query(models.ChatRun.goal_id).join(
+    models.ChatGoal, models.ChatGoal.id == models.ChatRun.goal_id,
+  ).filter(
     models.ChatRun.id == run_id,
     models.ChatRun.chat_id == chat_id,
+    models.ChatGoal.chat_id == chat_id,
+    models.ChatGoal.status == "open",
   ).scalar()
 
 

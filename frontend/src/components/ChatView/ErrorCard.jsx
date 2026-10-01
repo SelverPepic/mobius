@@ -54,13 +54,21 @@ export function errorCardViewModel(block) {
 export default function ErrorCard({
   block,
   autoResume = false,
+  continuationWait = null,
   resetElapsed = false,
   recoveryCredit = null,
   cardRef,
   children,
 }) {
   const vm = errorCardViewModel(block)
-  const recoveryTitle = vm.modelCapacity
+  // A retry deadline cannot promise progress while platform recovery holds
+  // automatic admission. This live status never rewrites the original error.
+  const busyModelHold = vm.modelCapacity && (
+    continuationWait === 'restart_required' || continuationWait === 'restoring_edits'
+  )
+  const recoveryTitle = busyModelHold
+    ? (continuationWait === 'restart_required' ? 'Waiting for a server restart' : 'Waiting for the platform update')
+    : vm.modelCapacity
     ? (vm.resetLabel ? `Trying again ${vm.resetLabel}` : 'Trying again shortly')
     : vm.parked
     ? autoResume
@@ -69,7 +77,11 @@ export default function ErrorCard({
         ? 'Usage is available again'
         : (vm.resetLabel ? `Usage resets ${vm.resetLabel}` : 'Usage limit reached')
     : null
-  const recoveryCopy = vm.modelCapacity
+  const recoveryCopy = busyModelHold
+    ? (continuationWait === 'restart_required'
+      ? 'Your work is saved. Automatic retries are paused until a server restart loads the restored work. Möbius will retry after those changes are loaded.'
+      : 'Your work is saved. Automatic retries are paused while the update restores unfinished work. Möbius will retry once that work is restored and loaded.')
+    : vm.modelCapacity
     ? 'Your work is safe. Möbius will retry with increasing pauses, up to five times. If the model stays busy, you can choose another model and Resume.'
     : vm.parked
     ? autoResume
@@ -128,7 +140,11 @@ export default function ErrorCard({
                 ? block.resumable
                   ? block.pause.manual
                     ? 'Your work is saved. Resume to continue.'
-                    : 'Möbius will continue automatically when the restart is complete.'
+                    : continuationWait === 'restart_required'
+                      ? 'Waiting for a server restart to load the restored work. This chat will continue after those changes are loaded.'
+                      : continuationWait === 'restoring_edits'
+                        ? 'Waiting for the update to restore unfinished work. This chat will continue once that work is restored and loaded.'
+                        : 'Möbius will continue automatically when the restart is complete.'
                   : (block.message || 'This response is paused.')
                 : vm.resourceWait
                   ? (block.message || 'Möbius will continue automatically when resources free up.')

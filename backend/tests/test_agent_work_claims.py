@@ -32,6 +32,10 @@ def _fixture(db):
     ),
   ]
   db.add_all(runs)
+  db.add_all([
+    models.ChatGoal(id="claim-goal-first", chat_id=first.id, objective="Ship the change"),
+    models.ChatGoal(id="claim-goal-second", chat_id=second.id, objective="Align the platform"),
+  ])
   db.commit()
   return owner, first, second
 
@@ -143,7 +147,9 @@ def test_deleted_follower_cannot_suppress_live_follower_notification(db):
     goal_id="claim-goal-live", goal_objective="Follow exact work",
     chat_id=live.id, status="running", provider="codex",
   )
-  db.add_all([live, live_run])
+  db.add_all([live, live_run, models.ChatGoal(
+    id="claim-goal-live", chat_id=live.id, objective="Follow exact work",
+  )])
   db.commit()
   key = "platform:claim-fanout:test"
   claim_work(db, owner_id=owner.id, chat_id=first.id,
@@ -196,19 +202,11 @@ KEY = "github:mobius-os/mobius:pr:1079:3134e050:merge"
 def _owned_goal_claim(db, *, task_status="completed"):
   """First chat's open Goal owns KEY; the second chat's Goal follows it."""
   owner, first, second = _fixture(db)
-  db.add_all([
-    models.ChatGoal(
-      id="claim-goal-first", chat_id=first.id, objective="Ship the change",
-      plan_json={"tasks": [{
-        "id": "ship", "title": "Ship", "status": task_status,
-        "depends_on": [],
-      }]},
-      revision=1,
-    ),
-    models.ChatGoal(
-      id="claim-goal-second", chat_id=second.id, objective="Align the platform",
-    ),
-  ])
+  goal = db.get(models.ChatGoal, "claim-goal-first")
+  goal.plan_json = {"tasks": [{
+    "id": "ship", "title": "Ship", "status": task_status, "depends_on": [],
+  }]}
+  goal.revision = 1
   db.commit()
   claim_work(db, owner_id=owner.id, chat_id=first.id, run_id="claim-run-first",
              work_key=KEY, summary="Merge the reviewed PR")
@@ -350,6 +348,27 @@ def test_claim_taken_outside_a_goal_waits_for_explicit_finish(db):
   assert _claim_row(db).completed_at is None
 
 
+@pytest.mark.parametrize("status", ["completed", "stopped", "dismissed"])
+def test_new_claim_after_goal_ends_is_not_released_as_old_work(db, status):
+  from app.agent_work_claims import stage_settle_claims_with_owner
+
+  owner, first, second = _fixture(db)
+  db.get(models.ChatGoal, "claim-goal-first").status = status
+  db.commit()
+  won = claim_work(db, owner_id=owner.id, chat_id=first.id,
+                   run_id="claim-run-first", work_key=KEY, summary="New approved action")
+  assert won["owner_goal_id"] is None
+  assert stage_settle_claims_with_owner(db, first.id) == []
+  db.commit()
+  lost = claim_work(db, owner_id=owner.id, chat_id=second.id,
+                    run_id="claim-run-second", work_key=KEY, summary="Same new action")
+  assert lost["state"] == "held_by_peer"
+  assert _claim_row(db).released_at is None
+  finished = finish_work(db, owner_id=owner.id, chat_id=first.id,
+                         work_key=KEY, outcome="New action verified", release=False)
+  assert finished.claim["state"] == "completed"
+
+
 def test_racing_first_claims_leave_one_owner_and_one_follower(db):
   """Two chats insert the same key at once: the unique key picks one owner."""
   from sqlalchemy import event
@@ -358,9 +377,6 @@ def test_racing_first_claims_leave_one_owner_and_one_follower(db):
   from app.database import SessionLocal
 
   owner, first, second = _fixture(db)
-  db.add(models.ChatGoal(id="claim-goal-second", chat_id=second.id,
-                         objective="Align the platform"))
-  db.commit()
   raced = []
 
   def first_chat_wins_inside_the_gap(session, _ctx, _instances):

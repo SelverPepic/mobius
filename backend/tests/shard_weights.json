@@ -6,7 +6,6 @@
   "tests/test_admin_rebuild.py": 3.3,
   "tests/test_agent_activity.py": 0.2,
   "tests/test_agent_admission.py": 0.2,
-  "tests/test_agent_browser_profile_cleanup.py": 0.2,
   "tests/test_agent_browser_session_reset.py": 0.3,
   "tests/test_agent_coordination.py": 11.2,
   "tests/test_agent_lifecycle.py": 1.8,

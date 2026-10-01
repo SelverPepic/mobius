@@ -56,6 +56,29 @@ test('a Goal update names what it did to the Goal', () => {
   assert.equal(goal('', 'running'), 'Reading the plan')
 })
 
+test('JSON Goal arguments describe the operation, not a plan read', () => {
+  for (const prefix of ['mcp__mobius_control__', 'mobius_control:']) {
+    const goal = (args, status = 'done', extra = {}) => toolCallLabel({
+      ...tool(`${prefix}update_goal`, JSON.stringify(args, null, 2), status), ...extra,
+    })
+    assert.equal(goal({ tasks: [{ id: 'activate', status: 'completed' }], complete: 'Verified', finished_claims: ['key'] }), 'Completed the Goal')
+    assert.equal(goal({ complete: 'Verified' }, 'running'), 'Completing the Goal')
+    assert.equal(goal({ complete: 'Verified' }, 'done', { output_exit_code: 1 }), 'Could not complete the Goal')
+    assert.equal(goal({ tasks: [{ id: 'a' }] }), 'Updated the plan')
+    assert.equal(goal({ tasks: [{ id: 'a' }] }, 'failed'), 'Could not update the plan')
+    assert.equal(goal({ next_action: 'Run the check' }), 'Left the next step')
+    assert.equal(goal({}), 'Read the plan')
+    assert.equal(goal({ complete: null }), 'Read the plan')
+    assert.equal(goal({ next_action: 'Text mentioning complete=Verified' }), 'Left the next step')
+  }
+})
+
+test('JSON control details preserve the same wording as summarized inputs', () => {
+  assert.equal(toolCallLabel(tool('mobius_control:promote_goal', JSON.stringify({ objective: 'Ship the release' }))), 'Started a Goal: Ship the release')
+  assert.equal(toolCallLabel(tool('mobius_control:apply_app', JSON.stringify({ source_dir: '/data/apps/notes' }))), 'Applied app notes')
+  assert.equal(toolCallLabel(tool('mobius_control:update_goal', 'complete=Verified', 'failed')), 'Could not complete the Goal')
+})
+
 test('app and screenshot tools name their target', () => {
   assert.equal(
     toolCallLabel(tool('mobius_control:screenshot', 'route=/shell/?app=4, content_only=True')),
