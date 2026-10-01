@@ -8,7 +8,7 @@ import json
 import re
 from typing import Any
 
-from sqlalchemy import or_, update
+from sqlalchemy import func, or_, update
 from sqlalchemy.orm import Session, load_only
 
 from app import models
@@ -307,36 +307,65 @@ def helper_plan_task(
   return leaves[0] if len(leaves) == 1 else None
 
 
+def _presented_goal_attempts(db: Session, chat_ids):
+  """Shared exact retained-Goal selection, independent of execution liveness.
+
+  Rank before applying visibility: clearing the latest identity (or a latest
+  attempt without an objective) must not uncover an older Goal. Ordinary
+  non-Goal turns do not displace the retained Goal.
+  """
+  ranked = db.query(
+    models.ChatRun.id.label("run_id"),
+    func.row_number().over(
+      partition_by=models.ChatRun.chat_id,
+      order_by=(models.ChatRun.started_at.desc(), models.ChatRun.id.desc()),
+    ).label("position"),
+  ).filter(
+    models.ChatRun.chat_id.in_(list(chat_ids)),
+    or_(models.ChatRun.goal_id.isnot(None), models.ChatRun.goal_objective.isnot(None)),
+  ).subquery()
+  return db.query(models.ChatRun).join(
+    ranked, ranked.c.run_id == models.ChatRun.id,
+  ).join(models.Chat, models.Chat.id == models.ChatRun.chat_id).filter(
+    ranked.c.position == 1,
+    models.ChatRun.goal_objective.isnot(None),
+    or_(models.ChatRun.goal_id.is_(None), models.Chat.dismissed_goal_id.is_(None),
+        models.ChatRun.goal_id != models.Chat.dismissed_goal_id),
+  )
+
+
 def presented_goal_rows(
   db: Session, chat_id: str,
 ) -> tuple[models.ChatRun, models.ChatGoal] | None:
-  """Return the latest Goal that remains visible until an explicit clear.
+  """Latest Goal remains visible until its exact identity is explicitly cleared."""
+  physical = _presented_goal_attempts(db, [chat_id]).first()
+  return _goal_rows_for_physical(db, physical) if physical is not None else None
 
-  ``Chat.dismissed_goal_id`` suppresses only the exact Goal the owner cleared;
-  later ordinary turns cannot revive it, while a genuinely new Goal has a new
-  identity and naturally becomes visible. Execution liveness is deliberately
-  absent from this query so completed and paused Goals survive reloads.
+
+def presented_deferred_goals(db: Session, chat_ids) -> dict[str, dict]:
+  """Tiny batch hold projection: no plans, transcripts, or per-chat reads.
+
+  Uses the same retained-attempt selection as the full Goal presentation; a
+  newer terminal or cleared Goal must never expose an older deferred Goal.
   """
-  physical = (
-    db.query(models.ChatRun)
-    .filter(
-      models.ChatRun.chat_id == chat_id,
-      or_(
-        models.ChatRun.goal_id.isnot(None),
-        models.ChatRun.goal_objective.isnot(None),
-      ),
-    )
-    .order_by(models.ChatRun.started_at.desc(), models.ChatRun.id.desc())
-    .first()
-  )
-  if physical is None or physical.goal_objective is None:
-    return None
-  dismissed_goal_id = db.query(models.Chat.dismissed_goal_id).filter(
-    models.Chat.id == chat_id,
-  ).scalar()
-  if physical.goal_id is not None and physical.goal_id == dismissed_goal_id:
-    return None
-  return _goal_rows_for_physical(db, physical)
+  from app.goals import goal_hold
+  ids = list(chat_ids)
+  if not ids:
+    return {}
+  rows = _presented_goal_attempts(db, ids).join(
+    models.ChatGoal,
+    (models.ChatGoal.id == models.ChatRun.goal_id)
+    & (models.ChatGoal.chat_id == models.ChatRun.chat_id),
+  ).filter(models.ChatGoal.status == "stopped").with_entities(
+    models.ChatRun.chat_id, models.ChatGoal.id, models.ChatGoal.hold_json,
+  ).all()
+  result = {}
+  for row in rows:
+    hold = goal_hold(row)
+    if hold and hold["cause"] == "deferred":
+      result[row.chat_id] = {"id": row.id, "pause_reason": "deferred",
+                             "hold_reason": hold["reason"]}
+  return result
 
 
 def goal_attempt_root_ids(db: Session, chat_id: str, goal_id: str) -> set[str]:

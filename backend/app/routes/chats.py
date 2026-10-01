@@ -72,7 +72,7 @@ from app.chat_titles import (
 )
 from app.database import get_db
 from app.delegations import background_helper_chat_ids, serialize_background_helpers
-from app.goal_plans import presented_goal
+from app.goal_plans import presented_goal, presented_deferred_goals
 from app.helper_transcripts import read_helper_conversation
 from app.memory_observability import record_memory_checkpoint_once
 from app.owner_input import OwnerInputKind
@@ -819,6 +819,7 @@ def _chat_detail_response(
     waits=response["waits"],
     helper_count=response["background_helpers"]["count"],
     park=continuation_handoff_for_chat(db, chat.id),
+    goal=response["goal"],
   )
   if requested_anchor_found is not None:
     response["requested_anchor_found"] = requested_anchor_found
@@ -933,6 +934,7 @@ def list_chats(
       "shell_chat_list_first_response",
       chat_count=len(chats),
     )
+  deferred_goals = presented_deferred_goals(db, (chat.id for chat in chats))
   result = []
   for chat in chats:
     owner_kind = "question" if chat.pending_question_id is not None else (
@@ -948,6 +950,7 @@ def list_chats(
       waits=waits,
       helper_count=1 if chat.id in helper_chat_ids else 0,
       park=park,
+      goal=deferred_goals.get(chat.id),
     )
     result.append(_owner_chat_summary(
       chat,
@@ -1862,6 +1865,7 @@ def get_chat_runtime(
     running=running, waits=response["waits"],
     helper_count=response["background_helpers"]["count"],
     park=continuation_handoff_for_chat(db, chat.id),
+    goal=response["goal"],
   )
   return response
 
