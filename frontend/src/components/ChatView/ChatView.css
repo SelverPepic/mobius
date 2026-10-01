@@ -924,6 +924,11 @@
 }
 .chat__text--assistant + .chat__text--assistant { margin-top: 0.75rem; }
 
+/* Lifecycle cards and the prose that follows are separate reading blocks. */
+.chat__goal-history + .chat__text--assistant {
+  margin-top: 16px;
+}
+
 .chat__tool {
   border-radius: 10px;
   font-size: 12px; /* floor raised from 11px for readability */
