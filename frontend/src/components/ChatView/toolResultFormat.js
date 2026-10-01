@@ -280,9 +280,9 @@ export function toolInputText(input) {
   return typeof input === 'string' ? input : JSON.stringify(input, null, 2)
 }
 
-// MCP tools may report isError without a terminal exit code. Inspect only the
-// result envelope and bounded common wrappers, never words inside the payload.
-export function toolResultFailed(output) {
+// MCP completion and transport success do not imply application success.
+// Inspect bounded result envelopes, never error-shaped command stdout.
+function mcpResultFailed(output) {
   let value = tryParse(output)
   for (let depth = 0; depth <= 4 && value && typeof value === 'object'; depth += 1) {
     if (value.isError === true) return true
@@ -291,6 +291,11 @@ export function toolResultFailed(output) {
     const inner = value[keys[0]]
     value = typeof inner === 'string' ? tryParse(inner) : inner
   }
+  return false
+}
+
+export function toolResultFailed(output) {
+  if (mcpResultFailed(output)) return true
   const r = formatToolResult(output)
   return r.kind === 'terminal' && r.exitCode != null && r.exitCode !== 0
 }
@@ -310,5 +315,7 @@ export function toolBlockExitCode(t) {
 
 export function toolBlockFailed(t) {
   const code = toolBlockExitCode(t)
-  return code != null ? code !== 0 : toolResultFailed(t?.output)
+  // Shell stdout is arbitrary user data, not an MCP result envelope.
+  if (t?.tool === 'Bash' || t?.tool === 'shell') return code != null && code !== 0
+  return code != null ? code !== 0 || mcpResultFailed(t?.output) : toolResultFailed(t?.output)
 }

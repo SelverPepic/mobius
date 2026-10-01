@@ -268,7 +268,7 @@ export function isQuietBookkeepingTool(tool) {
   if (!capture && !['checkpoint_chat', 'memory_remember', 'reflection_log_friction'].includes(bare)) return false
   const activity = tool?.app_activity
   return tool?.status !== 'failed' && !toolBlockFailed(tool)
-    && activity?.status !== 'failed' && !activity?.warning
+    && activity?.status !== 'failed' && !activity?.warning && !activity?.receipt_missing
     && !(activity?.resources?.length > 0)
 }
 
@@ -277,11 +277,20 @@ export function isQuietBookkeepingTool(tool) {
 export function isOwnerAnswerNotification(tool, chatId) {
   if (bareControlName(tool?.tool) !== 'notify_owner'
       || tool?.status !== 'done' || toolBlockFailed(tool)) return false
-  if (controlInputValue(tool.input, 'title') !== 'Möbius needs your answer') return false
-  const target = controlInputValue(tool.input, 'target')
-  // Legacy summaries end at 200 chars; an omitted target there is unknown.
-  if (target === undefined && tool.input.length >= 200 && !tool.input.trim().startsWith('{')) return false
-  return target === undefined || (chatId && target === `/shell/?chat=${chatId}`)
+  if (typeof tool.input !== 'string') return false
+  let args
+  try {
+    args = JSON.parse(tool.input)
+  } catch {
+    // Legacy summaries are unescaped and truncated; ambiguous inputs stay visible.
+    if (/^(?:\{|\[)/.test(tool.input.trimStart()) || tool.input.length >= 200) return false
+    const pairs = [...tool.input.matchAll(/(?:^|, )([a-z_]+)=([\s\S]*?)(?=, [a-z_]+=|$)/g)]
+    if (!pairs.length || pairs[0].index !== 0 || new Set(pairs.map(p => p[1])).size !== pairs.length) return false
+    args = Object.fromEntries(pairs.map(p => [p[1], p[2]]))
+  }
+  if (!args || typeof args !== 'object' || Array.isArray(args)
+      || args.title !== 'Möbius needs your answer') return false
+  return !Object.hasOwn(args, 'target') || (chatId && args.target === `/shell/?chat=${chatId}`)
 }
 
 function summaryValue(input, key) {

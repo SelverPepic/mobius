@@ -44,6 +44,9 @@ test('failed saves, warnings and useful resources never become quiet receipts', 
     { output_exit_code: 1 }, { status: 'failed' },
     { app_activity: { status: 'failed' } },
     { app_activity: { warning: 'Needs attention' } },
+    { app_activity: { receipt_missing: true } },
+    { output_exit_code: 0, output: JSON.stringify({ isError: true }) },
+    { output_exit_code: 0, output: JSON.stringify({ result: JSON.stringify({ isError: true }) }) },
     { app_activity: { resources: [{ label: 'Useful result' }] } },
     { output: JSON.stringify({ isError: true, content: [{ type: 'text', text: 'Save failed' }] }) },
   ]) assert.equal(isQuietBookkeepingTool(tool('memory_remember', extra)), false, JSON.stringify(extra))
@@ -83,10 +86,26 @@ test('missing cards, unrelated notifications and failed or running sends stay in
   for (const extra of [
     { status: 'running' }, { status: 'failed' }, { output_exit_code: 1 },
     { output: JSON.stringify({ isError: true }) },
+    { output_exit_code: 0, output: JSON.stringify({ isError: true }) },
+    { output_exit_code: 0, output: JSON.stringify({ result: { isError: true } }) },
     { input: '{}' }, { input: '{invalid' },
+    { input: '{invalid, title=Möbius needs your answer, body=Continue?' },
+    { input: 'title=Möbius needs your answer, target=/shell/?app=57, body=See, target=/shell/?chat=this-chat' },
+    { input: 'title=Build finished, body=Context, title=Möbius needs your answer' },
+    { input: '["x, title=Möbius needs your answer, body=x"]' },
+    { input: '[invalid, title=Möbius needs your answer, body=x' },
     { input: JSON.stringify({ title: 'Build finished' }) },
     { input: JSON.stringify({ title: 'Möbius needs your answer', target: '/shell/?app=57' }) },
     { input: JSON.stringify({ title: 'Möbius needs your answer', target: null }) },
     { input: 'title=Möbius needs your answer, body=' + 'a'.repeat(200) },
   ]) assert.equal(suppressedQuestionToolIndices([notification(extra), question], 'this-chat').size, 0, JSON.stringify(extra))
+})
+
+test('a missing Memory receipt remains distinctive rather than routine', () => {
+  const capture = tool('memory_remember', { app_activity: {
+    app_slug: 'memory', activity_id: 'memory-capture', status: 'succeeded', receipt_missing: true,
+  } })
+  assert.equal(isQuietBookkeepingTool(capture), false)
+  assert.equal(isDistinctiveActivityTool(capture), true)
+  assert.equal(groupActivityRuns([entry(capture), entry(tool('checkpoint_chat'))]).length, 2)
 })

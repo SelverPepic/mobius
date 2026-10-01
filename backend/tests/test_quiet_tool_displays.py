@@ -29,7 +29,14 @@ def test_card_owns_its_successful_notification_in_either_order(prefix, before):
   {"status": "running"}, {"status": "failed"}, {"output_exit_code": 1},
   {"output": json.dumps({"isError": True})},
   {"output": json.dumps({"result": json.dumps({"isError": True})})},
+  {"output_exit_code": 0, "output": json.dumps({"isError": True})},
+  {"output_exit_code": 0, "output": json.dumps({"result": json.dumps({"isError": True})})},
   {"input": "{}"}, {"input": "{invalid"}, {"input": "[]"},
+  {"input": "{invalid, title=Möbius needs your answer, body=Continue?"},
+  {"input": 'title=Möbius needs your answer, target=/shell/?app=57, body=See, target=/shell/?chat=this-chat'},
+  {"input": 'title=Build finished, body=Context, title=Möbius needs your answer'},
+  {"input": '["x, title=Möbius needs your answer, body=x"]'},
+  {"input": '[invalid, title=Möbius needs your answer, body=x'},
   {"input": json.dumps({"title": "Build finished"})},
   {"input": json.dumps({"title": "Möbius needs your answer", "target": "/shell/?app=57"})},
   {"input": json.dumps({"title": "Möbius needs your answer", "target": None})},
@@ -87,3 +94,19 @@ def test_compact_and_expanded_reads_both_omit_only_the_card_notification(client,
   visible = [entry["item"] for entry in detail.json()["entries"]]
   assert len(visible) == 3
   assert json.loads(visible[-1]["input"])["title"] == "Build finished"
+
+
+@pytest.mark.parametrize("result", [{"isError": True}, {"result": {"isError": True}}])
+def test_compact_and_expanded_reads_keep_semantic_mcp_failure_with_exit_zero(client, auth, result):
+  failed = notice(output_exit_code=0, output=json.dumps(result))
+  response = client.post("/api/chats", headers=auth, json={
+    "title": "Synthetic failed notification", "messages": [{"role": "assistant", "blocks": [failed, CARD]}],
+  })
+  assert response.status_code == 200
+  chat_id = response.json()["id"]
+  compact = client.get(f"/api/chats/{chat_id}?compact=1", headers=auth)
+  assert compact.status_code == 200
+  assert compact.json()["messages"][0]["blocks"][0]["output"] == failed["output"]
+  detail = client.get(f"/api/chats/{chat_id}/activity-detail?message_index=0&start=0&end=2", headers=auth)
+  assert detail.status_code == 200
+  assert detail.json()["entries"][0]["item"]["output"] == failed["output"]
