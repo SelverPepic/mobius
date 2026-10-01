@@ -259,7 +259,9 @@ class GoalUpdateRequest(BaseModel):
 
 def _goal_summary(db: Session, goal) -> dict[str, Any]:
   from app.agent_work_claims import open_claim_keys
+  from app.goals import goal_hold
   return {
+    "hold": goal_hold(goal) if goal.status == "stopped" else None,
     "id": goal.id, "status": goal.status, "revision": goal.revision,
     "objective": goal.objective, "next_action": goal.next_action,
     "result": goal.result,
@@ -278,7 +280,7 @@ async def _attach_run_to_goal(db: Session, chat_id: str, principal: Principal,
   rows = active_goal_rows(db, chat_id)
   if (
     rows is not None and rows[0].id == principal.run_id
-    and rows[0].status == "running"
+    and rows[0].status == "running" and rows[1].status != "stopped"
     and (goal_id is None or rows[1].id == goal_id)
   ):
     return rows
@@ -293,7 +295,10 @@ async def _attach_run_to_goal(db: Session, chat_id: str, principal: Principal,
   else:
     presented = presented_goal_rows(db, chat_id)
     target = presented[1] if presented else None
-  if target is None or target.status != "open":
+  # Naming a held Goal is a deliberate reattachment. An implicit plan write
+  # must never undo a hold simply because that Goal remains on screen.
+  allowed = {"open", "stopped"} if goal_id is not None else {"open"}
+  if target is None or target.status not in allowed:
     raise HTTPException(status_code=409, detail={
       "code": "no_active_goal",
       "message": "This chat has no open Goal to update. Promote one first.",

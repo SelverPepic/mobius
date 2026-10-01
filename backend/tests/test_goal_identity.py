@@ -373,9 +373,10 @@ def test_stopped_unplanned_goal_stays_resumable_after_ordinary_turns(db, chat):
     "id": "paused-id",
     "objective": "Pause safely",
     "status": "paused",
+    "revision": 0,
     "resumable": True,
-    "pause_reason": "owner",
-    "handoff": {"kind": "owner_hold", "reason": "owner"},
+    "pause_reason": "unknown",
+    "handoff": {"kind": "recovery", "reason": "unknown_stop"},
   }
   assert goal_identity_for_run_start(
     db, chat.id, {"content": "continue"},
@@ -421,6 +422,7 @@ def test_new_goal_remains_visible_after_the_previous_identity_was_dismissed(
   assert presented_goal(db, chat.id) == {
     "id": "new-id",
     "objective": "New",
+    "revision": 0,
     "status": "active",
     "resumable": False,
     "handoff": {"kind": "working", "reason": None},

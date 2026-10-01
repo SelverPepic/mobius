@@ -251,9 +251,10 @@ def test_goal_completion_completes_the_claims_it_names_with_the_result(db):
 
 @pytest.mark.parametrize("run_token", ["claim-run-first", ""])
 def test_stop_releases_the_goal_claims_in_the_same_writer_commit(db, run_token):
-  from app.chat_writer import FinishRun, get_writer
+  from app.chat_writer import FinishRun, PrepareChatStop, get_writer
 
   owner, first, second = _owned_goal_claim(db, task_status="running")
+  get_writer().submit(PrepareChatStop(chat_id=first.id, actor="owner")).result(timeout=5)
   get_writer().submit(FinishRun(
     chat_id=first.id, run_token=run_token, terminal_status="stopped",
   )).result(timeout=5)

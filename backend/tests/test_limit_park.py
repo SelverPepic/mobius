@@ -731,7 +731,10 @@ def test_owner_message_queues_behind_future_limit_park(
   assert response.json()["status"] == "queued"
   assert scheduled == []
   assert _run_row("rt-park-owner-queue")["status"] == "parked"
-  assert _chat_row(cid)["pending"] == [{
+  pending = _chat_row(cid)["pending"]
+  accepted_at = pending[0].pop("_owner_input_at")
+  assert datetime.fromisoformat(accepted_at).tzinfo == UTC
+  assert pending == [{
     "role": "user",
     "content": "also check the weekly limit",
     "ts": response.json()["ts"],

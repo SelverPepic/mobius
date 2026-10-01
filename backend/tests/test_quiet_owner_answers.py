@@ -210,7 +210,9 @@ def test_quiet_answer_closes_a_card_of_an_unfinished_goal(client, chat, auth, ap
   with SessionLocal() as db:
     goal = db.get(models.ChatGoal, approval_run[0].run_token)
     assert goal.status == 'stopped'
-    assert 'without continuing' in goal.checkpoint
+    assert goal.hold_json['cause'] == 'quiet_answer'
+    assert goal.hold_json['actor'] == 'owner'
+    assert goal.hold_json['source_id'] == qid
     assert goal.plan_json['tasks'][0]['status'] == 'pending'
 
 

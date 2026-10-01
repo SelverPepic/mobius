@@ -249,6 +249,7 @@ def continuation_control_envelope(
   *, reason: str, control_id: str,
   source_work_id: str | None = None, goal_id: str | None = None,
   supersedes_run_token: str | None = None,
+  goal_revision: int | None = None,
 ) -> dict:
   """Return the bounded durable half of a provider-only continuation."""
   envelope = {
@@ -261,7 +262,21 @@ def continuation_control_envelope(
     envelope["goal_id"] = goal_id
   if supersedes_run_token is not None:
     envelope["supersedes_run_token"] = supersedes_run_token
+  if goal_revision is not None:
+    envelope["goal_revision"] = goal_revision
   return envelope
+
+
+def manual_resume_matches(control, *, control_id, run_id=None,
+                          goal_id=None, goal_revision=None):
+  """A lost Resume receipt can acknowledge only the original exact target."""
+  if control.get("control_id") != control_id or control.get("reason") != "manual":
+    return False
+  if goal_id is not None or "goal_revision" in control:
+    return (goal_id == control.get("goal_id")
+            and goal_revision == control.get("goal_revision") and run_id is None)
+  recorded_run = control.get("supersedes_run_token")
+  return run_id is None or recorded_run is None or recorded_run == run_id
 
 
 def manual_continuation_run_token(chat_id: str, control_id: str) -> str:

@@ -127,7 +127,9 @@ UPDATE_GOAL_DESCRIPTION = (
   "off. Settle every task honestly and wait for helpers before any outcome. "
   "Tasks and outcome commit atomically; refusal saves neither. No proof-of-prose "
   "approval validator substitutes for the agent's judgment. With no arguments it returns the current "
-  "plan. goal_id attaches to a named retained Goal instead of the presented one."
+  "plan. goal_id explicitly resumes a named retained Goal instead of the presented "
+  "one, including a held Goal only when the owner asked to continue that work. "
+  "Do not create a replacement Goal or reattach an unrelated follow-up."
 )
 DECLARE_WAIT_DESCRIPTION = (
   "Persist this top-level chat's one cross-turn wait: the chat resumes by "

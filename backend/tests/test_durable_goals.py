@@ -168,8 +168,9 @@ def test_exact_completion_retry_is_idempotent(db, chat):
 
 
 def test_stop_racing_stale_completion_keeps_obligation_stopped(db, chat):
-  from app.chat_writer import FinishRun, get_writer
+  from app.chat_writer import FinishRun, PrepareChatStop, get_writer
   goal, run = work(db, chat, task_status="completed")
+  get_writer().submit(PrepareChatStop(chat_id=chat.id, actor="owner")).result(timeout=5)
   get_writer().submit(FinishRun(chat_id=chat.id, run_token=run.id,
                               terminal_status="stopped")).result(timeout=5)
   # Deliberately retain the stale ORM snapshot from before Stop.
@@ -179,8 +180,8 @@ def test_stop_racing_stale_completion_keeps_obligation_stopped(db, chat):
   assert db.get(models.ChatGoal, goal.id).status == "stopped"
 
 
-def test_tokenless_stop_reaches_latest_open_goal_past_completed_goal(db, chat):
-  from app.chat_writer import FinishRun, get_writer
+def test_idle_explicit_stop_targets_presented_goal_not_a_terminal_record(db, chat):
+  from app.chat_writer import FinishRun, PrepareChatStop, get_writer
   goal, run = work(db, chat, attempt_status="completed")
   db.add(models.ChatGoal(
     id="newer-completed", chat_id=chat.id, objective="Already finished",
@@ -188,6 +189,7 @@ def test_tokenless_stop_reaches_latest_open_goal_past_completed_goal(db, chat):
   ))
   db.commit()
 
+  get_writer().submit(PrepareChatStop(chat_id=chat.id, actor="owner")).result(timeout=5)
   get_writer().submit(FinishRun(
     chat_id=chat.id, run_token="", terminal_status="stopped",
   )).result(timeout=5)

@@ -40,6 +40,23 @@ def stage_goal_hold(goal, *, cause, actor, source_id, run_id=None, actor_id=None
   return True
 
 
+def has_owner_input_after_hold(run, goal) -> bool:
+  """A later owner request may deliberately resume work; a wake may not.
+
+  Recovery carries the original admission time, not a fresh permission. Older
+  records fail closed because neither run status nor transcript prose proves intent.
+  """
+  if run.owner_input_at is None:
+    return False
+  hold = goal_hold(goal)
+  admitted_at = run.owner_input_at.replace(tzinfo=UTC)
+  if hold is None:
+    # A direct or queued owner request has no physical recovery envelope.
+    # With no trustworthy hold time, inherited recovery cannot prove ordering.
+    return run.continuation_json is None
+  return admitted_at > datetime.fromisoformat(hold["at"]).astimezone(UTC)
+
+
 def goal_for_run(db, run):
   if run is None or not run.goal_id:
     return None
@@ -47,6 +64,14 @@ def goal_for_run(db, run):
   if goal is None or goal.chat_id != run.chat_id:
     raise RuntimeError("Goal attempt has no matching durable work record")
   return goal
+
+
+def goal_allows_automatic_resume(db, run) -> bool:
+  """A process park cannot override a durable hold or a terminal outcome."""
+  if not run.goal_id:
+    return True
+  goal = db.get(models.ChatGoal, run.goal_id)
+  return goal is not None and goal.chat_id == run.chat_id and goal.status == "open"
 
 
 def admit_goal(db, chat_id, goal_id, objective, message=None):

@@ -374,6 +374,9 @@ def continuation_handoff_for_chat(db: Session, chat_id: str) -> dict:
   run = _latest_continuation_park(db, chat_id)
   if run is None:
     return {"kind": "none", "reason": None}
+  from app.goals import goal_allows_automatic_resume
+  if not goal_allows_automatic_resume(db, run):
+    return {"kind": "recovery", "reason": "goal_held"}
   chat = db.query(models.Chat).options(load_only(
     models.Chat.id, models.Chat.deleted_at, models.Chat.pending_question_id,
     models.Chat.auto_resume_on_limit, models.Chat.auto_resume_on_restart,
@@ -1987,6 +1990,9 @@ def _auto_resume_recovery(
   from app.delegations import retired_delegation_for_chat
   if retired_delegation_for_chat(db, chat.id):
     return None
+  from app.goals import goal_allows_automatic_resume
+  if not goal_allows_automatic_resume(db, physical):
+    return None
   control = physical.continuation_json
   messages = list(chat.messages or [])
   source = messages[-1] if messages else None
@@ -2222,6 +2228,9 @@ async def _auto_resume_chat(
               .first()
             )
             latest_id = latest[0] if latest is not None else None
+            from app.goals import goal_allows_automatic_resume
+            if park is not None and not goal_allows_automatic_resume(check_db, park):
+              return False
             restart_park = (
               park is not None and park.park_reason == "restart"
             )
@@ -2536,6 +2545,9 @@ async def sweep_reset_parks(
       isinstance(msg, dict) and msg.get("_initiated_by_app_id") is not None
       for msg in pending
     )
+    from app.goals import goal_allows_automatic_resume
+    if not goal_allows_automatic_resume(db, run):
+      return "Goal held or settled"
     if chat is None or chat.deleted_at is not None:
       return "chat unavailable"
     from app.delegations import delegation_recovery_allowed
@@ -2912,7 +2924,8 @@ def _log_superseded_run(chat_id: str, phase: str) -> None:
 
 
 async def stop_chat(
-  chat_id: str | None = None, db: Session = None,
+  chat_id: str | None = None, db: Session = None, *,
+  actor: str | None = None, actor_id: str | None = None,
 ) -> tuple[bool, list[str]]:
   """Kills the active subprocess for a chat, bumps its generation, and
   clears its pending queue so a queued continuation cannot auto-start
@@ -2925,7 +2938,7 @@ async def stop_chat(
   isn't double-sent. The global sweep (`chat_id=None`) returns `[]` for it —
   that path doesn't resend."""
   if chat_id is not None:
-    return await stop_chat_for(chat_id, db=db)
+    return await stop_chat_for(chat_id, db=db, actor=actor, actor_id=actor_id)
   from app.broadcast import _broadcasts
   # Snapshot `_broadcasts` via `list()` first — iterating the live
   # mapping can raise RuntimeError if a concurrent task creates a
@@ -2935,7 +2948,7 @@ async def stop_chat(
   }
   stopped_any = False
   for cid in targets:
-    stopped_cid, _ = await stop_chat_for(cid, db=db)
+    stopped_cid, _ = await stop_chat_for(cid, db=db, actor=actor, actor_id=actor_id)
     if stopped_cid:
       stopped_any = True
   return stopped_any, []
@@ -3016,7 +3029,8 @@ async def stop_browser_grant_runs(grant_id: str, db: Session = None) -> dict:
 
 
 async def stop_chat_for(
-  chat_id: str, db: Session = None,
+  chat_id: str, db: Session = None, *,
+  actor: str | None = None, actor_id: str | None = None,
 ) -> tuple[bool, list[str]]:
   """Kills the agent subprocess for a specific chat.
 
@@ -3043,7 +3057,7 @@ async def stop_chat_for(
   handle, queue behind it, and then be stranded when Stop releases ownership.
   """
   async with chat_queue.get_transition_lock(chat_id):
-    return await _stop_chat_for_locked(chat_id, db=db)
+    return await _stop_chat_for_locked(chat_id, db=db, actor=actor, actor_id=actor_id)
 
 
 async def clear_goal_for(chat_id: str, expected_goal_id: str) -> dict:
@@ -3120,6 +3134,7 @@ async def clear_goal_for(chat_id: str, expected_goal_id: str) -> dict:
 async def _stop_chat_for_locked(
   chat_id: str, db: Session = None, *,
   preserve_pending: bool = False,
+  actor: str | None = None, actor_id: str | None = None,
 ) -> tuple[bool, list[str]]:
   """Stop one chat while its per-chat lifecycle transition is exclusive."""
   stopped_gen = current_run_generation(chat_id)
@@ -3136,8 +3151,10 @@ async def _stop_chat_for_locked(
   if handles:
     _clear_after_terminal_generation[chat_id] = stopped_gen
     _clear_after_terminal_status[chat_id] = "stopped"
-  from app.chat_writer import CancelActivationWaits
-  await _await_ack(get_writer().submit(CancelActivationWaits(chat_id=chat_id)))
+  from app.chat_writer import PrepareChatStop
+  await _await_ack(get_writer().submit(PrepareChatStop(
+    chat_id=chat_id, actor=actor, actor_id=actor_id,
+  )))
   # The queue-lock window guards the clear's COMPOUND decision against a
   # racing append/cancel/promote (the actor's ClearPending serializes the
   # DB write itself). Generation bump happens BEFORE the lock so the dying

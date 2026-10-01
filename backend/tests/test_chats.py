@@ -222,6 +222,7 @@ def test_chat_reads_keep_goal_identity_after_a_mid_turn_question(
   assert runtime.json()["active_goal_objective"] == "finish the review"
   assert detail.json()["goal"] == {
     "id": "active-goal-run",
+    "revision": 0,
     "objective": "finish the review",
     "status": "active",
     "resumable": False,
@@ -373,11 +374,12 @@ def test_chat_reads_retain_completed_and_paused_goals(client, auth, chat, db):
   assert runtime["active_goal_objective"] is None
   assert detail["goal"] == {
     "id": "paused-id",
+    "revision": 0,
     "objective": "Paused work",
     "status": "paused",
     "resumable": True,
-    "pause_reason": "owner",
-    "handoff": {"kind": "owner_hold", "reason": "owner"},
+    "pause_reason": "unknown",
+    "handoff": {"kind": "recovery", "reason": "unknown_stop"},
   }
   assert runtime["goal"] == detail["goal"]
 

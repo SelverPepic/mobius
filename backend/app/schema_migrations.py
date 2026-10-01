@@ -5789,6 +5789,18 @@ def _add_goal_hold(eng) -> None:
       conn.execute(text("ALTER TABLE chat_goals ADD COLUMN hold_json JSON"))
 
 
+def _add_run_owner_input_at(eng) -> None:
+  """Remember new owner admissions; never infer authority for historical runs."""
+  from sqlalchemy import inspect as sa_inspect, text
+
+  inspector = sa_inspect(eng)
+  if "chat_runs" not in inspector.get_table_names():
+    return
+  if "owner_input_at" not in {c["name"] for c in inspector.get_columns("chat_runs")}:
+    with eng.begin() as conn:
+      conn.execute(text("ALTER TABLE chat_runs ADD COLUMN owner_input_at DATETIME"))
+
+
 _SCHEMA_MIGRATIONS = (
   # Full IDs are permanent identities, not sequence positions. Append new
   # work in execution order; never renumber a shipped ID to reconcile sources.
@@ -5882,6 +5894,7 @@ _SCHEMA_MIGRATIONS = (
   ("0080_embed_browser_lineage", _add_embed_browser_lineage),
   ("0078_agent_write_journal", _add_agent_write_journal),
   ("0081_goal_hold", _add_goal_hold),
+  ("0082_run_owner_input_at", _add_run_owner_input_at),
 )
 
 

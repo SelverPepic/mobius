@@ -49,8 +49,14 @@ note or result holds up to 1000 characters. Work deepest leaves.
 Children inherit ancestor dependencies and make a parent **Ready to verify**,
 not complete. Verify upward; cancelled prerequisites are settled. Plans may
 change; outcomes may not. Settled tasks do not close the Goal. To work on a
-retained unfinished Goal other than the one shown, pass its `goal_id`; that
-attaches this attempt and cannot reopen closed work.
+retained unfinished Goal, pass its exact `goal_id`; this attaches the current
+attempt to the original objective and checklist, rather than creating a
+replacement. Naming a held Goal deliberately reopens it: do that only when the
+owner asked to continue that work. This needs a later owner-requested attempt;
+an automatic result or an old recovery cannot undo a hold. If attachment is
+refused, preserve the Goal rather than minting a replacement. An unrelated
+follow-up must remain separate. Terminal outcomes cannot reopen. A legacy interruption without recorded intent
+is unknown, not evidence that the owner paused the work.
 
 ### Responsibility, handoffs and outcomes
 

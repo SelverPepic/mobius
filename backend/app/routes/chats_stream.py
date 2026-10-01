@@ -284,7 +284,7 @@ def _content_with_uploads(chat: models.Chat, content: str) -> str:
 
 async def _append_to_pending(
   chat: models.Chat, body: schemas.SendMessage, db: Session,
-  *, initiated_by_app_id: int | None = None,
+  *, initiated_by_app_id: int | None = None, owner_input: bool = False,
   browser_grant_id: str | None = None, browser_grant_epoch: int | None = None,
   front: bool = False,
   require_answer_match: bool = False,
@@ -314,6 +314,7 @@ async def _append_to_pending(
       selected_options=body.selected_options, question_id=body.question_id,
       initiated_by_app_id=initiated_by_app_id,
       browser_grant_id=browser_grant_id, browser_grant_epoch=browser_grant_epoch,
+      owner_input=owner_input,
       front=front, require_answer_match=require_answer_match,
       restore_archived=restore_archived,
     ),
@@ -323,7 +324,7 @@ async def _append_to_pending(
 
 async def _append_restart_feedback_to_pending(
   chat: models.Chat, body: schemas.SendMessage, db: Session,
-  *, initiated_by_app_id: int | None = None,
+  *, initiated_by_app_id: int | None = None, owner_input: bool = False,
   browser_grant_id: str | None = None, browser_grant_epoch: int | None = None,
   restore_archived: bool = False,
 ) -> dict:
@@ -335,6 +336,7 @@ async def _append_restart_feedback_to_pending(
       question_id=body.question_id, initiated_by_app_id=initiated_by_app_id,
       browser_grant_id=browser_grant_id, browser_grant_epoch=browser_grant_epoch,
       restore_archived=restore_archived,
+      owner_input=owner_input,
     ),
   )
 
@@ -765,6 +767,7 @@ async def _send_message_impl(
               browser_grant_id=principal.browser_grant_id,
               browser_grant_epoch=principal.browser_grant_epoch,
               restore_archived=restore_archived,
+              owner_input=is_owner_input_principal(principal),
             )
             stored = append_result["stored"]
             duplicate = append_result.get("duplicate") is True
@@ -1037,6 +1040,8 @@ async def _send_message_impl(
             answers=body.answers, selected_options=body.selected_options,
             close_without_reply=True,
             restore_archived=restore_archived,
+            answer_actor="owner" if is_owner_input_principal(principal) else "agent",
+            answer_actor_id=principal.run_id or principal.chat_id or principal.embed_session_id,
           )))
       except questions.AnswerConflict as exc:
         raise HTTPException(409, detail=str(exc)) from exc
@@ -1087,6 +1092,7 @@ async def _send_message_impl(
           browser_grant_id=principal.browser_grant_id,
           browser_grant_epoch=principal.browser_grant_epoch,
           restore_archived=restore_archived,
+          owner_input=is_owner_input_principal(principal),
           front=True, require_answer_match=True,
         )
         from app.chat_event_sink import get_active_sink
@@ -1225,6 +1231,7 @@ async def _send_message_impl(
           browser_grant_id=principal.browser_grant_id,
           browser_grant_epoch=principal.browser_grant_epoch,
           restore_archived=restore_archived,
+          owner_input=is_owner_input_principal(principal),
           front=True,
           require_answer_match=True,
         )
@@ -1385,14 +1392,10 @@ async def _send_message_locked(
     ).first()
     if existing_resume is not None:
       control = existing_resume.continuation_json or {}
-      recorded_resume = control.get("supersedes_run_token")
-      if (
-        control.get("control_id") != body.cid
-        or (
-          body.resume_run_id is not None
-          and isinstance(recorded_resume, str)
-          and recorded_resume != body.resume_run_id
-        )
+      from app.continuations import manual_resume_matches
+      if not manual_resume_matches(
+        control, control_id=body.cid, run_id=body.resume_run_id,
+        goal_id=body.resume_goal_id, goal_revision=body.resume_goal_revision,
       ):
         raise HTTPException(409, detail={
           "code": "recovery_changed",
@@ -1425,6 +1428,7 @@ async def _send_message_locked(
       browser_grant_id=principal.browser_grant_id,
       browser_grant_epoch=principal.browser_grant_epoch,
       restore_archived=restore_archived,
+      owner_input=is_owner_input_principal(principal),
     )
     db.expire(chat)
     return _queued_response(new_msg, len(chat.pending_messages or []))
@@ -1434,11 +1438,17 @@ async def _send_message_locked(
   # The activation writer command has the sole authenticated bypass.
   from app.platform_restart import activation_barrier_wait_id
   if activation_barrier_wait_id(db, chat_id) is not None:
+    if manual_resume:
+      raise HTTPException(409, detail={
+        "code": "recovery_changed",
+        "message": "The saved restart must finish before this Goal can resume.",
+      })
     new_msg = await _append_to_pending(
       chat, body, db, initiated_by_app_id=principal.app_id,
       browser_grant_id=principal.browser_grant_id,
       browser_grant_epoch=principal.browser_grant_epoch,
       restore_archived=restore_archived,
+      owner_input=is_owner_input_principal(principal),
     )
     db.expire(chat)
     return _queued_response(new_msg, len(chat.pending_messages or []))
@@ -1459,6 +1469,7 @@ async def _send_message_locked(
       browser_grant_id=principal.browser_grant_id,
       browser_grant_epoch=principal.browser_grant_epoch,
       restore_archived=restore_archived,
+      owner_input=is_owner_input_principal(principal),
     )
     db.expire(chat)
     return _queued_response(new_msg, len(chat.pending_messages or []))
@@ -1527,6 +1538,7 @@ async def _send_message_locked(
           browser_grant_id=principal.browser_grant_id,
           browser_grant_epoch=principal.browser_grant_epoch,
           restore_archived=restore_archived,
+          owner_input=is_owner_input_principal(principal),
         )
         db.expire(chat)
         reserved_cid = cid_of(reserved)
@@ -1580,6 +1592,7 @@ async def _send_message_locked(
       browser_grant_id=principal.browser_grant_id,
       browser_grant_epoch=principal.browser_grant_epoch,
       restore_archived=restore_archived,
+      owner_input=is_owner_input_principal(principal),
     )
     started_message = None
 
@@ -1663,6 +1676,7 @@ async def _send_message_locked(
       browser_grant_id=principal.browser_grant_id,
       browser_grant_epoch=principal.browser_grant_epoch,
       restore_archived=restore_archived,
+      owner_input=is_owner_input_principal(principal),
     )
     return _queued_response(new_msg, len(chat.pending_messages))
 
@@ -1713,7 +1727,10 @@ async def _send_message_locked(
         browser_grant_id=principal.browser_grant_id,
         browser_grant_epoch=principal.browser_grant_epoch,
         restore_archived=restore_archived,
+        owner_input=is_owner_input_principal(principal),
         resume_run_id=body.resume_run_id,
+        resume_goal_id=body.resume_goal_id,
+        resume_goal_revision=body.resume_goal_revision,
       )
     )
     # StartTurn returns the agent history (schemas.ChatMessage list built
