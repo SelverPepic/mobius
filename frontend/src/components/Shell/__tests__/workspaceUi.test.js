@@ -54,6 +54,18 @@ const walkthroughCss = readFileSync(
   new URL('../../Walkthrough/WalkthroughOverlay.css', import.meta.url), 'utf8',
 )
 
+test('onboarding discovery delegates access review and installation to App Store', () => {
+  const guide = readFileSync(new URL('../../Walkthrough/WalkthroughOverlay.jsx', import.meta.url), 'utf8')
+  const discovery = readFileSync(new URL('../../Walkthrough/WalkthroughStore.jsx', import.meta.url), 'utf8')
+  assert.match(shell, /<WalkthroughOverlay[\s\S]*?onOpenApp=\{openAppWithIntent\}/)
+  assert.match(guide, /onOpenApp\(storeAppId, `app:\$\{id\}`\)/)
+  assert.match(discovery, /findAppStoreApp\(apps\)/)
+  assert.match(shell, /const walkthroughStoreApp = showWalkthrough \? findAppStoreApp\(apps\)/)
+  assert.match(shell, /storeActive=\{activeView === 'canvas' && walkthroughStoreApp != null/)
+  assert.match(discovery, /Review in App Store/)
+  assert.doesNotMatch(discovery, /\/apps\/(?:preview|install)/)
+})
+
 test('the workspace menu avoids an oversized border-and-shadow card', () => {
   const rule = css.match(/\.workspace__menu\s*\{[\s\S]*?\}/)?.[0] || ''
   assert.match(rule, /border:\s*1px/)
@@ -221,17 +233,6 @@ test('post-drag click suppression is source-scoped and expires on fresh input', 
 test('the undo chord defers to focused inputs', () => {
   assert.match(shell, /isEditableTarget\(document\.activeElement\)/)
   assert.match(shell, /dispatchWorkspace\(\{ type: 'UNDO_LAST' \}\)/)
-})
-
-test('the first-run walkthrough stays short and action-first', () => {
-  assert.doesNotMatch(walkthrough, /const STEPS/)
-  assert.match(walkthrough, /Your Möbius is ready/)
-  assert.match(walkthrough, /Connect an agent/)
-  assert.match(walkthrough, /Open the App Store/)
-  assert.match(walkthrough, /Keep Möbius close/)
-  assert.match(walkthrough, /requestInstall/)
-  assert.match(walkthrough, /I’ll explore/)
-  assert.match(walkthrough, /mobius:walkthrough-completed/)
 })
 
 test('the first-run walkthrough remains dismissible in a short landscape viewport wider than 520px', () => {
@@ -1250,17 +1251,13 @@ test('the builder no-full-screen invariant scopes to DESTINATIONS, not transient
   // review remains modal while its backdrop is scoped to the Settings pane.
   const navSrc = readFileSync(new URL('../../../hooks/useNavigation.js', import.meta.url), 'utf8')
   assert.match(navSrc, /DESTINATIONS, NOT DIALOGS/)
-  const walkthrough = readFileSync(
-    new URL('../../Walkthrough/WalkthroughOverlay.jsx', import.meta.url), 'utf8',
-  )
-  const urmCss = readFileSync(
-    new URL('../../SettingsView/UpdateReviewModal.css', import.meta.url), 'utf8',
-  )
-  // First-use guidance is now a non-modal region layered over the live shell,
-  // with an explicit dismiss action; update review remains a pane-scoped modal.
+  // The first-use coach remains modeless while update review is pane-scoped.
   assert.match(walkthrough, /role="region"/)
   assert.match(walkthrough, /aria-label="Dismiss welcome"/)
   assert.doesNotMatch(walkthrough, /aria-modal="true"/)
+  const urmCss = readFileSync(
+    new URL('../../SettingsView/UpdateReviewModal.css', import.meta.url), 'utf8',
+  )
   assert.match(urmCss, /\.urm__overlay\s*\{[\s\S]*?position:\s*absolute/)
 })
 
