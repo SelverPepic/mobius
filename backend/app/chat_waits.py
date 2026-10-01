@@ -322,7 +322,33 @@ def _cancel_active_check(wait_id: str) -> None:
     _kill_process_group(pid)
 
 
-def serialize_wait(row: models.ChatWait) -> dict:
+def wait_resume_blocker(db: Session, row: models.ChatWait) -> str | None:
+  """Explain an owed result using the same owners that admit its wake.
+
+  This is a read-only projection, never permission to release a safety hold.
+  Check deadlines bound polling, not an owner action or provider recovery.
+  """
+  from app.chat import is_chat_running, programmatic_start_blocker
+  from app.platform_update import late_edits_pending, read_prepared_update
+
+  if late_edits_pending():
+    update = read_prepared_update()
+    return "platform_restart" if update and update["replayed"] else "restoring_edits"
+  blocker = programmatic_start_blocker(
+    db, row.chat_id,
+    activation_wait_id=row.id if row.kind == "platform_activation" else None,
+  )
+  if blocker:
+    return blocker
+  if is_chat_running(row.chat_id):
+    return "live_turn"
+  retry = db.get(models.ChatRun, f"wait-resume-{row.id}{_RESUME_RETRY}")
+  if retry is not None and retry.status == "failed":
+    return "resume_failed"
+  return None
+
+
+def serialize_wait(row: models.ChatWait, *, db: Session) -> dict:
   # Platform activation has no product deadline. Its non-null storage value is
   # retained only for compatibility with the original shared ChatWait schema.
   presented_deadline = None if row.kind == "platform_activation" else row.deadline_at
@@ -334,6 +360,14 @@ def serialize_wait(row: models.ChatWait) -> dict:
     "kind": row.kind,
     "command": row.command,
     "status": row.status,
+    "delivery_pending": row.status in _OUTCOMES and row.resume_delivered_at is None,
+    "resume_delivered_at": (
+      row.resume_delivered_at.isoformat() if row.resume_delivered_at else None
+    ),
+    "resume_blocker": (
+      wait_resume_blocker(db, row)
+      if row.status in _OUTCOMES and row.resume_delivered_at is None else None
+    ),
     "interval_secs": row.interval_secs,
     "due_at": row.due_at.isoformat() if row.due_at else None,
     "deadline_at": (
@@ -474,6 +508,7 @@ def terminal_wait_summaries_by_message_index(
       "description": row.description,
       "condition_owner": row.condition_owner,
       "status": row.status,
+      "delivery_pending": row.status in _OUTCOMES and row.resume_delivered_at is None,
       "checks_count": int(row.checks_count or 0),
       "created_at": row.created_at.isoformat() if row.created_at else None,
       "settled_at": settled_at.isoformat(),
@@ -1067,6 +1102,14 @@ def armed_waits_for_chat(db: Session, chat_id: str) -> list[models.ChatWait]:
   )
 
 
+def outstanding_waits_for_chat(db: Session, chat_id: str) -> list[models.ChatWait]:
+  """Keep the completion promise visible until its result reaches a turn."""
+  return db.query(models.ChatWait).filter(
+    models.ChatWait.chat_id == chat_id,
+    (models.ChatWait.status == "armed") | _FIRED_UNDELIVERED,
+  ).order_by(models.ChatWait.created_at.asc()).all()
+
+
 def _goal_waits(db: Session, chat_id: str, goal_id: str):
   """Waits declared by any attempt of one Goal in this chat."""
   from sqlalchemy import func
@@ -1150,11 +1193,11 @@ async def withdraw_delivered_resume_notices(chat_id: str) -> int:
   return len(delivered)
 
 
-def armed_wait_chat_ids(db: Session) -> set[str]:
-  """Return which owner-list chats have at least one armed durable wait."""
+def outstanding_wait_chat_ids(db: Session) -> set[str]:
+  """Return chats still owed either a check or a continuation result."""
   return {
     chat_id
     for (chat_id,) in db.query(models.ChatWait.chat_id).filter(
-      models.ChatWait.status == "armed",
+      (models.ChatWait.status == "armed") | _FIRED_UNDELIVERED,
     ).distinct().all()
   }

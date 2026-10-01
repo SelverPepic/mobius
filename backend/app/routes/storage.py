@@ -70,7 +70,7 @@ from app.deps import (
   get_principal,
   reject_cross_site,
 )
-from app.path_utils import validate_path_within_base
+from app.path_utils import has_overlong_segment, validate_path_within_base
 
 router = APIRouter(prefix="/api/storage", tags=["storage"])
 
@@ -314,6 +314,8 @@ def _resolve(base: Path, rel: str) -> Path:
     raise HTTPException(status_code=400, detail="Invalid path.")
   if ".." in Path(rel).parts:
     raise HTTPException(status_code=400, detail="Path traversal not allowed.")
+  if has_overlong_segment(rel):
+    raise HTTPException(status_code=400, detail="A path name is too long.")
   resolved = validate_path_within_base(rel, base)
   # Reject a symlink ANYWHERE in the path. validate_path_within_base resolves
   # symlinks before its containment check, so an in-tree symlink (target also
@@ -784,7 +786,11 @@ async def move_app_file(
       raise HTTPException(status_code=404, detail="Source not found.")
     if dst.exists():
       raise HTTPException(status_code=409, detail="Destination already exists.")
-    dst.parent.mkdir(parents=True, exist_ok=True)
+    if src in dst.parents:
+      raise HTTPException(
+        status_code=400, detail="Cannot move a folder into itself.",
+      )
+    storage_io.make_parent_folders(dst)
     shutil.move(str(src), str(dst))
     # Carry the MIME sidecar(s) to the new path so the moved bytes keep their
     # stored type, and the old path keeps no stale sidecar.

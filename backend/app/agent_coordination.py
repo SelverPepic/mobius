@@ -1818,7 +1818,7 @@ async def _wake_idle_recipient(
 ) -> bool:
   """Wake one idle unfinished Goal without cancelling its external wait."""
   import app.chat_queue as chat_queue
-  from app.chat import is_chat_running, programmatic_start_blocked
+  from app.chat import is_chat_running, programmatic_start_blocker
   from app.chat_start import start_programmatic_chat_turn
   from app.database import SessionLocal
 
@@ -1830,7 +1830,7 @@ async def _wake_idle_recipient(
       ).first()
       if chat is None or is_chat_running(chat_id):
         return False
-      if programmatic_start_blocked(db, chat_id):
+      if programmatic_start_blocker(db, chat_id):
         return False
       goal_run = paused_goal_run(db, chat_id)
       if goal_run is None:

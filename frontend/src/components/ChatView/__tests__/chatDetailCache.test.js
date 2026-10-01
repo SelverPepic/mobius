@@ -332,3 +332,11 @@ test('a tail refresh retains every verified older row needed by a saved address'
   assert.equal(merged.messages[0].content, 'Loaded 5')
   assert.equal(merged.messages[20].content, 'Fresh 25')
 })
+
+
+test('continuation wait is retained on reopen and cleared by a resumed snapshot', () => {
+  const cached = chatDetailCacheValue({ messages: [], continuation_wait: 'restart_required' })
+  assert.equal(cached.continuationWait, 'restart_required')
+  assert.equal(chatDetailCacheValue({ messages: [], continuation_wait: null }).continuationWait, null)
+  assert.equal(chatDetailCacheValue({ messages: [] }).continuationWait, null)
+})

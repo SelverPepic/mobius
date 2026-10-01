@@ -29,6 +29,19 @@ def test_turn_identity_never_lives_in_the_shared_host_environment():
   }
 
 
+def test_core_helpers_are_available_and_caller_defaults_are_turn_scoped():
+  from app import platform_tools
+  host, turn = helper_hosts.split_env({
+    "MOBIUS_AGENT_PROVIDER": "codex", "MOBIUS_AGENT_MODEL": "chosen-model",
+    "MOBIUS_AGENT_EFFORT": "high", "AGENT_TOKEN": "secret",
+  })
+  assert host == {}
+  assert turn["MOBIUS_AGENT_MODEL"] == "chosen-model"
+  assert turn["MOBIUS_AGENT_PROVIDER"] == "codex"
+  assert turn["MOBIUS_AGENT_EFFORT"] == "high"
+  assert "spawn_agent" in platform_tools.expected_control_tool_names(top_level=False)
+
+
 def test_turn_env_file_is_private_round_trips_and_is_removed(tmp_path):
   values = {"AGENT_TOKEN": "tok with 'quotes' $x", "CHAT_ID": "c1"}
   env_file = helper_hosts.TurnEnvFile(tmp_path, "marker", values)
@@ -630,7 +643,8 @@ def test_connector_capabilities_do_not_change_the_host_key(monkeypatch):
   assert first == second
 
 
-def test_every_hosted_helper_gets_the_claude_register(tmp_path):
+@pytest.mark.parametrize("supports_effort", [True, False])
+def test_every_hosted_helper_gets_the_claude_register(tmp_path, supports_effort):
   """Hosted helpers get the same Claude register as a top-level turn."""
   from contextlib import ExitStack
   from types import SimpleNamespace
@@ -638,12 +652,147 @@ def test_every_hosted_helper_gets_the_claude_register(tmp_path):
   factory = claude_host._host_options(
     key=SimpleNamespace(cwd=str(tmp_path)), host_env={},
     skill_text="CONSTITUTION", connector_plan=None, skills_enabled=False,
-    model=None,
+    model=None, supports_effort=supports_effort,
   )
   host = SimpleNamespace(stderr_tail=[], pre_tool_use=None, post_tool_use=None)
   for resume in (None, "host-session"):
     with ExitStack() as stack:
       options = factory(host, resume, stack)
+    assert set(options.agents) == {
+      "mobius-helper", *(claude_host.agent_type_for(e) for e in claude_host.EFFORTS),
+    }
+    if not supports_effort:
+      assert all(agent.effort is None for agent in options.agents.values())
     for agent in options.agents.values():
       assert agent.prompt.startswith("CONSTITUTION")
       assert "# Interruptions in Möbius" in agent.prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model,expected_agent", [
+  ("claude-haiku-4-5-20251001", "mobius-helper"),
+  ("claude-live-no-effort", "mobius-helper"),
+  ("claude-opus-4-8", "mobius-helper-high"),
+])
+@pytest.mark.parametrize("saved_settings", [False, True])
+@pytest.mark.parametrize("session_id", [None, "claude-host:host-session:agent-1:tool-1"])
+async def test_hosted_helper_omits_effort_when_its_model_rejects_it(
+  tmp_path, monkeypatch, model, expected_agent, saved_settings, session_id,
+):
+  from contextlib import asynccontextmanager
+  from types import SimpleNamespace
+  import time
+  from app import providers, process_groups
+
+  monkeypatch.setattr(providers, "_model_registry_cache", {
+    "claude": (time.monotonic(), [
+      {"id": "claude-live-no-effort", "effort_levels": []},
+      {"id": "claude-opus-4-8"},
+    ]),
+  })
+  dispatched = []
+
+  class Host:
+    session_id = "host-session"
+
+    async def run_turn(self, turn, on_started):
+      dispatched.append(turn.spec)
+      turn.finish("completed")
+
+  @asynccontextmanager
+  async def lease(key, factory):
+    yield Host()
+
+  monkeypatch.setattr(helper_hosts.MANAGER, "lease", lease)
+  monkeypatch.setattr(process_groups, "terminate_run_processes", lambda *_a, **_kw: None)
+  policy = SimpleNamespace(model=model, effort="high", scope="write")
+  result = await claude_host.run_claude_host_turn(
+    user_message="inspect the source", session_id=session_id,
+    base_env={"TMPDIR": str(tmp_path)}, chat_id="effort-test",
+    skill_text="", bc=None,
+    agent_settings={"model": model, "effort": "high"} if saved_settings else None,
+    skills_enabled=False, run_policy=policy, connector_plan=None,
+    resumed_context=None,
+    helper_host_key=helper_hosts.HostKey("parent", "claude", "write", str(tmp_path), "setup"),
+    data_dir=str(tmp_path),
+  )
+
+  assert result["error"] is None
+  assert len(dispatched) == 1
+  if session_id:
+    # A continuing agent keeps its SDK launch options: never replay its task.
+    assert dispatched[0]["to"] == "agent-1"
+    assert "subagent_type" not in dispatched[0]
+  else:
+    assert dispatched[0]["subagent_type"] == expected_agent
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initial_support", [False, True])
+async def test_reused_claude_host_keeps_dispatch_names_across_capability_changes(
+  tmp_path, monkeypatch, initial_support,
+):
+  from contextlib import ExitStack, asynccontextmanager
+  from types import SimpleNamespace
+  from app import providers, process_groups
+
+  supported = initial_support
+
+  async def supports_effort(data_dir, model):
+    return supported
+
+  monkeypatch.setattr(providers, "model_supports_effort", supports_effort)
+  monkeypatch.setattr(process_groups, "terminate_run_processes", lambda *_a, **_kw: None)
+  options = None
+  seen = []
+
+  class Host:
+    session_id = "host-session"
+
+    async def run_turn(self, turn, on_started):
+      agent = options.agents[turn.spec["subagent_type"]]
+      seen.append(agent.effort)
+      turn.finish("completed")
+
+  @asynccontextmanager
+  async def lease(key, factory):
+    nonlocal options
+    if options is None:
+      host = factory()
+      with ExitStack() as stack:
+        options = host._options_factory(host, None, stack)
+    yield Host()
+
+  monkeypatch.setattr(helper_hosts.MANAGER, "lease", lease)
+  for support in (initial_support, not initial_support):
+    supported = support
+    result = await claude_host.run_claude_host_turn(
+      user_message="inspect", session_id=None, base_env={"TMPDIR": str(tmp_path)},
+      chat_id="capability-test", skill_text="", bc=None, agent_settings=None,
+      skills_enabled=False,
+      run_policy=SimpleNamespace(model="claude-live", effort="high", scope="write"),
+      connector_plan=None, resumed_context=None,
+      helper_host_key=helper_hosts.HostKey("parent", "claude", "write", str(tmp_path), "setup"),
+      data_dir=str(tmp_path),
+    )
+    assert result["error"] is None
+
+  assert seen == (["high", None] if initial_support else [None, None])
+
+
+def test_codex_host_death_observation_survives_sdk_and_counter_changes(monkeypatch):
+  from types import SimpleNamespace
+
+  count = 4
+  monkeypatch.setattr(helper_hosts, "cgroup_oom_kill_count", lambda: count)
+  sync = SimpleNamespace(_proc=SimpleNamespace(poll=lambda: -9))
+  host = helper_hosts.CodexHelperHost(_key(), sdk={}, config=None)
+  host.client = SimpleNamespace(_client=SimpleNamespace(_sync=sync))
+  assert not host.alive
+  evidence = host.exit_evidence
+  sync._proc = None
+  count = 5
+  assert not host.alive
+  assert host.exit_evidence is evidence
+  assert evidence.was_oom_killed(3)
+  assert not evidence.was_oom_killed(4)

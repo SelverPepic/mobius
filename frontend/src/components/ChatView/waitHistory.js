@@ -20,15 +20,22 @@ const OUTCOMES = {
   cancelled: { kicker: 'Wait stopped', tone: 'stopped', spoken: 'Stopped wait' },
 }
 
-/** A met, expired or failed wait woke the answer the server anchored it to;
- * only a deliberate stop belongs to the answer that owned the wait. */
+/** Only a delivered result can explain what started an answer. Undelivered
+ * results and deliberate stops stay beside the answer that owned the wait. */
 export function waitWokeItsAnswer(summary) {
-  return summary?.status !== 'cancelled'
+  return summary?.status !== 'cancelled' && !summary?.delivery_pending
 }
 
 export function waitHistoryViewModel(summary) {
   const condition = waitConditionLabel(summary?.description)
-  const outcome = OUTCOMES[summary?.status]
+  const settledOutcome = OUTCOMES[summary?.status]
+  const outcome = summary?.delivery_pending && settledOutcome ? {
+    ...settledOutcome,
+    kicker: summary.status === 'met' ? 'Condition met · follow-up pending'
+      : `${settledOutcome.kicker} · follow-up pending`,
+    tone: 'attention',
+    spoken: 'Follow-up pending',
+  } : settledOutcome
   if (!condition || !outcome) return null
   const count = Number(summary?.checks_count)
   const checks = Number.isInteger(count) && count > 0

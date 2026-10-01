@@ -17,6 +17,7 @@ from app.chat_waits import (
   WaitValidationError,
   cancel_wait,
   declare_wait,
+  outstanding_waits_for_chat,
   serialize_wait,
 )
 from app.database import get_db
@@ -78,7 +79,7 @@ def declare(
     )
   except WaitValidationError as exc:
     raise HTTPException(status_code=422, detail=str(exc))
-  return serialize_wait(row)
+  return serialize_wait(row, db=db)
 
 
 @router.get("")
@@ -94,13 +95,13 @@ def list_waits(
   if principal.chat_id is not None and principal.chat_id != chat_id:
     raise HTTPException(status_code=403, detail="Not this chat's waits.")
   get_active_chat_or_404(db, chat_id)
-  query = db.query(models.ChatWait).filter(
-    models.ChatWait.chat_id == chat_id,
-  )
-  if not include_settled:
-    query = query.filter(models.ChatWait.status == "armed")
-  rows = query.order_by(models.ChatWait.created_at.asc()).limit(50).all()
-  return {"waits": [serialize_wait(row) for row in rows]}
+  if include_settled:
+    rows = db.query(models.ChatWait).filter(
+      models.ChatWait.chat_id == chat_id,
+    ).order_by(models.ChatWait.created_at.asc()).limit(50).all()
+  else:
+    rows = outstanding_waits_for_chat(db, chat_id)[:50]
+  return {"waits": [serialize_wait(row, db=db) for row in rows]}
 
 
 @router.post("/{wait_id}/cancel")
@@ -124,4 +125,4 @@ def cancel(
       status_code=409,
       detail="Use the Restart card or Stop the chat instead.",
     )
-  return serialize_wait(cancel_wait(db, row))
+  return serialize_wait(cancel_wait(db, row), db=db)

@@ -60,6 +60,29 @@ jobs:
           # already-published entries remained unchanged.
           fetch-depth: 0
       - uses: ./.github/actions/backend-env
+      - name: A changed replacement worker declares a higher revision
+        env:
+          BASE_SHA: ${{ github.event.merge_group.base_sha || github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          # Installed launchers take a worker from an image only when its
+          # WORKER_REVISION is higher than any they have seen, so changed
+          # worker bytes under an unchanged revision would never ship.
+          git fetch -q origin main
+          base=${BASE_SHA:-$(git merge-base HEAD FETCH_HEAD)}
+          python3 - "$base" <<'PY'
+          import re, subprocess, sys
+          path = "scripts/mobius-rebuild-host.py"
+          def revision(text):
+              found = re.findall(r"^WORKER_REVISION = ([0-9]+)$", text, re.M)
+              return int(found[0]) if found else 0
+          old = subprocess.run(["git", "show", f"{sys.argv[1]}:{path}"],
+                               capture_output=True, text=True).stdout
+          new = open(path).read()
+          assert revision(new) >= revision(old), "WORKER_REVISION decreased"
+          assert old == new or not old or revision(new) > revision(old), (
+              f"{path} changed: increase WORKER_REVISION")
+          PY
+
       - name: Run backend static analysis
         working-directory: backend
         run: |

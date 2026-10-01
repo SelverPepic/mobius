@@ -143,6 +143,30 @@ def python_lock(manifest) -> str | None:
   return python["lock"]
 
 
+def validate_setup(manifest) -> None:
+  """Validate optional setup steps and native Debian dependency strings."""
+  if not isinstance(manifest, Mapping):
+    _fail("Manifest must be an object.")
+  if "setup" not in manifest:
+    return
+  setup = manifest["setup"]
+  if not isinstance(setup, Mapping) or set(setup) - {"steps", "apt"}:
+    _fail("Manifest `setup` must be an object with only `steps` and `apt`.")
+  steps = setup.get("steps", [])
+  if not isinstance(steps, list):
+    _fail("Manifest `setup.steps` must be an array.")
+  for index, path in enumerate(steps):
+    validate_repo_relative_path(path, f"setup.steps[{index}]")
+  apt = setup.get("apt", [])
+  if not isinstance(apt, list) or any(
+    not isinstance(dependency, str) or not dependency.strip()
+    or dependency.startswith("-") or "\x00" in dependency
+    or "\n" in dependency or "\r" in dependency
+    for dependency in apt
+  ):
+    _fail("Manifest `setup.apt` must be an array of Debian dependency strings.")
+
+
 def python_job_arguments(interpreter: tuple[str, ...]) -> tuple[str, ...] | None:
   """The interpreter arguments of a Python job shebang, or None for another program.
 
@@ -220,6 +244,14 @@ def validate_repo_relative_path(path: str, field: str) -> None:
   if any("/" in part or "\\" in part for part in parts):
     _fail(
       f"Manifest `{field}` must not contain encoded path separators."
+      f"{seed_hint}"
+    )
+  # Git owns its metadata directory and refuses to track any path inside it,
+  # so a package naming one could never install; say so instead of failing
+  # later inside Git with an unexplained server error.
+  if any(part.lower() == ".git" for part in parts):
+    _fail(
+      f"Manifest `{field}` must not point inside a `.git` directory."
       f"{seed_hint}"
     )
 
@@ -557,6 +589,15 @@ def validate_manifest_contract(manifest) -> None:
       f"Manifest permission {names} has been removed; server-side app jobs "
       "run as ordinary Möbius processes."
     )
+  job_secrets = permissions.get("job_secret_read", [])
+  if (
+    not isinstance(job_secrets, list) or len(job_secrets) > 16
+    or any(not isinstance(name, str) or not re.fullmatch(
+      r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", name,
+    ) for name in job_secrets)
+    or len(set(job_secrets)) != len(job_secrets)
+  ):
+    _fail("Manifest `permissions.job_secret_read` must list up to 16 unique secret names.")
   for field in RECOGNIZED_CAPABILITIES:
     if field in permissions and not isinstance(permissions[field], bool):
       _fail(f"Manifest `permissions.{field}` must be a boolean.")
@@ -800,6 +841,11 @@ def validate_manifest_contract(manifest) -> None:
           "node_modules/, the cron/job scripts, .bak snapshots, or the "
           "numeric-id storage tree)."
         )
+
+  validate_setup(manifest)
+  for index, path in enumerate(manifest.get("setup", {}).get("steps", [])):
+    if path not in (source_files or []):
+      _fail(f"Manifest `setup.steps[{index}]` must be listed in `source_files`.")
 
   agent_activities = manifest.get("agent_activities", {})
   if not isinstance(agent_activities, Mapping):

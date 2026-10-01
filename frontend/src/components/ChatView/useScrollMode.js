@@ -132,6 +132,7 @@ import { createNestedScrollHandoff } from './scroll/nestedScrollHandoff.js'
 import {
   _modeForPersistence,
   entryRestoreDecision,
+  readingLayoutPending,
 } from './scroll/restore.js'
 import {
   forgetReadingPosition,
@@ -546,6 +547,21 @@ export default function useScrollMode({
     }
     return true
   }, [recordTrace])
+
+  const rememberAppliedMode = useCallback((scrollEl) => {
+    const mode = modeRef.current
+    lastAppliedModeRef.current = mode
+    const pinnedEl = mode.kind === 'PIN_USER_MSG'
+      ? _pinnedUserEl(scrollEl, mode.cid)
+      : null
+    const anchorEl = mode.kind === 'ANCHOR_AT'
+      ? _anchorEl(scrollEl, mode)
+      : null
+    lastPinTopRef.current = pinnedEl?.offsetTop ?? null
+    lastAnchorTopRef.current = anchorEl
+      ? _scrollTopOf(scrollEl, anchorEl)
+      : null
+  }, [])
 
   const persistMode = useCallback(({ freezeToCurrentPosition = false } = {}) => {
     try {
@@ -1318,21 +1334,6 @@ export default function useScrollMode({
       }
     }
 
-    function rememberAppliedMode() {
-      const mode = modeRef.current
-      lastAppliedModeRef.current = mode
-      const pinnedEl = mode.kind === 'PIN_USER_MSG'
-        ? _pinnedUserEl(scrollEl, mode.cid)
-        : null
-      const anchorEl = mode.kind === 'ANCHOR_AT'
-        ? _anchorEl(scrollEl, mode)
-        : null
-      lastPinTopRef.current = pinnedEl?.offsetTop ?? null
-      lastAnchorTopRef.current = anchorEl
-        ? _scrollTopOf(scrollEl, anchorEl)
-        : null
-    }
-
     const commitQuestionSubmission = ({
       mode,
       authorityVersion,
@@ -1351,7 +1352,7 @@ export default function useScrollMode({
         event,
         authorityVersion,
       )) return false
-      rememberAppliedMode()
+      rememberAppliedMode(scrollEl)
       persistMode()
       return true
     }
@@ -1389,7 +1390,7 @@ export default function useScrollMode({
         if (nativePositionAlreadyApplied
             && modeRef.current?.kind === 'ANCHOR_AT'
             && !isQuestionSubmissionMode(modeRef.current)) {
-          rememberAppliedMode()
+          rememberAppliedMode(scrollEl)
         }
         return false
       }
@@ -1399,7 +1400,7 @@ export default function useScrollMode({
       if (revealAnchor === nextMode) {
         applyLayoutMode(event, authorityVersion)
       } else if (nativePositionAlreadyApplied) {
-        rememberAppliedMode()
+        rememberAppliedMode(scrollEl)
       }
       return true
     }
@@ -1408,7 +1409,7 @@ export default function useScrollMode({
       if (!writeMode(scrollEl, modeRef.current, event, authorityVersion)) {
         return false
       }
-      rememberAppliedMode()
+      rememberAppliedMode(scrollEl)
       return true
     }
 
@@ -1481,6 +1482,10 @@ export default function useScrollMode({
       // clamped the first write, instead of waiting for a later RO event that
       // may never fire for the spacer-only height change.
       settlePinnedMode(authorityVersion)
+      // A retained reading hold can outlive a hidden transcript replacement.
+      // Repair its shifted or clamped target in this same pre-paint transaction,
+      // not in the next ResizeObserver delivery after readiness reveals it.
+      settleAnchoredMode(authorityVersion)
       return true
     }
     syncLayout({ authorityVersion: currentAuthority() })
@@ -1533,9 +1538,11 @@ export default function useScrollMode({
     // by the caller and cannot be bypassed by a timer.
     let revealTimer = 0
     let mountMutationObserver = null
-    const entryReady = () => initialEntryPhaseRef.current === 'cached'
+    const entryReady = () => !readingLayoutPending(scrollEl) && (
+      initialEntryPhaseRef.current === 'cached'
       || initialEntryPhaseRef.current === 'stream-catchup'
       || initialEntryPhaseRef.current === 'ready'
+    )
     const requestRevealOnQuiet = () => {
       clearTimeout(revealTimer)
       if (revealedRef.current && !mountStabilizingRef.current) return
@@ -1553,6 +1560,7 @@ export default function useScrollMode({
         // Rows may have finished painting only now; resolve the entry
         // coordinate from them so reveal never commits at the physical top.
         attemptEntryRestore()
+        if (modeRef.current.kind === 'INITIAL') return
         if (!syncLayout({ authorityVersion })) return
         revealedRef.current = true
         mountStabilizingRef.current = initialEntryPhaseRef.current !== 'ready'
@@ -1566,7 +1574,8 @@ export default function useScrollMode({
       // Even the safety-cap reveal resolves the coordinate first, so a forced
       // reveal with rows present still lands on the saved location, not the top.
       attemptEntryRestore()
-      syncLayout({ authorityVersion: currentAuthority() })
+      if (modeRef.current.kind === 'INITIAL') return
+      if (!syncLayout({ authorityVersion: currentAuthority() })) return
       mountStabilizingRef.current = false
       revealedRef.current = true
       setRevealed(true)
@@ -1756,7 +1765,12 @@ export default function useScrollMode({
     // and removing them is what made entry visibly unstable.
     if (mountStabilizingRef.current && typeof MutationObserver !== 'undefined') {
       mountMutationObserver = new MutationObserver(requestRevealOnQuiet)
-      mountMutationObserver.observe(listEl, { childList: true, subtree: true })
+      mountMutationObserver.observe(listEl, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['data-reading-layout-pending'],
+      })
     }
     scrollEl.addEventListener('load', requestRevealOnQuiet, true)
     scrollEl.addEventListener('error', requestRevealOnQuiet, true)
@@ -2363,6 +2377,7 @@ export default function useScrollMode({
     chatId,
     initialEntryPhase,
     onCachedCoordinateReady,
+    rememberAppliedMode,
     ownsReadingPosition,
     pinModeActive,
     chatRef,
@@ -2388,15 +2403,17 @@ export default function useScrollMode({
       touchContactActive: touchContactCountRef.current > 0,
     })) return
     const k = modeRef.current.kind
+    if (k === 'ANCHOR_AT'
+        && !_anchorReapplyNeeded(scrollEl, modeRef.current, lastAnchorTopRef.current)) return
     if (k === 'FOLLOW_BOTTOM' || k === 'ANCHOR_AT' || k === 'PIN_USER_MSG') {
-      writeMode(
+      if (writeMode(
         scrollEl,
         modeRef.current,
         'lifecycle:transcript-reapply',
         authorityVersion,
-      )
+      )) rememberAppliedMode(scrollEl)
     }
-  }, [scrollRef, writeMode])
+  }, [rememberAppliedMode, scrollRef, writeMode])
 
   // Terminal stream promotion and final buffered text can land in separate
   // React/browser phases. Observe committed geometry until two consecutive

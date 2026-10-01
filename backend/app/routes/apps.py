@@ -42,7 +42,9 @@ from app.routes.app_publication import (
 from app.routes.app_runtime import router as runtime_router
 from app.storage_io import (
   delete_content_type_tree,
+  make_parent_folders,
   read_capped_body,
+  require_parent_folders,
   rmtree_strict as _rmtree_strict,
 )
 from app.app_capabilities import (
@@ -270,6 +272,7 @@ async def create_app_source_folder(
     target = _resolve_app_source_path(root, body.path)
     if target == root:
       raise HTTPException(400, "The app source root already exists.")
+    require_parent_folders(target)
     try:
       target.mkdir(parents=True, exist_ok=False)
     except FileExistsError as exc:
@@ -323,7 +326,7 @@ async def move_app_source_path(
       raise HTTPException(404, "Source path not found.")
     if destination.exists():
       raise HTTPException(409, "A file or folder already uses the destination.")
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    make_parent_folders(destination)
     try:
       os.replace(source, destination)
     except OSError as exc:
