@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test'
+import { randomUUID } from 'node:crypto'
 import { applyApp } from './app-source.mjs'
 
 const BASE = process.env.MOBIUS_URL || 'http://localhost:8001'
@@ -141,7 +142,8 @@ test('app discovery hands access review to Store and preserves the guide through
   await page.goto(BASE, { waitUntil: 'domcontentloaded' })
   const token = await page.evaluate(() => localStorage.getItem('token'))
   const { app: storeApp } = await applyApp(request, token, {
-    slug: 'store', name: 'App Store', jsxSource: STORE_FIXTURE,
+    slug: 'store', sourceSlug: `store-onboarding-${randomUUID()}`,
+    name: 'App Store', jsxSource: STORE_FIXTURE,
   })
   try {
     await page.route(/\/api\/proxy\?/, route => {

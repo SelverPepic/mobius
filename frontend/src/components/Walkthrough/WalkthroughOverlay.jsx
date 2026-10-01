@@ -50,14 +50,27 @@ export default function WalkthroughOverlay({ apps, storeActive = false, onOpenAp
     cardRef.current?.scrollTo({ top: 0 })
   }
 
-  // Navigation and Store return announce the current step, but mounting a
-  // modeless coach must not steal focus from the working shell.
+  // Moving between guide steps announces the new step. On return from Store,
+  // wait for browser-history focus restoration before moving focus off the
+  // retired app surface. A modeless guide must not take focus from an owner
+  // who has meanwhile chosen another shell control.
   useEffect(() => {
-    if (!suspended && (pendingFocusRef.current || wasSuspendedRef.current)) {
+    const returnedFromStore = !suspended && wasSuspendedRef.current
+    if (!suspended && pendingFocusRef.current) {
       titleRef.current?.focus({ preventScroll: true })
       pendingFocusRef.current = false
     }
     wasSuspendedRef.current = suspended
+    if (returnedFromStore) requestAnimationFrame(() => {
+      const title = titleRef.current
+      const active = document.activeElement
+      const focusIsReleased = active === document.body
+        || active === document.documentElement
+        || active?.id === 'main-content'
+        || (active?.tagName === 'IFRAME'
+          && active.closest?.('[data-app-frame-owner]')?.getAttribute('aria-hidden') === 'true')
+      if (title?.isConnected && focusIsReleased) title.focus({ preventScroll: true })
+    })
   }, [stepIndex, suspended])
 
   useEffect(() => () => installAbortRef.current?.abort(), [])
@@ -141,9 +154,9 @@ export default function WalkthroughOverlay({ apps, storeActive = false, onOpenAp
 
         {slide === 'apps' && <>
           <h2 id="wt-title" ref={titleRef} tabIndex={-1}>Explore apps</h2>
-          <WalkthroughStore apps={apps} onReviewApp={id => {
+          <WalkthroughStore apps={apps} onReviewApp={(id, storeAppId) => {
             setReviewingStore(true)
-            void onOpenApp('store', `app:${id}`)
+            void onOpenApp(storeAppId, `app:${id}`)
           }} />
         </>}
 

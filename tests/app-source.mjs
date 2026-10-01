@@ -9,7 +9,7 @@ from pathlib import Path
 import sys
 
 payload = json.load(sys.stdin)
-root = Path("/data/apps") / payload["slug"]
+root = Path("/data/apps") / payload["source_slug"]
 root.mkdir(parents=True, exist_ok=True)
 (root / "index.jsx").write_text(payload["jsx_source"], encoding="utf-8")
 (root / "mobius.json").write_text(
@@ -46,6 +46,7 @@ function manifestFor({
 
 export function writeAppSource({
   slug,
+  sourceSlug = slug,
   name,
   jsxSource,
   description,
@@ -55,7 +56,7 @@ export function writeAppSource({
   files = {},
 }) {
   const payload = {
-    slug,
+    source_slug: sourceSlug,
     jsx_source: jsxSource,
     manifest: manifestFor({
       slug,
@@ -79,7 +80,7 @@ export function writeAppSource({
       stdio: ['pipe', 'pipe', 'pipe'],
     },
   )
-  return `/data/apps/${slug}`
+  return `/data/apps/${sourceSlug}`
 }
 
 export async function applyApp(request, token, options) {

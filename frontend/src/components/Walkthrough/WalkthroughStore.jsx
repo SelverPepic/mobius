@@ -2,6 +2,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { apiFetch } from '../../api/client.js'
 import AppIcon from '../AppIcon.jsx'
+import { findAppStoreApp } from '../../lib/appRecovery.js'
 
 const CORE_IDS = ['store', 'social', 'memory', 'reflection', 'skills', 'integrations', 'identity']
 const PICK_IDS = ['notes', 'habits', 'kanban', 'pages', 'webstudio', 'connect']
@@ -34,7 +35,7 @@ function asDataUrl(blob) {
 }
 
 export default function WalkthroughStore({ apps, onReviewApp }) {
-  const storeApp = apps.find(app => app.slug === 'store')
+  const storeApp = findAppStoreApp(apps)
   const [catalog, setCatalog] = useState(null)
   const [catalogError, setCatalogError] = useState('')
   const [icons, setIcons] = useState({})
@@ -119,7 +120,7 @@ export default function WalkthroughStore({ apps, onReviewApp }) {
           <AppIcon className="wt__store-icon" item={{ slug: item.id, icon_url: icons[item.id] }} label={item.name} size={null} />
           <h3>{item.name}</h3>
           <p className="wt__store-description">{guideDescription(item.description)}</p>
-          <button type="button" className={installed ? 'wt__installed' : 'wt__action'} aria-label={installed ? `Installed ${item.name}` : `Review ${item.name} in App Store`} disabled={installed || !storeApp} onClick={() => onReviewApp(item.id)}>{installed ? 'Installed' : 'Review in App Store'}</button>
+          <button type="button" className={installed ? 'wt__installed' : 'wt__action'} aria-label={installed ? `Installed ${item.name}` : `Review ${item.name} in App Store`} disabled={installed || !storeApp} onClick={() => onReviewApp(item.id, storeApp.id)}>{installed ? 'Installed' : 'Review in App Store'}</button>
         </article>
       })}
     </div>}

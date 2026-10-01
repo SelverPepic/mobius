@@ -91,6 +91,7 @@ import {
 } from './workspacePlacement.js'
 import {
   appCrashReportDraft,
+  findAppStoreApp,
 } from '../../lib/appRecovery.js'
 import {
   acknowledgeAppActivity,
@@ -2149,6 +2150,7 @@ export default function Shell({ onInitialVisualReady }) {
     && walkthroughQuery.isFetched
     && walkthroughQuery.data
     && !walkthroughQuery.data.completed
+  const walkthroughStoreApp = showWalkthrough ? findAppStoreApp(apps) : null
 
   // Local streaming ids come from the mounted ChatView immediately at send
   // time. The run-lifecycle owner merges those with durable
@@ -4604,7 +4606,7 @@ export default function Shell({ onInitialVisualReady }) {
       {showWalkthrough && (
         <WalkthroughOverlay
           apps={apps}
-          storeActive={activeView === 'canvas' && apps.some(app => app.slug === 'store' && String(app.id) === String(activeAppId))}
+          storeActive={activeView === 'canvas' && walkthroughStoreApp != null && String(walkthroughStoreApp.id) === String(activeAppId)}
           onOpenApp={openAppWithIntent}
         />
       )}
