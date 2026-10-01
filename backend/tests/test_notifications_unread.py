@@ -276,6 +276,70 @@ def test_clear_preserves_active_undo_and_records_only_count(client, auth, db, mo
   assert events[-1] == ("notification_history_cleared", {"deleted": 0})
 
 
+def test_clear_uses_dismiss_recovery_family_and_expires_unknown_receipts(client, auth, db):
+  owner = db.query(models.Owner).first()
+  now = datetime.now(UTC)
+  for suffix, expires_at in (
+    ("future", now + timedelta(days=1)),
+    ("expired", now - timedelta(days=1)),
+  ):
+    db.add(models.Notification(
+      id=f"future-recovery-{suffix}", owner_id=owner.id,
+      source_type="shell", title="Recoverable",
+      actions=[{"action": "recover_future_resource", "expires_at": expires_at.isoformat()}],
+    ))
+  db.add(models.Notification(
+    id="future-recovery-malformed", owner_id=owner.id,
+    source_type="shell", title="Recoverable",
+    actions=[{"action": "recover_future_resource", "expires_at": "not-a-date"}],
+  ))
+  db.commit()
+
+  assert client.delete("/api/notifications/future-recovery-future", headers=auth).status_code == 409
+  cleared = client.delete("/api/notifications", headers=auth)
+  assert cleared.status_code == 200, cleared.text
+  assert cleared.json() == {"deleted": 1}
+  assert {row.id for row in db.query(models.Notification).all()} == {
+    "future-recovery-future", "future-recovery-malformed",
+  }
+
+
+def test_clear_rechecks_actions_at_delete_boundary(client, auth, db, monkeypatch):
+  from app.database import SessionLocal
+  from app.routes import notifications as route
+
+  owner_id = db.query(models.Owner.id).first()[0]
+  db.add(models.Notification(
+    id="became-recoverable", owner_id=owner_id,
+    source_type="shell", title="Ordinary",
+    sent_at=datetime.now(UTC) - timedelta(minutes=1),
+  ))
+  db.commit()
+  original = route._has_active_undo
+  changed = False
+
+  def add_recovery_after_selection(actions, now):
+    nonlocal changed
+    if not changed:
+      changed = True
+      with SessionLocal() as other:
+        row = other.query(models.Notification).filter_by(id="became-recoverable").one()
+        row.actions = [{
+          "action": "recover_future_resource",
+          "expires_at": (now + timedelta(days=1)).isoformat(),
+        }]
+        other.commit()
+    return original(actions, now)
+
+  monkeypatch.setattr(route, "_has_active_undo", add_recovery_after_selection)
+  cleared = client.delete("/api/notifications", headers=auth)
+  assert cleared.status_code == 200, cleared.text
+  assert cleared.json() == {"deleted": 0}
+  db.expire_all()
+  saved = db.query(models.Notification).filter_by(id="became-recoverable").one()
+  assert saved.actions[0]["action"] == "recover_future_resource"
+
+
 def test_clear_scans_large_history_without_skipping_live_undo(client, auth, db):
   owner = db.query(models.Owner).first()
   db.add_all([

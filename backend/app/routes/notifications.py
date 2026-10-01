@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from slowapi import Limiter
-from sqlalchemy import and_, func, or_
+from sqlalchemy import JSON, and_, func, or_
 from sqlalchemy.orm import Session
 
 from app import activity, models
@@ -54,14 +54,20 @@ def _sender_bucket(request: Request) -> str:
 limiter = Limiter(key_func=_sender_bucket)
 
 
+def _is_recovery_action(action: object) -> bool:
+  return (
+    isinstance(action, dict)
+    and isinstance(action.get("action"), str)
+    and action["action"].startswith("recover_")
+  )
+
+
 def _has_active_undo(actions: object, now: datetime) -> bool:
   """Keep a live Undo receipt; preserve malformed ones rather than risk losing one."""
   if not isinstance(actions, list):
     return False
   for action in actions:
-    if not isinstance(action, dict) or action.get("action") not in (
-      "recover_chat", "recover_app", "recover_project",
-    ):
+    if not _is_recovery_action(action):
       continue
     if action.get("completed_at"):
       continue
@@ -260,7 +266,7 @@ def clear_notifications(
   cursor = ""
   while True:
     batch = (
-      db.query(models.Notification.id, models.Notification.actions)
+      db.query(models.Notification.id, models.Notification.actions, models.Notification.sent_at)
       .filter(
         models.Notification.owner_id == owner.id,
         models.Notification.id > cursor,
@@ -274,11 +280,18 @@ def clear_notifications(
     if not batch:
       break
     cursor = batch[-1].id
-    removable = [row.id for row in batch if not _has_active_undo(row.actions, started_at)]
-    if removable:
+    for row in batch:
+      if _has_active_undo(row.actions, started_at):
+        continue
+      # Match the selected snapshot at the DELETE boundary: a concurrently
+      # changed receipt or arrival must not be removed on stale classification.
       deleted += db.query(models.Notification).filter(
         models.Notification.owner_id == owner.id,
-        models.Notification.id.in_(removable),
+        models.Notification.id == row.id,
+        models.Notification.actions == row.actions if row.actions is not None
+        else or_(models.Notification.actions.is_(None), models.Notification.actions == JSON.NULL),
+        models.Notification.sent_at == row.sent_at if row.sent_at is not None
+        else models.Notification.sent_at.is_(None),
       ).delete(synchronize_session=False)
   db.commit()
   # Content-free, timestamped activity record for future history-loss diagnosis.
@@ -310,12 +323,7 @@ def dismiss_notification(
   if notification is None:
     raise HTTPException(status_code=404, detail="Notification not found.")
   actions = notification.actions if isinstance(notification.actions, list) else []
-  if any(
-    isinstance(action, dict)
-    and isinstance(action.get("action"), str)
-    and action["action"].startswith("recover_")
-    for action in actions
-  ):
+  if any(_is_recovery_action(action) for action in actions):
     raise HTTPException(
       status_code=409,
       detail="Undo notifications cannot be dismissed individually.",
