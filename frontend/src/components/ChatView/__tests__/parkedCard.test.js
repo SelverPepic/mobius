@@ -434,7 +434,7 @@ test('continuations render as product markers, not user bubbles', () => {
     'Resume delegates the lifecycle action instead of manufacturing owner text')
   assert.match(chatView, /chat__msg--\$\{continuationMarker \? 'marker' : msg\.role\}/,
     'the row shell must not inherit owner-user alignment')
-  assert.match(chatView, /supersedeResumedPauseBlocks\(messages\)/,
+  assert.match(chatView, /supersedeResumedPauseBlocks\(messages,/,
     'a completed continuation replaces its stale actionable pause in the render projection')
 })
 

@@ -1330,6 +1330,7 @@
      The cap keeps that reading surface inside the disclosure; the transcript
      and its tail reservation never absorb the hidden overflow. */
   overflow-y: auto;
+  overscroll-behavior-y: auto;
   line-height: 1.5;
 }
 
@@ -2267,6 +2268,7 @@
   margin-top: 2px;
   max-height: 360px;
   overflow-y: auto;
+  overscroll-behavior-y: auto;
 }
 
 /* ── Input footer ──────────────────────────────────── */
