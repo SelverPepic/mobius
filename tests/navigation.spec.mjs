@@ -287,7 +287,9 @@ for (const mode of ['single', 'panes']) {
           await expect(page.locator(`[data-chat-id="${NAV_CHATS[1].id}"][data-chat-surface="painted"]`)).toBeVisible()
         } else {
           await expect(page.locator('.workspace__chrome')).not.toBeVisible()
-          await expect(page.locator('.shell__settings-view--active')).toBeVisible()
+          const overlay = page.locator('.shell__settings-view.shell__view--active')
+          await expect(overlay).toBeVisible()
+          await expect(overlay).not.toHaveAttribute('role', 'tabpanel')
         }
       }
     })
