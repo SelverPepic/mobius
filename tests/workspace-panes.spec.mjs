@@ -153,6 +153,14 @@ async function mockApps(page, apps) {
     })
   })
   for (const a of apps) {
+    // These apps exist only in the fixture. Opening one records recency in the
+    // backend; let that write succeed as it would for a real installed app.
+    // A 404 here invalidates the app list while navigation is in progress.
+    await page.route(new RegExp(`/api/apps/${a.id}/opened$`), route => (
+      route.request().method() === 'POST'
+        ? route.fulfill({ status: 204 })
+        : route.fallback()
+    ))
     await page.route(new RegExp(`/api/apps/${a.id}/frame`), route => route.fulfill({
       status: 200, contentType: 'text/html',
       body: '<!doctype html><html><body style="margin:0;min-height:100vh" '
