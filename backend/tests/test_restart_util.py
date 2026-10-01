@@ -295,3 +295,30 @@ def test_external_cutover_drains_without_requesting_self_restart(monkeypatch):
     "nonce": "nonce-12345678",
     "runs": [{"chat_id": "chat-12345678", "run_token": "run-12345678"}],
   }]
+
+
+def test_competing_restart_cards_share_one_worker_drain_and_dispatch(monkeypatch):
+  requests = []
+  drains = []
+  _FakeTimer.instances = []
+  monkeypatch.setattr(ru, "validate_restart_source", lambda: None)
+  monkeypatch.setattr(ru.threading, "Timer", _FakeTimer)
+  monkeypatch.setattr(ru.os, "kill", lambda *_args: (_ for _ in ()).throw(
+    AssertionError("test must never signal a worker")
+  ))
+  monkeypatch.setattr(restart_ledger, "request_restart", lambda **kwargs: requests.append(kwargs))
+
+  async def drain():
+    drains.append(True)
+    await asyncio.sleep(0)  # A competing card reaches admission while draining.
+    return "boot-multiple-cards", "one-restart-nonce", []
+
+  monkeypatch.setattr(ru, "_drain_exact_restart", drain)
+
+  async def competing_cards():
+    await asyncio.gather(ru.restart_this_worker(), ru.restart_this_worker())
+
+  asyncio.run(competing_cards())
+  assert drains == [True]
+  assert requests == [{"boot_id": "boot-multiple-cards", "nonce": "one-restart-nonce", "runs": []}]
+  assert len(_FakeTimer.instances) == 1

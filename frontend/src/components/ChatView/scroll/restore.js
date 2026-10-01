@@ -11,6 +11,12 @@ import {
   bottomAnchorModeFromScroll,
 } from './geometry.js'
 
+/** Restored-open activity is part of the reading layout, not a new toggle.
+ * Coordinate validation and reveal must wait for its complete or failed read. */
+export function readingLayoutPending(scrollEl) {
+  return !!scrollEl?.querySelector?.('[data-reading-layout-pending="true"]')
+}
+
 /** Validates a saved ScrollMode against current state. A valid reader anchor
  * is exact. With no resolvable location, show the latest real content once as
  * a settled ANCHOR_AT — never FOLLOW_BOTTOM. */
@@ -74,6 +80,9 @@ export function entryRestoreDecision({ mode, saved, messages, scrollEl, phase })
     || phase === 'ready'
   if (mode?.kind !== 'INITIAL' || !restorePhase) {
     return { action: 'idle', resolved: false, savedPresent }
+  }
+  if (readingLayoutPending(scrollEl)) {
+    return { action: 'wait', resolved: false, savedPresent }
   }
   const restored = _validateSavedMode(saved, messages, scrollEl)
   // No addressable row yet — revealing now would strand the reader at the top.

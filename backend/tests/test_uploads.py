@@ -50,6 +50,28 @@ def test_upload_deduplicates_filename(client, db, auth, chat):
   assert "photo_1.png" in names
 
 
+def test_upload_shortens_a_name_longer_than_the_filesystem_allows(
+  client, db, auth, chat,
+):
+  """A 300-byte name (150 accented letters) is shortened, keeping its type."""
+  long_name = "é" * 150 + ".png"
+  for _ in range(2):
+    res = client.post(
+      f"/api/chats/{chat.id}/uploads",
+      files=[("files", (long_name, io.BytesIO(b"data"), "image/png"))],
+      headers=auth,
+    )
+    assert res.status_code == 200, res.text
+  db.refresh(chat)
+  names = [u["name"] for u in chat.uploads]
+  assert len(set(names)) == 2
+  for name in names:
+    assert name.endswith(".png")
+    assert len(name.encode("utf-8")) <= 255
+    served = client.get(f"/api/chats/{chat.id}/uploads/{name}", headers=auth)
+    assert served.status_code == 200
+
+
 def test_list_uploads(client, db, auth, chat):
   """GET /api/chats/{id}/uploads returns the stored upload list."""
   client.post(

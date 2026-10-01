@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import DOMPurify from 'dompurify'
-import { getToken, isEphemeralAuth, BASE } from '../../../api/client.js'
+import { getToken, isEphemeralAuth, BASE, apiFetch } from '../../../api/client.js'
 import { mediaTokenParam } from '../../../api/mediaToken.js'
 import { useMathHtml } from './math.js'
 import { imageDimensionsForHref, imageVarsFromDims } from './imageDims.js'
@@ -10,6 +10,7 @@ import {
 } from './mediaImageSource.js'
 import ImageLightbox from './ImageLightbox.jsx'
 import ChatPanePortal from '../ChatPanePortal.jsx'
+import { projectFileDownloadTarget, fetchProjectFileDownload } from './projectFileDownload.js'
 import { useHistoryDismiss } from '../../../hooks/useHistoryDismiss.jsx'
 import { captureLayoutSpace, clientLengthToLayout } from '../../../lib/layoutSpace.js'
 import '../lightbox.css'
@@ -91,6 +92,8 @@ function InlineToken({ token, onInternalNav, mediaDimensions }) {
         />
       )
     }
+    const projectDownload = projectFileDownloadTarget(href, location.origin, BASE)
+    if (projectDownload) return <ProjectFileDownloadLink target={projectDownload} token={token} />
     return (
       <a
         href={href}
@@ -173,6 +176,37 @@ function InlineToken({ token, onInternalNav, mediaDimensions }) {
 
   // Fallback: render raw text.
   return token.raw || token.text || ''
+}
+
+function ProjectFileDownloadLink({ target, token }) {
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState(false)
+
+  async function download() {
+    if (busy) return
+    setBusy(true)
+    setError(false)
+    try {
+      const blob = await fetchProjectFileDownload(target, apiFetch)
+      const objectUrl = URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = objectUrl
+      anchor.download = target.filename
+      anchor.click()
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 1000)
+    } catch {
+      setError(true)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return <>
+    <button type="button" className="md-project-download" aria-busy={busy} onClick={download}>
+      <InlineContent tokens={token.tokens} />
+    </button>
+    {error && <span className="md-project-download-error" role="alert">Couldn’t download this Project file. Try again from Projects.</span>}
+  </>
 }
 
 function safeUrl(href, protocols) {

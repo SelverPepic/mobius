@@ -898,6 +898,19 @@ useEffect(() => {
 
   Element fullscreen remains unavailable for this path on iOS. In a launch where `matchMedia('(display-mode: fullscreen)').matches`, skip the redundant request — but do not infer that iOS removed its own status bar.
 
+### Mouse-look and controllers
+
+App frames, including the shell, standalone, and public-link hosts, grant pointer
+lock and the Gamepad API directly, so a game uses the ordinary browser APIs:
+
+- **Pointer lock:** call `canvas.requestPointerLock()` from a click, then read
+  `movementX`/`movementY`. Esc always releases it; show a "click to play"
+  overlay on `pointerlockchange` when it is released. Phones have no pointer
+  lock, so keep touch controls as the mobile path.
+- **Gamepad:** poll `navigator.getGamepads()` each frame after a
+  `gamepadconnected` event. Controllers only report once the page has focus
+  and a button is pressed.
+
 ### Splash / status-bar color
 
 Set `"theme_color"` and `"background_color"` (`#rrggbb`) in `mobius.json` to pin the OS splash + status-bar color to your app's own background. Omit them and Möbius defaults the status bar to the owner's current **theme** color (not a color sampled from your icon), so an undeclared app still blends with the platform.
