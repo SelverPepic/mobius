@@ -331,7 +331,7 @@ def _pair(base, code):
     # Additive: pairing to another instance keeps the machine's existing
     # connections, so one runner can serve several Mobius instances at once.
     _add_connection(conn)
-    print("Paired as '%s'." % out.get("name", "machine"))
+    print("Granted command access to %s." % base)
     return conn
 
 
