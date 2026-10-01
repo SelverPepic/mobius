@@ -1657,7 +1657,9 @@ receipts preserve immutable accepted/rejected batches. States distinguish
 queued, executing, succeeded, failed, cancelled and unknown. Neither worker
 loss nor restart changes unknown back to queued. Bounds are explicit: 64 KiB
 per frame, eight writes per item, 256 items, 128 admitted writes/1 MiB arguments
-and 32 bounded diagnostics per run. These cap one protocol turn, not owner data.
+and 32 detailed diagnostics per run, with a count of further omitted diagnostics
+that advances failure-report acknowledgment. These cap one protocol turn, not
+owner data.
 
 `agent_write_tools` launches the existing control dispatcher with the exact
 already-materialized run/delegation environment; payloads cannot choose caller

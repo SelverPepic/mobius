@@ -151,6 +151,60 @@ def test_rejected_batch_and_dedup_only_batch_keep_immutable_item_receipts(chat, 
   assert states(owner)==[("w1","queued")]
 
 
+def test_rejection_after_diagnostic_cap_changes_report_but_identical_replay_does_not(chat, db, monkeypatch):
+  from app import agent_write_journal as journal
+
+  owner = start(chat)
+  monkeypatch.setattr(journal, "MAX_RUN_WRITES", 0)
+  for index in range(journal.MAX_DIAGNOSTICS):
+    assert save(owner, write(), item=f"rejected-{index}")["status"] == "rejected"
+  db.expire_all()
+  run = db.get(models.ChatRun, owner["run_token"])
+  before = journal.failure_report(db, run)
+
+  rejection = save(owner, write(), item="overflow")
+  db.expire_all()
+  after = journal.failure_report(db, run)
+  assert after["fingerprint"] != before["fingerprint"]
+  assert len(after["diagnostics"]) == journal.MAX_DIAGNOSTICS
+  assert after["diagnostics"][-1]["additional_diagnostics_omitted"] == 1
+  assert save(owner, write(), item="overflow") == rejection
+  db.expire_all()
+  assert journal.failure_report(db, run) == after
+  assert states(owner) == []
+
+
+def test_failure_report_selects_negative_metadata_without_loading_saved_arguments(chat, db):
+  from sqlalchemy import event
+  from app import agent_write_journal as journal
+
+  owner = start(chat)
+  save(owner, write("success", value="private success" * 1000), write("failure"))
+  submit(ClaimAgentWrite(**owner))
+  submit(SettleAgentWrite(**owner, operation_id="success", status="succeeded"))
+  submit(ClaimAgentWrite(**owner))
+  submit(SettleAgentWrite(**owner, operation_id="failure", status="failed", reason="synthetic failure"))
+  db.expire_all()
+  run = db.get(models.ChatRun, owner["run_token"])
+  statements = []
+
+  def capture(_connection, _cursor, statement, _parameters, _context, _executemany):
+    statements.append(statement)
+
+  engine = db.get_bind()
+  event.listen(engine, "before_cursor_execute", capture)
+  try:
+    report = journal.failure_report(db, run)
+  finally:
+    event.remove(engine, "before_cursor_execute", capture)
+  assert [entry["id"] for entry in report["writes"]] == ["failure"]
+  assert report["writes"][0]["reason"] == "synthetic failure"
+  assert "private success" not in str(report)
+  intent_queries = [sql for sql in statements if "agent_write_intents" in sql]
+  assert intent_queries
+  assert all("arguments_json" not in sql for sql in intent_queries)
+
+
 def test_interrupt_never_requeues_ambiguous_work(chat):
   owner=start(chat)
   save(owner,write(),write("w2"))

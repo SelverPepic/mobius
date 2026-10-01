@@ -1,5 +1,6 @@
 import json
 import pytest
+import app.agent_write_channel as channel_module
 from app.agent_write_channel import FrameDecoder, OutputChannel, ProtocolError, WriteIntent as Write, decode, frame
 
 NONCE = "test_turn_nonce_123456"
@@ -115,7 +116,7 @@ def test_final_only_items_reserve_capacity_before_async_admission():
         channel.final(str(i), frame(NONCE, WRITE))
     with pytest.raises(ProtocolError, match='Too many'):
         channel.final('overflow', frame(NONCE, WRITE))
-    assert len(channel.parsed) == 256
+    assert sum(state.raw_fingerprint is not None for state in channel.items.values()) == 256
 
 
 def test_authoritative_final_seals_deltas_before_durable_admission():
@@ -126,6 +127,38 @@ def test_authoritative_final_seals_deltas_before_durable_admission():
     with pytest.raises(ProtocolError, match='changed'):
         channel.final('i', 'Changed plain text.')
     channel.acknowledge('i', visible, writes)
+    channel.finish()
+
+
+def test_provisional_deltas_construct_one_decoder_per_item(monkeypatch):
+    constructed = []
+    original = FrameDecoder
+
+    def make_decoder(*args, **kwargs):
+        constructed.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(channel_module, 'FrameDecoder', make_decoder)
+    channel = OutputChannel(NONCE)
+    assert channel.delta('item', 'First ') == 'First '
+    assert channel.delta('item', 'second.') == 'second.'
+    assert len(constructed) == 1
+
+
+def test_in_flight_final_replay_retains_one_admission_and_immutable_raw_snapshot():
+    channel = OutputChannel(NONCE)
+    raw = 'Visible.' + frame(NONCE, WRITE)
+    visible, writes = channel.final('item', raw)
+    fingerprint = channel.reserve_admission('item', visible, writes)
+    assert fingerprint is not None
+    assert channel.final('item', raw) == (visible, writes)
+    assert channel.reserve_admission('item', visible, writes) is None
+    with pytest.raises(ProtocolError, match='admitting'):
+        channel.replace('item')
+    with pytest.raises(ProtocolError, match='changed'):
+        channel.final('item', 'Changed.' + frame(NONCE, WRITE))
+    channel.acknowledge('item', visible, writes)
+    assert channel.final('item', raw) == (visible, ())
     channel.finish()
 
 
@@ -187,7 +220,7 @@ def test_authoritative_item_not_turn_end_is_acceptance_boundary():
     channel = OutputChannel(NONCE)
     command = frame(NONCE, WRITE)
     assert channel.delta('commentary-1', command) == ''
-    assert channel.completed == {}  # streamed guess never dispatches
+    assert channel.items['commentary-1'].admitted_fingerprint is None  # streamed guess never dispatches
     assert channel.final('commentary-1', command) == ('', (WRITE,))
     assert channel.delta('commentary-2', 'Still working.') == 'Still working.'
 
@@ -230,14 +263,14 @@ def test_stop_does_not_dispatch_complete_but_provisional_command():
     channel.delta('item', frame(NONCE, WRITE))
     with pytest.raises(ProtocolError, match='unaccepted'):
         channel.finish()
-    assert not channel.completed
+    assert all(state.admitted_fingerprint is None for state in channel.items.values())
 
 
 def test_partial_item_with_valid_then_broken_frame_admits_nothing():
     channel = OutputChannel(NONCE)
     with pytest.raises(ProtocolError):
         channel.final('item', frame(NONCE, WRITE) + FrameDecoder(NONCE).open + '{}')
-    assert not channel.completed
+    assert all(state.admitted_fingerprint is None for state in channel.items.values())
 
 
 @pytest.mark.parametrize('method,args', [('delta', ('', 'Text')), ('final', ('', 'Text'))])

@@ -94,8 +94,7 @@ class QuietToolDispatcher:
     self.publish({**event, "type": "tool_start", "input": json.dumps(arguments, ensure_ascii=False),
                   "delivery": "quiet"})
     request = {"jsonrpc": "2.0", "id": call_id, "method": "tools/call",
-      "params": {"name": name, "arguments": arguments,
-        "_meta": {"mobius/writeOperationId": write["id"]}}}
+      "params": {"name": name, "arguments": arguments}}
     process = None
     pgid = None
     readers = []

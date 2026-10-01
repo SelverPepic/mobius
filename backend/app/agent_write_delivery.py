@@ -14,7 +14,7 @@ from collections.abc import Awaitable, Callable
 from app.agent_write_channel import FrameDecoder, OutputChannel, ProtocolError
 from app.chat_writer import (AdmitAgentWrites, ClaimAgentWrite, SettleAgentWrite,
   SealAgentWrites, InterruptAgentWrites, RecordAgentWriteFailure,
-  ReadAgentWriteOutcomes, await_ack, get_writer)
+  await_ack, get_writer)
 
 
 @dataclass(frozen=True)
@@ -37,7 +37,6 @@ class AgentWriteDelivery:
     self.closing = False
     self.worker = None
     self.admissions: set[asyncio.Task] = set()
-    self.pending_items: dict[str, str] = {}
     self.wake = asyncio.Event()
     self.finish_task = None
     self.persistence_failed = False
@@ -98,8 +97,6 @@ class AgentWriteDelivery:
       if kind == "text_boundary":
         replaced = event.get("replace_text_item_id")
         if replaced:
-          if replaced in self.pending_items:
-            raise ProtocolError("An admitting item cannot be replaced")
           self.channel.replace(replaced)
         return event
       if kind == "text":
@@ -109,22 +106,13 @@ class AgentWriteDelivery:
         if writes:
           if any(write.tool not in self.eligible_tools for write in writes):
             raise ProtocolError("Tool requires the ordinary result-bearing path")
-          fingerprint = self.channel._fingerprint(content, writes)
-          pending = self.pending_items.get(item)
-          if pending is not None and pending != fingerprint:
-            raise ProtocolError("An admitting item changed")
-          if pending is None:
-            self.pending_items[item] = fingerprint
+          fingerprint = self.channel.reserve_admission(item, content, writes)
+          if fingerprint is not None:
             # Submit synchronously: message order becomes actor order before
             # asynchronous disk acknowledgments can complete out of order.
             ack = get_writer().submit(AdmitAgentWrites(**self.owner,
               item_id=item, fingerprint=fingerprint, writes=writes))
             self._task(self._accept(ack, item, content, writes))
-        else:
-          if item in self.pending_items:
-            raise ProtocolError("An admitting item changed")
-          if item not in self.channel.completed:
-            self.channel.acknowledge(item, content, writes)
       return {**event, "content": content} if content or kind == "text_final" else None
     except (ProtocolError, ValueError):
       # Hide an invalid snapshot in full; never show a raw private payload.
@@ -161,11 +149,10 @@ class AgentWriteDelivery:
       self.wake.set()
     except Exception:
       # A timeout does not prove rollback. Retain an explicit unknown admission
-      # and never reissue the command merely because the ack was lost.
+      # and never reissue the command merely because the ack was lost. The
+      # channel keeps pending ownership until a terminal receipt acknowledges it.
       self.persistence_failed = True
       self.on_failure({"stage": "admission", "reason": "admission_outcome_unknown"})
-    finally:
-      self.pending_items.pop(item, None)
 
   async def _drain(self):
     while True:
@@ -283,4 +270,3 @@ class AgentWriteDelivery:
       raise failure
     if self.persistence_failed:
       raise RuntimeError("Quiet-write persistence outcome is uncertain; inspect before retry")
-    return await self._command(ReadAgentWriteOutcomes(**self.owner))

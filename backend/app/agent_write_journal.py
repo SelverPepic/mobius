@@ -18,7 +18,6 @@ from app.agent_write_channel import WriteIntent
 MAX_RUN_WRITES = 128
 MAX_RUN_BYTES = 1024 * 1024
 MAX_DIAGNOSTICS = 32
-TERMINAL_STATES = frozenset({"succeeded", "failed", "cancelled", "unknown"})
 
 
 def _commit(db):
@@ -45,14 +44,25 @@ def _view(row):
           "run_id": row.source_run_id, "stage": row.stage, "reason": row.reason}
 
 
-def _reject(db, stream, reason, *, item_id=None, fingerprint=None, signature=None):
-  # Fixed reasons only: argument values and exception text do not enter errors.
+def _append_diagnostic(stream, diagnostic):
+  """Bound details without making later failures look already delivered."""
   diagnostics = list(stream.diagnostics or [])
   if len(diagnostics) < MAX_DIAGNOSTICS:
-    diagnostics.append({"stage": "admission", "reason": reason, **(
-      {"item_id": item_id} if item_id else {})})
-    stream.diagnostics = diagnostics
-    stream.failure_delivered_by = None
+    diagnostics.append(diagnostic)
+  else:
+    # Preserve the first bounded details, including records from older runs.
+    # The count changes the report fingerprint even after acknowledgment.
+    last = dict(diagnostics[-1])
+    last["additional_diagnostics_omitted"] = last.get("additional_diagnostics_omitted", 0) + 1
+    diagnostics[-1] = last
+  stream.diagnostics = diagnostics
+  stream.failure_delivered_by = None
+
+
+def _reject(db, stream, reason, *, item_id=None, fingerprint=None, signature=None):
+  # Fixed reasons only: argument values and exception text do not enter errors.
+  _append_diagnostic(stream, {"stage": "admission", "reason": reason, **(
+    {"item_id": item_id} if item_id else {})})
   receipt = {"status": "rejected", "reason": reason}
   if item_id and item_id not in (stream.item_receipts or {}) and len(stream.item_receipts or {}) < 256:
     stream.item_receipts = {**(stream.item_receipts or {}), item_id: {
@@ -116,12 +126,8 @@ def admit(db, run, *, item_id: str, fingerprint: str, writes: tuple[WriteIntent,
   receipt = {"status": "accepted", "new_count": len(new), "ids": [w.id for w in writes]}
   if negative_replays:
     receipt["negative_replays"] = negative_replays
-    diagnostics = list(stream.diagnostics or [])
-    if len(diagnostics) < MAX_DIAGNOSTICS:
-      diagnostics.append({"stage": "admission", "reason": "replayed_unsuccessful_write",
-                          "item_id": item_id, "writes": negative_replays})
-      stream.diagnostics = diagnostics
-      stream.failure_delivered_by = None
+    _append_diagnostic(stream, {"stage": "admission", "reason": "replayed_unsuccessful_write",
+                               "item_id": item_id, "writes": negative_replays})
   stream.item_receipts = {**(stream.item_receipts or {}), item_id: {
     "fingerprint": fingerprint, "signature": signature, "receipt": receipt}}
   _commit(db)
@@ -211,25 +217,26 @@ def outcomes(db, run):
 
 def record_failure(db, run, *, stage: str, reason: str):
   stream = _stream(db, run)
-  diagnostics = list(stream.diagnostics or [])
-  if len(diagnostics) < MAX_DIAGNOSTICS:
-    diagnostics.append({"stage": stage[:40], "reason": reason[:500]})
-    stream.diagnostics = diagnostics
-    stream.failure_delivered_by = None
+  _append_diagnostic(stream, {"stage": stage[:40], "reason": reason[:500]})
   _commit(db)
   return {"status": "recorded"}
 
 
 def failure_report(db, run):
   """Only negative outcomes enter model context; never arguments or success receipts."""
-  state = outcomes(db, run)
-  failed = [{k: row[k] for k in ("id", "tool", "status", "stage", "reason")}
-    for row in state["writes"] if row["status"] in {"failed", "unknown", "cancelled"}]
+  intent = models.AgentWriteIntent
+  rows = db.query(intent.operation_id, intent.tool, intent.status, intent.stage, intent.reason).filter(
+    intent.source_run_id == run.id, intent.status.in_(("failed", "unknown", "cancelled")),
+  ).order_by(intent.ordinal).all()
+  failed = [{"id": row.operation_id, "tool": row.tool, "status": row.status,
+             "stage": row.stage, "reason": row.reason} for row in rows]
+  stream = db.get(models.AgentWriteStream, run.id)
+  diagnostics = list(stream.diagnostics or []) if stream else []
   for row in failed:
     row["details_url"] = f"/api/chats/{run.chat_id}/write-outcomes/{run.id}/{row['id']}"
-  if not failed and not state["diagnostics"]:
+  if not failed and not diagnostics:
     return None
-  report = {"source_run_id": run.id, "writes": failed, "diagnostics": state["diagnostics"]}
+  report = {"source_run_id": run.id, "writes": failed, "diagnostics": diagnostics}
   report["fingerprint"] = hashlib.sha256(json.dumps(report, sort_keys=True).encode()).hexdigest()
   return report
 

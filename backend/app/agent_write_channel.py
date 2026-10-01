@@ -231,6 +231,16 @@ def frame(nonce: str, write: WriteIntent) -> str:
     ) + "\n</MOBIUS_WRITE>\n"
 
 
+@dataclass
+class _Item:
+    decoder: FrameDecoder | None = None
+    raw_fingerprint: str | None = None
+    admitted_fingerprint: str | None = None
+    pending_fingerprint: str | None = None
+    abandoned: bool = False
+    quarantined: bool = False
+
+
 class OutputChannel:
     """One attributed turn; snapshots, not streamed guesses, authorize writes.
 
@@ -240,64 +250,64 @@ class OutputChannel:
     """
     def __init__(self, nonce: str):
         self.nonce = nonce
-        self.streaming: dict[str, FrameDecoder] = {}
-        self.completed: dict[str, str] = {}
-        self.parsed: set[str] = set()
-        self.finalized: dict[str, str] = {}
+        self.items: dict[str, _Item] = {}
         self.closed = False
-        self.quarantined: set[str] = set()
-        self.abandoned: set[str] = set()
 
-    def _open_item(self, item):
+    def _open_item(self, item) -> _Item:
         if self.closed:
             raise ProtocolError("Output channel is closed")
         if not isinstance(item, str) or not item or len(item) > 256:
             raise ProtocolError("Missing authoritative item identity")
         if not self.has_capacity(item):
             raise ProtocolError("Too many output items in this turn")
+        state = self.items.get(item)
+        if state is None:
+            self.items[item] = state = _Item()
+        return state
 
     def has_capacity(self, item) -> bool:
-        known = self.streaming.keys() | self.completed.keys() | self.abandoned | self.quarantined | self.parsed
-        return item in known or len(known) < 256
+        return item in self.items or len(self.items) < 256
 
     def delta(self, item: str, text: str) -> str:
-        self._open_item(item)
-        if item in self.abandoned or item in self.completed or item in self.parsed:
+        state = self._open_item(item)
+        if state.abandoned or state.admitted_fingerprint or state.raw_fingerprint:
             return ""
-        if item in self.quarantined:
+        if state.quarantined:
             return ""
         try:
-            return self.streaming.setdefault(item, FrameDecoder(self.nonce, validate=False)).feed(text)
+            if state.decoder is None:
+                state.decoder = FrameDecoder(self.nonce, validate=False)
+            return state.decoder.feed(text)
         except ProtocolError:
             # A provisional oversize frame must not expose its remaining bytes.
             # The authoritative snapshot may still repair/replace it.
-            self.quarantined.add(item)
+            state.quarantined = True
             return ""
 
     def replace(self, item: str):
-        self._open_item(item)
-        if item in self.completed:
+        state = self._open_item(item)
+        if state.admitted_fingerprint:
             raise ProtocolError("An accepted item cannot be replaced")
-        self.streaming.pop(item, None)
-        self.abandoned.add(item)
+        if state.pending_fingerprint:
+            raise ProtocolError("An admitting item cannot be replaced")
+        state.decoder = None
+        state.abandoned = True
 
     def final(self, item: str, text: str) -> tuple[str, tuple[WriteIntent, ...]]:
-        self._open_item(item)
+        state = self._open_item(item)
         # Reserve identity before asynchronous durable admission can lag behind
         # a burst of final-only snapshots (including rejected snapshots).
-        if item in self.abandoned:
+        if state.abandoned:
             return "", ()
-        if item not in self.completed:
-            self.parsed.add(item)
         raw_fingerprint = hashlib.sha256(text.encode()).hexdigest()
-        prior_final = self.finalized.get(item)
+        prior_final = state.raw_fingerprint
         if prior_final is not None and prior_final != raw_fingerprint:
             raise ProtocolError("An authoritative item changed")
-        self.finalized[item] = raw_fingerprint
+        state.raw_fingerprint = raw_fingerprint
         parsed = FrameDecoder(self.nonce)
         visible = parsed.feed(text) + parsed.finish()
         value = (visible, tuple(parsed.writes))
-        old = self.completed.get(item)
+        old = state.admitted_fingerprint
         if old is not None:
             if old != self._fingerprint(*value):
                 raise ProtocolError("An accepted item changed")
@@ -310,27 +320,46 @@ class OutputChannel:
         # durably recorded). A rejected admission cannot disappear on replay.
         return value
 
+    def reserve_admission(self, item, visible, writes) -> str | None:
+        """Own one actor submission for this final; None means it is in flight."""
+        state = self.items[item]
+        fingerprint = self._fingerprint(visible, writes)
+        if state.pending_fingerprint is not None:
+            if state.pending_fingerprint != fingerprint:
+                raise ProtocolError("An admitting item changed")
+            return None
+        state.pending_fingerprint = fingerprint
+        return fingerprint
+
     @staticmethod
     def _fingerprint(visible, writes):
         payload = json.dumps([visible, [(w.id, w.tool, w._arguments_json) for w in writes]])
         return hashlib.sha256(payload.encode()).hexdigest()
 
     def acknowledge(self, item, visible, writes):
-        self._open_item(item)
+        state = self._open_item(item)
         fingerprint = self._fingerprint(visible, writes)
-        old = self.completed.get(item)
+        old = state.admitted_fingerprint
         if old is not None and old != fingerprint:
             raise ProtocolError("An accepted item changed")
-        self.completed[item] = fingerprint
-        self.parsed.discard(item)
-        self.streaming.pop(item, None)
-        self.quarantined.discard(item)
+        state.admitted_fingerprint = fingerprint
+        state.pending_fingerprint = None
+        state.decoder = None
+        state.quarantined = False
 
     def finish(self):
         self.closed = True
         # Even syntactically complete provisional commands are NOT accepted if
         # Stop/crash prevents the authoritative item-end from arriving.
-        unaccepted = bool(self.quarantined or (self.parsed - self.abandoned)) or any(p.frames_seen or p.private for p in self.streaming.values())
-        self.streaming.clear()
+        unaccepted = any(
+            state.quarantined or (
+                not state.abandoned and (
+                    (state.raw_fingerprint is not None and state.admitted_fingerprint is None) or
+                    (state.decoder is not None and (state.decoder.frames_seen or state.decoder.private))
+                )
+            ) for state in self.items.values()
+        )
+        for state in self.items.values():
+            state.decoder = None
         if unaccepted:
             raise ProtocolError("Turn ended with unaccepted write instructions")

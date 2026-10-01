@@ -4895,15 +4895,9 @@ class ChatWriterActor:
       raise _PersistFailed("PromotePending: malformed queue head") from exc
     chat.messages = existing + stored_messages
     chat.pending_messages = remaining_pending
-    chat.live_assistant = {
-      "id": durable_run_token,
-      "role": "assistant",
-      "blocks": [],
-      "ts": next_message_ts(
-        chat.messages + list(chat.pending_messages or [])
-      ),
-    }
-    chat.active_assistant_message_id = durable_run_token
+    assistant_ts = next_message_ts(
+      chat.messages + list(chat.pending_messages or [])
+    )
     started_at = datetime.now(UTC)
     chat.updated_at = datetime.now(UTC)
     # Restart recovery can route the first send through PromotePending instead
@@ -4952,18 +4946,18 @@ class ChatWriterActor:
       db, cmd.chat_id, cmd.ending_status, except_token=durable_run_token
     )
     admit_goal(db, cmd.chat_id, goal_id, goal_objective, agent_pending)
-    db.add(ChatRun(
+    new_run = ChatRun(
       id=durable_run_token, chat_id=cmd.chat_id, status="running",
       root_run_id=root_run_id,
       provider=chat.provider, started_at=started_at,
       initiated_by_app_id=initiated_by_app_id,
       goal_objective=goal_objective,
       goal_id=goal_id,
-    ))
-    if not _commit_or_rollback(db):
-      raise _PersistFailed("PromotePending did not persist")
-    # The promoted continuation now owns the in-process handoff fence.
-    self._run_token_owner[cmd.chat_id] = durable_run_token
+    )
+    self._commit_admitted_run_start(
+      db, chat, new_run, assistant_ts,
+      failure_message="PromotePending did not persist",
+    )
     return {
       "history": history,
       "promoted": returned_promoted,
@@ -5034,7 +5028,7 @@ class ChatWriterActor:
     now = datetime.now(UTC)
     prior.status = "completed"
     prior.ended_at = now
-    db.add(models.ChatRun(
+    new_run = models.ChatRun(
       id=token, chat_id=chat.id, status="running", provider=prior.provider,
       root_run_id=prior.root_run_id or prior.id, started_at=now,
       goal_id=goal.id if goal else None, goal_objective=goal.objective if goal else None,
@@ -5043,18 +5037,34 @@ class ChatWriterActor:
         reason="quiet_write_failure", control_id=token, source_work_id=prior.id,
         goal_id=goal.id if goal else None, supersedes_run_token=prior.id,
       ),
-    ))
-    chat.live_assistant = {"id": token, "role": "assistant", "blocks": [],
-                           "ts": source["ts"]}
-    chat.active_assistant_message_id = token
+    )
     chat.updated_at = now
-    if not _commit_or_rollback(db):
-      raise _PersistFailed("Clean recovery attempt did not persist")
-    self._run_token_owner[chat.id] = token
+    self._commit_admitted_run_start(
+      db, chat, new_run, source["ts"],
+      failure_message="Clean recovery attempt did not persist",
+    )
     return {"history": history, "session_id": chat.session_id,
             "promoted": {**source, "_messages": [], "_consumed_cids": [],
                          "_goal_id": goal.id if goal else None,
                          "_goal_objective": goal.objective if goal else None}}
+
+  def _commit_admitted_run_start(
+    self, db, chat, run: models.ChatRun, assistant_ts: float,
+    *, failure_message: str,
+  ) -> None:
+    """Persist an already-authorized run and fence its token only after commit.
+
+    Callers own queue/history, root/Goal attribution, and admission policy.
+    Nothing here grants provider execution permission or retries a failed ack.
+    """
+    chat.live_assistant = {
+      "id": run.id, "role": "assistant", "blocks": [], "ts": assistant_ts,
+    }
+    chat.active_assistant_message_id = run.id
+    db.add(run)
+    if not _commit_or_rollback(db):
+      raise _PersistFailed(failure_message)
+    self._run_token_owner[chat.id] = run.id
 
   def _cancel_pending(self, db, cmd: CancelPending) -> dict:
     """Remove the queued message whose `cid` matches; return the remainder.

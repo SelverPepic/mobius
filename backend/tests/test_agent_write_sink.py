@@ -12,13 +12,18 @@ from app.agent_write_channel import WriteIntent, frame
 from app.agent_write_delivery import WriteOutcome
 from app.broadcast import ChatBroadcast
 from app.chat_event_sink import ChatEventSink
-from app.chat_writer import StartTurn, get_writer
+from app.chat_writer import ReadAgentWriteOutcomes, StartTurn, get_writer
 from app.claude_events import dispatch_sdk_message
 from app.codex_events import _tool_completed_events
 from app.codex_sdk_runner import _sdk_imports
 
 NONCE='sink_fixture_nonce_123456'
 WRITE=WriteIntent('capture','checkpoint_chat',{'summary':'private synthetic fact'})
+
+
+async def saved_outcomes(sink):
+  delivery = sink._write_delivery
+  return await delivery._command(ReadAgentWriteOutcomes(**delivery.owner))
 
 
 def test_quiet_checkpoint_uses_existing_title_digest_summary_handler_once(
@@ -138,7 +143,8 @@ def test_stop_fences_late_provider_events_synchronously_before_any_await(chat,mo
     effects=[];sink=sink_for(chat,monkeypatch,effects)
     sink.interrupt_write_delivery()
     sink.publish({'type':'text_final','text_item_id':'late','content':frame(NONCE,WRITE)})
-    result=await sink.finish_write_delivery()
+    await sink.finish_write_delivery()
+    result=await saved_outcomes(sink)
     assert not effects and result['writes']==[]
     assert 'MOBIUS_WRITE' not in json.dumps(sink.bc.event_log)
   asyncio.run(scenario())
@@ -149,7 +155,8 @@ def test_admission_failure_is_visible_without_mislabeling_provider_execution(cha
     effects=[];sink=sink_for(chat,monkeypatch,effects)
     bad=WriteIntent('not-quiet','request_restart',{})
     sink.publish({'type':'text_final','text_item_id':'bad','content':frame(NONCE,bad)})
-    result=await sink.finish_write_delivery()
+    await sink.finish_write_delivery()
+    result=await saved_outcomes(sink)
     assert result['diagnostics'] and not effects
     assert sink._last_error is None
     failures=[block for block in sink.assistant_blocks if block.get('output_exit_code')==1]
@@ -225,7 +232,8 @@ def test_claude_missing_identity_preserves_prose_but_never_authorizes_a_write(ch
       sink.publish({'type':'text','content':chunk})
     dispatch_sdk_message(AssistantMessage(content=[TextBlock(text=frame(NONCE,WRITE))],
       model='synthetic'),sink,None)
-    state=await sink.finish_write_delivery()
+    await sink.finish_write_delivery()
+    state=await saved_outcomes(sink)
     assert not effects and state['diagnostics']
     assert 'private synthetic fact' not in json.dumps(sink.bc.event_log)
   asyncio.run(scenario())

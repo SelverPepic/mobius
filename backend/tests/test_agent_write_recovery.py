@@ -128,6 +128,63 @@ def test_acknowledgment_cannot_consume_late_changes_or_hide_future_negative_info
   db.expire_all();assert pending_failure_reports(db,chat_id=chat.id,exclude_run_id='consumer')
 
 
+def test_diagnostic_overflow_invalidates_both_stale_and_prior_acknowledgments(chat, db):
+  from app.agent_write_journal import MAX_DIAGNOSTICS
+
+  owner = attempt(chat)
+  for index in range(MAX_DIAGNOSTICS):
+    submit(RecordAgentWriteFailure(**owner, stage='protocol', reason=f'failure-{index}'))
+  submit(FinishRun(**owner, terminal_status='completed'))
+  consumer = attempt(chat, 'consumer')
+
+  def report():
+    db.expire_all()
+    return pending_failure_reports(db, chat_id=chat.id, exclude_run_id='consumer')[0]
+
+  def acknowledge(snapshot):
+    submit(AcknowledgeAgentWriteFailures(
+      **consumer, reports=((owner['run_token'], snapshot['fingerprint']),)))
+
+  selected = report()
+  submit(RecordAgentWriteFailure(**owner, stage='late', reason='first late detail'))
+  acknowledge(selected)
+  current = report()
+  assert current['fingerprint'] != selected['fingerprint']
+  assert len(current['diagnostics']) == MAX_DIAGNOSTICS
+  assert current['diagnostics'][-1] == {
+    **selected['diagnostics'][-1], 'additional_diagnostics_omitted': 1,
+  }
+  acknowledge(current)
+  db.expire_all()
+  assert pending_failure_reports(db, chat_id=chat.id, exclude_run_id='consumer') == []
+
+  submit(RecordAgentWriteFailure(**owner, stage='late', reason='second late detail'))
+  newest = report()
+  assert newest['fingerprint'] != current['fingerprint']
+  assert newest['diagnostics'][-1]['additional_diagnostics_omitted'] == 2
+  assert len(newest['diagnostics']) == MAX_DIAGNOSTICS
+
+
+def test_negative_replay_after_diagnostic_cap_still_changes_failure_report(chat, db):
+  from app.agent_write_journal import MAX_DIAGNOSTICS, failure_report
+
+  owner = attempt(chat)
+  outcome(owner, seal=False)
+  for index in range(MAX_DIAGNOSTICS):
+    submit(RecordAgentWriteFailure(**owner, stage='protocol', reason=f'failure-{index}'))
+  db.expire_all()
+  run = db.get(models.ChatRun, owner['run_token'])
+  before = failure_report(db, run)
+  replay = submit(AdmitAgentWrites(**owner, item_id='replay', fingerprint='b' * 64,
+    writes=(WriteIntent(owner['run_token'], 'checkpoint_chat', {'summary': 'private contents'}),)))
+  assert replay['negative_replays'][0]['status'] == 'failed'
+  db.expire_all()
+  after = failure_report(db, run)
+  assert after['fingerprint'] != before['fingerprint']
+  assert after['diagnostics'][-1]['additional_diagnostics_omitted'] == 1
+  assert submit(ClaimAgentWrite(**owner))['status'] == 'empty'
+
+
 def test_repair_context_prioritizes_its_exact_cause_ahead_of_old_backlog(chat,db):
   from app import agent_write_context
   for index in range(10):

@@ -50,7 +50,6 @@ def test_existing_worker_receipt_reaches_ui_but_not_a_provider(tmp_path,monkeypa
   call=dispatcher(tmp_path,monkeypatch,'''
 assert os.environ['CHAT_ID']=='exact-child'
 assert r['params']['arguments']=={'summary':'synthetic'}
-assert r['params']['_meta']=={'mobius/writeOperationId':'operation1'}
 print(json.dumps({'jsonrpc':'2.0','id':r['id'],'result':{'content':[{'type':'text','text':'Saved.'}],'isError':False}}))
 ''',events)
   outcome=asyncio.run(call(WRITE))
