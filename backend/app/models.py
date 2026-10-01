@@ -1716,10 +1716,12 @@ class Notification(Base):
   actions = Column(JSON, nullable=True)
   sent_at = Column(DateTime, default=lambda: datetime.now(UTC))
   clicked_at = Column(DateTime, nullable=True)
-  # Seen via the in-app notification preview (bulk-stamped by read-all).
+  # Explicitly marked read in the notification panel (individually or in bulk).
   # Distinct from clicked_at, which records a tap on the OS push itself —
   # bulk-marking THAT would fabricate click data.
   read_at = Column(DateTime, nullable=True)
+  # Opening the panel acknowledges an arrival without marking its row read.
+  seen_at = Column(DateTime, nullable=True)
 
 
 class ToolOutput(Base):

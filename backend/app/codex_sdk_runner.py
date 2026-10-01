@@ -2181,6 +2181,14 @@ async def _run_codex_sdk_turn(
             for event in _tool_completed_events(
               item, sdk, streamed_command_output=streamed_command_output,
             ):
+              image_view_cls = sdk.get("ImageViewThreadItem")
+              if image_view_cls is not None and isinstance(item, image_view_cls):
+                # Bind the completed view to its bytes without retaining a
+                # copy. An empty value prevents later same-name substitution.
+                event["viewed_image_sha256"] = await asyncio.to_thread(
+                  generated_files.viewed_inbox_sha256,
+                  runtime_data_dir, chat_id, getattr(item, "path", ""),
+                ) or ""
               _stamp_tool_use_id(event, item)
               bc.publish(event)
           # Also record child links here (idempotent) in case receiver_thread_ids
