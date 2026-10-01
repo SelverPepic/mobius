@@ -44,6 +44,24 @@ let sharedBrowserToken = null
 let sharedBrowserGrantId = null
 let sharedBrowserExpiresAt = 0
 let sharedBrowserGeneration = 0
+let sharedBrowserAuthorityGeneration = 0
+// Web Locks are origin-scoped: while documents remain alive, each tab finishes
+// its cookie response (and stale-success cleanup) before the next tab starts.
+// No document-only fallback may falsely claim ownership of that shared cookie.
+const SHARED_BROWSER_COOKIE_LOCK = 'mobius:shared-browser-session-cookie:v1'
+let sharedBrowserRedeemIntent = 0
+function sharedBrowserCookieLocks() {
+  const locks = globalThis.navigator?.locks
+  if (typeof locks?.request !== 'function') throw new Error('SHARED_ACCESS_BROWSER_UNSUPPORTED')
+  return locks
+}
+function withSharedBrowserCookieOwner(operation) {
+  try {
+    return sharedBrowserCookieLocks().request(SHARED_BROWSER_COOKIE_LOCK, { mode: 'exclusive' }, operation)
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
 let sharedBrowserRenewal = null
 let pendingSharedBrowserLogoutGrantId = null
 let sharedBrowserClosed = false
@@ -64,51 +82,77 @@ function acceptSharedBrowserSession(data, { renewal = false } = {}) {
       && String(data.grant.id) !== sharedBrowserGrantId) {
     throw new Error('SHARED_ACCESS_GRANT_CHANGED')
   }
+  sharedBrowserClosed = false
   sharedBrowserToken = data.access_token
   sharedBrowserGrantId = String(data.grant.id)
   setActiveSharedBrowserGrantId(sharedBrowserGrantId)
   sharedBrowserExpiresAt = Date.now() + Math.min(900, Number(data.expires_in)) * 1000
   sharedBrowserGeneration += 1
+  if (!renewal) sharedBrowserAuthorityGeneration += 1
   return data
 }
 
-export function clearSharedBrowserSession() {
+export function clearSharedBrowserSession({ invalidateRedeem = true } = {}) {
+  if (invalidateRedeem) sharedBrowserRedeemIntent += 1
   sharedBrowserClosed = true
   sharedBrowserToken = null
   sharedBrowserGrantId = null
   setActiveSharedBrowserGrantId(null)
   sharedBrowserExpiresAt = 0
   sharedBrowserGeneration += 1
+  sharedBrowserAuthorityGeneration += 1
   try { window.dispatchEvent(new CustomEvent('mobius:shared-browser-auth-ended')) } catch {}
 }
 
-async function sharedBrowserSessionRequest(path, body) {
+function sharedBrowserSessionRequest(path, body, redeemIntent) {
   const generationAtStart = sharedBrowserGeneration
-  const response = await fetch(`${BASE}/api/connect/browser-access/${path}`, {
-    method: 'POST', credentials: 'same-origin',
-    headers: { 'Content-Type': 'application/json' },
-    ...(body ? { body: JSON.stringify(body) } : {}),
+  return withSharedBrowserCookieOwner(async () => {
+    if (path === 'session' && sharedBrowserGeneration !== generationAtStart) throw new Error('SHARED_ACCESS_SUPERSEDED')
+    if (redeemIntent && redeemIntent !== sharedBrowserRedeemIntent) throw new Error('SHARED_ACCESS_SUPERSEDED')
+    const response = await fetch(`${BASE}/api/connect/browser-access/${path}`, {
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    })
+    if (!response.ok) throw new Error('SHARED_ACCESS_ENDED')
+    const data = await response.json()
+    if (redeemIntent && redeemIntent !== sharedBrowserRedeemIntent) {
+      // The response may already have installed a cookie. Retire exactly its
+      // grant before the next queued redemption starts; never install its bearer.
+      const grantId = data?.grant?.id
+      if (grantId) {
+        const logout = await fetch(`${BASE}/api/connect/browser-access/session/logout`, {
+          method: 'POST', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ grant_id: String(grantId) }),
+        })
+        if (!logout.ok) throw new Error('SHARED_ACCESS_LOGOUT_FAILED')
+      }
+      throw new Error('SHARED_ACCESS_SUPERSEDED')
+    }
+    if (path === 'session' && sharedBrowserGeneration !== generationAtStart) throw new Error('SHARED_ACCESS_SUPERSEDED')
+    return acceptSharedBrowserSession(data, { renewal: path === 'session' })
   })
-  if (!response.ok) throw new Error('SHARED_ACCESS_ENDED')
-  const data = await response.json()
-  if (sharedBrowserGeneration !== generationAtStart) throw new Error('SHARED_ACCESS_SUPERSEDED')
-  return acceptSharedBrowserSession(data, { renewal: path === 'session' })
 }
 
 export function redeemSharedBrowserInvite(invite) {
   if (!sharedBrowserEnabled || !invite) throw new Error('SHARED_ACCESS_INVALID_INVITE')
-  sharedBrowserClosed = false
-  return sharedBrowserSessionRequest('session/redeem', { invite })
+  return sharedBrowserSessionRequest('session/redeem', { invite }, ++sharedBrowserRedeemIntent)
 }
 
 export function renewSharedBrowserSession() {
   if (!sharedBrowserEnabled) throw new Error('SHARED_ACCESS_NOT_ENABLED')
   if (sharedBrowserClosed) throw new Error('SHARED_ACCESS_ENDED')
   if (!sharedBrowserRenewal) {
-    sharedBrowserRenewal = sharedBrowserSessionRequest('session').catch(error => {
-      clearSharedBrowserSession()
+    const authority = sharedBrowserAuthorityGeneration
+    const renewal = sharedBrowserSessionRequest('session').catch(error => {
+      if (sharedBrowserAuthorityGeneration === authority) clearSharedBrowserSession({ invalidateRedeem: false })
       throw error
-    }).finally(() => { sharedBrowserRenewal = null })
+    })
+    sharedBrowserRenewal = renewal.finally(() => {
+      if (sharedBrowserRenewal === ownedRenewal) sharedBrowserRenewal = null
+    })
+    const ownedRenewal = sharedBrowserRenewal
   }
   return sharedBrowserRenewal
 }
@@ -116,16 +160,19 @@ export function renewSharedBrowserSession() {
 export async function leaveSharedBrowserSession() {
   const grantId = sharedBrowserGrantId || pendingSharedBrowserLogoutGrantId
   if (!grantId) throw new Error('SHARED_ACCESS_LOGOUT_UNAVAILABLE')
+  sharedBrowserCookieLocks()
   pendingSharedBrowserLogoutGrantId = grantId
   clearSharedBrowserSession()
-  const response = await fetch(`${BASE}/api/connect/browser-access/session/logout`, {
-    method: 'POST', credentials: 'same-origin',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ grant_id: grantId }),
+  return withSharedBrowserCookieOwner(async () => {
+    const response = await fetch(`${BASE}/api/connect/browser-access/session/logout`, {
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ grant_id: grantId }),
+    })
+    if (!response.ok) throw new Error('SHARED_ACCESS_LOGOUT_FAILED')
+    if (pendingSharedBrowserLogoutGrantId === grantId) pendingSharedBrowserLogoutGrantId = null
+    return true
   })
-  if (!response.ok) throw new Error('SHARED_ACCESS_LOGOUT_FAILED')
-  pendingSharedBrowserLogoutGrantId = null
-  return true
 }
 
 export function beginEphemeralAuth() {
@@ -399,14 +446,18 @@ async function ownerSessionConfirmedInvalid(ownerToken) {
 
 export async function apiFetch(path, options = {}) {
   if (sharedBrowserEnabled) {
-    // Do not send an expired bearer or let a failed renewal fall through to an
-    // owner credential. A 401 gets exactly one cookie-backed renewal and retry.
+    // An API operation belongs to the authority that initiated it, even if
+    // renewal rotates its bearer. Never send its body with a later grant.
+    const authority = sharedBrowserAuthorityGeneration
+    const assertAuthority = () => {
+      if (authority !== sharedBrowserAuthorityGeneration || !sharedBrowserToken) {
+        throw new Error('SHARED_ACCESS_SUPERSEDED')
+      }
+    }
     if (!sharedBrowserToken || Date.now() >= sharedBrowserExpiresAt - 30_000) {
       await renewSharedBrowserSession()
     }
-    // A query-only lane keeps even an older controlling SW from serving or
-    // replacing the owner's URL-keyed offline shell lists/theme. The marker is
-    // not a credential; the bearer remains exclusively in Authorization.
+    assertAuthority()
     const guestPath = (options.method || 'GET').toUpperCase() !== 'GET'
       ? path
       : path === '/theme'
@@ -414,17 +465,23 @@ export async function apiFetch(path, options = {}) {
         : ['/chats', '/apps/'].includes(path)
         ? `${path}?shared_browser=1`
         : path
-    const send = () => fetch(`${BASE}/api${guestPath}`, {
-      ...options, credentials: 'same-origin',
-      headers: { 'Content-Type': 'application/json', ...getAuthHeaders(options.headers), 'X-Mobius-Shared-Browser': '1' },
-    })
+    const send = () => {
+      assertAuthority()
+      return fetch(`${BASE}/api${guestPath}`, {
+        ...options, credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json', ...getAuthHeaders(options.headers), 'X-Mobius-Shared-Browser': '1' },
+      })
+    }
     const tokenAtSend = sharedBrowserToken
     let response = await send()
+    assertAuthority()
     if (response.status === 401) {
       if (sharedBrowserToken === tokenAtSend) await renewSharedBrowserSession()
+      assertAuthority()
       response = await send()
+      assertAuthority()
       if (response.status === 401) {
-        clearSharedBrowserSession()
+        clearSharedBrowserSession({ invalidateRedeem: false })
         throw new Error('SHARED_ACCESS_ENDED')
       }
     }

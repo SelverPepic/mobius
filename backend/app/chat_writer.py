@@ -649,7 +649,6 @@ class StartTurn(_Command):
   initiated_by_app_id: int | None = None
   browser_grant_id: str | None = None
   browser_grant_epoch: int | None = None
-  owner_input: bool = False
   # The rendered recovery control names its exact interrupted physical run.
   resume_run_id: str | None = None
   restore_archived: bool = False
@@ -919,7 +918,6 @@ class AppendPending(_Command):
   initiated_by_app_id: int | None = None
   browser_grant_id: str | None = None
   browser_grant_epoch: int | None = None
-  owner_input: bool = False
   front: bool = False
   require_answer_match: bool = False
   restore_archived: bool = False
@@ -4270,11 +4268,8 @@ class ChatWriterActor:
     pending = list(chat.pending_messages or [])
     new_msg = dict(cmd.user_msg)
     # Only the authenticated route may supply this provenance, never message data.
-    new_msg.pop("_owner_input_at", None)
     new_msg.pop("_browser_grant_id", None)
     new_msg.pop("_browser_grant_epoch", None)
-    if cmd.owner_input:
-      new_msg["_owner_input_at"] = datetime.now(UTC).isoformat()
     _require_browser_grant(db, cmd.browser_grant_id, cmd.browser_grant_epoch)
     if cmd.browser_grant_id is not None:
       new_msg["_browser_grant_id"] = cmd.browser_grant_id

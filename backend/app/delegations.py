@@ -152,7 +152,7 @@ def _attach_existing_delegation(
     raise ValueError(
       "task key is already attached to different immutable work"
     )
-  if (
+  if intent.browser_grant_id is not None and (
     row.browser_grant_id, row.browser_grant_epoch
   ) != (intent.browser_grant_id, intent.browser_grant_epoch):
     raise ValueError("task key belongs to different browser authority")
@@ -174,10 +174,6 @@ def create_or_attach_delegation(
   steps leaves a discoverable ``starting`` delegation that reconciliation can
   safely start with the same immutable prompt.
   """
-  if intent.browser_grant_id is not None:
-    from app.browser_access import validate_grant
-    validate_grant(db, intent.browser_grant_id, intent.browser_grant_epoch,
-                   db.query(models.Owner.id).scalar())
   spawning_run = db.query(models.ChatRun).filter(
     models.ChatRun.chat_id == intent.parent_chat_id,
     models.ChatRun.status.in_(ACTIVE_RUN_STATUSES),

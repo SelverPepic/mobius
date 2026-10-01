@@ -72,9 +72,9 @@ from app.database import get_db
 from app.deps import (
   get_current_owner, get_current_owner_for_lifecycle_control,
   get_current_owner_or_app, get_principal, get_principal_or_public_service,
-  Principal,
+  Principal, revocable_browser_stream,
   get_owner_or_app_with_manage_apps, reject_cross_site,
-  require_nondelegated_owner_control,
+  require_nondelegated_owner_control, require_nondelegated_owner_or_app_control,
 )
 from app.resource_access import live_app, live_app_or_404
 from app.timeutil import now_naive_utc, SOFT_DELETE_TTL
@@ -1743,7 +1743,7 @@ async def stream_app_events(
       get_system_broadcast().unsubscribe(queue)
 
   return StreamingResponse(
-    generate(),
+    revocable_browser_stream(generate(), principal),
     media_type="text/event-stream",
     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
   )
@@ -1754,7 +1754,7 @@ async def stream_app_events(
   response_model=schemas.AppConflictResolverChatOut,
   dependencies=[
     Depends(reject_cross_site),
-    Depends(_require_nondelegated_control),
+    Depends(require_nondelegated_owner_or_app_control),
   ],
 )
 async def create_conflict_resolver_chat(

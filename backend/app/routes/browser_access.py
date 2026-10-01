@@ -69,7 +69,18 @@ def _grant_view(db: Session, grant) -> dict:
     access.BrowserAccessInvite.grant_id == grant.id,
     access.BrowserAccessInvite.consumed_at.isnot(None),
   ).first() is not None
+  stop_pending = False
+  if grant.revoked_at:
+    from app.chat import browser_grant_active_chat_ids
+    from app.app_services import browser_grant_has_active_calls
+    from app.routes.connect import browser_grant_pending_commands
+    stop_pending = bool(
+      browser_grant_active_chat_ids(db, grant.id)
+      or browser_grant_has_active_calls(grant.id)
+      or browser_grant_pending_commands(grant.id)
+    )
   return {
+    "stop_pending": stop_pending,
     "id": grant.id, "label": grant.label,
     "status": "revoked" if grant.revoked_at else ("active" if accepted else "invited"),
     "created_at": grant.created_at.isoformat() + "Z",
@@ -96,7 +107,7 @@ def _response(db: Session, grant, session, owner, secret: str) -> JSONResponse:
 
 
 @router.get("")
-def list_browser_grants(owner: models.Owner = Depends(_manager), db: Session = Depends(get_db)):
+async def list_browser_grants(owner: models.Owner = Depends(_manager), db: Session = Depends(get_db)):
   rows = db.query(access.BrowserAccessGrant).filter_by(owner_id=owner.id).order_by(
     access.BrowserAccessGrant.created_at.asc(),
   ).all()

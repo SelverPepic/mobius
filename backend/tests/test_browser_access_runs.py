@@ -243,9 +243,13 @@ def test_guest_submitted_child_under_owner_run_retains_guest_lineage(tmp_path):
     assert not attached
     assert (row.browser_grant_id, row.browser_grant_epoch) == (grant.id, grant.epoch)
     from dataclasses import replace
+    observed, attached = create_or_attach_delegation(db, replace(
+      intent, browser_grant_id=None, browser_grant_epoch=None))
+    assert attached and observed.browser_grant_id == grant.id
+    other, _ = create_invitation(db, owner, 'other guest')
     with pytest.raises(ValueError, match='browser authority'):
-      create_or_attach_delegation(db, replace(intent, browser_grant_id=None,
-                                              browser_grant_epoch=None))
+      create_or_attach_delegation(db, replace(intent, browser_grant_id=other.id,
+                                             browser_grant_epoch=other.epoch))
     revoke_grant(db, grant.id, owner.id)
     with pytest.raises(HTTPException):
       create_or_attach_delegation(db, intent)
@@ -261,3 +265,22 @@ def test_guest_cannot_restart_owner_or_other_guest_child():
       _require_guest_child_lineage(child, guest)
     assert exc.value.status_code == 403
   _require_guest_child_lineage(own_child, guest)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("child_grant", [None, "other"])
+@pytest.mark.parametrize("operation", ["messages", "retry"])
+async def test_guest_followup_routes_reject_foreign_lineage_before_start(monkeypatch, child_grant, operation):
+  from app.routes import delegations as routes
+  row = SimpleNamespace(browser_grant_id=child_grant,
+                        browser_grant_epoch=0 if child_grant else None)
+  principal = SimpleNamespace(browser_grant_id="guest", browser_grant_epoch=0)
+  monkeypatch.setattr(routes, "_row_for_principal", lambda *args: row)
+  with pytest.raises(HTTPException) as denied:
+    if operation == "messages":
+      await routes.message_delegation("child", routes.DelegationMessage(message="follow up"),
+                                      principal=principal, db=None)
+    else:
+      await routes.retry_delegation("child", routes.DelegationRetry(run_token="parked"),
+                                    principal=principal, db=None)
+  assert denied.value.status_code == 403

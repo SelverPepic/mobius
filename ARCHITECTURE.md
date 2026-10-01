@@ -1836,7 +1836,13 @@ privately. The feature requires the configured HTTPS origin.
 `routes/browser_access.py` owns invitation management and the same-origin
 cookie exchange. A 15-minute bearer stays in memory; the renewal credential is
 HttpOnly/Secure/SameSite=Strict and path-confined to the session routes. Accepting
-a new invitation atomically retires the previous shared-browser cookie session.
+a new invitation atomically retires the previous session presented by its cookie.
+Cookie exchanges use an origin-scoped Web Lock across live tabs; browsers without
+that capability fail visibly before sending an exchange. A tab dying mid-request
+can still interrupt cookie ordering; server-side grant validation remains the
+authority boundary. If cleanup of a superseded redemption fails, its cookie may
+remain restorable; the page must not imply server sign-out succeeded. Independent
+browsers may hold separate sessions.
 This never replaces the installation owner's login. `/shell/shared` owns an
 independent query cache and grant/tab-scoped navigation and drafts. Leaving ends
 that browser session, while revoking the recipient ends all their sessions.

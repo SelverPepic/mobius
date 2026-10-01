@@ -284,7 +284,7 @@ def _content_with_uploads(chat: models.Chat, content: str) -> str:
 
 async def _append_to_pending(
   chat: models.Chat, body: schemas.SendMessage, db: Session,
-  *, initiated_by_app_id: int | None = None, owner_input: bool = False,
+  *, initiated_by_app_id: int | None = None,
   browser_grant_id: str | None = None, browser_grant_epoch: int | None = None,
   front: bool = False,
   require_answer_match: bool = False,
@@ -312,7 +312,7 @@ async def _append_to_pending(
       chat_id=chat.id, run_token="",
       user_msg=_user_message_from_body(chat, body), answers=body.answers,
       selected_options=body.selected_options, question_id=body.question_id,
-      initiated_by_app_id=initiated_by_app_id, owner_input=owner_input,
+      initiated_by_app_id=initiated_by_app_id,
       browser_grant_id=browser_grant_id, browser_grant_epoch=browser_grant_epoch,
       front=front, require_answer_match=require_answer_match,
       restore_archived=restore_archived,
@@ -323,7 +323,7 @@ async def _append_to_pending(
 
 async def _append_restart_feedback_to_pending(
   chat: models.Chat, body: schemas.SendMessage, db: Session,
-  *, initiated_by_app_id: int | None = None, owner_input: bool = False,
+  *, initiated_by_app_id: int | None = None,
   browser_grant_id: str | None = None, browser_grant_epoch: int | None = None,
   restore_archived: bool = False,
 ) -> dict:
@@ -333,7 +333,6 @@ async def _append_restart_feedback_to_pending(
       chat_id=chat.id, run_token="",
       user_msg=_user_message_from_body(chat, body), answers=body.answers,
       question_id=body.question_id, initiated_by_app_id=initiated_by_app_id,
-      owner_input=owner_input,
       browser_grant_id=browser_grant_id, browser_grant_epoch=browser_grant_epoch,
       restore_archived=restore_archived,
     ),
@@ -765,7 +764,6 @@ async def _send_message_impl(
               chat, body, db, initiated_by_app_id=principal.app_id,
               browser_grant_id=principal.browser_grant_id,
               browser_grant_epoch=principal.browser_grant_epoch,
-              owner_input=is_owner_input_principal(principal),
               restore_archived=restore_archived,
             )
             stored = append_result["stored"]
@@ -1084,7 +1082,6 @@ async def _send_message_impl(
           chat, body, db, initiated_by_app_id=principal.app_id,
           browser_grant_id=principal.browser_grant_id,
           browser_grant_epoch=principal.browser_grant_epoch,
-          owner_input=is_owner_input_principal(principal),
           restore_archived=restore_archived,
           front=True, require_answer_match=True,
         )
@@ -1223,7 +1220,6 @@ async def _send_message_impl(
           initiated_by_app_id=principal.app_id,
           browser_grant_id=principal.browser_grant_id,
           browser_grant_epoch=principal.browser_grant_epoch,
-          owner_input=is_owner_input_principal(principal),
           restore_archived=restore_archived,
           front=True,
           require_answer_match=True,
@@ -1424,7 +1420,6 @@ async def _send_message_locked(
       chat, body, db, initiated_by_app_id=principal.app_id,
       browser_grant_id=principal.browser_grant_id,
       browser_grant_epoch=principal.browser_grant_epoch,
-      owner_input=is_owner_input_principal(principal),
       restore_archived=restore_archived,
     )
     db.expire(chat)
@@ -1439,7 +1434,6 @@ async def _send_message_locked(
       chat, body, db, initiated_by_app_id=principal.app_id,
       browser_grant_id=principal.browser_grant_id,
       browser_grant_epoch=principal.browser_grant_epoch,
-      owner_input=is_owner_input_principal(principal),
       restore_archived=restore_archived,
     )
     db.expire(chat)
@@ -1460,7 +1454,6 @@ async def _send_message_locked(
       chat, body, db, initiated_by_app_id=principal.app_id,
       browser_grant_id=principal.browser_grant_id,
       browser_grant_epoch=principal.browser_grant_epoch,
-      owner_input=is_owner_input_principal(principal),
       restore_archived=restore_archived,
     )
     db.expire(chat)
@@ -1529,7 +1522,6 @@ async def _send_message_locked(
           chat, body, db, initiated_by_app_id=principal.app_id,
           browser_grant_id=principal.browser_grant_id,
           browser_grant_epoch=principal.browser_grant_epoch,
-          owner_input=is_owner_input_principal(principal),
           restore_archived=restore_archived,
         )
         db.expire(chat)
@@ -1583,7 +1575,6 @@ async def _send_message_locked(
       chat, body, db, initiated_by_app_id=principal.app_id,
       browser_grant_id=principal.browser_grant_id,
       browser_grant_epoch=principal.browser_grant_epoch,
-      owner_input=is_owner_input_principal(principal),
       restore_archived=restore_archived,
     )
     started_message = None
@@ -1667,7 +1658,6 @@ async def _send_message_locked(
       chat, body, db, initiated_by_app_id=principal.app_id,
       browser_grant_id=principal.browser_grant_id,
       browser_grant_epoch=principal.browser_grant_epoch,
-      owner_input=is_owner_input_principal(principal),
       restore_archived=restore_archived,
     )
     return _queued_response(new_msg, len(chat.pending_messages))
@@ -1718,7 +1708,6 @@ async def _send_message_locked(
         initiated_by_app_id=principal.app_id,
         browser_grant_id=principal.browser_grant_id,
         browser_grant_epoch=principal.browser_grant_epoch,
-        owner_input=is_owner_input_principal(principal),
         restore_archived=restore_archived,
         resume_run_id=body.resume_run_id,
       )

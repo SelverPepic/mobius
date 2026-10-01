@@ -278,3 +278,39 @@ def test_existing_shared_app_owner_keeps_resource_confined_administration(db):
   owner = models.Owner(username="install-owner", hashed_password="unused")
   # Distinct existing sharing feature, not a browser guest; do not erase it.
   _require_membership_administration(SharedAppPrincipal(owner=owner, role="owner", member_id="member", instance_id="one-app"))
+
+
+@pytest.mark.asyncio
+async def test_revoked_list_derives_pending_stop_after_reload_without_cancelling(https, auth, db):
+  from app.browser_access import revoke_grant
+  from app.routes import connect
+  grant_id, _, _ = invite(https, auth)
+  owner = db.query(models.Owner).one()
+  host_id = connect._new_id()
+  connect._save_host({"id": host_id, "name": "Fixture", "active_commands": []})
+  command = connect._ActiveCommand("a" * 16, 60, cmd="true", browser_grant_id=grant_id)
+  command.state = "canceling"
+  connect._host_commands(host_id)[command.request_id] = command
+  connect._persist_commands(host_id)
+  revoke_grant(db, grant_id, owner.id)
+  connect._commands.clear()  # A server restart discards the process-local map.
+  channel = connect._Channel()
+  connect._channels[host_id] = channel
+  try:
+    grants = https.get(ROOT, headers=auth).json()["grants"]
+    assert grants[0]["status"] == "revoked"
+    assert grants[0]["stop_pending"] is True
+    assert channel.queue.empty()  # A read must not initiate another remote action.
+    connect._host_commands(host_id).clear()
+    connect._persist_commands(host_id)
+    assert https.get(ROOT, headers=auth).json()["grants"][0]["stop_pending"] is False
+  finally:
+    connect._channels.pop(host_id, None)
+    connect._commands.pop(host_id, None)
+
+
+def test_guest_cannot_launch_clean_owner_conflict_resolver(https, auth):
+  _, token, _ = invite(https, auth)
+  response = https.post("/api/apps/999/conflict-resolver-chat", json={},
+                        headers={"Authorization": "Bearer " + token})
+  assert response.status_code == 403

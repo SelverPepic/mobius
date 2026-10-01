@@ -520,6 +520,17 @@ async def _request_command_cancel(
   return True
 
 
+def browser_grant_pending_commands(grant_id: str) -> list[dict]:
+  """Read unfinished attributed commands without sending or requesting a stop."""
+  return [
+    {"host_id": host["id"], "request_id": command.request_id,
+     "state": command.state, "remote_confirmed": False}
+    for host in _list_hosts()
+    for command in _host_commands(host["id"]).values()
+    if command.browser_grant_id == grant_id
+  ]
+
+
 def cancel_browser_grant_commands(grant_id: str) -> list[dict]:
   """Request cancellation of only this grant's active commands.
 

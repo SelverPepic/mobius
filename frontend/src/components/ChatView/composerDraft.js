@@ -98,7 +98,7 @@ function queueDurableDraftWrite(chatId, raw) {
 
 export function composerDraftRevision(chatId) {
   if (chatId == null) return 0
-  return revisionOf(chatId)
+  return sharedBrowserDrafts() ? 0 : revisionOf(chatId)
 }
 
 export async function flushComposerDraftPersistence() {
@@ -217,7 +217,9 @@ function encodeDraft(input, attachments) {
  */
 export function readComposerDraft(chatId, storage) {
   if (chatId == null) return { input: '', attachments: [] }
-  const useLiveMirror = storage === undefined
+  // Guest drafts use the grant-partitioned tab store directly. Never consult
+  // the owner/chat keyed live mirror when a grant changes in this document.
+  const useLiveMirror = storage === undefined && !sharedBrowserDrafts()
   const id = draftId(chatId)
   if (useLiveMirror && liveDrafts.has(id)) {
     return publicDraft(decodeDraft(liveDrafts.get(id).raw))
@@ -285,8 +287,10 @@ export async function readComposerDraftAsync(chatId) {
 export function clearComposerDraft(chatId, storage) {
   if (chatId == null) return
   if (storage === undefined) {
-    rememberLiveDraft(chatId, null, 'live', { advance: true })
-    queueDurableDraftWrite(chatId, null)
+    if (!sharedBrowserDrafts()) {
+      rememberLiveDraft(chatId, null, 'live', { advance: true })
+      queueDurableDraftWrite(chatId, null)
+    }
   }
   const target = availableStorage(storage)
   if (!target) return
@@ -303,7 +307,7 @@ export function clearComposerDraft(chatId, storage) {
  * a chance to remove the composer.
  */
 export function persistComposerDraft(chatId, input, attachments = [], storage) {
-  const useDurableStore = storage === undefined
+  const useDurableStore = storage === undefined && !sharedBrowserDrafts()
   if (chatId == null) return false
   const key = `draft:${chatId}`
   const value = encodeDraft(input, attachments)

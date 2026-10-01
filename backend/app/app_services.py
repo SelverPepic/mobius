@@ -303,6 +303,11 @@ def _validate_browser_call(owner, actor):
         validate_session(db, actor["browser_session_id"], grant_id, owner.id)
 
 
+def browser_grant_has_active_calls(grant_id: str) -> bool:
+  """Whether attributed invocation cleanup is still outstanding."""
+  return any(not task.done() for task in _browser_calls.get(grant_id, ()))
+
+
 async def cancel_browser_grant_calls(grant_id: str) -> None:
   tasks = tuple(_browser_calls.get(grant_id, ()))
   for task in tasks:
@@ -368,9 +373,9 @@ async def invoke_service(
       environment = app_python_env.activated_environment(
         service_environment(
           app, owner, service, public=public,
-          browser_grant_id=(request_envelope.get("actor") or {}).get("browser_grant_id"),
-          browser_grant_epoch=(request_envelope.get("actor") or {}).get("browser_grant_epoch"),
-          browser_session_id=(request_envelope.get("actor") or {}).get("browser_session_id"),
+          browser_grant_id=actor.get("browser_grant_id"),
+          browser_grant_epoch=actor.get("browser_grant_epoch"),
+          browser_session_id=actor.get("browser_session_id"),
         ), python_env,
       )
       outcome = None

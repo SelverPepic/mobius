@@ -3089,7 +3089,6 @@ async def clear_goal_for(chat_id: str, expected_goal_id: str) -> dict:
 
 async def _stop_chat_for_locked(
   chat_id: str, db: Session = None, *,
-  actor: str | None = None, actor_id: str | None = None,
   preserve_pending: bool = False,
 ) -> tuple[bool, list[str]]:
   """Stop one chat while its per-chat lifecycle transition is exclusive."""

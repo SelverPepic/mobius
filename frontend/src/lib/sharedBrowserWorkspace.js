@@ -65,6 +65,10 @@ export function setActiveSharedBrowserGrantId(grantId) {
   activeGrantId = grantId == null ? null : String(grantId)
 }
 
+export function currentSharedBrowserGrantId() {
+  return isSharedBrowserRoute() ? activeGrantId : null
+}
+
 export function currentSharedBrowserStorage() {
   if (!isSharedBrowserRoute() || !activeGrantId) return null
   return sharedBrowserStorageForGrant(activeGrantId)
