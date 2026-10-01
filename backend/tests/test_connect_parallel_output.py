@@ -6,6 +6,7 @@ Möbius in numbered chunks while the command runs; the final result still
 carries each stream's head and tail for callers that never read live output.
 """
 
+from contextlib import closing
 import asyncio
 import io
 import sys
@@ -299,29 +300,29 @@ def test_runner_final_view_matches_the_capped_full_text():
 
 
 def test_runner_retries_undelivered_chunks_with_the_same_sequence():
-  output = connect_runner._CommandOutput()
-  output.append("stdout", "one ")
-  output.append("stdout", "two ")
-  first = output.take_batch()
-  assert [(c["seq"], c["text"]) for c in first] == [(0, "one "), (1, "two ")]
-  output.append("stderr", "three")
-  # The first delivery failed; a retry resends the same numbers plus new text.
-  retry = output.take_batch()
-  assert [c["seq"] for c in retry] == [0, 1, 2]
-  output.acknowledge(2)
-  assert output.take_batch() == []
+  with closing(connect_runner._CommandOutput()) as output:
+    output.append("stdout", "one ")
+    output.append("stdout", "two ")
+    first = output.take_batch()
+    assert [(c["seq"], c["text"]) for c in first] == [(0, "one "), (1, "two ")]
+    output.append("stderr", "three")
+    # The first delivery failed; a retry resends the same numbers plus new text.
+    retry = output.take_batch()
+    assert [c["seq"] for c in retry] == [0, 1, 2]
+    output.acknowledge(2)
+    assert output.take_batch() == []
 
 
 def test_runner_spools_undelivered_output_without_dropping_oldest():
-  output = connect_runner._CommandOutput()
-  for text in ("aaaa", "bbbb", "cccc"):
-    output.append("stdout", text)
-  batch = output.take_batch()
-  assert [(c["seq"], c["text"]) for c in batch] == [
-    (0, "aaaa"), (1, "bbbb"), (2, "cccc"),
-  ]
-  # The capped final view is independent of live delivery.
-  assert output.final_streams() == ("aaaabbbbcccc", "", False)
+  with closing(connect_runner._CommandOutput()) as output:
+    for text in ("aaaa", "bbbb", "cccc"):
+      output.append("stdout", text)
+    batch = output.take_batch()
+    assert [(c["seq"], c["text"]) for c in batch] == [
+      (0, "aaaa"), (1, "bbbb"), (2, "cccc"),
+    ]
+    # The capped final view is independent of live delivery.
+    assert output.final_streams() == ("aaaabbbbcccc", "", False)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell contract")
@@ -430,6 +431,9 @@ def test_heavy_output_cannot_starve_the_time_limit(monkeypatch):
   assert result["outcome"] == "timed_out"
   assert result["exit_code"] == 124
   assert runner.active == {}
+  # This test deliberately disables delivery; it owns the retained scratch.
+  for record in runner.pending_outputs.values():
+    record["output"].close()
 
 
 def test_hello_enables_live_output_and_survives_reconnects(monkeypatch):

@@ -2017,14 +2017,8 @@ def test_runner_refuses_expired_command_without_spawning(
     connect_runner, "_spawn_command",
     lambda *args, **kwargs: pytest.fail("expired command was spawned"),
   )
-  monkeypatch.setattr(
-    connect_runner,
-    "_post",
-    lambda *_args, **_kwargs: (_ for _ in ()).throw(
-      urllib.error.URLError("offline"),
-    ),
-  )
   runner = connect_runner._CommandRunner("https://mobius.test", "token")
+  monkeypatch.setattr(runner, "_wake_result_worker", lambda: None)
   reported = threading.Event()
   original_post_result = runner._post_result
 
@@ -2140,6 +2134,7 @@ def test_runner_ignores_duplicate_delivery_of_an_accepted_request(monkeypatch):
   assert spawned == [("do it once", None)]
   assert list(runner.active) == [event["request_id"]]
   assert runner.pending_messages() == []
+  runner.active[event["request_id"]]["output"].close()
 
 
 def test_runner_runs_commands_in_parallel_without_queueing(monkeypatch):
@@ -2182,6 +2177,8 @@ def test_runner_runs_commands_in_parallel_without_queueing(monkeypatch):
   assert runner.cancel("1" * 16) is True
   assert first["reason"] == "canceled"
   assert runner.active["2" * 16]["reason"] is None
+  for record in runner.active.values():
+    record["output"].close()
 
 
 def test_runner_keeps_literal_script_off_the_process_command_line(monkeypatch):
@@ -2212,6 +2209,7 @@ def test_runner_keeps_literal_script_off_the_process_command_line(monkeypatch):
 
   assert spawned == [(None, "/srv/app", script, "bash")]
   assert runner.active["e" * 16]["input"] == script
+  runner.active["e" * 16]["output"].close()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell contract")
@@ -2255,24 +2253,21 @@ def test_windows_literal_script_stdin_is_unicode_safe_ascii():
 
 
 def test_runner_rechecks_expiry_after_start_ack_before_spawning(monkeypatch):
-  clock = iter((100.0, 102.0))
+  clock = iter((100.0, 100.0, 102.0))
   # Replace this module's clock reference rather than mutating the process-wide
   # time module that pytest and database teardown also use.
   monkeypatch.setattr(
     connect_runner, "time", SimpleNamespace(time=lambda: next(clock)),
   )
   monkeypatch.setattr(
-    connect_runner, "_spawn_command",
+    connect_runner.subprocess, "Popen",
     lambda *args, **kwargs: pytest.fail("late command was spawned"),
   )
 
-  def post(url, _payload, token=None):
-    if url.endswith("/result"):
-      raise urllib.error.URLError("offline")
-    return {"ok": True}
-
-  monkeypatch.setattr(connect_runner, "_post", post)
   runner = connect_runner._CommandRunner("https://mobius.test", "token")
+  reported = threading.Event()
+  monkeypatch.setattr(runner, "_post_started", lambda _id: None)
+  monkeypatch.setattr(runner, "_wake_result_worker", reported.set)
 
   runner.start({
     "request_id": "3" * 16,
@@ -2280,6 +2275,7 @@ def test_runner_rechecks_expiry_after_start_ack_before_spawning(monkeypatch):
     "timeout": 30,
     "not_after": 101.0,
   })
+  assert reported.wait(2)
 
   messages = list(runner.outbox)
   assert [message["type"] for message in messages] == ["result"]
@@ -2289,13 +2285,18 @@ def test_runner_rechecks_expiry_after_start_ack_before_spawning(monkeypatch):
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX cancellation timing")
 def test_runner_cancel_stops_process_tree_and_reports_once(monkeypatch):
-  def post(url, _payload, token=None):
-    if url.endswith("/result"):
-      raise urllib.error.URLError("offline")
-    return {"ok": True}
-
-  monkeypatch.setattr(connect_runner, "_post", post)
   runner = connect_runner._CommandRunner("https://mobius.test", "token")
+  process_started = threading.Event()
+  reported = threading.Event()
+  supervise = connect_runner._supervise_process
+
+  def process_ready(*args, **kwargs):
+    process_started.set()
+    return supervise(*args, **kwargs)
+
+  monkeypatch.setattr(connect_runner, "_supervise_process", process_ready)
+  monkeypatch.setattr(runner, "_post_started", lambda _id: None)
+  monkeypatch.setattr(runner, "_wake_result_worker", reported.set)
   request_id = "2" * 16
   started = time.monotonic()
   runner.start({
@@ -2304,15 +2305,10 @@ def test_runner_cancel_stops_process_tree_and_reports_once(monkeypatch):
     "timeout": 30,
     "not_after": time.time() + 5,
   })
-
+  assert process_started.wait(2)
   assert runner.cancel(request_id) is True
-  deadline = time.monotonic() + 3
-  results = []
-  while time.monotonic() < deadline:
-    results = [message for message in runner.outbox if message["type"] == "result"]
-    if results:
-      break
-    time.sleep(0.025)
+  assert reported.wait(2)
+  results = runner.pending_messages()
 
   assert len(results) == 1
   assert results[0]["outcome"] == "canceled"

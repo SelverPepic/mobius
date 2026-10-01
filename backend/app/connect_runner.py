@@ -722,6 +722,10 @@ class _CommandOutput:
         if not text:
             return
         with self.lock:
+            # Delivery can finish after the bounded drain of an escaped child.
+            # Its late reader must not reopen or write to released scratch.
+            if self.spool.closed:
+                return
             self.final[stream].append(text)
             if self.output_error is not None:
                 return
@@ -800,6 +804,15 @@ class _CommandOutput:
         with self.lock:
             return self.read_offset < self.write_offset
 
+    def close(self):
+        with self.lock:
+            self.read_offset = self.write_offset
+            try:
+                self.spool.close()
+            except OSError as exc:
+                # Cleanup cannot overturn an acknowledged result.
+                print("failed to close output scratch: %s" % exc)
+
     def final_streams(self):
         with self.lock:
             stdout, stdout_truncated = self.final["stdout"].value()
@@ -829,7 +842,10 @@ def _pump_stream(pipe, stream, output):
     except (OSError, ValueError):
         pass
     finally:
-        output.append(stream, decoder.decode(b"", final=True))
+        try:
+            output.append(stream, decoder.decode(b"", final=True))
+        finally:
+            pipe.close()
 
 
 def _feed_stdin(pipe, text):
@@ -938,12 +954,15 @@ class _CommandRunner:
             return list(self.outbox)
 
     def acknowledge_message(self, message):
+        record = None
         with self.lock:
             for index, pending in enumerate(self.outbox):
                 if pending is message:
                     del self.outbox[index]
-                    self.pending_outputs.pop(message.get("request_id"), None)
-                    return
+                    record = self.pending_outputs.pop(message.get("request_id"), None)
+                    break
+        if record is not None:
+            record["output"].close()
 
     def snapshot(self):
         with self.lock:
@@ -980,6 +999,7 @@ class _CommandRunner:
                         message["output_error"] = record["output"].output_error[:1024]
                         record["output"].discard_pending()
                         self.pending_outputs.pop(message.get("request_id"), None)
+                        record["output"].close()
                 try:
                     _post(
                         self.base + "/api/connect/result", message,
@@ -1087,11 +1107,14 @@ class _CommandRunner:
         with self.lock:
             self.outbox.append(message)
             output = record.get("output") if record is not None else None
-            if (output is not None and output.output_error is None
-                    and output.has_pending()):
+            retain_output = (output is not None and output.output_error is None
+                             and output.has_pending())
+            if retain_output:
                 self.pending_outputs[request_id] = record
             if record is not None and self.active.get(request_id) is record:
                 del self.active[request_id]
+        if output is not None and not retain_output:
+            output.close()
         self._wake_result_worker()
 
     def _wake_result_worker(self):

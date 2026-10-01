@@ -1,4 +1,5 @@
 """Focused transport, lifecycle, and durable-output runner regressions."""
+from contextlib import closing
 import http.client
 import io
 import json
@@ -156,36 +157,37 @@ def test_stream_inventory_never_falls_back_on_auth_or_transport_error(monkeypatc
 
 
 def test_output_spools_large_unicode_in_bounded_batches_and_retries():
-    output = runner._CommandOutput()
-    for _ in range(5000):
-        output.append('stdout', '😀' * 20)
-    first = output.take_batch()
-    assert len(first) <= 4096
-    assert len(json.dumps({'request_id': 'r', 'chunks': first}).encode()) <= runner._OUTPUT_BATCH_BYTES
-    assert output.take_batch() == first
-    output.acknowledge(first[-1]['seq'])
-    second = output.take_batch()
-    assert second[0]['seq'] == first[-1]['seq'] + 1
-    assert output.next_seq == 5000
+    with closing(runner._CommandOutput()) as output:
+        for _ in range(5000):
+            output.append('stdout', '😀' * 20)
+        first = output.take_batch()
+        assert len(first) <= 4096
+        assert len(json.dumps({'request_id': 'r', 'chunks': first}).encode()) <= runner._OUTPUT_BATCH_BYTES
+        assert output.take_batch() == first
+        output.acknowledge(first[-1]['seq'])
+        second = output.take_batch()
+        assert second[0]['seq'] == first[-1]['seq'] + 1
+        assert output.next_seq == 5000
 
 
 def test_output_acknowledges_server_cursor_not_attempted_last(monkeypatch):
     command = runner._CommandRunner('https://example.test', 'token')
     command.live_output = True
-    output = runner._CommandOutput()
-    output.append('stdout', 'one')
-    output.append('stdout', 'two')
-    record = {'request_id': 'r', 'output': output}
-    replies = iter([{'ok': True, 'next': 1}, {'ok': True, 'next': 2}])
-    monkeypatch.setattr(runner, '_post', lambda *a, **k: next(replies))
-    assert command.flush_output(record, drain=False)
-    assert [c['seq'] for c in output.take_batch()] == [1]
-    assert command.flush_output(record, drain=True)
-    assert output.take_batch() == []
+    with closing(runner._CommandOutput()) as output:
+        output.append('stdout', 'one')
+        output.append('stdout', 'two')
+        record = {'request_id': 'r', 'output': output}
+        replies = iter([{'ok': True, 'next': 1}, {'ok': True, 'next': 2}])
+        monkeypatch.setattr(runner, '_post', lambda *a, **k: next(replies))
+        assert command.flush_output(record, drain=False)
+        assert [c['seq'] for c in output.take_batch()] == [1]
+        assert command.flush_output(record, drain=True)
+        assert output.take_batch() == []
 
 
 def test_async_start_deduplicates_while_ack_is_blocked(monkeypatch):
     entered, release = threading.Event(), threading.Event()
+    reported = threading.Event()
     spawns = []
     command = runner._CommandRunner('https://example.test', 'token')
     def state(_):
@@ -196,7 +198,7 @@ def test_async_start_deduplicates_while_ack_is_blocked(monkeypatch):
         kwargs['before_spawn']()
         spawns.append(1)
     monkeypatch.setattr(runner, '_spawn_command', spawn)
-    monkeypatch.setattr(command, '_post_result', lambda *a, **k: None)
+    monkeypatch.setattr(command, '_wake_result_worker', reported.set)
     event = {'request_id': 'x', 'cmd': 'echo x', 'not_after': time.time() + 10}
     start = time.monotonic()
     command.start(event)
@@ -206,7 +208,7 @@ def test_async_start_deduplicates_while_ack_is_blocked(monkeypatch):
         command.start(event)
     command.cancel('x')
     release.set()
-    time.sleep(0.05)
+    assert reported.wait(1)
     assert spawns == []
 
 
@@ -319,45 +321,45 @@ def test_final_result_is_retained_before_output_drain(monkeypatch):
     command = runner._CommandRunner('https://example.test', 'token')
     class Proc:
         returncode = 0
-    output = runner._CommandOutput()
-    output.append('stdout', 'hello')
-    record = {'request_id': 'r', 'proc': Proc(), 'output': output, 'input': None,
-              'timeout': 1, 'reason': None}
-    command.active['r'] = record
-    monkeypatch.setattr(runner, '_supervise_process', lambda *a, **k: None)
-    monkeypatch.setattr(command, 'flush_output', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('drain')))
-    monkeypatch.setattr(command, '_wake_result_worker', lambda: None)
-    command._wait(record)
-    [result] = command.pending_messages()
-    assert result['stdout'] == 'hello'
-    assert result['outcome'] == 'completed'
-    assert result['exit_code'] == 0
-    assert result['output_seq'] == 1
-    assert command.pending_outputs['r'] is record
+    with closing(runner._CommandOutput()) as output:
+        output.append('stdout', 'hello')
+        record = {'request_id': 'r', 'proc': Proc(), 'output': output, 'input': None,
+                  'timeout': 1, 'reason': None}
+        command.active['r'] = record
+        monkeypatch.setattr(runner, '_supervise_process', lambda *a, **k: None)
+        monkeypatch.setattr(command, 'flush_output', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('drain')))
+        monkeypatch.setattr(command, '_wake_result_worker', lambda: None)
+        command._wait(record)
+        [result] = command.pending_messages()
+        assert result['stdout'] == 'hello'
+        assert result['outcome'] == 'completed'
+        assert result['exit_code'] == 0
+        assert result['output_seq'] == 1
+        assert command.pending_outputs['r'] is record
 
 
 def test_spool_read_failure_downgrades_pending_result(monkeypatch):
     command = runner._CommandRunner('https://example.test', 'token')
     command.live_output = True
-    output = runner._CommandOutput()
-    output.append('stdout', 'first')
-    record = {'request_id': 'r', 'output': output}
-    command.pending_outputs['r'] = record
-    message = {'type': 'result', 'request_id': 'r', 'stdout': 'first',
-               'stderr': '', 'exit_code': 0, 'outcome': 'completed',
-               'output_seq': 1}
-    command.outbox.append(message)
-    def fail(*_args, **_kwargs):
-        output.output_error = 'disk read failed'
-        return False
-    monkeypatch.setattr(command, 'flush_output', fail)
-    sent = []
-    monkeypatch.setattr(runner, '_post', lambda _url, payload, **_kw: sent.append(dict(payload)))
-    assert command.flush_pending_results()
-    assert sent[0]['outcome'] == 'completed'
-    assert sent[0]['exit_code'] == 0
-    assert 'disk read failed' in sent[0]['output_error']
-    assert 'output_seq' not in sent[0]
+    with closing(runner._CommandOutput()) as output:
+        output.append('stdout', 'first')
+        record = {'request_id': 'r', 'output': output}
+        command.pending_outputs['r'] = record
+        message = {'type': 'result', 'request_id': 'r', 'stdout': 'first',
+                   'stderr': '', 'exit_code': 0, 'outcome': 'completed',
+                   'output_seq': 1}
+        command.outbox.append(message)
+        def fail(*_args, **_kwargs):
+            output.output_error = 'disk read failed'
+            return False
+        monkeypatch.setattr(command, 'flush_output', fail)
+        sent = []
+        monkeypatch.setattr(runner, '_post', lambda _url, payload, **_kw: sent.append(dict(payload)))
+        assert command.flush_pending_results()
+        assert sent[0]['outcome'] == 'completed'
+        assert sent[0]['exit_code'] == 0
+        assert 'disk read failed' in sent[0]['output_error']
+        assert 'output_seq' not in sent[0]
 
 
 def test_config_replacement_preserves_old_on_serialization_failure(tmp_path, monkeypatch):
@@ -388,10 +390,13 @@ def test_download_validation_preserves_old_runner(tmp_path, monkeypatch):
 def test_script_stdin_is_utf8_on_posix(monkeypatch):
     monkeypatch.setattr(runner.os, 'name', 'posix')
     class Pipe(io.BytesIO):
-        def close(self): pass
+        def close(self):
+            self.written = self.getvalue()
+            super().close()
     pipe = Pipe()
     runner._feed_stdin(pipe, '雪')
-    assert pipe.getvalue() == '雪'.encode('utf-8')
+    assert pipe.closed
+    assert pipe.written == '雪'.encode('utf-8')
 
 
 @pytest.mark.skipif(os.name == 'nt', reason='POSIX shell command-file contract')
@@ -410,31 +415,31 @@ def test_long_inline_command_preserves_exit_and_trap(monkeypatch):
 
 @pytest.mark.skipif(os.name == 'nt', reason='POSIX shell command-file contract')
 def test_long_inline_command_keeps_stdin_inherited():
-    proc = runner._spawn_command('exit 0\n#' + 'x' * 150_000, None)
-    try:
-        assert proc.stdin is None
-        assert proc.wait(timeout=5) == 0
-    finally:
-        os.unlink(proc._mobius_command_file)
+    with runner._spawn_command('exit 0\n#' + 'x' * 150_000, None) as proc:
+        try:
+            assert proc.stdin is None
+            assert proc.wait(timeout=5) == 0
+        finally:
+            os.unlink(proc._mobius_command_file)
 
 
 def test_spool_index_stays_constant_size_and_ack_reclaims_scratch():
-    output = runner._CommandOutput()
-    for _ in range(20_000):
-        output.append('stdout', 'x')
-    assert not hasattr(output, 'chunks')
-    assert output.read_offset == 0 and output.has_pending()
-    seen = 0
-    while output.has_pending():
-        batch = output.take_batch()
-        assert len(batch) <= 4096
-        assert batch[0]['seq'] == seen
-        seen += len(batch)
-        output.acknowledge(batch[-1]['seq'])
-    assert seen == 20_000
-    assert output.spool.seek(0, 2) == 0
-    output.append('stdout', 'after reclaim')
-    assert output.take_batch()[0]['seq'] == 20_000
+    with closing(runner._CommandOutput()) as output:
+        for _ in range(20_000):
+            output.append('stdout', 'x')
+        assert not hasattr(output, 'chunks')
+        assert output.read_offset == 0 and output.has_pending()
+        seen = 0
+        while output.has_pending():
+            batch = output.take_batch()
+            assert len(batch) <= 4096
+            assert batch[0]['seq'] == seen
+            seen += len(batch)
+            output.acknowledge(batch[-1]['seq'])
+        assert seen == 20_000
+        assert output.spool.seek(0, 2) == 0
+        output.append('stdout', 'after reclaim')
+        assert output.take_batch()[0]['seq'] == 20_000
 
 
 def test_large_inline_nul_cannot_change_os_rejection_into_script_execution():
@@ -443,51 +448,110 @@ def test_large_inline_nul_cannot_change_os_rejection_into_script_execution():
 
 
 def test_acknowledged_output_stays_delivered_when_scratch_reclaim_fails():
-    output = runner._CommandOutput()
-    output.append('stdout', 'acknowledged')
-    original = output.spool
-    class NoTruncate:
-        def __getattr__(self, name):
-            return getattr(original, name)
-        def truncate(self):
-            raise OSError('scratch reclaim unavailable')
-    output.spool = NoTruncate()
-    output.acknowledge(0)
-    assert not output.has_pending()
-    assert output.output_error is None
-    output.append('stdout', 'next')
-    assert output.take_batch() == [{'seq': 1, 'stream': 'stdout', 'text': 'next'}]
+    with closing(runner._CommandOutput()) as output:
+        output.append('stdout', 'acknowledged')
+        original = output.spool
+        class NoTruncate:
+            def __getattr__(self, name):
+                return getattr(original, name)
+            def truncate(self):
+                raise OSError('scratch reclaim unavailable')
+        output.spool = NoTruncate()
+        output.acknowledge(0)
+        assert not output.has_pending()
+        assert output.output_error is None
+        output.append('stdout', 'next')
+        assert output.take_batch() == [{'seq': 1, 'stream': 'stdout', 'text': 'next'}]
 
 
 @pytest.mark.parametrize('status', [409, 422])
 def test_rejected_output_cannot_be_reported_as_complete(monkeypatch, status):
     command = runner._CommandRunner('https://example.test', 'token')
     command.live_output = True
-    output = runner._CommandOutput()
-    output.append('stdout', 'known preview')
-    record = {'request_id': 'r', 'output': output}
-    command.pending_outputs['r'] = record
-    command.outbox.append({'type': 'result', 'request_id': 'r',
-                          'outcome': 'completed', 'exit_code': 0,
-                          'stdout': 'known preview', 'stderr': '', 'output_seq': 1})
-    sent = []
-    def post(url, payload, **_kwargs):
-        if url.endswith('/output'):
-            raise urllib.error.HTTPError(url, status, 'rejected', {}, io.BytesIO())
-        sent.append(dict(payload))
-        return {'ok': True}
-    monkeypatch.setattr(runner, '_post', post)
-    assert command.flush_pending_results()
-    assert not command.active and not command.pending_messages()
-    assert sent[0]['outcome'] == 'completed' and sent[0]['exit_code'] == 0
-    assert 'HTTP %s' % status in sent[0]['output_error']
-    assert 'output_seq' not in sent[0]
+    with closing(runner._CommandOutput()) as output:
+        output.append('stdout', 'known preview')
+        record = {'request_id': 'r', 'output': output}
+        command.pending_outputs['r'] = record
+        command.outbox.append({'type': 'result', 'request_id': 'r',
+                              'outcome': 'completed', 'exit_code': 0,
+                              'stdout': 'known preview', 'stderr': '', 'output_seq': 1})
+        sent = []
+        def post(url, payload, **_kwargs):
+            if url.endswith('/output'):
+                raise urllib.error.HTTPError(url, status, 'rejected', {}, io.BytesIO())
+            sent.append(dict(payload))
+            return {'ok': True}
+        monkeypatch.setattr(runner, '_post', post)
+        assert command.flush_pending_results()
+        assert not command.active and not command.pending_messages()
+        assert sent[0]['outcome'] == 'completed' and sent[0]['exit_code'] == 0
+        assert 'HTTP %s' % status in sent[0]['output_error']
+        assert 'output_seq' not in sent[0]
 
 
 def test_invalid_spool_record_length_is_bounded_and_explicit():
+    with closing(runner._CommandOutput()) as output:
+        output.append('stdout', 'text')
+        output.spool.seek(0)
+        output.spool.write(runner._SPOOL_HEADER.pack(0, 0xffffffff))
+        assert output.take_batch() == []
+        assert 'invalid output spool record length' in output.output_error
+
+
+@pytest.mark.parametrize('status', [None, 503, 422])
+def test_output_scratch_lives_until_result_delivery_settles(monkeypatch, status):
+    command = runner._CommandRunner('https://example.test', 'token')
+    command.live_output = True
+    monkeypatch.setattr(command, '_wake_result_worker', lambda: None)
+    with closing(runner._CommandOutput()) as output:
+        output.append('stdout', 'retained')
+        record = {'request_id': 'scratch', 'output': output}
+        command._post_result('scratch', 'retained', '', 0, 'completed',
+                             record=record, output_seq=1)
+        assert not output.spool.closed
+
+        def post(url, _payload, **_kwargs):
+            if url.endswith('/output'):
+                return {'ok': True, 'next': 1}
+            if status is not None:
+                raise urllib.error.HTTPError(url, status, 'test', {}, io.BytesIO())
+            return {'ok': True}
+
+        monkeypatch.setattr(runner, '_post', post)
+        assert command.flush_pending_results() is (status != 503)
+        if status == 503:
+            assert not output.spool.closed
+            assert command.pending_messages()
+            status = None
+            assert command.flush_pending_results()
+        assert output.spool.closed
+        assert not command.pending_messages()
+
+
+def test_output_without_pending_chunks_closes_before_delivery(monkeypatch):
+    command = runner._CommandRunner('https://example.test', 'token')
+    monkeypatch.setattr(command, '_wake_result_worker', lambda: None)
     output = runner._CommandOutput()
-    output.append('stdout', 'text')
-    output.spool.seek(0)
-    output.spool.write(runner._SPOOL_HEADER.pack(0, 0xffffffff))
+    command._post_result('empty', '', '', 124, 'expired',
+                         record={'request_id': 'empty', 'output': output})
+    assert output.spool.closed
+    assert command.pending_messages()[0]['outcome'] == 'expired'
+
+
+def test_late_escaped_child_output_cannot_reopen_released_scratch():
+    output = runner._CommandOutput()
+    output.append('stdout', 'captured before delivery')
+    output.close()
+    output.append('stdout', 'late escaped descendant')
+    assert output.spool.closed
+    assert not output.has_pending()
     assert output.take_batch() == []
-    assert 'invalid output spool record length' in output.output_error
+    assert output.next_seq == 1
+
+
+def test_pipe_reader_closes_its_own_pipe_after_eof():
+    pipe = io.BytesIO(b'last bytes')
+    with closing(runner._CommandOutput()) as output:
+        runner._pump_stream(pipe, 'stdout', output)
+        assert pipe.closed
+        assert output.final_streams() == ('last bytes', '', False)
