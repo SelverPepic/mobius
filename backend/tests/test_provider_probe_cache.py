@@ -2,6 +2,7 @@
 import asyncio
 import subprocess
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
@@ -56,13 +57,14 @@ async def test_catalog_probe_reaps_before_cache_advice_on_every_exit(monkeypatch
   async def spawn(*args, **kwargs):
     return proc
 
-  async def reclaim(provider):
+  def reclaim(provider):
     assert proc.returncode is not None
+    assert threading.current_thread().name.startswith('mobius-model-cache')
     events.append(provider)
 
   monkeypatch.setattr(providers.shutil, 'which', lambda _: '/codex')
   monkeypatch.setattr(asyncio, 'create_subprocess_exec', spawn)
-  monkeypatch.setattr(file_cache, 'reclaim_provider_cache', reclaim)
+  monkeypatch.setattr(file_cache, 'reclaim_provider_cache_sync', reclaim)
   call = providers._fetch_codex_models_from_cli('/unused')
   if outcome == 'success':
     assert await call == [{'id': 'test-model'}]
@@ -70,6 +72,44 @@ async def test_catalog_probe_reaps_before_cache_advice_on_every_exit(monkeypatch
     with pytest.raises(asyncio.CancelledError if outcome == 'cancel' else RuntimeError):
       await call
   assert events == (['kill', 'reaped', 'codex'] if outcome in ('timeout', 'cancel') else ['exit', 'codex'])
+
+
+@pytest.mark.asyncio
+async def test_catalog_cleanup_ignores_saturated_live_turn_executor(monkeypatch):
+  class Process:
+    returncode = 0
+
+    async def communicate(self):
+      return b'{"models":[{"slug":"test-model"}]}', b''
+
+  async def spawn(*_args, **_kwargs):
+    return Process()
+
+  loop = asyncio.get_running_loop()
+  occupied = threading.Event()
+  release = threading.Event()
+  saturated = ThreadPoolExecutor(max_workers=1)
+  replacement = ThreadPoolExecutor(max_workers=1)
+  loop.set_default_executor(saturated)
+  blocker = loop.run_in_executor(None, lambda: (occupied.set(), release.wait()))
+  while not occupied.is_set():
+    await asyncio.sleep(0)
+  advised = []
+  monkeypatch.setattr(providers.shutil, 'which', lambda _: '/codex')
+  monkeypatch.setattr(asyncio, 'create_subprocess_exec', spawn)
+  monkeypatch.setattr(file_cache, 'reclaim_provider_cache_sync',
+                      lambda provider: advised.append((provider, threading.current_thread().name)))
+  try:
+    assert await asyncio.wait_for(providers._fetch_codex_models_from_cli('/unused'), 1) == [
+      {'id': 'test-model'},
+    ]
+    assert advised[0][0] == 'codex'
+    assert advised[0][1].startswith('mobius-model-cache')
+  finally:
+    release.set()
+    await blocker
+    loop.set_default_executor(replacement)
+    saturated.shutdown(wait=True)
 
 
 @pytest.mark.asyncio
@@ -138,3 +178,43 @@ def test_sync_advice_failure_never_masks_probe_result(monkeypatch):
     raise OSError('unavailable')
   monkeypatch.setattr(file_cache, 'provider_tool_paths', fail)
   assert file_cache.reclaim_provider_cache_sync('codex') is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('probe', ['usage', 'interaction'])
+async def test_stubborn_account_worker_skips_post_exit_advice(monkeypatch, tmp_path, probe):
+  import openai_codex.client as sdk
+
+  release = threading.Event()
+  closed = threading.Event()
+  advised = []
+
+  class Client:
+    def __init__(self, _config):
+      pass
+
+    def close(self):
+      closed.set()
+
+  def work(_client):
+    release.wait(5)
+    return None, None
+
+  async def acquire(_):
+    return SimpleNamespace(release=lambda: None)
+
+  monkeypatch.setattr(sdk, 'CodexClient', Client)
+  monkeypatch.setattr(provider_usage.shutil, 'which', lambda _: '/codex')
+  monkeypatch.setattr(provider_usage, '_PROVIDER_TIMEOUT_SECONDS', .01)
+  monkeypatch.setattr(provider_usage, '_read_codex_client', work)
+  monkeypatch.setattr(file_cache, 'reclaim_provider_cache_sync', lambda _: advised.append(True))
+  monkeypatch.setattr('app.codex_session_lock.acquire_codex_session_activity_async', acquire)
+  try:
+    call = (provider_usage._fetch_codex_usage(str(tmp_path)) if probe == 'usage' else
+            provider_usage._run_on_codex_client(str(tmp_path), work, timeout_error='timed out'))
+    with pytest.raises(RuntimeError, match='timed out'):
+      await call
+    assert closed.is_set()
+    assert advised == []
+  finally:
+    release.set()

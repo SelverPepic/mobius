@@ -21,6 +21,7 @@ an app-owned setup UI, not another platform runner or picker branch.
 
 import asyncio
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import os
@@ -1991,8 +1992,19 @@ async def _fetch_codex_models_from_cli(
           pass
         await proc.wait()
     finally:
-      from app.file_cache import reclaim_provider_cache
-      await reclaim_provider_cache("codex")
+      # Live turns can occupy the loop's default workers. Cache advice is
+      # optional, but waiting behind those turns must not stall model refresh.
+      from app.file_cache import reclaim_provider_cache_sync
+      try:
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mobius-model-cache")
+        try:
+          await asyncio.get_running_loop().run_in_executor(
+            executor, reclaim_provider_cache_sync, "codex",
+          )
+        finally:
+          executor.shutdown(wait=False, cancel_futures=True)
+      except Exception:
+        log.debug("model probe cache advice failed", exc_info=True)
   if proc.returncode != 0:
     msg = stderr.decode("utf-8", "replace").strip()
     raise RuntimeError(f"codex debug models failed: {msg[:500]}")

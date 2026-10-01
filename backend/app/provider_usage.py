@@ -1009,16 +1009,18 @@ async def _run_on_codex_client(data_dir: str, work: Any, *, timeout_error: str) 
   except TimeoutError:
     await in_worker(client.close)
     with suppress(Exception):
-      await asyncio.wait_for(task, timeout=2.0)
+      await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
     raise RuntimeError(timeout_error)
   finally:
     try:
       await in_worker(client.close)
     finally:
       try:
-        # Keep cleanup on the same independent executor as the probe.
-        from app.file_cache import reclaim_provider_cache_sync
-        await in_worker(reclaim_provider_cache_sync, "codex")
+        # A close may time out a stubborn worker without ending it. Advise
+        # executable pages only after that worker has actually stopped.
+        if task.done():
+          from app.file_cache import reclaim_provider_cache_sync
+          await in_worker(reclaim_provider_cache_sync, "codex")
       finally:
         executor.shutdown(wait=False, cancel_futures=True)
 
@@ -1066,15 +1068,16 @@ async def _fetch_codex_usage(data_dir: str) -> dict[str, Any]:
   except TimeoutError:
     await in_worker(client.close)
     with suppress(Exception):
-      await asyncio.wait_for(task, timeout=2.0)
+      await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
     raise RuntimeError("codex usage read timed out")
   finally:
     try:
       await in_worker(client.close)
     finally:
       try:
-        from app.file_cache import reclaim_provider_cache_sync
-        await in_worker(reclaim_provider_cache_sync, "codex")
+        if task.done():
+          from app.file_cache import reclaim_provider_cache_sync
+          await in_worker(reclaim_provider_cache_sync, "codex")
       finally:
         executor.shutdown(wait=False, cancel_futures=True)
         ownership.release()
