@@ -1,4 +1,4 @@
-import { Fragment, memo } from 'react'
+import { Fragment, memo, useMemo } from 'react'
 import { usePositionedPeerNotes } from './peerTimelineContext.js'
 import {
   insertPositionedActivity,
@@ -196,6 +196,15 @@ function MsgContentInner({
   activitySourceBlocks,
 }) {
   const positionedNotes = usePositionedPeerNotes(activityMessageId || msg.id)
+  const generatedFiles = useMemo(() => (
+    msg.role === 'assistant' && !isStreaming
+      ? (msg.blocks || []).flatMap(block =>
+          block.type === 'generated_files' && Array.isArray(block.files)
+            ? block.files.map(file => ({ ...file, kind: 'generated' }))
+            : [],
+        )
+      : []
+  ), [msg.role, msg.blocks, isStreaming])
   // Build a stable per-render answerable predicate that closes over the
   // scalar props (no function prop needed from ChatView).
   const isQuestionAnswerable = (block) =>
@@ -346,6 +355,8 @@ function MsgContentInner({
             <ActivityStretch
               entries={visibleEntries}
               chatId={chatId}
+              generatedFiles={generatedFiles}
+              generatedCapturePending={isStreaming}
               live={false}
               surfaceKey={messageKey}
               detailRef={block.detail_segments ? null : {
@@ -631,6 +642,8 @@ function MsgContentInner({
                 <ActivityStretch
                   entries={node.group}
                   chatId={chatId}
+                  generatedFiles={generatedFiles}
+                  generatedCapturePending={isStreaming}
                   live={live}
                   surfaceKey={messageKey}
                   onInternalNav={onInternalNav}
