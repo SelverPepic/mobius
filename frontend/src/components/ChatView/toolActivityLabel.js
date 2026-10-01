@@ -2,6 +2,7 @@ import { imagePathFromInput } from './toolImageResult.js'
 import { peerMessageCardModel } from './peerMessageCard.js'
 import { appActivityLabel } from './appActivityCard.js'
 import { runningBackgroundTask } from './toolTasks.js'
+import { toolBlockFailed } from './toolResultFormat.js'
 
 // Owner-facing activity labels for raw tool names. Collapsed summary lines
 // (the activity-group header, a running tool's header) speak in activities —
@@ -256,6 +257,31 @@ function controlInputValue(input, key) {
   } catch { /* A provider's plain-text summary is not JSON. */ }
   const match = input.match(new RegExp(`(?:^|, )${key}=([\\s\\S]*?)(?=, [a-z_]+=|$)`))
   return match ? match[1].trim() : undefined
+}
+
+// These writes have no decision-bearing result. Keep their full receipts in
+// the activity disclosure, but don't promote routine saving into a chat beat.
+export function isQuietBookkeepingTool(tool) {
+  const bare = bareControlName(tool?.tool)
+  const capture = tool?.app_activity?.app_slug === 'memory'
+    && tool.app_activity.activity_id === 'memory-capture'
+  if (!capture && !['checkpoint_chat', 'memory_remember', 'reflection_log_friction'].includes(bare)) return false
+  const activity = tool?.app_activity
+  return tool?.status !== 'failed' && !toolBlockFailed(tool)
+    && activity?.status !== 'failed' && !activity?.warning
+    && !(activity?.resources?.length > 0)
+}
+
+// A notification is redundant only when it points back to this card's chat.
+// Other notifications, failed sends and in-flight sends remain real activity.
+export function isOwnerAnswerNotification(tool, chatId) {
+  if (bareControlName(tool?.tool) !== 'notify_owner'
+      || tool?.status !== 'done' || toolBlockFailed(tool)) return false
+  if (controlInputValue(tool.input, 'title') !== 'Möbius needs your answer') return false
+  const target = controlInputValue(tool.input, 'target')
+  // Legacy summaries end at 200 chars; an omitted target there is unknown.
+  if (target === undefined && tool.input.length >= 200 && !tool.input.trim().startsWith('{')) return false
+  return target === undefined || (chatId && target === `/shell/?chat=${chatId}`)
 }
 
 function summaryValue(input, key) {
@@ -538,5 +564,6 @@ export function memoryRecallLabel(tool) {
   return `Recalled ${count} note${count === 1 ? '' : 's'} from Memory`
 }
 export function isDistinctiveActivityTool(item) {
-  return item?.type === 'tool' && DISTINCTIVE_ACTIVITIES.has(effectiveToolName(item))
+  return item?.type === 'tool' && !isQuietBookkeepingTool(item)
+    && DISTINCTIVE_ACTIVITIES.has(effectiveToolName(item))
 }

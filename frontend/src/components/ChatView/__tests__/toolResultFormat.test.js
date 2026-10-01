@@ -1,12 +1,36 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
+  toolInputText,
   formatToolResult,
   toolResultCopyText,
   toolResultFailed,
   toolBlockFailed,
   toolBlockExitCode,
 } from '../toolResultFormat.js'
+
+test('historical structured quiet inputs render as readable text without rewriting them', () => {
+  const input = { digest: 'Saved context', summary: 'Continued work', title: 'Quiet details' }
+  assert.equal(toolInputText('original text'), 'original text')
+  assert.equal(toolInputText(null), '')
+  assert.equal(toolInputText(undefined), '')
+  assert.deepEqual(JSON.parse(toolInputText(input)), input)
+  assert.equal(toolInputText(input), JSON.stringify(input, null, 2))
+  assert.deepEqual(input, { digest: 'Saved context', summary: 'Continued work', title: 'Quiet details' })
+})
+
+test('MCP error flags preserve diagnostics even without a terminal exit', () => {
+  for (const output of [
+    { isError: true, content: [{ type: 'text', text: 'Denied' }] },
+    { result: JSON.stringify({ isError: true }) },
+  ]) {
+    assert.equal(toolResultFailed(JSON.stringify(output)), true)
+    assert.equal(toolBlockFailed({ output: JSON.stringify(output) }), true)
+  }
+  assert.equal(toolResultFailed(JSON.stringify({ isError: false })), false)
+  assert.equal(toolResultFailed('The text mentions isError=true'), false)
+  assert.equal(toolResultFailed(JSON.stringify({ content: [{ text: 'isError=true' }] })), false)
+})
 
 test('copy text matches readable terminal and structured presentation', () => {
   assert.equal(

@@ -4,6 +4,7 @@ import {
   formatToolResult,
   toolBlockFailed,
   toolResultCopyText,
+  toolInputText,
 } from './toolResultFormat.js'
 import { copyPlainText } from './messageCopy.js'
 import { fetchLazyText } from './lazySidecar.js'
@@ -11,6 +12,7 @@ import {
   toolActivityIcon,
   toolCallLabel,
   effectiveToolName,
+  isQuietBookkeepingTool,
 } from './toolActivityLabel.js'
 import { preserveTogglePosition } from './preserveTogglePosition.js'
 import { elapsedLabel, runningBackgroundTask } from './toolTasks.js'
@@ -137,7 +139,7 @@ function GenericToolBlock({
   // Use that raw identity for command/result formatting even though
   // effectiveToolName intentionally classifies the collapsed row as Skill.
   const isShell = t?.tool === 'Bash' || t?.tool === 'shell'
-  const label = toolCallLabel(t)
+  const label = compact && isQuietBookkeepingTool(t) ? 'Activity details' : toolCallLabel(t)
   // A command sent (or auto-moved) to the background is still running after
   // its tool call returned: the row says so and times it until it finishes.
   const backgroundTask = runningBackgroundTask(t)
@@ -545,7 +547,7 @@ function GenericToolBlock({
                 `chat__tool-text${isShell ? ' chat__tool-command' : ''}`
               }>
                 {isShell && <span className="chat__tool-prompt" aria-hidden="true">$ </span>}
-                {t.input}
+                {toolInputText(t.input)}
               </pre>
             </div>
           )}
@@ -662,6 +664,7 @@ export default function ToolBlock({
       <AppActivityCard
         t={t}
         chatId={chatId}
+        compact={compact}
         disclosureKey={disclosureKey}
         onInternalNav={onInternalNav}
       />

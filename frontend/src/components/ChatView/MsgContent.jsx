@@ -243,7 +243,7 @@ function MsgContentInner({
     // the live stream absorbs the tool twin into the card. Skip the twin
     // here so a reopened chat matches the live view — render-time, so it
     // also cleans up already-persisted old chats with no backend migration.
-    const skipToolIdx = suppressedQuestionToolIndices(displayBlocks)
+    const skipToolIdx = suppressedQuestionToolIndices(displayBlocks, chatId)
 
     // Entry idx is the POST-suppression position, not the raw msg.blocks
     // ordinal. The two surfaces of the active answer disagree about the twin:

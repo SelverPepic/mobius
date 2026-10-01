@@ -5,6 +5,7 @@ import {
   toolActivitySingular,
   toolActivityPastSingular,
   effectiveToolName,
+  isQuietBookkeepingTool,
 } from './toolActivityLabel.js'
 export { groupActivityRuns } from './activityGrouping.js'
 
@@ -72,6 +73,8 @@ export function toolGroupState(tools) {
 // is running (a done/persisted group) the order is plain first-seen.
 // Pure — no React, no mutation of the input array.
 export function toolGroupSummary(tools) {
+  tools = tools.filter(tool => !isQuietBookkeepingTool(tool))
+  if (tools.length === 0) return 'Activity details'
   // Search from the tail so "currently running" reads as the most-recent live
   // tool. Seeding `seen` with its label pins it first; the first-seen scan then
   // fills the rest, and the dedupe folds the running label back out if it also
@@ -101,6 +104,8 @@ export function toolGroupSummary(tools) {
 // raw name and casing (it is an identifier, not prose). Dedupe is on the
 // label, same as the live summary. Pure — no React, no mutation.
 export function toolGroupPastSummary(tools) {
+  tools = tools.filter(tool => !isQuietBookkeepingTool(tool))
+  if (tools.length === 0) return 'Activity details'
   const seen = []
   const counts = new Map()
   for (const t of tools) {
@@ -168,7 +173,7 @@ export function activityMemoSig(entries, { liveThinkingTail = false } = {}) {
     .map(e => {
       const it = e?.item
       if (it?.type === 'tool') {
-        return `t:${effectiveToolName(it) || ''}:${it.status || ''}`
+        return `t:${effectiveToolName(it) || ''}:${it.status || ''}:${isQuietBookkeepingTool(it) ? 'quiet' : ''}`
       }
       if (it?.type === 'helper_result') return `h:${it.status || ''}`
       return 'k'
