@@ -422,7 +422,10 @@ def test_a_planless_goal_cannot_complete_while_its_helper_works(db, chat, monkey
 
   _add_goal_run(db, chat, plan=None)
   helper = {"id": "d1", "task_key": "review", "status": "running", "children": []}
-  monkeypatch.setattr(goal_plans, "_delegation_tree", lambda *_: [helper])
+  def helper_tree(*_, all_attempts=False):
+    assert all_attempts  # Settlement includes superseded attempts, not just the UI projection.
+    return [helper]
+  monkeypatch.setattr(goal_plans, "_delegation_tree", helper_tree)
 
   with pytest.raises(GoalPlanError, match="active delegations"):
     _complete(db)
