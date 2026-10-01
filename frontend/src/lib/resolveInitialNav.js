@@ -44,7 +44,7 @@ export function resolveInitialNav({
   // (Previously activeView/activeAppId/activeChatId were resolved by three
   // separate `||` chains that could cross-contaminate sources.)
   let dest
-  if (deepLink?.view === 'settings' && deepLink.section === 'ai-providers') {
+  if (deepLink?.view === 'settings' && deepLink.providerReturn === true) {
     dest = { view: 'settings', appId: null, chatId: null, section: 'ai-providers' }
   } else if (shellReload?.activeView) {
     dest = {
@@ -53,7 +53,10 @@ export function resolveInitialNav({
       chatId: shellReload.activeChatId ?? null,
     }
   } else if (deepLink?.view) {
-    dest = { view: deepLink.view, appId: deepLink.appId ?? null, chatId: deepLink.chatId ?? null }
+    dest = {
+      view: deepLink.view, appId: deepLink.appId ?? null, chatId: deepLink.chatId ?? null,
+      ...(deepLink.section ? { section: deepLink.section } : {}),
+    }
   } else if (returnView?.view) {
     dest = { view: returnView.view, appId: null, chatId: null }
   } else if (restored?.view) {

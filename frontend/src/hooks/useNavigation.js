@@ -1367,9 +1367,9 @@ export default function useNavigation({
         }
         bootPaneId = workspaceStateRef.current.ws.focusedPaneId
       }
-      // resolveInitialNav owns the OAuth callback exception to reload
-      // precedence; its section marks the destination that won this boot.
-      const claimedReloadDestination = shellReload?.destinationClaimed && !initialNav.section
+      // A marked provider return, not an ordinary Settings link, may replace
+      // the stale destination claimed by a prior shell reload.
+      const claimedReloadDestination = shellReload?.destinationClaimed && !deepLink?.providerReturn
         ? {
             view: shellReload.activeView,
             appId: shellReload.activeAppId ?? null,

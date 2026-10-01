@@ -115,13 +115,16 @@ test('OAuth Settings callback alone overrides shellReload, but ordinary shell de
   const shellReload = { activeView: 'chat', activeChatId: 'reloaded', destinationClaimed: true }
   const callback = resolveInitialNav({
     shellReload,
-    deepLink: { view: 'settings', section: 'ai-providers' },
+    deepLink: { view: 'settings', section: 'ai-providers', providerReturn: true },
     storedChatId: 'home',
   })
   assert.equal(callback.view, 'settings')
   assert.equal(callback.section, 'ai-providers')
   assert.equal(callback.chatId, 'home')
   assert.equal(callback.seedHome, true)
+  assert.equal(resolveInitialNav({
+    shellReload, deepLink: { view: 'settings', section: 'ai-providers' },
+  }).chatId, 'reloaded')
   assert.equal(resolveInitialNav({
     shellReload, deepLink: { view: 'canvas', appId: 56 },
   }).chatId, 'reloaded')

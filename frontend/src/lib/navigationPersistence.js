@@ -61,10 +61,14 @@ export function parseShellDeepLink(location = globalThis.location) {
   if (/^\/settings\/?$/.test(path)) {
     // The OAuth callback needs this one section after a cold navigation. Do
     // not carry arbitrary URL input into SettingsView's focus target.
-    const sections = new URLSearchParams(location?.search || '').getAll('section')
-    return sections.length === 1 && sections[0] === 'ai-providers'
-      ? { view: 'settings', section: 'ai-providers' }
-      : { view: 'settings' }
+    const params = new URLSearchParams(location?.search || '')
+    const sections = params.getAll('section')
+    if (sections.length !== 1 || sections[0] !== 'ai-providers') return { view: 'settings' }
+    const returned = ['mobius_enroll_return', 'mobius_enroll_error'].some(key => {
+      const values = params.getAll(key)
+      return values.length === 1 && values[0] === '1'
+    })
+    return { view: 'settings', section: 'ai-providers', ...(returned ? { providerReturn: true } : {}) }
   }
   return null
 }

@@ -1018,7 +1018,9 @@ def test_self_host_mobius_callback_uses_single_use_broker_state_without_auth_hea
     follow_redirects=False,
   )
   assert callback.status_code == 303
-  assert callback.headers["location"] == "/settings?section=ai-providers"
+  assert callback.headers["location"] == (
+    "/settings?section=ai-providers&mobius_enroll_return=1"
+  )
   replay = client.get(
     "/api/auth/provider/mobius/callback",
     params={"code": "central-code", "state": state},
