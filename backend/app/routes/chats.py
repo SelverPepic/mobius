@@ -707,15 +707,14 @@ def _chat_detail_response(
       projected_message["wait_summaries"] = summaries
       next_page[relative_index] = projected_message
     page = next_page
-  from app.continuations import recovery_reasons_by_run_id
-  recovery_reasons = recovery_reasons_by_run_id(db, chat.id, [
-    message["id"] for message in page
-    if message.get("role") == "assistant" and isinstance(message.get("id"), str)
-  ])
+  from app.continuations import recovery_reasons_by_message_index
+  recovery_reasons = recovery_reasons_by_message_index(
+    db, chat.id, all_msgs, message_start=start, message_end=start + len(page),
+  )
   if recovery_reasons:
     next_page = list(page)
     for relative_index, message in enumerate(page):
-      reason = recovery_reasons.get(message.get("id"))
+      reason = recovery_reasons.get(start + relative_index)
       if message.get("role") != "assistant" or reason is None:
         continue
       next_page[relative_index] = {**message, "continuation_reason": reason}

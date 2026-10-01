@@ -105,7 +105,7 @@ import MsgContent from './MsgContent.jsx'
 import MessageMetaRow from './MessageMetaRow.jsx'
 import ActivityLineHeader from './ActivityLineHeader.jsx'
 import { messageCopyText } from './messageCopy.js'
-import { formatResetTime } from './resetTime.js'
+import { formatResetTime, isProviderLimitPause, pauseTiming } from './resetTime.js'
 import { isResourcePause } from './waitingPresentation.js'
 import { limitRecoveryCredit } from './limitRecoveryCredit.js'
 import {
@@ -1545,7 +1545,7 @@ export default function ChatView({
         running: !!data.running,
         activeAssistantMessageId: data.active_assistant_message_id || null,
         pendingQuestionId: data.pending_question_id || null,
-        pendingLimitResume: !!tailResumableBlock(msgs)?.pause?.resets_at,
+        pendingLimitResume: isProviderLimitPause(tailResumableBlock(msgs)?.pause),
       }
       // Stream retirement and the authoritative replacement must be one
       // commit, not two paints separated by the detail request.
@@ -5538,7 +5538,12 @@ export default function ChatView({
   // then just looks stopped. Detect the tail resumable block so the offscreen
   // nudge + SR status can name the recovery. A pause is terminal (the turn has
   // ended), so it only ever lives in `messages`, never in a live stream item.
-  const pendingResumeBlock = tailResumableBlock(messages)
+  const recoveryMessages = useMemo(() => supersedeResumedPauseBlocks(messages, {
+    running: serverRunning && !hasPendingQuestion,
+    activeAssistantMessageId,
+    streamAssistantMessageId,
+  }), [messages, serverRunning, hasPendingQuestion, activeAssistantMessageId, streamAssistantMessageId])
+  const pendingResumeBlock = tailResumableBlock(recoveryMessages)
   const resourcePause = isResourcePause(pendingResumeBlock)
     ? pendingResumeBlock
     : null
@@ -5549,7 +5554,8 @@ export default function ChatView({
     && !hasPendingQuestion
     && !resourcePause
     && !modelCapacityPause
-  const pendingLimitResetAt = pendingResumeBlock?.pause?.resets_at || null
+  const { checkAt: pendingLimitCheckAt, resetAt: pendingLimitResetAt } = pauseTiming(pendingResumeBlock?.pause)
+  const pendingLimitPark = isProviderLimitPause(pendingResumeBlock?.pause)
   // New parks preserve the provider that actually enforced the limit. Older
   // cards predate that fact, so fall back to the chat's current provider.
   const pendingLimitProvider = pendingResumeBlock?.pause?.provider
@@ -5557,24 +5563,24 @@ export default function ChatView({
     || null
   const pendingLimitUsageQuery = settingsQueries.providerUsage.useQuery(
     pendingLimitProvider,
-    { enabled: Boolean(pendingLimitResetAt && pendingLimitProvider) },
+    { enabled: Boolean(pendingLimitPark && pendingLimitProvider) },
   )
   const pendingLimitRecoveryCredit = limitRecoveryCredit(
     pendingLimitProvider,
     pendingLimitUsageQuery.data,
   )
   useEffect(() => {
-    if (!embedded || !autoResumeEnabled || !pendingLimitResetAt) {
-      if (!pendingLimitResetAt) armedEmbeddedResetRef.current = null
+    if (!embedded || !autoResumeEnabled || !pendingLimitPark || !pendingLimitCheckAt) {
+      if (!pendingLimitCheckAt) armedEmbeddedResetRef.current = null
       return
     }
-    if (armedEmbeddedResetRef.current === pendingLimitResetAt) return
-    armedEmbeddedResetRef.current = pendingLimitResetAt
+    if (armedEmbeddedResetRef.current === pendingLimitCheckAt) return
+    armedEmbeddedResetRef.current = pendingLimitCheckAt
     // Arm the parent protocol once per durable park, before the automatic run
     // exists. If both system events are missed, the stream-open authoritative
     // idle handshake can still complete this new turn exactly once.
     onExternalRunEventRef.current?.('auto_resume_waiting')
-  }, [autoResumeEnabled, embedded, pendingLimitResetAt])
+  }, [autoResumeEnabled, embedded, pendingLimitPark, pendingLimitCheckAt])
   const handleEmbeddedRunEvent = useCallback((event) => {
     if (
       !embedded
@@ -5599,15 +5605,15 @@ export default function ChatView({
   useSystemEventStream(handleEmbeddedRunEvent, {
     enabled: !!(
       embedded
-      && ((autoResumeEnabled && pendingLimitResetAt) || embeddedRunActive)
+      && ((autoResumeEnabled && pendingLimitPark && pendingLimitCheckAt) || embeddedRunActive)
     ),
     onOpen: handleEmbeddedStreamOpen,
   })
-  const limitResetElapsed = resetDeadlineState(pendingLimitResetAt).elapsed
+  const limitResetElapsed = resetDeadlineState(pendingLimitCheckAt).elapsed
   const showAutoResumeControl = !!(
     !embedded
     && chatInfo !== null
-    && pendingLimitResetAt
+    && pendingLimitPark && pendingLimitCheckAt
     // Once enabled, keep the persistent policy cancellable even if the
     // viewer's clock passes the advertised reset before the server resumes.
     && (!limitResetElapsed || autoResumeEnabled)
@@ -5619,7 +5625,7 @@ export default function ChatView({
     let cancelled = false
     const schedule = () => {
       if (cancelled) return
-      const delayMs = resetDeadlineDelay(pendingLimitResetAt)
+      const delayMs = resetDeadlineDelay(pendingLimitCheckAt)
       if (delayMs === null) return
       timer = setTimeout(() => {
         setLimitResetClockTick(tick => tick + 1)
@@ -5633,7 +5639,7 @@ export default function ChatView({
       cancelled = true
       if (timer !== null) clearTimeout(timer)
     }
-  }, [clearAutoResumeError, pendingLimitResetAt])
+  }, [clearAutoResumeError, pendingLimitCheckAt])
 
   // Visibility of either card is a pure viewport question — an
   // IntersectionObserver rooted at the scroll container is the signal, no
@@ -5747,23 +5753,23 @@ export default function ChatView({
         ? 'Waiting for storage headroom. This chat will resume automatically.'
         : 'Waiting for memory to settle. This chat will resume automatically.'
     }
-    if (pendingResumeBlock.pause?.resets_at) {
-      if (modelCapacityPause) {
-        const label = formatResetTime(pendingResumeBlock.pause.resets_at)
-        return label
-          ? `Selected model is busy. Retrying ${label}.`
-          : 'Selected model is busy. Retrying automatically shortly.'
-      }
-      const label = formatResetTime(pendingResumeBlock.pause.resets_at)
-      if (autoResumeEnabled) {
-        return label
-          ? `Usage limit reached. Queued to continue ${label}.`
-          : 'Usage limit reached. Queued to continue automatically.'
-      }
-      if (limitResetElapsed) return 'Usage is available again. Continue available.'
+    if (modelCapacityPause) {
+      const label = formatResetTime(pendingLimitCheckAt)
       return label
-        ? `Usage limit reached. Usage resets ${label}. Automatic continuation available.`
-        : 'Usage limit reached. Automatic continuation available.'
+        ? `Selected model is busy. Retrying ${label}.`
+        : 'Selected model is busy. Retrying automatically shortly.'
+    }
+    if (pendingLimitPark) {
+      const label = formatResetTime(pendingLimitCheckAt)
+      const resetLabel = formatResetTime(pendingLimitResetAt)
+      const providerReset = resetLabel
+        ? `Provider reports the limit resets ${resetLabel}.`
+        : 'Provider reset time unknown.'
+      if (autoResumeEnabled) {
+        return `Provider limit reached. ${providerReset} ${label ? `Next retry check ${label}.` : 'Retry check pending.'} Automatic continuation enabled.`
+      }
+      if (limitResetElapsed) return `Ready to retry; availability is not confirmed. ${providerReset}`
+      return `Provider limit reached. ${providerReset} ${label ? `Next retry check ${label}.` : 'Retry check pending.'} Automatic continuation available.`
     }
     if (pendingResumeBlock.pause?.kind === 'restart' && !pendingResumeBlock.pause.manual) {
       return 'Response paused for restart. Möbius will continue automatically.'
@@ -5850,10 +5856,10 @@ export default function ChatView({
   const draftGoal = draftGoalObjective(input)
   const displayedMessages = useMemo(
     () => projectSettledSteerContinuations(
-      supersedeResumedPauseBlocks(messages),
+      recoveryMessages,
       { preserveHidden: true },
     ),
-    [messages],
+    [recoveryMessages],
   )
   const peerTimeline = usePeerTimeline(
     chatId,
@@ -6269,19 +6275,17 @@ export default function ChatView({
                         activateOnTouchEnd: true,
                       })}
                     >
-                      {pendingResumeBlock?.pause?.resets_at
+                      {pendingLimitPark
                         ? autoResumeEnabled
                           ? (() => {
-                              const label = formatResetTime(
-                                pendingResumeBlock.pause.resets_at,
-                              )
+                              const label = formatResetTime(pendingLimitCheckAt)
                               return label
-                                ? `Queued to continue ${label}`
-                                : 'Queued to continue automatically'
+                                ? `Queued to retry ${label}`
+                                : 'Queued to retry automatically'
                             })()
                           : limitResetElapsed
-                            ? 'Usage available — tap to continue'
-                            : 'Usage limit reached — continuation available'
+                            ? 'Ready to retry — availability unconfirmed'
+                            : 'Provider limit reached — continuation available'
                         : pendingResumeBlock?.pause?.kind === 'restart' && !pendingResumeBlock.pause.manual
                           ? 'Paused for restart — continuing automatically'
                           : 'Turn paused — tap to resume'}
