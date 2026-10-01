@@ -1036,7 +1036,7 @@ def test_content_mode_suppresses_modals_without_dom_surgery():
   standalone = STANDALONE.read_text(encoding="utf-8")
 
   assert "querySelectorAll('.wt__overlay, #install-backdrop')" not in helper
-  assert "const showWalkthrough = !visualContentOnly" in shell
+  assert "const showWalkthrough = !isSharedBrowserAccess && !visualContentOnly" in shell
   assert "!visualContentOnly && (" in standalone
 
 
