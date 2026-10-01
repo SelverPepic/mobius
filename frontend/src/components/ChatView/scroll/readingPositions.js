@@ -1,3 +1,5 @@
+import { isSharedBrowserRoute } from '../../../lib/sharedBrowserWorkspace.js'
+
 /**
  * Durable reading-position storage for chat scroll.
  *
@@ -10,6 +12,9 @@ export const READING_POSITION_KEY = 'chat-reading-position'
 const READING_POSITION_LIMIT = 300
 
 const positions = (() => {
+  // Shared-browser access must not hydrate owner-local scroll history. Its
+  // reading positions are document-memory only, like its bearer token.
+  if (isSharedBrowserRoute()) return {}
   try {
     const parsed = JSON.parse(localStorage.getItem(READING_POSITION_KEY) || '{}')
     return (parsed && typeof parsed === 'object') ? parsed : {}
@@ -24,6 +29,7 @@ let writesEnabled = true
 
 function persist() {
   if (!writesEnabled) return
+  if (isSharedBrowserRoute()) return
   try {
     const entries = Object.entries(positions)
     if (entries.length > READING_POSITION_LIMIT) {

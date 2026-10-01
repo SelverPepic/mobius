@@ -1,8 +1,10 @@
 /* View acknowledgement for actionable work represented by the Brain's Changes row. */
+import { currentSharedBrowserStorage, isSharedBrowserRoute } from '../../lib/sharedBrowserWorkspace.js'
 
 const STORAGE_PREFIX = 'mobius:brain-changes-seen:v1:'
 
 function browserStorage() {
+  if (isSharedBrowserRoute()) return currentSharedBrowserStorage()
   try { return globalThis.localStorage ?? null } catch { return null }
 }
 

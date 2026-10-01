@@ -1377,9 +1377,11 @@ def _pending_head_is_stale(
   pending: list[dict], now_ms: int,
 ) -> bool:
   """Whether the queue head is old enough for an unattended claim."""
-  if not pending or not isinstance(pending[0], dict):
+  head = next((row for row in pending if isinstance(row, dict)
+               and row.get("delivery_status") != "rejected"), None)
+  if head is None:
     return False
-  timestamp = pending[0].get("ts")
+  timestamp = head.get("ts")
   if not isinstance(timestamp, (int, float)) or isinstance(timestamp, bool):
     return False
   age_ms = _IDLE_PENDING_MIN_AGE_SECS * 1000
@@ -2910,6 +2912,80 @@ async def stop_chat(
   return stopped_any, []
 
 
+def browser_grant_active_chat_ids(db, grant_id: str) -> list[str]:
+  """Return attributed live/parked chats for the existing Stop machinery.
+
+  ``stop_browser_grant_runs`` rechecks these candidates under each transition
+  lock; no second scheduler or cancellation state is introduced here.
+  """
+  return [chat_id for (chat_id,) in db.query(models.ChatRun.chat_id).filter(
+    models.ChatRun.browser_grant_id == grant_id,
+    models.ChatRun.status.in_(models.NONTERMINAL_RUN_STATUSES),
+  ).distinct().all()]
+
+
+async def stop_browser_grant_runs(grant_id: str, db: Session = None) -> dict:
+  """Stop only physical runs still attributed to a revoked browser grant.
+
+  A fresh state read under each chat's transition lock prevents a stale
+  revocation sweep from stopping a replacement owner/other-guest turn. Leave
+  queued messages intact: unrelated owner intent must not be collapsed by a
+  remote recipient's revocation. Attributed child chats are included because
+  their ChatRuns carry the inherited grant; unstarted children fail the
+  writer's grant check before their first provider admission.
+  """
+  from app.database import SessionLocal
+  from app.chat_writer import RejectBrowserPending
+  with SessionLocal() as state_db:
+    candidates = set(browser_grant_active_chat_ids(state_db, grant_id))
+    for candidate in _nonempty_pending_queues(state_db):
+      if any(isinstance(row, dict) and row.get("_browser_grant_id") == grant_id
+             for row in candidate.pending_messages or []):
+        candidates.add(candidate.id)
+  stopped: list[str] = []
+  incomplete: list[str] = []
+  rejected_messages = 0
+  for chat_id in sorted(candidates):
+    async with chat_queue.get_transition_lock(chat_id):
+      with SessionLocal() as state_db:
+        from app.run_state import latest_run
+        current = latest_run(state_db, chat_id)
+        attributed = (
+          current is not None
+          and current.status in models.NONTERMINAL_RUN_STATUSES
+          and current.browser_grant_id == grant_id
+        )
+      if attributed:
+        complete, _ = await _stop_chat_for_locked(
+          chat_id, db=db, preserve_pending=True,
+        )
+        with SessionLocal() as state_db:
+          from app.run_state import latest_run
+          after = latest_run(state_db, chat_id)
+          still_attributed = (
+            after is not None
+            and after.status in models.NONTERMINAL_RUN_STATUSES
+            and after.browser_grant_id == grant_id
+          )
+        if not complete or still_attributed:
+          incomplete.append(chat_id)
+        else:
+          stopped.append(chat_id)
+      async with chat_queue.get_lock(chat_id):
+        result = await _await_ack(get_writer().submit(RejectBrowserPending(
+          chat_id=chat_id, browser_grant_id=grant_id,
+        )))
+        rejected_messages += result["rejected"]
+  if incomplete:
+    from fastapi import HTTPException
+    raise HTTPException(status_code=503, detail={
+      "code": "browser_grant_stop_incomplete",
+      "message": "Access was revoked, but some attributed runs are still stopping. Retry revocation.",
+      "chat_ids": incomplete,
+    })
+  return {"stopped_chat_ids": stopped, "rejected_messages": rejected_messages}
+
+
 async def stop_chat_for(
   chat_id: str, db: Session = None,
 ) -> tuple[bool, list[str]]:
@@ -3012,7 +3088,9 @@ async def clear_goal_for(chat_id: str, expected_goal_id: str) -> dict:
 
 
 async def _stop_chat_for_locked(
-  chat_id: str, db: Session = None,
+  chat_id: str, db: Session = None, *,
+  actor: str | None = None, actor_id: str | None = None,
+  preserve_pending: bool = False,
 ) -> tuple[bool, list[str]]:
   """Stop one chat while its per-chat lifecycle transition is exclusive."""
   stopped_gen = current_run_generation(chat_id)
@@ -3047,7 +3125,7 @@ async def _stop_chat_for_locked(
   # an empty cleared list: handleStop re-sends only what the backend confirms
   # it cleared (the PM-115 contract), so an empty list means the frontend
   # re-sends nothing and the queue rides through the restart intact.
-  if not draining:
+  if not draining and not preserve_pending:
     try:
       async with asyncio.timeout(chat_queue.TERMINAL_LOCK_TIMEOUT_SECS):
         async with chat_queue.get_lock(chat_id):
@@ -5529,6 +5607,18 @@ async def _run_chat_impl_with_db(
     db.close()
     return disposition
 
+  run_lineage = db.get(models.ChatRun, run_token) if run_token else None
+  if run_lineage is None:
+    raise RuntimeError("Provider admission has no durable run lineage")
+  if run_lineage.browser_grant_id is not None:
+    from app.browser_access import validate_grant
+    validate_grant(
+      db, run_lineage.browser_grant_id, run_lineage.browser_grant_epoch,
+      owner.id,
+    )
+  elif run_lineage.browser_grant_epoch is not None:
+    raise RuntimeError("Incomplete browser grant lineage")
+
   if run_policy is not None:
     from app.delegations import delegation_execution_token
     agent_token = delegation_execution_token(
@@ -5540,6 +5630,8 @@ async def _run_chat_impl_with_db(
       owner.username,
       owner.token_epoch,
       run_id=run_token,
+      browser_grant_id=run_lineage.browser_grant_id,
+      browser_grant_epoch=run_lineage.browser_grant_epoch,
     )
 
   # Build the base environment shared by all providers.
@@ -5736,8 +5828,10 @@ async def _run_chat_impl_with_db(
         "owner MCP connections withheld (%s) chat_id=%s", reason, chat_id,
       )
     connector_turn_plan = build_turn_plan(
-      db,
-      include_owner_connectors=include_owner_connectors,
+      db, include_owner_connectors=include_owner_connectors,
+      owner_id=owner.id, owner_epoch=owner.token_epoch,
+      browser_grant_id=run_lineage.browser_grant_id,
+      browser_grant_epoch=run_lineage.browser_grant_epoch,
     )
   except Exception:
     log.warning(

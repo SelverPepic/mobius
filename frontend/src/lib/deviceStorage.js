@@ -1,3 +1,5 @@
+import { currentSharedBrowserStorage, isSharedBrowserRoute } from './sharedBrowserWorkspace.js'
+
 export const DEVICE_STORAGE = 'device.storage'
 
 const KEY_RE = /^[A-Za-z0-9._:-]{1,128}$/
@@ -12,6 +14,7 @@ function capabilityError(name, message, code) {
 
 function browserStorage(explicit) {
   if (explicit !== undefined) return explicit
+  if (isSharedBrowserRoute()) return currentSharedBrowserStorage()
   try { return globalThis.localStorage || null } catch { return null }
 }
 

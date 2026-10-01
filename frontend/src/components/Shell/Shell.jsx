@@ -207,6 +207,7 @@ import ScreenControlButton from './ScreenControlButton.jsx'
 import { createMediaSessionOwner } from './mediaSessionOwner.js'
 import { HistoryDismissProvider } from '../../hooks/useHistoryDismiss.jsx'
 import { rememberRecentDestination } from '../../lib/recentSelections.js'
+import { isSharedBrowserRoute, sharedBrowserRoutePath, sharedBrowserStorageForGrant } from '../../lib/sharedBrowserWorkspace.js'
 
 const APP_SETTINGS_SECTIONS = new Set([
   'ai-providers',
@@ -227,12 +228,18 @@ const SettingsView = lazy(() => import('../SettingsView/SettingsView.jsx'))
 // Capture the incoming fragment before navigation normalizes the URL; consume
 // the tab-scoped one-shot carry if identity sign-in redirected through /shell/.
 const incomingProjectCopy = (() => {
+  if (isSharedBrowserRoute(window.location.pathname)) return ''
   let session
   try { session = window.sessionStorage } catch { /* fragment-only in restricted browsers */ }
   return consumeProjectCopyRequest(window.location.href, session)
 })()
 
-export default function Shell({ onInitialVisualReady }) {
+export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null }) {
+  const sharedGrantId = sharedBrowserAccess?.grant.id
+  const isSharedBrowserAccess = Boolean(sharedBrowserAccess)
+  const sharedWorkspaceStorage = useMemo(() => sharedGrantId
+    ? sharedBrowserStorageForGrant(sharedGrantId)
+    : null, [sharedGrantId])
   const [projectCopyUrl, setProjectCopyUrl] = useState(incomingProjectCopy)
   function closeProjectCopy() {
     setProjectCopyUrl('')
@@ -251,7 +258,7 @@ export default function Shell({ onInitialVisualReady }) {
     setOpen: setDesktopSidebarOpen,
     width: desktopSidebarWidth,
     setWidth: setDesktopSidebarWidth,
-  } = useDesktopSidebar()
+  } = useDesktopSidebar(isSharedBrowserAccess ? sharedWorkspaceStorage : localStorage)
 
   const {
     workspace,
@@ -277,8 +284,8 @@ export default function Shell({ onInitialVisualReady }) {
     visiblePaneIds,
     persistWorkspaceSnapshot,
   } = useWorkspaceSession({
-    storage: localStorage,
-    legacyStorage: sessionStorage,
+    storage: isSharedBrowserAccess ? sharedWorkspaceStorage : localStorage,
+    legacyStorage: sharedBrowserAccess ? null : sessionStorage,
   })
   // Back/Forward can reserve a draft's mobile writing session before the
   // outgoing surface becomes inert. The callback is filled after the shared
@@ -314,17 +321,20 @@ export default function Shell({ onInitialVisualReady }) {
     replaceImplicitBootTab,
     dragActiveRef,
     beforeRestoreRouteRef,
+    navigationStorage: isSharedBrowserAccess ? sharedWorkspaceStorage : localStorage,
+    routePath: sharedBrowserAccess ? sharedBrowserRoutePath() : '/shell/',
   })
 
   // Navigation owns the search MRU so drawer, history, deep-link, and search
   // activations all contribute the same current destination.
   useEffect(() => {
+    if (isSharedBrowserAccess) return
     rememberRecentDestination({
       view: activeView,
       chatId: activeChatId,
       appId: activeAppId,
     })
-  }, [activeAppId, activeChatId, activeView])
+  }, [activeAppId, activeChatId, activeView, isSharedBrowserAccess])
 
   // A mobile drawer is a history-backed virtual route. A desktop sidebar is a
   // saved layout preference. Keep those state machines separate: while a mobile
@@ -1044,6 +1054,7 @@ export default function Shell({ onInitialVisualReady }) {
     retireAppHistory,
     tombstoneRoute,
     dispatchWorkspace,
+    storage: isSharedBrowserAccess ? sharedWorkspaceStorage : localStorage,
   })
   // Becoming a two-tab workspace engages the strip; returning to zero resets it.
   // A single implicit home tab on a fresh session stays visually identical to
@@ -2146,23 +2157,26 @@ export default function Shell({ onInitialVisualReady }) {
   // wall time for them. Automated browsers (agent screenshots) run on the
   // server's clock and do not speak for the owner, so they never report.
   useEffect(() => {
+    if (isSharedBrowserAccess) return
     if (typeof navigator !== 'undefined' && navigator.webdriver) return
     let zone = ''
     try { zone = Intl.DateTimeFormat().resolvedOptions().timeZone || '' } catch (_) {}
     if (zone) api.owner.timezone.save(zone).catch(() => {})
-  }, [])
+  }, [isSharedBrowserAccess])
   // First-sign-in walkthrough. The query result is the source of
   // truth — backend persists completion via
   // POST /api/owner/walkthrough/complete. We render the overlay iff
   // the query has resolved AND `completed` is false; both gates
   // matter (rendering before resolution shows a flash for users who
   // are already past it).
-  const walkthroughQuery = ownerQueries.walkthrough.useQuery()
+  const walkthroughQuery = ownerQueries.walkthrough.useQuery({ enabled: !isSharedBrowserAccess })
   let visualContentOnly = false
-  try {
-    visualContentOnly = sessionStorage.getItem('mobius:visual-content-only') === '1'
-  } catch (_) {}
-  const showWalkthrough = !visualContentOnly
+  if (!isSharedBrowserAccess) {
+    try {
+      visualContentOnly = sessionStorage.getItem('mobius:visual-content-only') === '1'
+    } catch (_) {}
+  }
+  const showWalkthrough = !isSharedBrowserAccess && !visualContentOnly
     && walkthroughQuery.isFetched
     && walkthroughQuery.data
     && !walkthroughQuery.data.completed
@@ -2221,7 +2235,8 @@ export default function Shell({ onInitialVisualReady }) {
     win: window,
     doc: document,
     nav: navigator,
-    storage: sessionStorage,
+    storage: isSharedBrowserAccess ? sharedWorkspaceStorage : sessionStorage,
+    sharedBrowserAccess: Boolean(sharedBrowserAccess),
     queryClient,
     persistWorkspaceSnapshot,
     workspaceStateRef,
@@ -4606,6 +4621,12 @@ export default function Shell({ onInitialVisualReady }) {
           />
         </div>
       </header>
+      {sharedBrowserAccess && <div className="shell__shared-access">
+        <span title="Trusted access to this Möbius instance, including chats, apps, data and actions">
+          Shared access · {sharedBrowserAccess.grant.label || 'Möbius'}
+        </span>
+        <button type="button" onClick={sharedBrowserAccess.onLeave}>Leave</button>
+      </div>}
 
       <Drawer
         open={navigationOpen}
@@ -5272,6 +5293,7 @@ export default function Shell({ onInitialVisualReady }) {
                 focusTarget={settingsFocusTarget}
                 active={settingsFullBleed || !!settingsPaned}
                 refreshToken={settingsRefreshToken}
+                onLeaveSharedAccess={sharedBrowserAccess?.onLeave || null}
               />
             </Suspense>
           </div>

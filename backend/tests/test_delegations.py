@@ -619,7 +619,7 @@ def test_app_token_can_only_submit_bounded_work_under_its_own_child(
   child_policy = policy_for_chat(db, child_id)
   assert child_policy is not None and child_policy.depth == 1
   child_auth = {
-    "Authorization": f"Bearer {delegation_execution_token(db, child_policy)}"
+    "Authorization": f"Bearer {delegation_execution_token(db, child_policy, run_id='child-parent-run')}"
   }
   async def fake_models(_data_dir):
     return {
@@ -669,7 +669,7 @@ def test_app_token_can_only_submit_bounded_work_under_its_own_child(
     assert nested_parent_policy is not None
     nested_auth = {
       "Authorization": (
-        f"Bearer {delegation_execution_token(db, nested_parent_policy)}"
+        f"Bearer {delegation_execution_token(db, nested_parent_policy, run_id=f'depth-{depth}-parent-run')}"
       )
     }
     deeper = client.post("/api/delegations", json={
@@ -693,7 +693,7 @@ def test_app_token_can_only_submit_bounded_work_under_its_own_child(
   assert fifth_parent_policy is not None and fifth_parent_policy.depth == 4
   fifth_parent_auth = {
     "Authorization": (
-      f"Bearer {delegation_execution_token(db, fifth_parent_policy)}"
+      f"Bearer {delegation_execution_token(db, fifth_parent_policy, run_id='depth-5-parent-run')}"
     )
   }
   fifth = client.post("/api/delegations", json={
@@ -1830,7 +1830,7 @@ def _drive_parent_turn(
     if provider_error is not None:
       bc.publish({"type": "error", "message": provider_error})
       return {"session_id": None, "cost_usd": None, "error": provider_error}
-    bc.publish({"type": "text", "content": response})
+    bc.publish({"type": "text_final", "text_item_id": "checkpoint-answer", "content": response})
     if before_provider_return is not None:
       before_provider_return()
     return {

@@ -6,9 +6,15 @@ import {
   set as setIdbValue,
 } from 'idb-keyval'
 import { reclaimStoredStreamSnapshots } from './streamSnapshotCache.js'
+import { currentSharedBrowserStorage, isSharedBrowserRoute } from '../../lib/sharedBrowserWorkspace.js'
+
+function sharedBrowserDrafts() {
+  return isSharedBrowserRoute()
+}
 
 function availableStorage(storage) {
   if (storage !== undefined) return storage
+  if (sharedBrowserDrafts()) return currentSharedBrowserStorage()
   try { return globalThis.sessionStorage ?? null } catch { return null }
 }
 
@@ -45,6 +51,7 @@ function rememberLiveDraft(chatId, raw, source, { advance = false } = {}) {
 }
 
 function queueDurableDraftWrite(chatId, raw) {
+  if (sharedBrowserDrafts()) return Promise.resolve()
   const id = draftId(chatId)
   let state = durableWrites.get(id)
   if (state) {
@@ -102,6 +109,7 @@ export async function flushComposerDraftPersistence() {
 
 /** Clear both the live mirror and the dedicated owner-draft database on logout. */
 export async function clearDurableComposerDrafts() {
+  if (sharedBrowserDrafts()) return
   durableGeneration += 1
   liveDrafts.clear()
   draftRevisions.clear()
@@ -235,6 +243,7 @@ export function readComposerDraft(chatId, storage) {
  */
 export async function readComposerDraftAsync(chatId) {
   if (chatId == null) return { input: '', attachments: [] }
+  if (sharedBrowserDrafts()) return readComposerDraft(chatId)
   const id = draftId(chatId)
   const revisionAtStart = revisionOf(id)
   const current = liveDrafts.get(id)

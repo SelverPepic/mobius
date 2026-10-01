@@ -10,6 +10,7 @@ from app.routes import connect
 
 @pytest.fixture(autouse=True)
 def clear_connect_state():
+  connect._pair_limiter.reset()
   connect._channels.clear()
   connect._commands.clear()
   yield

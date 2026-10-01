@@ -187,7 +187,7 @@
         mode = d.mode || infer(bg);
       }
     } catch (e) {}
-    if (!bg) {
+    if (!bg && !(location.pathname.endsWith('/shell/shared') || location.pathname.endsWith('/shell/shared/'))) {
       try {
         var raw = localStorage.getItem('mobius-theme');
         if (raw) {
@@ -244,7 +244,7 @@
     // Opaque app frames use a memory-only storage shim with an EMPTY slot, so it must NOT write — else it clobbers the owner's
     // real theme with the dark default and the shell re-reads it (drawer bleed).
     try {
-      if (window.parent === window) {
+      if (window.parent === window && !(location.pathname.endsWith('/shell/shared') || location.pathname.endsWith('/shell/shared/'))) {
         localStorage.setItem('mobius-theme', JSON.stringify({ bg: bg, mode: mode }));
       }
     } catch (e) {}

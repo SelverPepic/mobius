@@ -1,9 +1,13 @@
 /* Recent selections are one bounded MRU list shared by shell navigation and search. */
+import { isSharedBrowserRoute } from './sharedBrowserWorkspace.js'
 
 export const RECENT_SELECTION_LIMIT = 12
 const RECENT_SELECTIONS_STORAGE_KEY = 'mobius:global-search:recent-selections:v1'
 
 function browserStorage() {
+  // The shared shell has its own session-scoped navigation; owner MRU must not
+  // be read or amended by a guest (including the search modal's default read).
+  if (isSharedBrowserRoute()) return null
   try {
     return globalThis.localStorage || null
   } catch (_) {

@@ -82,6 +82,9 @@
     "0075_notification_seen_at": "127060b297085cfb0c4f1953533da06031a7ccd9aebcaf9487ba605e1e4c9c92",
     "0076_legacy_helper_interruption": "b25cbf7974f6b75387f4e1fb8b896e6bd29fb163a1e19a890a0637ece558b1eb",
     "0077_chat_archive": "764ce51985533ff56149c3501f4c87b0308cfaf6e3c91dad400573c9cddb9e95",
-    "0077_note_recovery_attempted": "7ca40661e4dd079a503eba3a0119d40bce00c1ae4977221c19499afda32e4252"
+    "0077_note_recovery_attempted": "7ca40661e4dd079a503eba3a0119d40bce00c1ae4977221c19499afda32e4252",
+    "0078_browser_access_tables": "3239e635c60b7c42d97427c24146599185e8c62b953499c1506da0abd64b1814",
+    "0079_chat_run_browser_lineage": "4b7b8175b039f23d048fbb56b35958a9ffba512706ffd7923842d03622e17217",
+    "0080_embed_browser_lineage": "3b300c865a5a6a4742ca676f29776cb179d665655f76431977305a41850cb9c1"
   }
 }

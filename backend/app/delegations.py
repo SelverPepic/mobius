@@ -10,7 +10,7 @@ projection. It never writes Chat.messages or Chat.pending_messages directly.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 import hashlib
 import json
@@ -111,6 +111,8 @@ class DelegationIntent:
   # Placement under the parent Goal's plan, not task identity: reattaching by
   # name never re-files the helper.
   goal_task_id: str | None = None
+  browser_grant_id: str | None = None
+  browser_grant_epoch: int | None = None
 
 
 def same_delegation_intent(
@@ -150,6 +152,10 @@ def _attach_existing_delegation(
     raise ValueError(
       "task key is already attached to different immutable work"
     )
+  if (
+    row.browser_grant_id, row.browser_grant_epoch
+  ) != (intent.browser_grant_id, intent.browser_grant_epoch):
+    raise ValueError("task key belongs to different browser authority")
   # Notification is an observation owner, not task identity. Reattachment
   # must not add a second observer: the submit route may transfer an
   # undelivered background wake to a blocking caller under the parent's
@@ -168,19 +174,54 @@ def create_or_attach_delegation(
   steps leaves a discoverable ``starting`` delegation that reconciliation can
   safely start with the same immutable prompt.
   """
+  if intent.browser_grant_id is not None:
+    from app.browser_access import validate_grant
+    validate_grant(db, intent.browser_grant_id, intent.browser_grant_epoch,
+                   db.query(models.Owner.id).scalar())
+  spawning_run = db.query(models.ChatRun).filter(
+    models.ChatRun.chat_id == intent.parent_chat_id,
+    models.ChatRun.status.in_(ACTIVE_RUN_STATUSES),
+  ).order_by(models.ChatRun.started_at.desc()).first()
+  if spawning_run is not None:
+    spawning_root = (
+      spawning_run.goal_id or spawning_run.root_run_id or spawning_run.id
+    )
+    if spawning_root != intent.parent_root_run_id:
+      spawning_run = None
+  if spawning_run is None:
+    spawning_run = db.query(models.ChatRun).filter(
+      models.ChatRun.chat_id == intent.parent_chat_id,
+      or_(
+        models.ChatRun.id == intent.parent_root_run_id,
+        models.ChatRun.root_run_id == intent.parent_root_run_id,
+        models.ChatRun.goal_id == intent.parent_root_run_id,
+      ),
+    ).order_by(models.ChatRun.started_at.desc()).first()
+  grant_id = intent.browser_grant_id or (spawning_run.browser_grant_id if spawning_run else None)
+  grant_epoch = (intent.browser_grant_epoch if intent.browser_grant_id is not None
+                 else spawning_run.browser_grant_epoch if spawning_run else None)
+  if grant_id is not None:
+    from app.browser_access import validate_grant
+    owner_id = db.query(models.Owner.id).scalar()
+    validate_grant(db, grant_id, grant_epoch, owner_id)
+  # Attachment must carry the same authority as the existing child. The
+  # authenticated guest wins over an owner-authored parent physical run.
+  resolved_intent = replace(intent, browser_grant_id=grant_id,
+                            browser_grant_epoch=grant_epoch)
   row = db.query(models.Delegation).filter(
     models.Delegation.parent_root_run_id == intent.parent_root_run_id,
     models.Delegation.task_key == intent.task_key,
   ).first()
   if row is not None:
-    return _attach_existing_delegation(db, row, intent)
-
+    return _attach_existing_delegation(db, row, resolved_intent)
   child_id = str(uuid.uuid4())
   row = models.Delegation(
     id=str(uuid.uuid4()),
     app_id=intent.app_id,
     parent_chat_id=intent.parent_chat_id,
     parent_root_run_id=intent.parent_root_run_id,
+    browser_grant_id=grant_id,
+    browser_grant_epoch=grant_epoch,
     task_key=intent.task_key,
     goal_task_id=intent.goal_task_id,
     child_chat_id=child_id,
@@ -229,7 +270,7 @@ def create_or_attach_delegation(
     ).first()
     if row is None:
       raise ValueError("different delegation claimed the task key")
-    return _attach_existing_delegation(db, row, intent)
+    return _attach_existing_delegation(db, row, resolved_intent)
   # Anchor the parent's live "helper working" row where the launch happened.
   from app.activity_position import record_activity_position
   record_activity_position(
@@ -1151,6 +1192,20 @@ def delegation_execution_token(
     raise RuntimeError("delegation is unavailable")
   if row.scope != "write" or row.interrupted_at is not None:
     raise RuntimeError("legacy helper cannot receive an execution token")
+  run = db.get(models.ChatRun, run_id) if run_id else None
+  if run is None:
+    raise RuntimeError("Delegation has no durable run lineage")
+  if run.chat_id != row.child_chat_id:
+    raise RuntimeError("Delegation run does not belong to its child chat")
+  if (run.browser_grant_id, run.browser_grant_epoch) != (
+    row.browser_grant_id, row.browser_grant_epoch,
+  ):
+    raise RuntimeError("Delegation run browser lineage does not match")
+  if run.browser_grant_id is not None:
+    from app.browser_access import validate_grant
+    validate_grant(db, run.browser_grant_id, run.browser_grant_epoch, owner.id)
+  elif run.browser_grant_epoch is not None:
+    raise RuntimeError("Incomplete browser grant lineage")
   return auth.create_agent_token(
     row.child_chat_id,
     owner.username,
@@ -1159,6 +1214,8 @@ def delegation_execution_token(
     expires_delta=auth.AGENT_RUN_TOKEN_TTL,
     delegation_id=policy.delegation_id,
     delegation_chat=row.child_chat_id,
+    browser_grant_id=run.browser_grant_id,
+    browser_grant_epoch=run.browser_grant_epoch,
   )
 
 

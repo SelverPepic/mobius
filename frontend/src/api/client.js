@@ -10,6 +10,7 @@ import { clearOwnerDraftStorage } from '../lib/ownerDraftStorage.js'
 import { clearReadingPositions } from '../components/ChatView/scroll/readingPositions.js'
 import { clearDurableComposerDrafts } from '../components/ChatView/composerDraft.js'
 import { clearChatOutbox } from '../components/ChatView/chatOutbox.js'
+import { setActiveSharedBrowserGrantId, sharedBrowserCacheBuster } from '../lib/sharedBrowserWorkspace.js'
 import {
   reportNetworkReachable,
   verifyConnectivity,
@@ -36,6 +37,96 @@ let ephemeralAuthEnabled = false
 let ephemeralToken = null
 let ephemeralInstanceId = null
 let ephemeralSessionGeneration = 0
+// A shared-browser session is not an owner or an opaque chat embed. Its bearer
+// lives only in this document; the renewal cookie is HttpOnly and server scoped.
+let sharedBrowserEnabled = false
+let sharedBrowserToken = null
+let sharedBrowserGrantId = null
+let sharedBrowserExpiresAt = 0
+let sharedBrowserGeneration = 0
+let sharedBrowserRenewal = null
+let pendingSharedBrowserLogoutGrantId = null
+let sharedBrowserClosed = false
+
+export function beginSharedBrowserAuth() {
+  sharedBrowserEnabled = true
+  sharedBrowserClosed = false
+}
+
+export function isSharedBrowserAuth() { return sharedBrowserEnabled }
+
+function acceptSharedBrowserSession(data, { renewal = false } = {}) {
+  if (!data?.access_token || data.token_type?.toLowerCase() !== 'bearer'
+      || !data.grant?.id || !Number.isFinite(Number(data.expires_in))) {
+    throw new Error('SHARED_ACCESS_INVALID_SESSION')
+  }
+  if (renewal && sharedBrowserGrantId !== null
+      && String(data.grant.id) !== sharedBrowserGrantId) {
+    throw new Error('SHARED_ACCESS_GRANT_CHANGED')
+  }
+  sharedBrowserToken = data.access_token
+  sharedBrowserGrantId = String(data.grant.id)
+  setActiveSharedBrowserGrantId(sharedBrowserGrantId)
+  sharedBrowserExpiresAt = Date.now() + Math.min(900, Number(data.expires_in)) * 1000
+  sharedBrowserGeneration += 1
+  return data
+}
+
+export function clearSharedBrowserSession() {
+  sharedBrowserClosed = true
+  sharedBrowserToken = null
+  sharedBrowserGrantId = null
+  setActiveSharedBrowserGrantId(null)
+  sharedBrowserExpiresAt = 0
+  sharedBrowserGeneration += 1
+  try { window.dispatchEvent(new CustomEvent('mobius:shared-browser-auth-ended')) } catch {}
+}
+
+async function sharedBrowserSessionRequest(path, body) {
+  const generationAtStart = sharedBrowserGeneration
+  const response = await fetch(`${BASE}/api/connect/browser-access/${path}`, {
+    method: 'POST', credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  })
+  if (!response.ok) throw new Error('SHARED_ACCESS_ENDED')
+  const data = await response.json()
+  if (sharedBrowserGeneration !== generationAtStart) throw new Error('SHARED_ACCESS_SUPERSEDED')
+  return acceptSharedBrowserSession(data, { renewal: path === 'session' })
+}
+
+export function redeemSharedBrowserInvite(invite) {
+  if (!sharedBrowserEnabled || !invite) throw new Error('SHARED_ACCESS_INVALID_INVITE')
+  sharedBrowserClosed = false
+  return sharedBrowserSessionRequest('session/redeem', { invite })
+}
+
+export function renewSharedBrowserSession() {
+  if (!sharedBrowserEnabled) throw new Error('SHARED_ACCESS_NOT_ENABLED')
+  if (sharedBrowserClosed) throw new Error('SHARED_ACCESS_ENDED')
+  if (!sharedBrowserRenewal) {
+    sharedBrowserRenewal = sharedBrowserSessionRequest('session').catch(error => {
+      clearSharedBrowserSession()
+      throw error
+    }).finally(() => { sharedBrowserRenewal = null })
+  }
+  return sharedBrowserRenewal
+}
+
+export async function leaveSharedBrowserSession() {
+  const grantId = sharedBrowserGrantId || pendingSharedBrowserLogoutGrantId
+  if (!grantId) throw new Error('SHARED_ACCESS_LOGOUT_UNAVAILABLE')
+  pendingSharedBrowserLogoutGrantId = grantId
+  clearSharedBrowserSession()
+  const response = await fetch(`${BASE}/api/connect/browser-access/session/logout`, {
+    method: 'POST', credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ grant_id: grantId }),
+  })
+  if (!response.ok) throw new Error('SHARED_ACCESS_LOGOUT_FAILED')
+  pendingSharedBrowserLogoutGrantId = null
+  return true
+}
 
 export function beginEphemeralAuth() {
   ephemeralAuthEnabled = true
@@ -65,7 +156,8 @@ export function clearEphemeralAuthSession() {
 // its per-chat cache entry atomically when that session changes, without
 // exposing or decoding the bearer itself.
 export function getAuthSessionCacheKey() {
-  return ephemeralAuthEnabled ? `embed:${ephemeralSessionGeneration}` : 'owner'
+  return sharedBrowserEnabled ? `shared:${sharedBrowserGeneration}`
+    : ephemeralAuthEnabled ? `embed:${ephemeralSessionGeneration}` : 'owner'
 }
 
 export function isEphemeralAuth() {
@@ -77,12 +169,19 @@ export function isEphemeralAuth() {
 // to decide between Shell / Login / SetupWizard — an uncaught throw
 // here would crash the splash. Wrap all three helpers defensively.
 export function getToken() {
+  if (sharedBrowserEnabled) return sharedBrowserToken
   if (ephemeralAuthEnabled) return ephemeralToken
   try { return localStorage.getItem('token') } catch { return null }
 }
 
 export function getAuthHeaders(extra = {}) {
   const token = getToken()
+  if (sharedBrowserEnabled) {
+    const safeExtra = Object.fromEntries(Object.entries(extra).filter(
+      ([name]) => name.toLowerCase() !== 'authorization',
+    ))
+    return { ...safeExtra, ...(token ? { Authorization: `Bearer ${token}` } : {}) }
+  }
   return {
     ...(token ? { Authorization: `Bearer ${token}` } : {}),
     ...(ephemeralAuthEnabled && ephemeralInstanceId
@@ -93,11 +192,16 @@ export function getAuthHeaders(extra = {}) {
 }
 
 export function setToken(token) {
+  if (sharedBrowserEnabled) throw new Error('Owner token cannot be set in shared access')
   try { localStorage.setItem('token', token) } catch {}
   try { window.dispatchEvent(new Event(OWNER_TOKEN_CHANGED_EVENT)) } catch {}
 }
 
 export function clearToken() {
+  if (sharedBrowserEnabled) {
+    clearSharedBrowserSession()
+    return
+  }
   if (ephemeralAuthEnabled) {
     clearEphemeralAuthSession()
     return
@@ -169,6 +273,7 @@ function clearOwnerClientState({ preserveChatOutbox }) {
 
 /** Remove every browser-local trace owned by the current signed-in owner. */
 export function clearQueryCache() {
+  if (sharedBrowserEnabled) return Promise.resolve()
   return clearOwnerClientState({ preserveChatOutbox: false })
 }
 
@@ -179,6 +284,10 @@ export function clearQueryCache() {
  * it with the rest of the owner-scoped browser state.
  */
 export async function clearExpiredOwnerSession() {
+  if (sharedBrowserEnabled) {
+    clearSharedBrowserSession()
+    return
+  }
   clearToken()
   try { sessionStorage.setItem('auth_expired', '1') } catch {}
   await clearOwnerClientState({ preserveChatOutbox: true })
@@ -289,6 +398,38 @@ async function ownerSessionConfirmedInvalid(ownerToken) {
 }
 
 export async function apiFetch(path, options = {}) {
+  if (sharedBrowserEnabled) {
+    // Do not send an expired bearer or let a failed renewal fall through to an
+    // owner credential. A 401 gets exactly one cookie-backed renewal and retry.
+    if (!sharedBrowserToken || Date.now() >= sharedBrowserExpiresAt - 30_000) {
+      await renewSharedBrowserSession()
+    }
+    // A query-only lane keeps even an older controlling SW from serving or
+    // replacing the owner's URL-keyed offline shell lists/theme. The marker is
+    // not a credential; the bearer remains exclusively in Authorization.
+    const guestPath = (options.method || 'GET').toUpperCase() !== 'GET'
+      ? path
+      : path === '/theme'
+        ? `${path}?shared_browser=${encodeURIComponent(sharedBrowserCacheBuster())}`
+        : ['/chats', '/apps/'].includes(path)
+        ? `${path}?shared_browser=1`
+        : path
+    const send = () => fetch(`${BASE}/api${guestPath}`, {
+      ...options, credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json', ...getAuthHeaders(options.headers), 'X-Mobius-Shared-Browser': '1' },
+    })
+    const tokenAtSend = sharedBrowserToken
+    let response = await send()
+    if (response.status === 401) {
+      if (sharedBrowserToken === tokenAtSend) await renewSharedBrowserSession()
+      response = await send()
+      if (response.status === 401) {
+        clearSharedBrowserSession()
+        throw new Error('SHARED_ACCESS_ENDED')
+      }
+    }
+    return response
+  }
   const headers = {
     'Content-Type': 'application/json',
     ...getAuthHeaders(options.headers),

@@ -5692,6 +5692,58 @@ def _add_note_recovery_attempted(eng) -> None:
     ))
 
 
+def _add_chat_run_browser_lineage(eng) -> None:
+  """Retain the browser initiator on physical runs across restarts."""
+  from sqlalchemy import inspect as sa_inspect, text
+
+  for table in ("chat_runs", "delegations"):
+    inspector = sa_inspect(eng)
+    if not inspector.has_table(table):
+      continue
+    columns = {c["name"] for c in inspector.get_columns(table)}
+    with eng.begin() as conn:
+      if "browser_grant_id" not in columns:
+        conn.execute(text(f"ALTER TABLE {table} ADD COLUMN browser_grant_id VARCHAR(64)"))
+      if "browser_grant_epoch" not in columns:
+        conn.execute(text(f"ALTER TABLE {table} ADD COLUMN browser_grant_epoch INTEGER"))
+      conn.execute(text(
+        f"CREATE INDEX IF NOT EXISTS ix_{table}_browser_grant_id "
+        f"ON {table} (browser_grant_id)"
+      ))
+
+
+def _add_browser_access_tables(eng) -> None:
+  """Create empty sharing tables; frozen DDL never grants access."""
+  from sqlalchemy import inspect as sa_inspect, text
+  if not sa_inspect(eng).has_table("owner"):
+    return
+  statements = (
+    "CREATE TABLE IF NOT EXISTS browser_access_grants (id VARCHAR(64) NOT NULL PRIMARY KEY, owner_id INTEGER NOT NULL REFERENCES owner(id), label VARCHAR(128) NOT NULL, epoch INTEGER NOT NULL, created_at TIMESTAMP NOT NULL, revoked_at TIMESTAMP)",
+    "CREATE INDEX IF NOT EXISTS ix_browser_access_grants_owner_id ON browser_access_grants(owner_id)",
+    "CREATE TABLE IF NOT EXISTS browser_access_invites (id VARCHAR(64) NOT NULL PRIMARY KEY, grant_id VARCHAR(64) NOT NULL REFERENCES browser_access_grants(id), secret_hash VARCHAR(64) NOT NULL, owner_token_epoch INTEGER NOT NULL, created_at TIMESTAMP NOT NULL, expires_at TIMESTAMP NOT NULL, consumed_at TIMESTAMP)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ix_browser_access_invites_secret_hash ON browser_access_invites(secret_hash)",
+    "CREATE INDEX IF NOT EXISTS ix_browser_access_invites_grant_id ON browser_access_invites(grant_id)",
+    "CREATE TABLE IF NOT EXISTS browser_access_sessions (id VARCHAR(64) NOT NULL PRIMARY KEY, grant_id VARCHAR(64) NOT NULL REFERENCES browser_access_grants(id), secret_hash VARCHAR(64) NOT NULL, owner_token_epoch INTEGER NOT NULL, created_at TIMESTAMP NOT NULL, idle_expires_at TIMESTAMP NOT NULL, revoked_at TIMESTAMP)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ix_browser_access_sessions_secret_hash ON browser_access_sessions(secret_hash)",
+    "CREATE INDEX IF NOT EXISTS ix_browser_access_sessions_grant_id ON browser_access_sessions(grant_id)",
+  )
+  with eng.begin() as conn:
+    for statement in statements:
+      conn.execute(text(statement))
+
+
+def _add_embed_browser_lineage(eng) -> None:
+  """Embedded app chats retain the browser authority that opened them."""
+  from sqlalchemy import inspect as sa_inspect, text
+  if not sa_inspect(eng).has_table("chat_embed_grants"):
+    return
+  columns = {c["name"] for c in sa_inspect(eng).get_columns("chat_embed_grants")}
+  with eng.begin() as conn:
+    for name, sqltype in (("browser_grant_id", "VARCHAR(64)"), ("browser_grant_epoch", "INTEGER"), ("browser_session_id", "VARCHAR(64)")):
+      if name not in columns:
+        conn.execute(text(f"ALTER TABLE chat_embed_grants ADD COLUMN {name} {sqltype}"))
+
+
 _SCHEMA_MIGRATIONS = (
   # Full IDs are permanent identities, not sequence positions. Append new
   # work in execution order; never renumber a shipped ID to reconcile sources.
@@ -5780,6 +5832,9 @@ _SCHEMA_MIGRATIONS = (
   ("0076_legacy_helper_interruption", _add_legacy_helper_interruption),
   ("0077_chat_archive", _add_chat_archive),
   ("0077_note_recovery_attempted", _add_note_recovery_attempted),
+  ("0078_browser_access_tables", _add_browser_access_tables),
+  ("0079_chat_run_browser_lineage", _add_chat_run_browser_lineage),
+  ("0080_embed_browser_lineage", _add_embed_browser_lineage),
 )
 
 

@@ -65,6 +65,7 @@ from app.deps import (
   get_current_owner, reject_cross_site,
   chat_embed_session_is_active, require_chat_embed_operation,
   is_owner_input_principal, require_nondelegated_owner_control,
+  revocable_browser_stream,
 )
 from app.resource_access import (
   get_active_chat_for_principal, get_active_chat_or_404,
@@ -283,7 +284,8 @@ def _content_with_uploads(chat: models.Chat, content: str) -> str:
 
 async def _append_to_pending(
   chat: models.Chat, body: schemas.SendMessage, db: Session,
-  *, initiated_by_app_id: int | None = None,
+  *, initiated_by_app_id: int | None = None, owner_input: bool = False,
+  browser_grant_id: str | None = None, browser_grant_epoch: int | None = None,
   front: bool = False,
   require_answer_match: bool = False,
   restore_archived: bool = False,
@@ -310,7 +312,8 @@ async def _append_to_pending(
       chat_id=chat.id, run_token="",
       user_msg=_user_message_from_body(chat, body), answers=body.answers,
       selected_options=body.selected_options, question_id=body.question_id,
-      initiated_by_app_id=initiated_by_app_id,
+      initiated_by_app_id=initiated_by_app_id, owner_input=owner_input,
+      browser_grant_id=browser_grant_id, browser_grant_epoch=browser_grant_epoch,
       front=front, require_answer_match=require_answer_match,
       restore_archived=restore_archived,
     ),
@@ -320,7 +323,8 @@ async def _append_to_pending(
 
 async def _append_restart_feedback_to_pending(
   chat: models.Chat, body: schemas.SendMessage, db: Session,
-  *, initiated_by_app_id: int | None = None,
+  *, initiated_by_app_id: int | None = None, owner_input: bool = False,
+  browser_grant_id: str | None = None, browser_grant_epoch: int | None = None,
   restore_archived: bool = False,
 ) -> dict:
   """Settle a Restart card and queue its written response as one command."""
@@ -329,6 +333,8 @@ async def _append_restart_feedback_to_pending(
       chat_id=chat.id, run_token="",
       user_msg=_user_message_from_body(chat, body), answers=body.answers,
       question_id=body.question_id, initiated_by_app_id=initiated_by_app_id,
+      owner_input=owner_input,
+      browser_grant_id=browser_grant_id, browser_grant_epoch=browser_grant_epoch,
       restore_archived=restore_archived,
     ),
   )
@@ -411,6 +417,10 @@ def _duplicate_send_response(
   pending = list(chat.pending_messages or [])
   for position, row in enumerate(pending, start=1):
     if cid_of(row) == cid:
+      if row.get("delivery_status") == "rejected":
+        return JSONResponse(status_code=200, content={
+          "status": "rejected", "message": row, "running": is_chat_running(chat_id),
+        })
       if is_chat_running(chat_id):
         return _queued_response(row, position)
       # Preserve the existing stale-queue self-heal: the normal queue branch
@@ -527,6 +537,19 @@ def _is_exact_agent_card_retry(
 # so it can't lost-update against a concurrent streaming snapshot.
 
 
+def _browser_may_steer_run(db: Session, chat_id: str, principal: Principal) -> bool:
+  """A guest may only steer its own currently attributed physical run."""
+  if principal.browser_grant_id is None:
+    return True
+  run = db.query(models.ChatRun).filter(
+    models.ChatRun.chat_id == chat_id,
+    models.ChatRun.status == "running",
+  ).order_by(models.ChatRun.started_at.desc()).first()
+  return run is not None and (
+    run.browser_grant_id, run.browser_grant_epoch
+  ) == (principal.browser_grant_id, principal.browser_grant_epoch)
+
+
 def _steer_enabled(chat: models.Chat) -> bool:
   """Whether AUTO-steering is opted in for this chat.
 
@@ -608,7 +631,7 @@ def _selected_force_steer_pending(
     return None
   selected = [
     m for m in list(chat.pending_messages or [])
-    if cid_of(m) in requested_cids
+    if cid_of(m) in requested_cids and m.get("delivery_status") != "rejected"
   ]
   if len(selected) != len(requested_cids):
     return None
@@ -740,6 +763,9 @@ async def _send_message_impl(
           try:
             append_result = await _append_restart_feedback_to_pending(
               chat, body, db, initiated_by_app_id=principal.app_id,
+              browser_grant_id=principal.browser_grant_id,
+              browser_grant_epoch=principal.browser_grant_epoch,
+              owner_input=is_owner_input_principal(principal),
               restore_archived=restore_archived,
             )
             stored = append_result["stored"]
@@ -1056,6 +1082,9 @@ async def _send_message_impl(
         # wake, so neither a second runner nor a polling task is needed.
         stored = await _append_to_pending(
           chat, body, db, initiated_by_app_id=principal.app_id,
+          browser_grant_id=principal.browser_grant_id,
+          browser_grant_epoch=principal.browser_grant_epoch,
+          owner_input=is_owner_input_principal(principal),
           restore_archived=restore_archived,
           front=True, require_answer_match=True,
         )
@@ -1192,6 +1221,9 @@ async def _send_message_impl(
           body,
           db,
           initiated_by_app_id=principal.app_id,
+          browser_grant_id=principal.browser_grant_id,
+          browser_grant_epoch=principal.browser_grant_epoch,
+          owner_input=is_owner_input_principal(principal),
           restore_archived=restore_archived,
           front=True,
           require_answer_match=True,
@@ -1390,6 +1422,9 @@ async def _send_message_locked(
   if is_draining():
     new_msg = await _append_to_pending(
       chat, body, db, initiated_by_app_id=principal.app_id,
+      browser_grant_id=principal.browser_grant_id,
+      browser_grant_epoch=principal.browser_grant_epoch,
+      owner_input=is_owner_input_principal(principal),
       restore_archived=restore_archived,
     )
     db.expire(chat)
@@ -1402,6 +1437,9 @@ async def _send_message_locked(
   if activation_barrier_wait_id(db, chat_id) is not None:
     new_msg = await _append_to_pending(
       chat, body, db, initiated_by_app_id=principal.app_id,
+      browser_grant_id=principal.browser_grant_id,
+      browser_grant_epoch=principal.browser_grant_epoch,
+      owner_input=is_owner_input_principal(principal),
       restore_archived=restore_archived,
     )
     db.expire(chat)
@@ -1420,6 +1458,9 @@ async def _send_message_locked(
   ):
     new_msg = await _append_to_pending(
       chat, body, db, initiated_by_app_id=principal.app_id,
+      browser_grant_id=principal.browser_grant_id,
+      browser_grant_epoch=principal.browser_grant_epoch,
+      owner_input=is_owner_input_principal(principal),
       restore_archived=restore_archived,
     )
     db.expire(chat)
@@ -1465,6 +1506,14 @@ async def _send_message_locked(
         or not chat.pending_messages
       )
       and has_live_steerable_turn(chat_id, provider)
+      and _browser_may_steer_run(db, chat_id, principal)
+      and (
+        principal.browser_grant_id is None
+        or not body.force_steer
+        or all((row.get("_browser_grant_id"), row.get("_browser_grant_epoch")) == (
+          principal.browser_grant_id, principal.browser_grant_epoch,
+        ) for row in (selected_force_pending or []))
+      )
     ):
       # Every provider delivery names a row already durable in pending.
       user_msg = _user_message_from_body(chat, body)
@@ -1478,6 +1527,9 @@ async def _send_message_locked(
       else:
         reserved = await _append_to_pending(
           chat, body, db, initiated_by_app_id=principal.app_id,
+          browser_grant_id=principal.browser_grant_id,
+          browser_grant_epoch=principal.browser_grant_epoch,
+          owner_input=is_owner_input_principal(principal),
           restore_archived=restore_archived,
         )
         db.expire(chat)
@@ -1529,6 +1581,9 @@ async def _send_message_locked(
 
     new_msg = await _append_to_pending(
       chat, body, db, initiated_by_app_id=principal.app_id,
+      browser_grant_id=principal.browser_grant_id,
+      browser_grant_epoch=principal.browser_grant_epoch,
+      owner_input=is_owner_input_principal(principal),
       restore_archived=restore_archived,
     )
     started_message = None
@@ -1610,6 +1665,9 @@ async def _send_message_locked(
       })
     new_msg = await _append_to_pending(
       chat, body, db, initiated_by_app_id=principal.app_id,
+      browser_grant_id=principal.browser_grant_id,
+      browser_grant_epoch=principal.browser_grant_epoch,
+      owner_input=is_owner_input_principal(principal),
       restore_archived=restore_archived,
     )
     return _queued_response(new_msg, len(chat.pending_messages))
@@ -1658,6 +1716,9 @@ async def _send_message_locked(
         title_source=body.content,
         default_provider=default_provider,
         initiated_by_app_id=principal.app_id,
+        browser_grant_id=principal.browser_grant_id,
+        browser_grant_epoch=principal.browser_grant_epoch,
+        owner_input=is_owner_input_principal(principal),
         restore_archived=restore_archived,
         resume_run_id=body.resume_run_id,
       )
@@ -1985,7 +2046,7 @@ async def stream_chat(
       bc.unsubscribe(queue)
 
   return StreamingResponse(
-    generate(),
+    revocable_browser_stream(generate(), principal),
     media_type="text/event-stream",
     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
   )

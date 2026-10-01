@@ -395,7 +395,7 @@ test('direct chat actions hand focus to the destination composer', () => {
     /beforeRestoreRouteRef\.current = \(route\) => \{[\s\S]*route\?\.view !== 'chat'[\s\S]*focusSelectedChatComposer\(route\.chatId\)/,
     'Back and Forward must use the same destination-composer focus handoff')
   assert.match(shell, /const beforeRestoreRouteRef = useRef\(null\)/)
-  assert.match(shell, /beforeRestoreRouteRef,\s*\}\)/)
+  assert.match(shell, /beforeRestoreRouteRef,\s*navigationStorage:[\s\S]*?routePath:[\s\S]*?\}\)/)
   assert.match(
     navigationSource,
     /if \(itemRoute\) \{\s*beforeRestoreRouteRef\?\.current\?\.\(itemRoute\)\s*applyModeDestination\(itemRoute\)/,

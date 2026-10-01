@@ -97,13 +97,18 @@ def request_actor(db, principal, caller=None) -> dict:
       and delegation.interrupted_at is None
       else "read"
     )
-  return {
+  actor = {
     "scope": principal.scope,
     "app_id": principal.app_id,
     "app_slug": caller.slug if caller is not None else None,
     "delegated": principal.delegation_id is not None,
     "access": access,
   }
+  if principal.browser_grant_id is not None:
+    actor.update(browser_grant_id=principal.browser_grant_id,
+                 browser_grant_epoch=principal.browser_grant_epoch,
+                 browser_session_id=principal.browser_session_id)
+  return actor
 
 
 def service_entry(app, service: dict) -> Path:
@@ -129,7 +134,7 @@ def service_python_env(app, entry: Path) -> Path | None:
     raise HTTPException(503, str(exc)) from exc
 
 
-def service_environment(app, owner, service: dict, *, public: bool) -> dict[str, str]:
+def service_environment(app, owner, service: dict, *, public: bool, browser_grant_id=None, browser_grant_epoch=None, browser_session_id=None) -> dict[str, str]:
   """The environment of one invocation; its APP_TOKEN's authority follows the caller.
 
   A public invocation acts for an anonymous visitor, so its token has the narrow
@@ -159,6 +164,9 @@ def service_environment(app, owner, service: dict, *, public: bool) -> dict[str,
       app_nonce=app.token_nonce,
       expires_delta=timedelta(minutes=5),
       service="public" if public else "private",
+      browser_grant_id=browser_grant_id,
+      browser_grant_epoch=browser_grant_epoch,
+      browser_session_id=browser_session_id,
     ),
   })
   return env
@@ -279,6 +287,30 @@ async def _run_spawned(
   return stdout, stderr, returncode
 
 
+# Invocation tasks, not a second job queue: existing subprocess cancellation owns
+# process cleanup. A revoked grant cancels only its attributed in-flight calls.
+_browser_calls: dict[str, set[asyncio.Task]] = {}
+
+
+def _validate_browser_call(owner, actor):
+  grant_id = actor.get("browser_grant_id")
+  if grant_id is not None:
+    from app.database import SessionLocal
+    from app.browser_access import validate_grant, validate_session
+    with SessionLocal() as db:
+      validate_grant(db, grant_id, actor.get("browser_grant_epoch"), owner.id)
+      if actor.get("browser_session_id") is not None:
+        validate_session(db, actor["browser_session_id"], grant_id, owner.id)
+
+
+async def cancel_browser_grant_calls(grant_id: str) -> None:
+  tasks = tuple(_browser_calls.get(grant_id, ()))
+  for task in tasks:
+    if task is not asyncio.current_task():
+      task.cancel()
+  await asyncio.gather(*(task for task in tasks if task is not asyncio.current_task()), return_exceptions=True)
+
+
 async def invoke_service(
   app, owner, request_envelope: dict, *,
   timeout_seconds: float = SERVICE_TIMEOUT_SECONDS,
@@ -319,15 +351,27 @@ async def invoke_service(
   # waiting for that app's serialized request. Count only executable requests.
   # Queued requests already own an accepted revision. Pin before admission so
   # pruning or a migration drain cannot overlook a request waiting to run.
+  actor = request_envelope.get("actor") or {}
+  _validate_browser_call(owner, actor)
+  grant_id = actor.get("browser_grant_id")
+  task = asyncio.current_task()
   pin = hold_runtime(app.id)
+  if grant_id is not None:
+    _browser_calls.setdefault(grant_id, set()).add(task)
   try:
     async with slot, _global_slots[lane]:
+      _validate_browser_call(owner, actor)
       entry = service_entry(app, service)
       python_env = service_python_env(app, entry)
       python = app_python_env.python_for(python_env)
       # The preload host and its request children inherit this PATH too.
       environment = app_python_env.activated_environment(
-        service_environment(app, owner, service, public=public), python_env,
+        service_environment(
+          app, owner, service, public=public,
+          browser_grant_id=(request_envelope.get("actor") or {}).get("browser_grant_id"),
+          browser_grant_epoch=(request_envelope.get("actor") or {}).get("browser_grant_epoch"),
+          browser_session_id=(request_envelope.get("actor") or {}).get("browser_session_id"),
+        ), python_env,
       )
       outcome = None
       host = service_preload.ready_host(app, python, entry, environment)
@@ -354,6 +398,12 @@ async def invoke_service(
         raise HTTPException(502, "App service failed.")
   finally:
     pin.close()
+    if grant_id is not None:
+      calls = _browser_calls.get(grant_id)
+      if calls is not None:
+        calls.discard(task)
+        if not calls:
+          _browser_calls.pop(grant_id, None)
   try:
     response = json.loads(stdout, parse_constant=_reject_json_constant)
   except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError) as exc:
