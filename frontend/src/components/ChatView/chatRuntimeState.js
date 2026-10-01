@@ -6,6 +6,7 @@
 import { groupActivityRuns } from './activityGrouping.js'
 import { stripAugmentation } from './msgText.js'
 import { hasPendingQuestionMessage } from '../../lib/chatDetailCache.js'
+import { isResumableError } from './recoveryCard.js'
 
 export function isContinuationMessage(message) {
   return message?.kind === 'continuation'
@@ -82,8 +83,7 @@ export function supersedeResumedPauseBlocks(messages, {
     const previous = projected[index]
     const blocks = Array.isArray(previous?.blocks) ? previous.blocks : []
     const tail = blocks.at(-1)
-    if (previous?.role !== 'assistant' || tail?.type !== 'error'
-        || tail.resumable !== true) return
+    if (previous?.role !== 'assistant' || !isResumableError(tail)) return
     if (projected === messages) projected = [...messages]
     const remainingBlocks = blocks.slice(0, -1)
     projected[index] = {

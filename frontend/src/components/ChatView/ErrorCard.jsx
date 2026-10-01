@@ -4,6 +4,7 @@ import LifecycleIcon from './LifecycleIcon.jsx'
 import { ChevronRight, Clock, Pause, Warning } from '@openai/apps-sdk-ui/components/Icon'
 import MessageCopyButton from './MessageCopyButton.jsx'
 import { isResourcePause } from './waitingPresentation.js'
+import { isCreditPause } from './recoveryCard.js'
 
 // The single renderer for the error/pause/park card family. MsgContent consumes
 // both persisted blocks and the converted live stream, so source selection
@@ -18,11 +19,13 @@ import { isResourcePause } from './waitingPresentation.js'
 // without a reset time and reads "Paused". Both are WAIT
 // states (any `pause`) and get the soft `.chat__text--parked` treatment; the
 // danger-red "Error" card is reserved for genuine failures (no `pause`). Old
-// persisted blocks predate `pause` and fall back to the error rendering.
+// saved credit rejections are recognized by the shared recovery policy;
+// other old blocks without `pause` retain the error rendering.
 // A platform-resource wait (memory, storage) carries a check time but is not a
 // quota: Möbius continues it by itself, so it
 // reads as "Waiting" and never offers the auto-continue toggle.
 export function errorCardViewModel(block) {
+  const credits = isCreditPause(block)
   const resourceWait = isResourcePause(block)
   const modelCapacity = block.pause?.kind === 'model_capacity'
   const modelCapacityExhausted = block.pause?.kind === 'model_capacity_exhausted'
@@ -35,8 +38,9 @@ export function errorCardViewModel(block) {
       'This Goal paused repeatedly without a visible owner for the next action.',
     )
   )
-  const benign = !!block.pause || goalHandoff
+  const benign = !!block.pause || goalHandoff || credits
   return {
+    credits,
     parked,
     modelCapacity,
     modelCapacityExhausted,
@@ -44,7 +48,7 @@ export function errorCardViewModel(block) {
     goalHandoff,
     benign,
     className: `chat__text--error${benign ? ' chat__text--parked' : ''}`,
-    label: goalHandoff ? 'Goal paused' : modelCapacityExhausted ? 'Model still busy' : modelCapacity ? 'Model busy' : parked ? 'Rate limit' : (resourceWait ? 'Waiting' : (block.pause ? 'Paused' : 'Error')),
+    label: credits ? 'Credits needed' : goalHandoff ? 'Goal paused' : modelCapacityExhausted ? 'Model still busy' : modelCapacity ? 'Model busy' : parked ? 'Rate limit' : (resourceWait ? 'Waiting' : (block.pause ? 'Paused' : 'Error')),
     checkLabel: formatResetTime(checkAt),
     resetLabel: parked ? formatResetTime(resetAt) : null,
   }
@@ -139,7 +143,9 @@ export default function ErrorCard({
               {vm.label}
             </div>
             <div className="chat__recovery-copy">
-              {vm.modelCapacityExhausted
+              {vm.credits
+                ? 'Your workspace is out of credits. Your progress is saved. Add credits to your workspace or choose another provider, then Continue.'
+                : vm.modelCapacityExhausted
                 ? 'Five automatic retries were used. Choose another model, then Resume to continue your saved work.'
                 : vm.goalHandoff
                 ? 'The agent stopped before arranging the next step. Your progress is saved. Resume to continue this Goal.'

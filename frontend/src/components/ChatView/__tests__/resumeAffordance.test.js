@@ -113,14 +113,14 @@ test('MsgContent gates the Resume button on a resumable tail note', () => {
   assert.match(msgContent, /onResume/,
     'MsgContent must accept an onResume prop')
   assert.equal(ownsRecoveryAction({
-    block: { resumable: true },
+    block: { type: 'error', resumable: true },
     entryIndex: 4,
     lastEntryIndex: 4,
     isLastMessage: true,
     canResume: true,
   }), true, 'the resumable visible tail owns the action')
   assert.equal(ownsRecoveryAction({
-    block: { resumable: true },
+    block: { type: 'error', resumable: true },
     entryIndex: 3,
     lastEntryIndex: 4,
     isLastMessage: true,
