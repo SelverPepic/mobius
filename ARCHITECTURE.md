@@ -1214,7 +1214,7 @@ interrupting execution. `hold_json` identifies the actor, exact action/card and
 attempt, and time. Generic `FinishRun` never manufactures Goal intent. Absent or
 invalid historical attribution remains held but neutral: **Interrupted**, never
 **Paused by you**. Dismissal and verified terminal outcomes remain distinct.
-Migrations 0075/0076 add nullable provenance without rewriting historical intent.
+Migrations 0081/0082 add nullable provenance without rewriting historical intent.
 
 Resume uses the existing acknowledged continuation path. A Goal action carries
 its exact ID and revision; a reply action carries its physical run ID. Neither is
