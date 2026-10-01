@@ -1,7 +1,7 @@
 /* Hidden cuts preserve continuous prose, source identity, and one reference footer. */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { assistantReplyGroups, presentAssistantReply } from '../assistantReplies.js'
+import { assistantReplyGroups, presentAssistantReply, replyQuestionSuppression } from '../assistantReplies.js'
 import { messageSources } from '../messageSources.js'
 import { assistantReplyRoot, projectSettledSteerContinuations, projectSteerContinuationMessage } from '../steerContinuity.js'
 const assistant = (content, n = 0, extras = {}) => ({ role: 'assistant', id: n ? `run:assistant:${n}` : 'run', content, blocks: [{ type: 'text', content }], ...extras })
@@ -182,4 +182,15 @@ test('message-level outcome and wake cards remain between the original and conti
   const shown = presentAssistantReply(rows([assistant('Prefix', 0, before), carrier(), assistant('Prefix suffix', 1, after)]))
   assert.deepEqual(shown.map(text), ['Prefix', ' suffix'])
  }
+})
+
+
+test('the single selected reply source never suppresses its own question card', () => {
+ const liveQuestions = new Set(['question_id:q-accepted'])
+ assert.equal(replyQuestionSuppression(liveQuestions, 0, 0), null,
+   'an accepted saved/live source still paints Submitted while catch-up retains the key')
+ assert.equal(replyQuestionSuppression(liveQuestions, 1, 0), liveQuestions,
+   'a parallel durable row still deduplicates the active live card')
+ assert.equal(replyQuestionSuppression(null, -1, 0), null,
+   'settled history is never hidden after the live surface retires')
 })

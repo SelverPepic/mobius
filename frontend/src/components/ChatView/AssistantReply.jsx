@@ -5,7 +5,7 @@ import MessageSources from './MessageSources.jsx'
 import { carryDurableBlockState, streamItemsToAssistantPayload } from './streamPromotion.js'
 import { projectSteerContinuationMessage } from './steerContinuity.js'
 import { mergeProjectedPeerActivity } from './peerTimeline.js'
-import { presentAssistantReply } from './assistantReplies.js'
+import { presentAssistantReply, replyQuestionSuppression } from './assistantReplies.js'
 import { PeerTimelineRows } from './PeerTimeline.jsx'
 import { PeerTimelineContext } from './peerTimelineContext.js'
 
@@ -97,6 +97,9 @@ function AssistantReply({
               recoveryCredit={tail ? messageProps.recoveryCredit : null}
               pendingQuestionRef={pendingQuestionRef}
               resumeCardRef={resumeCardRef}
+              // The selected row already owns the live/DB question source.
+              // Suppressing its key would remove its only card on acceptance.
+              suppressedQuestionKeys={replyQuestionSuppression(messageProps.suppressedQuestionKeys, activeRowIndex, index)}
             />
           </li>}
         </Fragment>

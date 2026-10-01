@@ -42,6 +42,11 @@ export function assistantReplyGroups(messages, { offset = 0, slots = new Map(), 
   return groups
 }
 
+/** The selected source already paints its question; only parallel saved rows dedup it. */
+export function replyQuestionSuppression(questionKeys, activeRowIndex, rowIndex) {
+  return rowIndex === activeRowIndex ? null : questionKeys
+}
+
 const sourceBlocks = message => Array.isArray(message.blocks) && message.blocks.length
   ? message.blocks : message.content ? [{ type: 'text', content: message.content }] : []
 
