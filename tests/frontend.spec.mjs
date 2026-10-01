@@ -1306,10 +1306,16 @@ test.describe('Scroll after stream end', () => {
     await waitForComposerSendable(page.locator('[data-chat-surface="painted"]'))
     await page.keyboard.press('Enter')
 
-    await page.waitForFunction(
-      () => !document.querySelector('[data-chat-surface="painted"] .chat__stop'),
-      { timeout: 10000 }
-    )
+    // `!stop` alone can be true before the send starts. Wait for the last
+    // streamed chunk and the revealed, settled transcript before reader input.
+    await expect.poll(() => page.evaluate(() => {
+      const surface = document.querySelector('[data-chat-surface="painted"]')
+      const scroll = surface?.querySelector('.chat__scroll')
+      return !!scroll
+        && getComputedStyle(scroll).visibility === 'visible'
+        && scroll.textContent.includes('Paragraph 30.')
+        && !surface.querySelector('.chat__stop')
+    })).toBe(true)
 
     // Verify content overflows.
     await expect.poll(() => page.evaluate(() => {
@@ -1317,14 +1323,13 @@ test.describe('Scroll after stream end', () => {
       return s ? s.scrollHeight > s.clientHeight + 100 : false
     })).toBe(true)
 
-    // Scroll up to ~1/3 of the way (user reading earlier content).
-    await page.evaluate(() => {
-      const s = document.querySelector('[data-chat-surface="painted"] .chat__scroll')
-      if (s) s.scrollTop = Math.max(0, s.scrollHeight / 3)
-    })
-    await expect.poll(() => page.evaluate(
-      () => document.querySelector('[data-chat-surface="painted"] .chat__scroll')?.scrollTop || 0
-    )).toBeGreaterThan(0)
+    // A real wheel gesture, not a programmatic scrollTop write, establishes
+    // reader ownership in the scroll controller. Let its quiet edge settle.
+    const scroll = page.locator('[data-chat-surface="painted"] .chat__scroll')
+    await scroll.hover()
+    await page.mouse.wheel(0, -600)
+    await expect.poll(() => scroll.evaluate(s => s.dataset.scrollMode)).toBe('ANCHOR_AT')
+    await expect.poll(() => scroll.evaluate(s => s.scrollTop)).toBeGreaterThan(0)
 
     const scrollBefore = await page.evaluate(() => {
       const s = document.querySelector('[data-chat-surface="painted"] .chat__scroll')
