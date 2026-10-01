@@ -1,4 +1,4 @@
-import { Fragment, memo } from 'react'
+import { Fragment, memo, useMemo } from 'react'
 import { usePositionedPeerNotes } from './peerTimelineContext.js'
 import {
   insertPositionedActivity,
@@ -195,6 +195,15 @@ function MsgContentInner({
   activitySourceBlocks,
 }) {
   const positionedNotes = usePositionedPeerNotes(activityMessageId || msg.id)
+  const generatedFiles = useMemo(() => (
+    msg.role === 'assistant' && !isStreaming
+      ? (msg.blocks || []).flatMap(block =>
+          block.type === 'generated_files' && Array.isArray(block.files)
+            ? block.files.map(file => ({ ...file, kind: 'generated' }))
+            : [],
+        )
+      : []
+  ), [msg.role, msg.blocks, isStreaming])
   // Build a stable per-render answerable predicate that closes over the
   // scalar props (no function prop needed from ChatView).
   const isQuestionAnswerable = (block) =>
@@ -346,6 +355,8 @@ function MsgContentInner({
             <ActivityStretch
               entries={visibleEntries}
               chatId={chatId}
+              generatedFiles={generatedFiles}
+              generatedCapturePending={isStreaming}
               live={false}
               surfaceKey={messageKey}
               detailRef={block.detail_segments ? null : {
@@ -611,6 +622,8 @@ function MsgContentInner({
                 <ActivityStretch
                   entries={node.group}
                   chatId={chatId}
+                  generatedFiles={generatedFiles}
+                  generatedCapturePending={isStreaming}
                   live={live}
                   surfaceKey={messageKey}
                   onInternalNav={onInternalNav}
@@ -620,18 +633,8 @@ function MsgContentInner({
           }
           return renderBlock(node.single.item, node.single.idx)
         })}
-        {/* Deliverables are one turn-owned block rendered after the final text.
-            Keep them hidden while prose is still moving. */}
-        {msg.role === 'assistant' && !isStreaming && (() => {
-          const allFiles = (msg.blocks || []).flatMap(b =>
-            b.type === 'generated_files' && Array.isArray(b.files)
-              ? b.files.map(f => ({ ...f, kind: 'generated' }))
-              : []
-          )
-          return allFiles.length > 0
-            ? <Attachments attachments={allFiles} chatId={chatId} />
-            : null
-        })()}
+        {/* One final attachment owns each deliverable; tool previews reuse it. */}
+        {generatedFiles.length > 0 && <Attachments attachments={generatedFiles} chatId={chatId} />}
         {!isStreaming && <GoalHistory msg={msg} />}
         {!isStreaming && <StoppedWaits msg={msg} />}
       </AssistantCopySurface>

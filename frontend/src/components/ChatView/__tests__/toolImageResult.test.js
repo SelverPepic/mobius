@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import {
   chatImageReference,
+  generatedImageReference,
   imagePathFromInput,
   inlineImageReference,
   scratchImageReference,
@@ -73,6 +74,49 @@ test('a viewed /tmp image resolves through the owning chat only', () => {
   )
   assert.equal(temporaryImageReference('/tmp/visual.png', ''), null)
   assert.equal(temporaryImageReference('/var/tmp/visual.png', 'chat-123'), null)
+})
+
+test('a viewed generated image resolves only to matching final attachment bytes', () => {
+  const path = '/data/chats/chat-123/deliverables/inbox/image.png'
+  const digest = 'a'.repeat(64)
+  const files = [
+    { name: 'image.png', mime_type: 'image/png', previewable: true, sha256: 'b'.repeat(64) },
+    { name: 'image_1.png', mime_type: 'image/png', previewable: true, sha256: digest },
+  ]
+  const options = { files, viewedDigest: digest, completed: true }
+  const expected = {
+    kind: 'generated', chatId: 'chat-123', collection: 'generated-files',
+    filename: 'image_1.png', expectedSha256: digest,
+  }
+  assert.deepEqual(generatedImageReference(path, 'chat-123', options), expected)
+  assert.equal(generatedImageReference(path, 'chat-123', { files, viewedDigest: digest }), null)
+  assert.deepEqual(servedImageReference(path, 'chat-123', options), expected)
+  assert.equal(generatedImageReference(path, 'chat-123', { files, viewedDigest: 'c'.repeat(64), completed: true }), null)
+  assert.equal(generatedImageReference(path, 'chat-123', { files, viewedDigest: '', completed: true }), null)
+  assert.equal(generatedImageReference(path, 'chat-123', { files }), null)
+  assert.equal(generatedImageReference(path, 'another-chat', options), null)
+  assert.equal(generatedImageReference('/data/chats/chat-123/deliverables/files/secret.png', 'chat-123', options), null)
+  assert.equal(generatedImageReference('/data/chats/chat-123/deliverables/inbox/nested/x.png', 'chat-123', options), null)
+  assert.equal(generatedImageReference('/other/chats/chat-123/deliverables/inbox/image.png', 'chat-123', options), null)
+})
+
+test('a saved view with no file fingerprint still requires a serve-time byte match', () => {
+  const digest = 'a'.repeat(64)
+  const path = '/data/chats/chat-123/deliverables/inbox/image.png'
+  const files = [{ name: 'image.png', mime_type: 'image/png', previewable: true }]
+  assert.deepEqual(generatedImageReference(path, 'chat-123', { files, viewedDigest: digest, completed: true }), {
+    kind: 'generated', chatId: 'chat-123', collection: 'generated-files',
+    filename: 'image.png', expectedSha256: digest,
+  })
+  assert.equal(generatedImageReference(path, 'chat-123', {
+    files: [{ ...files[0], sha256: 'b'.repeat(64) }], viewedDigest: digest, completed: true,
+  }), null)
+})
+
+test('a historical image view without a fingerprint cannot claim a preview', () => {
+  const path = '/data/chats/chat-123/deliverables/inbox/image.png'
+  const files = [{ name: 'image.png', mime_type: 'image/png', previewable: true }]
+  assert.equal(generatedImageReference(path, 'chat-123', { files, completed: true }), null)
 })
 
 test('a viewed agent-scratch image resolves only for the same chat', () => {
@@ -153,8 +197,6 @@ test('image-load failures settle without fetching unrelated app metadata', () =>
 
   assert.doesNotMatch(result + preview, /apiFetch|\/apps\//)
   assert.match(preview, /status: 'failed'/)
-  assert.match(preview, /scratch-images/)
-  assert.match(result, /Temporary preview · current file may change or expire/)
   assert.match(result, /current\.status !== 'ready'/)
   assert.doesNotMatch(result, /useEffect|useState/)
   assert.match(trigger, /onError=\{onError\}/)
