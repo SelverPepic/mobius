@@ -89,13 +89,44 @@ export function normalizeGoalPresentation(goal) {
   if (!objective || !GOAL_PRESENTATION_STATUSES.has(goal.status)) return null
   return {
     id: goal.id == null ? null : String(goal.id),
+    ...(Number.isInteger(goal.revision) ? { revision: goal.revision } : {}),
     objective,
     status: goal.status,
     resumable: goal.status === 'paused',
-    ...(goal.pause_reason === 'owner' ? { pause_reason: 'owner' } : {}),
+    ...(goal.status === 'paused' && ['owner', 'agent', 'unknown'].includes(goal.pause_reason)
+      ? { pause_reason: goal.pause_reason } : {}),
     ...(goal.handoff?.kind ? { handoff: goal.handoff } : {}),
     ...(goal.result ? { result: goal.result } : {}),
   }
+}
+
+/** One status vocabulary for the Goal rail and its accessible announcement.
+ * Only the exact Goal's handoff may describe who moves next; chat cards cannot.
+ */
+export function goalStatusLabel(goal) {
+  if (!goal) return null
+  const terminal = {
+    completed: 'Completed', cannot_complete: 'Cannot complete', cancelled: 'Cancelled',
+  }[goal.status]
+  if (terminal) return terminal
+  if (goal.status === 'paused') {
+    const paused = {
+      owner: 'Paused by you', agent: 'Paused by agent', unknown: 'Interrupted',
+    }[goal.pause_reason]
+    if (paused) return paused
+  }
+  if (goal.handoff?.kind === 'owner_input') return 'Waiting for you'
+  if (goal.handoff?.kind === 'automatic') return 'Waiting'
+  return goal.status === 'paused' ? 'Interrupted' : null
+}
+
+/** Pause provenance never removes manual recovery; actual chat conflicts do. */
+export function canResumeGoal(goal, { turnActive, hasPendingQuestion, chatHandoff } = {}) {
+  return goal?.status === 'paused'
+    && !turnActive
+    && !hasPendingQuestion
+    && !['automatic', 'owner_input'].includes(goal.handoff?.kind)
+    && !['automatic', 'owner_input'].includes(chatHandoff)
 }
 
 /** Resolve a server runtime snapshot, with one rolling-server fallback. */
@@ -189,7 +220,8 @@ export function goalPresentationAtRunStart(text, messages, current = null) {
   }
   const normalizedCurrent = normalizeGoalPresentation(current)
   if (isContinue(text) && normalizedCurrent?.status === 'paused') {
-    return { ...normalizedCurrent, status: 'active', resumable: false }
+    const { pause_reason: _pauseReason, handoff: _handoff, ...continuingGoal } = normalizedCurrent
+    return { ...continuingGoal, status: 'active', resumable: false }
   }
   return normalizedCurrent
 }
@@ -269,7 +301,6 @@ export function progressRailViewModel(
   goal,
   buildPhases,
   goalPlan = null,
-  waitState = null,
 ) {
   const items = []
   const presentation = typeof goal === 'string'
@@ -283,21 +314,7 @@ export function progressRailViewModel(
     const planned = Number.isInteger(completed) && Number.isInteger(total)
     const activeTasks = visibleGoalTasks(goalPlan)
     const activeLabels = activeTasks.map(progressLabel).filter(Boolean)
-    // A paused Goal alone does not prove an owner handoff or a Resume action.
-    const ownerHold = actionable.pause_reason === 'owner'
-    const ownerActionRequired = !ownerHold && waitState?.ownerActionRequired === true
-    const waiting = !ownerHold && !ownerActionRequired && waitState?.monitoring === true
-    const statusLabel = ['completed', 'cannot_complete', 'cancelled'].includes(actionable.status)
-      ? { completed: 'Completed', cannot_complete: 'Cannot complete', cancelled: 'Cancelled' }[actionable.status]
-      : ownerHold
-        ? 'Paused by you'
-      : ownerActionRequired
-        ? 'Waiting for you'
-        : waiting
-          ? 'Waiting'
-          : actionable.status === 'paused'
-            ? (waitState?.manualRecovery ? 'Recovery needed' : 'Paused')
-            : null
+    const statusLabel = goalStatusLabel(actionable)
     const progressSummary = planned ? `${completed}/${total}` : goalObjective
     items.push({
       key: 'goal',
