@@ -2146,7 +2146,9 @@ export default function Shell({ onInitialVisualReady }) {
     visualContentOnly = sessionStorage.getItem('mobius:visual-content-only') === '1'
   } catch (_) {}
   const showWalkthrough = !visualContentOnly
-    && walkthroughQuery.isFetched && walkthroughQuery.data && !walkthroughQuery.data.completed
+    && walkthroughQuery.isFetched
+    && walkthroughQuery.data
+    && !walkthroughQuery.data.completed
 
   // Local streaming ids come from the mounted ChatView immediately at send
   // time. The run-lifecycle owner merges those with durable
@@ -4602,6 +4604,8 @@ export default function Shell({ onInitialVisualReady }) {
       {showWalkthrough && (
         <WalkthroughOverlay
           apps={apps}
+          storeActive={activeView === 'canvas' && apps.some(app => app.slug === 'store' && String(app.id) === String(activeAppId))}
+          onOpenApp={openAppWithIntent}
         />
       )}
 

@@ -86,6 +86,17 @@ test('Chat Changes is a modeless panel whose outside press reaches its destinati
     'outside activation must remain the browser’s real pointer sequence, not a replayed synthetic click')
 })
 
+test('first-use guidance is a labeled non-modal region with a dismiss action', () => {
+  const source = read('../../Walkthrough/WalkthroughOverlay.jsx')
+  assert.match(source, /role="region"/)
+  assert.match(source, /aria-labelledby="wt-title"/)
+  assert.match(source, /aria-label="Dismiss welcome"/)
+  assert.match(source, /aria-labelledby="wt-install-title"/)
+  assert.match(source, /aria-expanded=/)
+  assert.match(source, /role="status"/)
+  assert.doesNotMatch(source, /aria-modal="true"/)
+})
+
 test('chat image preview actions use labeled buttons', () => {
   const attachments = read('../Attachments.jsx')
   const composer = read('../ChatInputBar.jsx')

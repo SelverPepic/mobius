@@ -45,6 +45,22 @@ const paneStrip = readFileSync(new URL('../PaneStrip.jsx', import.meta.url), 'ut
 const settingsView = readFileSync(
   new URL('../../SettingsView/SettingsView.jsx', import.meta.url), 'utf8',
 )
+const walkthrough = readFileSync(
+  new URL('../../Walkthrough/WalkthroughOverlay.jsx', import.meta.url), 'utf8',
+)
+const walkthroughCss = readFileSync(
+  new URL('../../Walkthrough/WalkthroughOverlay.css', import.meta.url), 'utf8',
+)
+
+test('onboarding discovery delegates access review and installation to App Store', () => {
+  const guide = readFileSync(new URL('../../Walkthrough/WalkthroughOverlay.jsx', import.meta.url), 'utf8')
+  const discovery = readFileSync(new URL('../../Walkthrough/WalkthroughStore.jsx', import.meta.url), 'utf8')
+  assert.match(shell, /<WalkthroughOverlay[\s\S]*?onOpenApp=\{openAppWithIntent\}/)
+  assert.match(guide, /onOpenApp\('store', `app:\$\{id\}`\)/)
+  assert.match(discovery, /Review in App Store/)
+  assert.doesNotMatch(discovery, /\/apps\/(?:preview|install)/)
+})
+
 test('the workspace menu avoids an oversized border-and-shadow card', () => {
   const rule = css.match(/\.workspace__menu\s*\{[\s\S]*?\}/)?.[0] || ''
   assert.match(rule, /border:\s*1px/)
@@ -212,6 +228,25 @@ test('post-drag click suppression is source-scoped and expires on fresh input', 
 test('the undo chord defers to focused inputs', () => {
   assert.match(shell, /isEditableTarget\(document\.activeElement\)/)
   assert.match(shell, /dispatchWorkspace\(\{ type: 'UNDO_LAST' \}\)/)
+})
+
+test('the first-run walkthrough remains dismissible in a short landscape viewport wider than 520px', () => {
+  const shortLandscape = { width: 700, height: 360 }
+  assert.ok(shortLandscape.width > 520)
+  assert.ok(shortLandscape.height < 520)
+
+  const baseCardRule = walkthroughCss.match(/\.wt__card\s*\{[\s\S]*?\n\}/)?.[0] || ''
+  assert.match(
+    baseCardRule,
+    /max-height:\s*calc\(100dvh - 80px - env\(safe-area-inset-top,\s*0px\)\)/,
+    'the viewport-height cap must apply outside the phone-width media query',
+  )
+  assert.match(baseCardRule, /overflow-y:\s*auto/,
+    'clipped actions must remain reachable by scrolling')
+  assert.match(baseCardRule, /overscroll-behavior:\s*contain/,
+    'scrolling the coach card must not move the workspace behind it')
+  assert.doesNotMatch(baseCardRule, /overflow:\s*hidden/,
+    'the width-independent card rule must never clip its final actions')
 })
 
 test('the authenticated shell offers a keyboard skip link', () => {
@@ -1210,6 +1245,10 @@ test('the builder no-full-screen invariant scopes to DESTINATIONS, not transient
   // review remains modal while its backdrop is scoped to the Settings pane.
   const navSrc = readFileSync(new URL('../../../hooks/useNavigation.js', import.meta.url), 'utf8')
   assert.match(navSrc, /DESTINATIONS, NOT DIALOGS/)
+  // The first-use coach remains modeless while update review is pane-scoped.
+  assert.match(walkthrough, /role="region"/)
+  assert.match(walkthrough, /aria-label="Dismiss welcome"/)
+  assert.doesNotMatch(walkthrough, /aria-modal="true"/)
   const urmCss = readFileSync(
     new URL('../../SettingsView/UpdateReviewModal.css', import.meta.url), 'utf8',
   )

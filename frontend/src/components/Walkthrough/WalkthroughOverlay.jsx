@@ -1,5 +1,5 @@
-/* Stationary first-run slideshow: learn and optionally set up Möbius without automatic workspace navigation. */
-import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react'
+/* First-run coach: teach and optionally set up Möbius while the shell stays usable. */
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { Download } from '@openai/apps-sdk-ui/components/Icon'
 import { api } from '../../api/client.js'
@@ -12,17 +12,19 @@ import WalkthroughStore from './WalkthroughStore.jsx'
 import './WalkthroughOverlay.css'
 
 const SLIDES = ['welcome', 'connect', 'chat', 'apps', 'settings', 'identity']
-const CHAPTERS = ['Welcome', 'Connect an agent', 'Chat & projects', 'Apps', 'Settings', 'Möbius · You']
 const GUIDE_COUNT = SLIDES.length
 
-export default function WalkthroughOverlay({ apps }) {
+export default function WalkthroughOverlay({ apps, storeActive = false, onOpenApp }) {
   const queryClient = useQueryClient()
-  const dialogRef = useRef(null)
   const closingRef = useRef(false)
   const titleRef = useRef(null)
-  const scrollRef = useRef(null)
+  const cardRef = useRef(null)
+  const pendingFocusRef = useRef(false)
+  const wasSuspendedRef = useRef(false)
   const installAbortRef = useRef(null)
   const [stepIndex, setStepIndex] = useState(0)
+  const [reviewingStore, setReviewingStore] = useState(false)
+  const suspended = reviewingStore && storeActive
   const [platform] = useState(() => detectInstallPlatform())
   const [installCopy] = useState(() => installCopyForPlatform(platform))
   const [showInstallHelp, setShowInstallHelp] = useState(false)
@@ -34,7 +36,6 @@ export default function WalkthroughOverlay({ apps }) {
   function finish() {
     if (closingRef.current) return
     closingRef.current = true
-    if (dialogRef.current?.open) dialogRef.current.close()
     queryClient.setQueryData(ownerQueries.walkthrough.key, previous => ({
       ...(previous || { completed_at: null }), completed: true,
     }))
@@ -43,31 +44,22 @@ export default function WalkthroughOverlay({ apps }) {
   }
 
   function goTo(index) {
+    pendingFocusRef.current = true
+    setReviewingStore(false)
     setStepIndex(index)
-    scrollRef.current?.scrollTo({ top: 0 })
+    cardRef.current?.scrollTo({ top: 0 })
   }
 
-  function keepTabInside(event) {
-    if (event.key !== 'Tab') return
-    const controls = [...dialogRef.current.querySelectorAll('button, a[href], input, select, textarea, summary, [tabindex]')]
-      .filter(node => node.tabIndex >= 0 && !node.disabled && !node.closest('[inert]') && node.getClientRects().length)
-    const first = controls[0]
-    const last = controls.at(-1)
-    if ((event.shiftKey && document.activeElement === first) || (!event.shiftKey && document.activeElement === last)) {
-      event.preventDefault()
-      const destination = event.shiftKey ? last : first
-      destination?.focus()
+  // Navigation and Store return announce the current step, but mounting a
+  // modeless coach must not steal focus from the working shell.
+  useEffect(() => {
+    if (!suspended && (pendingFocusRef.current || wasSuspendedRef.current)) {
+      titleRef.current?.focus({ preventScroll: true })
+      pendingFocusRef.current = false
     }
-  }
+    wasSuspendedRef.current = suspended
+  }, [stepIndex, suspended])
 
-  useLayoutEffect(() => {
-    const dialog = dialogRef.current
-    if (!dialog.open) dialog.showModal()
-    titleRef.current?.focus({ preventScroll: true })
-    return () => { if (dialog.open) dialog.close() }
-  }, [])
-
-  useEffect(() => { titleRef.current?.focus({ preventScroll: true }) }, [stepIndex])
   useEffect(() => () => installAbortRef.current?.abort(), [])
 
   async function handleInstall() {
@@ -104,20 +96,16 @@ export default function WalkthroughOverlay({ apps }) {
 
   const installLabel = installBusy ? 'Opening…' : installState === 'ready' ? 'Install' : showInstallHelp ? 'Hide' : installCopy.ctaLabel
 
-  return <dialog ref={dialogRef} className="wt__card" aria-modal="true" aria-labelledby="wt-title" onCancel={event => { event.preventDefault(); finish() }} onKeyDown={keepTabInside}>
+  if (suspended) return null
+
+  return <aside ref={cardRef} className="wt__card" role="region" aria-labelledby="wt-title">
       <div className="wt__topline">
         <div className="wt__brand"><span className="wt__mark" aria-hidden="true"><span /></span><span>Möbius / Getting started</span><span className="wt__count"><span aria-hidden="true">{String(stepIndex + 1).padStart(2, '0')} / {String(GUIDE_COUNT).padStart(2, '0')}</span><span className="sr-only">Step {stepIndex + 1} of {GUIDE_COUNT}</span></span></div>
-        <button type="button" className="wt__close" onClick={finish} aria-label="Close guide" title="Close guide">×</button>
+        <button type="button" className="wt__close" onClick={finish} aria-label="Dismiss welcome" title="Dismiss guide">×</button>
       </div>
       <div className="wt__layout">
-        <nav className="wt__rail" aria-label="Guide sections">
-          <div className="wt__rail-art" aria-hidden="true"><span className="wt__rail-orbit wt__rail-orbit--one" /><span className="wt__rail-orbit wt__rail-orbit--two" /><span className="wt__rail-core" /></div>
-          <p className="wt__rail-title">Möbius, at a glance.</p>
-          <p className="wt__rail-copy">Meet your agent, keep bigger work together, and find apps for what you want to do.</p>
-          <ol className="wt__chapters">{CHAPTERS.map((chapter, index) => <li key={chapter}><button type="button" className={index === stepIndex ? 'is-current' : index < stepIndex ? 'is-past' : ''} aria-current={index === stepIndex ? 'step' : undefined} onClick={() => goTo(index)}><span>{String(index + 1).padStart(2, '0')}</span>{chapter}</button></li>)}</ol>
-        </nav>
         <div className="wt__main">
-          <div className="wt__slide" ref={scrollRef} role="region" aria-labelledby="wt-title" tabIndex={0}>
+          <div className="wt__slide" role="region" aria-labelledby="wt-title" tabIndex={0}>
         {slide === 'welcome' && <>
           <h2 id="wt-title" ref={titleRef} tabIndex={-1}>Welcome to Möbius</h2>
           <p className="wt__lead">Möbius is a place to think out loud and make things happen.</p>
@@ -153,7 +141,10 @@ export default function WalkthroughOverlay({ apps }) {
 
         {slide === 'apps' && <>
           <h2 id="wt-title" ref={titleRef} tabIndex={-1}>Explore apps</h2>
-          <WalkthroughStore apps={apps} />
+          <WalkthroughStore apps={apps} onReviewApp={id => {
+            setReviewingStore(true)
+            void onOpenApp('store', `app:${id}`)
+          }} />
         </>}
 
         {slide === 'settings' && <>
@@ -185,5 +176,5 @@ export default function WalkthroughOverlay({ apps }) {
           </div>
         </div>
       </div>
-  </dialog>
+  </aside>
 }
