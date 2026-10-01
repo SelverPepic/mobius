@@ -42,6 +42,61 @@ def test_post_wraps_raw_incomplete_read(monkeypatch):
         runner._post('https://example.test/api', {})
 
 
+@pytest.mark.parametrize('error', [
+    http.client.IncompleteRead(b'part'),
+    urllib.error.URLError('transport lost'),
+])
+def test_stream_read_failure_reconnects_instead_of_crashing(monkeypatch, capsys, error):
+    stopped = threading.Event()
+    attempts = []
+    delays = []
+
+    class BrokenStream:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_):
+            return False
+        def __iter__(self):
+            raise error
+
+    def open_stream(*_args):
+        attempts.append(1)
+        if len(attempts) == 1:
+            return BrokenStream()
+        stopped.set()
+        return io.BytesIO()
+
+    monkeypatch.setattr(runner, '_open_stream', open_stream)
+    monkeypatch.setattr(runner.time, 'sleep', delays.append)
+    runner._serve_connection({'url': 'https://example.test', 'token': 'test'}, stopped)
+
+    assert len(attempts) == 2
+    assert delays == [1]
+    assert 'connection lost (' in capsys.readouterr().out
+
+
+def test_runner_logs_command_identity_without_copying_command_text(monkeypatch, capsys):
+    stopped = threading.Event()
+    event = {'type': 'exec', 'request_id': 'a' * 16,
+             'cmd': 'private-command-text-' + 'x' * 100_000}
+    stream = io.BytesIO(('data: ' + json.dumps(event) + '\n').encode())
+    accepted = []
+
+    def start(_runner, work):
+        accepted.append(work)
+        stopped.set()
+
+    monkeypatch.setattr(runner, '_open_stream', lambda *_args: stream)
+    monkeypatch.setattr(runner._CommandRunner, 'start', start)
+    runner._serve_connection({'url': 'https://example.test', 'token': 'test'}, stopped)
+
+    assert accepted == [event]
+    logged = capsys.readouterr().out
+    assert 'Starting command ' + event['request_id'] in logged
+    assert 'private-command-text' not in logged
+    assert len(logged) < 500
+
+
 def test_stream_inventory_uses_post_body_and_small_metadata_query(monkeypatch):
     calls = []
     context = object()

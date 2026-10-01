@@ -64,7 +64,7 @@ RUNNER_PROTOCOL_VERSION = 4
 # Increment this for every shipped runner change that an existing installation
 # should receive. Protocol only describes wire compatibility; compatible
 # releases can keep using the same protocol while still offering an update.
-RUNNER_RELEASE = 5
+RUNNER_RELEASE = 6
 # What this runner can do, announced on every stream. Möbius gates behavior on
 # these names, never on release numbers: independently maintained copies of
 # this runner can reach the same release number with different abilities.
@@ -1408,7 +1408,7 @@ def _serve_connection(conn, stop_event=None):
                         return
                     if evt.get("type") != "exec":
                         continue
-                    print("$ " + evt.get("cmd", ""))
+                    print("Starting command %s" % evt.get("request_id", ""))
                     commands.start(evt)
             if stop_event is not None and stop_event.is_set():
                 return
@@ -1446,7 +1446,7 @@ def _serve_connection(conn, stop_event=None):
                 >= STREAM_HEALTHY_SECONDS
             ):
                 backoff = 1
-            print("connection lost (%s); retrying in %ss" % (exc.reason, backoff))
+            print("connection lost (%s); retrying in %ss" % (exc, backoff))
         time.sleep(backoff)
         backoff = min(backoff * 2, 30)
 
