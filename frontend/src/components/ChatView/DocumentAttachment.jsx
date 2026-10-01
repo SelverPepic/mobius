@@ -4,6 +4,7 @@ import { Download } from '@openai/apps-sdk-ui/components/Icon'
 import { BASE, apiFetch } from '../../api/client.js'
 import { mediaTokenParam } from '../../api/mediaToken.js'
 import { StandardMarkdown } from './markdown/BlockRenderer.jsx'
+import { MARKDOWN_EXCERPT_BYTES, MARKDOWN_READER_BYTES, readMarkdownPreview } from './markdownPreview.js'
 
 const filePath = (chatId, name) =>
   `/chats/${encodeURIComponent(chatId)}/generated-files/${encodeURIComponent(name)}`
@@ -163,13 +164,10 @@ export default function DocumentAttachment({
     const controller = new AbortController()
     apiFetch(filePath(chatId, file.name), {
       signal: controller.signal,
-      headers: { Range: 'bytes=0-8191' },
+      headers: { Range: `bytes=0-${MARKDOWN_EXCERPT_BYTES}` },
     })
-      .then(response => {
-        if (!response.ok) throw new Error(`HTTP ${response.status}`)
-        return response.text()
-      })
-      .then(text => setExcerpt({ status: 'ready', text }))
+      .then(response => readMarkdownPreview(response, MARKDOWN_EXCERPT_BYTES))
+      .then(({ text }) => setExcerpt({ status: 'ready', text }))
       .catch(error => {
         if (error.name !== 'AbortError') setExcerpt({ status: 'error', text: '' })
       })
@@ -179,12 +177,12 @@ export default function DocumentAttachment({
   useEffect(() => {
     if (!isMarkdown || !expanded || report.status !== 'loading') return undefined
     const controller = new AbortController()
-    apiFetch(filePath(chatId, file.name), { signal: controller.signal })
-      .then(response => {
-        if (!response.ok) throw new Error(`HTTP ${response.status}`)
-        return response.text()
-      })
-      .then(text => setReport({ status: 'ready', text }))
+    apiFetch(filePath(chatId, file.name), {
+      signal: controller.signal,
+      headers: { Range: `bytes=0-${MARKDOWN_READER_BYTES}` },
+    })
+      .then(response => readMarkdownPreview(response, MARKDOWN_READER_BYTES))
+      .then(({ text, truncated }) => setReport({ status: 'ready', text, truncated }))
       .catch(error => {
         if (error.name !== 'AbortError') setReport({ status: 'error', text: '' })
       })
@@ -262,6 +260,11 @@ export default function DocumentAttachment({
           }}>Try again</button>
         </div>}
         {report.status === 'ready' && <StandardMarkdown text={report.text} />}
+        {report.status === 'ready' && report.truncated && (
+          <p className="chat__document-card-status" role="status">
+            Preview limited to 256 KB. Download the file to read the rest.
+          </p>
+        )}
       </div> : pdfPreview.status === 'ready'
         ? <iframe
             className="chat__document-card-iframe"

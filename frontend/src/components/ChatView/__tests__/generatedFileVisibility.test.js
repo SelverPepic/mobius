@@ -19,6 +19,7 @@ const {
   generatedFileCanPreview,
   generatedFileIsMarkdown,
   generatedFileIsPdf,
+  documentAttachmentIdentity,
 } = await vite.ssrLoadModule(
   '/src/components/ChatView/Attachments.jsx',
 )
@@ -135,6 +136,13 @@ test('only browser-safe generated documents open as previews', () => {
   assert.equal(generatedFileIsPdf({
     kind: 'generated', mime_type: 'application/pdf', previewable: false,
   }), false)
+})
+
+test('document reader state is isolated by chat and captured attachment bytes', () => {
+  const file = { name: 'report.md', sha256: 'a'.repeat(64) }
+  const original = documentAttachmentIdentity(file, 'chat-one')
+  assert.notEqual(original, documentAttachmentIdentity(file, 'chat-two'))
+  assert.notEqual(original, documentAttachmentIdentity({ ...file, sha256: 'b'.repeat(64) }, 'chat-one'))
 })
 
 test('generated Markdown offers a content-preview card and Download without changing raw-file policy', () => {

@@ -23,6 +23,10 @@ export function generatedFileIsPdf(file) {
   return generatedFileCanPreview(file) && file.mime_type === 'application/pdf'
 }
 
+export function documentAttachmentIdentity(file, chatId) {
+  return `${chatId}:${file.name}:${file.sha256 || ''}`
+}
+
 export default function Attachments({ attachments, chatId }) {
   const hasAttachments = Array.isArray(attachments) && attachments.length > 0
 
@@ -68,7 +72,8 @@ export default function Attachments({ attachments, chatId }) {
         const isGenerated = f.kind === 'generated'
         const isMarkdown = generatedFileIsMarkdown(f)
         const hasChatPreview = isMarkdown || generatedFileIsPdf(f)
-        const previewOpen = expandedNames.has(f.name)
+        const identity = documentAttachmentIdentity(f, chatId)
+        const previewOpen = expandedNames.has(identity)
         const canPreview = generatedFileCanPreview(f)
         const href = tokenParam ? `${BASE}/api/chats/${encodeURIComponent(chatId)}/${
           isGenerated ? 'generated-files' : 'uploads'
@@ -81,14 +86,14 @@ export default function Attachments({ attachments, chatId }) {
           </>
         )
         if (hasChatPreview) return <DocumentAttachment
-          key={f.name}
+          key={identity}
           file={f}
           chatId={chatId}
           expanded={previewOpen}
           onToggle={() => setExpandedNames(current => {
             const next = new Set(current)
-            if (next.has(f.name)) next.delete(f.name)
-            else next.add(f.name)
+            if (next.has(identity)) next.delete(identity)
+            else next.add(identity)
             return next
           })}
         />
