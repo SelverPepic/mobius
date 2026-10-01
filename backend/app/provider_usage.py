@@ -1015,7 +1015,12 @@ async def _run_on_codex_client(data_dir: str, work: Any, *, timeout_error: str) 
     try:
       await in_worker(client.close)
     finally:
-      executor.shutdown(wait=False, cancel_futures=True)
+      try:
+        # Keep cleanup on the same independent executor as the probe.
+        from app.file_cache import reclaim_provider_cache_sync
+        await in_worker(reclaim_provider_cache_sync, "codex")
+      finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 async def _fetch_codex_usage(data_dir: str) -> dict[str, Any]:
@@ -1067,8 +1072,12 @@ async def _fetch_codex_usage(data_dir: str) -> dict[str, Any]:
     try:
       await in_worker(client.close)
     finally:
-      executor.shutdown(wait=False, cancel_futures=True)
-      ownership.release()
+      try:
+        from app.file_cache import reclaim_provider_cache_sync
+        await in_worker(reclaim_provider_cache_sync, "codex")
+      finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+        ownership.release()
 
   raw = limits.model_dump(mode="json", by_alias=False)
   return normalize_codex_usage(raw, plan_type=_codex_plan_type(account))

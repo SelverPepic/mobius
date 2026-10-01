@@ -1980,9 +1980,19 @@ async def _fetch_codex_models_from_cli(
   try:
     stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=20.0)
   except asyncio.TimeoutError:
-    proc.kill()
-    await proc.wait()
     raise RuntimeError("codex debug models timed out")
+  finally:
+    # A cancelled picker refresh must reap its child before releasing tool pages.
+    try:
+      if proc.returncode is None:
+        try:
+          proc.kill()
+        except ProcessLookupError:
+          pass
+        await proc.wait()
+    finally:
+      from app.file_cache import reclaim_provider_cache
+      await reclaim_provider_cache("codex")
   if proc.returncode != 0:
     msg = stderr.decode("utf-8", "replace").strip()
     raise RuntimeError(f"codex debug models failed: {msg[:500]}")
