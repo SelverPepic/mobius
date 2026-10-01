@@ -908,6 +908,10 @@ def _process_tool_event(event: dict, assistant_blocks: list) -> bool:
     if blk is None:
       return False
     blk["status"] = "done"
+    if "viewed_image_sha256" in event and blk.get("tool") == "ViewImage":
+      digest = event["viewed_image_sha256"]
+      if isinstance(digest, str):
+        blk["viewed_image_sha256"] = digest
     return True
 
   if event_type == "skill_loaded":
@@ -975,6 +979,8 @@ def _process_tool_event(event: dict, assistant_blocks: list) -> bool:
       "mime_type": event.get("mime_type"),
       "previewable": event.get("previewable") is True,
     }
+    if isinstance(event.get("sha256"), str):
+      entry["sha256"] = event["sha256"]
     target = next((
       block for block in reversed(assistant_blocks)
       if block.get("type") == "generated_files"
