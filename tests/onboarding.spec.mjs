@@ -184,6 +184,8 @@ test('app discovery hands access review to Store and preserves the guide through
     await expect(guide.getByRole('heading', { name: 'Explore apps' })).toBeFocused()
     await page.goForward()
     await expect(guide).not.toBeVisible()
+    await page.goBack()
+    await expect(guide.getByRole('heading', { name: 'Explore apps' })).toBeFocused()
     expect(installs).toBe(0)
     expect(completionCount()).toBe(0)
   } finally {

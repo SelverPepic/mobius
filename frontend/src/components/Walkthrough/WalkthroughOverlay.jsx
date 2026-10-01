@@ -1,5 +1,5 @@
 /* First-run coach: teach and optionally set up Möbius while the shell stays usable. */
-import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { Download } from '@openai/apps-sdk-ui/components/Icon'
 import { api } from '../../api/client.js'
@@ -14,7 +14,7 @@ import './WalkthroughOverlay.css'
 const SLIDES = ['welcome', 'connect', 'chat', 'apps', 'settings', 'identity']
 const GUIDE_COUNT = SLIDES.length
 
-export default function WalkthroughOverlay({ apps, storeActive = false, onOpenApp }) {
+export default function WalkthroughOverlay({ apps, storeActive = false, onOpenApp, onStoreSuspendedChange }) {
   const queryClient = useQueryClient()
   const closingRef = useRef(false)
   const titleRef = useRef(null)
@@ -33,6 +33,14 @@ export default function WalkthroughOverlay({ apps, storeActive = false, onOpenAp
   const installState = useSyncExternalStore(subscribeInstallPrompt, getInstallPromptSnapshot, getInstallPromptSnapshot)
   const slide = SLIDES[stepIndex]
 
+  // The shell's history restore must not queue chat-composer focus while this
+  // guide is handing back from Store. Publish the lease at the same commit that
+  // hides the guide, and release it on return or unmount.
+  useLayoutEffect(() => {
+    onStoreSuspendedChange?.(suspended)
+    return () => { if (suspended) onStoreSuspendedChange?.(false) }
+  }, [onStoreSuspendedChange, suspended])
+
   function finish() {
     if (closingRef.current) return
     closingRef.current = true
@@ -50,27 +58,21 @@ export default function WalkthroughOverlay({ apps, storeActive = false, onOpenAp
     cardRef.current?.scrollTo({ top: 0 })
   }
 
-  // Moving between guide steps announces the new step. On return from Store,
-  // wait for browser-history focus restoration before moving focus off the
-  // retired app surface. A modeless guide must not take focus from an owner
-  // who has meanwhile chosen another shell control.
+  // Navigation and Store return announce the current step, but mounting a
+  // modeless coach must not steal focus from the working shell.
   useEffect(() => {
-    const returnedFromStore = !suspended && wasSuspendedRef.current
-    if (!suspended && pendingFocusRef.current) {
+    const active = document.activeElement
+    const returnedFromStore = wasSuspendedRef.current && !suspended
+    const focusWasReleased = active === document.body
+      || active === document.documentElement
+      || active?.id === 'main-content'
+      || (active?.tagName === 'IFRAME'
+        && active.closest?.('[data-app-frame-owner]')?.getAttribute('aria-hidden') === 'true')
+    if (!suspended && (pendingFocusRef.current || (returnedFromStore && focusWasReleased))) {
       titleRef.current?.focus({ preventScroll: true })
       pendingFocusRef.current = false
     }
     wasSuspendedRef.current = suspended
-    if (returnedFromStore) requestAnimationFrame(() => {
-      const title = titleRef.current
-      const active = document.activeElement
-      const focusIsReleased = active === document.body
-        || active === document.documentElement
-        || active?.id === 'main-content'
-        || (active?.tagName === 'IFRAME'
-          && active.closest?.('[data-app-frame-owner]')?.getAttribute('aria-hidden') === 'true')
-      if (title?.isConnected && focusIsReleased) title.focus({ preventScroll: true })
-    })
   }, [stepIndex, suspended])
 
   useEffect(() => () => installAbortRef.current?.abort(), [])

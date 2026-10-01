@@ -282,6 +282,10 @@ export default function Shell({ onInitialVisualReady }) {
   // outgoing surface becomes inert. The callback is filled after the shared
   // composer handoff exists below.
   const beforeRestoreRouteRef = useRef(null)
+  const walkthroughStoreSuspendedRef = useRef(false)
+  const onWalkthroughStoreSuspendedChange = useCallback((suspended) => {
+    walkthroughStoreSuspendedRef.current = suspended
+  }, [])
 
   const {
     activeView,
@@ -877,6 +881,9 @@ export default function Shell({ onInitialVisualReady }) {
   // only for a saved draft; on desktop it restores keyboard focus.
   beforeRestoreRouteRef.current = (route) => {
     if (route?.view !== 'chat' || route.chatId == null) return
+    // The modeless guide owns focus when Back leaves its Store review. A chat
+    // restore still restores the chat; only its composer-focus request yields.
+    if (walkthroughStoreSuspendedRef.current) return
     focusSelectedChatComposer(route.chatId)
   }
 
@@ -4608,6 +4615,7 @@ export default function Shell({ onInitialVisualReady }) {
           apps={apps}
           storeActive={activeView === 'canvas' && walkthroughStoreApp != null && String(walkthroughStoreApp.id) === String(activeAppId)}
           onOpenApp={openAppWithIntent}
+          onStoreSuspendedChange={onWalkthroughStoreSuspendedChange}
         />
       )}
 
