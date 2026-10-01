@@ -1330,7 +1330,7 @@
      The cap keeps that reading surface inside the disclosure; the transcript
      and its tail reservation never absorb the hidden overflow. */
   overflow-y: auto;
-  overscroll-behavior-y: contain;
+  overscroll-behavior-y: auto;
   line-height: 1.5;
 }
 
@@ -2268,7 +2268,7 @@
   margin-top: 2px;
   max-height: 360px;
   overflow-y: auto;
-  overscroll-behavior-y: contain;
+  overscroll-behavior-y: auto;
 }
 
 /* ── Input footer ──────────────────────────────────── */
@@ -3752,7 +3752,7 @@
   max-height: min(62vh, 620px);
   overflow: auto;
   padding: 24px clamp(16px, 4vw, 34px) 36px;
-  overscroll-behavior: contain;
+  overscroll-behavior-y: auto;
 }
 
 .chat__document-card-reader > .standard-markdown {
