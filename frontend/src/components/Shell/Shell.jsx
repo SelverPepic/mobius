@@ -136,6 +136,8 @@ import {
   ownerInputChangeFromEvent,
   reconcileChatRenameGuards,
   withChatOwnerActivity,
+  withChatArchive,
+  withPendingChatArchives,
   withChatOwnerInput,
   withChatRename,
   withChatRunState,
@@ -284,6 +286,7 @@ export default function Shell({ onInitialVisualReady }) {
   const beforeRestoreRouteRef = useRef(null)
 
   const {
+    initialNav,
     activeView,
     activeAppId,
     activeChatId,
@@ -692,15 +695,18 @@ export default function Shell({ onInitialVisualReady }) {
   // commit. Keep that exact row revision until a list read confirms it, just as
   // newly-created rows stay protected from an older in-flight snapshot.
   const chatRenameGuardsRef = useRef(new Map())
+  const archiveActionsRef = useRef(new Map())
+  const archiveRequestsRef = useRef(new Map())
   const reconcileCreatedChats = useCallback(
-    rows => withoutConfirmedDeletions(
-      reconcileChatRenameGuards(
-        mergeChatListWithCreatedGuards(
-          rows, recentlyCreatedChatsRef.current,
+    rows => withPendingChatArchives(
+      withoutConfirmedDeletions(
+        reconcileChatRenameGuards(
+          mergeChatListWithCreatedGuards(rows, recentlyCreatedChatsRef.current),
+          chatRenameGuardsRef.current,
         ),
-        chatRenameGuardsRef.current,
+        deletedChatIdsRef.current,
       ),
-      deletedChatIdsRef.current,
+      archiveActionsRef.current,
     ),
     [],
   )
@@ -737,7 +743,10 @@ export default function Shell({ onInitialVisualReady }) {
   // variant: 'info' | 'error'  (see components/ui/Toast.jsx)
   const toastSequenceRef = useRef(0)
   const [toast, setToast] = useState(null)
-  const [settingsFocusTarget, setSettingsFocusTarget] = useState(null)
+  const [settingsFocusTarget, setSettingsFocusTarget] = useState(() =>
+    initialNav.section
+      ? { section: initialNav.section, nonce: Date.now() }
+      : null)
   // Settings stays mounted across workspace transitions. An explicit shell
   // apply can therefore complete a platform-conflict repair without remounting
   // Settings; this token lets that live instance re-read authoritative status
@@ -2379,6 +2388,8 @@ export default function Shell({ onInitialVisualReady }) {
       timeoutMs, signal, reconcile: reconcileCreatedChats,
     })
   }, [queryClient, reconcileCreatedChats])
+  // Archive controls can be pressed again before the previous request settles.
+  // Keep the latest visual intent while serializing only this chat's writes.
   const refreshChats = useCallback(() => {
     return fetchFreshChats()
       .catch(() => queryClient.getQueryData(chatQueries.keys.all) || [])
@@ -2400,8 +2411,9 @@ export default function Shell({ onInitialVisualReady }) {
         await api.chats.rows(ids, { cache: 'no-store' }), 'chat rows fetch failed:',
       ),
       applyRows: (ids, fresh) => {
+        const visible = withPendingChatArchives(fresh, archiveActionsRef.current)
         projectChatList(rows => reconcileCreatedChats(
-          withRefreshedChatRows(rows, ids, fresh),
+          withRefreshedChatRows(rows, ids, visible),
         ))
         // Scoped reads never refill the offline list copy; drop the stale one so
         // a cold offline start keeps the fresher persisted list.
@@ -2508,6 +2520,56 @@ export default function Shell({ onInitialVisualReady }) {
       ))
     }
   }, [projectChatLookup, queryClient])
+
+  // Archive state is owner filing. Keep rapid toggles in intent order; an
+  // older failure must not roll back a newer action's optimistic projection.
+  // The final scoped read settles the row from server truth in every case.
+  const setChatArchived = useCallback(async (chatId, archived, { undoable = true } = {}) => {
+    const sid = String(chatId)
+    const previous = chatsRef.current.find(row => String(row?.id) === sid)
+    if (!previous) return
+    const token = Symbol(sid)
+    archiveActionsRef.current.set(sid, {
+      token,
+      archivedAt: archived ? (previous.archived_at || new Date().toISOString()) : null,
+      pinnedAt: archived ? null : previous.pinned_at,
+    })
+    projectChatList(rows => withChatArchive(rows, sid, {
+      archivedAt: archived ? (previous.archived_at || new Date().toISOString()) : null,
+      pinnedAt: archived ? null : previous.pinned_at,
+    }))
+    const prior = archiveRequestsRef.current.get(sid) || Promise.resolve()
+    const request = prior.catch(() => {}).then(() => (
+      archived ? api.chats.archive(sid) : api.chats.unarchive(sid)
+    ))
+    archiveRequestsRef.current.set(sid, request)
+    let committed = false
+    try {
+      const response = await request
+      committed = response.ok
+    } catch {}
+    if (archiveActionsRef.current.get(sid)?.token !== token) return
+    archiveActionsRef.current.delete(sid)
+    archiveRequestsRef.current.delete(sid)
+    refreshChatRows(sid)
+    if (!committed) {
+      showToast(`Couldn’t ${archived ? 'archive' : 'restore'} that chat.`, { variant: 'error' })
+      return
+    }
+    if (!undoable) return
+    // Undo needs time to read and reach, matching the shell's other
+    // actionable notices rather than the 4 s informational default.
+    showToast(archived ? 'Chat archived' : 'Chat restored', {
+      duration: 6000,
+      action: {
+        label: 'Undo',
+        onAction: () => { void setChatArchived(sid, !archived, { undoable: false }) },
+      },
+    })
+  }, [projectChatList, refreshChatRows, showToast])
+  const archivedChatIds = useMemo(() => new Set(
+    chats.filter(row => row?.archived_at).map(row => String(row.id)),
+  ), [chats])
 
   const confirmAppDeleted = useCallback((id) => {
     const sid = String(id)
@@ -2977,6 +3039,11 @@ export default function Shell({ onInitialVisualReady }) {
       // pill and hot-swaps the preview when a build finishes — no polling.
       const projectId = buildEventProjectId(ev)
       if (projectId != null) projectQueries.artifacts.invalidate(queryClient, projectId)
+      void projectQueries.list.invalidate(queryClient)
+    } else if (ev.type === 'chat_archive_changed') {
+      // Re-read the one row rather than patch it: this window may hold no
+      // copy, or a stale one, of a chat archived elsewhere.
+      if (ev.chatId) refreshChatRows(ev.chatId)
       void projectQueries.list.invalidate(queryClient)
     } else if (ev.type === 'chat_renamed') {
       // The committed event carries the exact changed row fields. Apply those
@@ -4579,6 +4646,7 @@ export default function Shell({ onInitialVisualReady }) {
         onAddSourceToProjects={addSourceToProjects}
         onNewChat={startUserChat}
         onDeleteChat={deleteChat}
+        onSetChatArchived={setChatArchived}
         onDeleteApp={deleteApp}
         onDeleteAppData={deleteAppData}
         onNotice={showToast}
@@ -4941,6 +5009,8 @@ export default function Shell({ onInitialVisualReady }) {
                 onInternalNav={handleChatInternalNav}
                 onChatMissing={handlePaneChatMissing}
                 onFirstMessage={handlePaneChatFirstMessage}
+                archived={archivedChatIds.has(String(chatId))}
+                setChatArchived={setChatArchived}
                 onDisplayReady={role === 'held' || !surfaceVisible
                   ? null
                   : handlePaneChatDisplayReady}

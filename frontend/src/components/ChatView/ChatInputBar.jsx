@@ -81,8 +81,8 @@
  */
 
 import { useRef, useState, useEffect, useLayoutEffect } from 'react'
-import { createPortal } from 'react-dom'
 import ImageLightbox from './markdown/ImageLightbox.jsx'
+import ChatPanePortal from './ChatPanePortal.jsx'
 import { useHistoryDismiss } from '../../hooks/useHistoryDismiss.jsx'
 import { ArrowUp, DoubleChevronRight, Stop } from '@openai/apps-sdk-ui/components/Icon'
 import { BASE } from '../../api/client.js'
@@ -289,6 +289,7 @@ function stripExt(name) {
  *  The remove `×` is a 20×20 button floating at the card's top-
  *  right corner (half-overlapping outside). */
 function FileChips({ files, onRemove, chatId }) {
+  const trayRef = useRef(null)
   const [tokenState, setTokenState] = useState({
     chatId: null,
     param: '',
@@ -355,7 +356,7 @@ function FileChips({ files, onRemove, chatId }) {
     : null
 
   return (
-    <div className="chat__attach-tray">
+    <div ref={trayRef} className="chat__attach-tray">
       {cards.map(({ chip, isImage, previewSrc, previewFailed, galleryIndex }) => {
         const cls = classifyFile(chip.name || '')
         const errorMark = chip.status === 'error' ? ' chat__attach-card--error' : ''
@@ -383,7 +384,7 @@ function FileChips({ files, onRemove, chatId }) {
                   historyDismiss.open()
                   setLightboxIndex(galleryIndex)
                 }}
-                aria-label={`View ${chip.name} full screen`}
+                aria-label={`Preview ${chip.name}`}
               >
                 <img className="chat__attach-card-thumb" src={previewSrc} alt="" />
               </button>
@@ -419,7 +420,7 @@ function FileChips({ files, onRemove, chatId }) {
           </div>
         )
       })}
-      {openIndex !== null && createPortal(
+      {openIndex !== null && <ChatPanePortal anchorRef={trayRef}>
         <ImageLightbox
           src={gallery[openIndex].src}
           alt={gallery[openIndex].alt}
@@ -427,9 +428,8 @@ function FileChips({ files, onRemove, chatId }) {
           index={openIndex}
           onNavigate={setLightboxIndex}
           onClose={historyDismiss.close}
-        />,
-        document.body,
-      )}
+        />
+      </ChatPanePortal>}
     </div>
   )
 }

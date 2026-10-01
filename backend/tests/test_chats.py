@@ -864,7 +864,7 @@ def test_chat_list_projects_summaries_without_hydrating_transcripts(
     if "FROM chats" in statement:
       drawer_selects.append((statement, parameters))
 
-  schema_migrations._add_chat_drawer_covering_index(db.get_bind())
+  schema_migrations._add_chat_archive(db.get_bind())
   event.listen(models.Chat, "load", on_load)
   event.listen(db.get_bind(), "before_cursor_execute", capture_sql)
   try:
@@ -889,8 +889,8 @@ def test_chat_list_projects_summaries_without_hydrating_transcripts(
   plan = db.connection().exec_driver_sql(
     f"EXPLAIN QUERY PLAN {drawer_query}", drawer_parameters,
   ).fetchall()
-  assert any("COVERING INDEX ix_chats_drawer" in row[-1] for row in plan), (
-    "every drawer column must come from ix_chats_drawer; SQLite stores the "
+  assert any("COVERING INDEX ix_chats_drawer_v2" in row[-1] for row in plan), (
+    "every drawer column must come from ix_chats_drawer_v2; SQLite stores the "
     "transcript inline, so reading the chat row walks its whole history"
   )
 

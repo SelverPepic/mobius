@@ -20,10 +20,11 @@ will do what. Avoid paid test calls unless the owner approved them.
   retain its original prompt and policy. If defaults changed, inspect the
   existing helper and pass its original settings explicitly; do not invent a
   new task key merely to bypass a conflict.
-- Make `task` self-contained: outcome, relevant file paths, exact read/write
-  scope, constraints, and what verification means. Helpers do not see the
-  parent's conversation.
-- `access: read` permits investigation only; `write` permits the scoped edits.
+- Make `task` self-contained: outcome, relevant file paths, exact work scope,
+  any read-only or editing constraints, and what verification means. Helpers do
+  not see the parent's conversation. They use one trusted execution mode;
+  `spawn_agent` has no `access` selector. State read-only limits in the task,
+  not as a claimed platform-enforced permission.
 - Omit provider/model/effort to inherit the calling turn's selection. Explicit
   arguments take precedence, followed by explicit owner preferences in an
   installed Subagents app, then the calling turn. A different explicitly chosen
@@ -49,5 +50,6 @@ to a still-working helper, use the peer coordination tools instead.
 
 Quota pauses retain the same bounded task. Retry/check times do not guarantee
 provider availability. Planned restarts preserve accepted work; never infer
-permission to restart from delegation itself. A read-only helper may create
-only read-only children, and nested helpers remain under their own parent.
+permission to restart from delegation itself. Helpers may create bounded
+children; pass task-specific constraints to each child. Nested helpers remain
+under their own parent, and owner/public-action/secret safeguards still apply.

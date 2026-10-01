@@ -2810,13 +2810,14 @@ async def test_delegated_claude_keeps_parent_tools_without_hidden_budget(
   monkeypatch.setattr(claude_sdk_runner, "ClaudeAgentOptions", capture_options)
   _install_fake_client(monkeypatch)
 
-  policy = SimpleNamespace(scope="read")
+  policy = SimpleNamespace()
   await _run_turn(
     "delegated-tools", bc=_Bus(), prompt="review", cwd="/data",
     run_policy=policy,
   )
 
   kwargs = captured["kwargs"]
+  assert kwargs["permission_mode"] == "acceptEdits"
   assert "max_budget_usd" not in kwargs
   assert "agents" not in kwargs
   disallowed = set(kwargs["disallowed_tools"])

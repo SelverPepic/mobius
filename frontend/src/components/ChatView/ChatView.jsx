@@ -92,6 +92,7 @@ import GoalPlanDetails from './GoalPlanDetails.jsx'
 import GoalDraftChip from './GoalDraftChip.jsx'
 import WaitingChip from './WaitingChip.jsx'
 import AssistantReply from './AssistantReply.jsx'
+import ArchivedChatNotice from './ArchivedChatNotice.jsx'
 import QueuedMessages from './QueuedMessages.jsx'
 import {
   chatChangesActionIsCurrent,
@@ -379,6 +380,9 @@ export default function ChatView({
   onInternalNav,
   onMessageStart,
   onOwnerActivity,
+  // True while this chat is filed under Archived; the notice offers Restore.
+  archived = false,
+  onRestoreArchived,
   onVoiceListeningChange,
   showPicker = true,
   embedded = false,
@@ -6324,6 +6328,9 @@ export default function ChatView({
             resourcePause={resourcePause}
             onCancel={handleCancelWait}
           />
+        )}
+        {archived && !provisionalNewChat && (
+          <ArchivedChatNotice onRestore={onRestoreArchived} />
         )}
         <ConnectionStatus
           error={connectionError}

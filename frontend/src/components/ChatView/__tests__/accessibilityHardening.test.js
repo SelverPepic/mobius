@@ -41,11 +41,10 @@ test('ShareAppSheet presents hosted use and installable copies as separate lifec
   assert.match(client, /\/hosted-publication.*method: 'DELETE'/)
 })
 
-test('full-screen dialogs share one focus, inerting, and Escape contract', () => {
+test('workspace-wide dialogs share one focus, inerting, and Escape contract', () => {
   const dialogs = [
     read('../../ui/ModelSheet.jsx'),
     read('../ManageModelsModal.jsx'),
-    read('../markdown/ImageLightbox.jsx'),
     read('../AgentContextInspector.jsx'),
     read('../ChatSummaryViewer.jsx'),
   ]
@@ -55,6 +54,12 @@ test('full-screen dialogs share one focus, inerting, and Escape contract', () =>
     assert.match(source, /role="dialog"/)
     assert.match(source, /aria-modal="true"/)
   }
+
+  const imageViewer = read('../markdown/ImageLightbox.jsx')
+  assert.match(imageViewer, /useDialogFocus\(\{/)
+  assert.match(imageViewer, /inertBoundaryRef: paneBoundaryRef/)
+  assert.match(imageViewer, /modal: false/)
+  assert.match(imageViewer, /aria-modal="false"/)
 
   const manageModels = dialogs[1]
   assert.match(manageModels, /ref=\{keepEditingRef\}/)
@@ -103,7 +108,7 @@ test('chat image preview actions use labeled buttons', () => {
   const preview = read('../ImagePreviewButton.jsx')
   const markdown = read('../markdown/InlineContent.jsx')
   assert.match(attachments, /<ImagePreviewButton/)
-  assert.match(composer, /aria-label=\{`View \$\{chip\.name\} full screen`\}/)
+  assert.match(composer, /aria-label=\{`Preview \$\{chip\.name\}`\}/)
   assert.match(preview, /aria-label=\{`Open \$\{alt \|\| 'image'\} preview`\}/)
   assert.match(markdown, /<button[\s\S]*className="md-image-frame"[\s\S]*aria-label=\{`Open \$\{alt \|\| 'image'\} preview`\}/)
 })

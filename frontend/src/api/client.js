@@ -801,6 +801,15 @@ export const api = {
     // Chats and apps share one pinned section, so its order is one transaction
     // even though the rows live in two resource tables.
     reorderPinned: pinnedOrderMutation,
+    // Archiving files a chat under Archived without touching its history or
+    // work; restoring returns it to Recents. Both answer the persisted
+    // `{ archived_at, pinned_at }` so the drawer can settle its rows.
+    archive: (chatId) => listAffectingMutation(
+      'chats', `/chats/${encodeURIComponent(chatId)}/archive`, { method: 'POST' },
+    ),
+    unarchive: (chatId) => listAffectingMutation(
+      'chats', `/chats/${encodeURIComponent(chatId)}/unarchive`, { method: 'POST' },
+    ),
     remove: (chatId) => listAffectingMutation(
       'chats', `/chats/${chatId}`, { method: 'DELETE' },
     ),

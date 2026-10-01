@@ -28,6 +28,19 @@ PREVIOUS_RELEASE_SCHEMA = (
 )
 
 
+def test_legacy_helper_interruption_column_upgrades_idempotently(tmp_path):
+  eng = create_engine(f"sqlite:///{tmp_path / 'legacy-helper.db'}")
+  models.Base.metadata.create_all(eng)
+  with eng.begin() as conn:
+    conn.execute(text("ALTER TABLE delegations DROP COLUMN interrupted_at"))
+
+  migrations._add_legacy_helper_interruption(eng)
+  migrations._add_legacy_helper_interruption(eng)
+
+  columns = {column["name"] for column in inspect(eng).get_columns("delegations")}
+  assert "interrupted_at" in columns
+
+
 def test_autopilot_block_upgrade_preserves_legacy_pause_intent(tmp_path):
   eng = create_engine(f"sqlite:///{tmp_path / 'autopilot-upgrade.db'}")
   models.Base.metadata.create_all(eng)
@@ -1765,6 +1778,8 @@ def test_run_migrations_records_an_inspectable_append_only_history(tmp_path):
     "0073_schedule_provenance",
     "0074_chat_owned_delegations",
     "0075_notification_seen_at",
+    "0076_legacy_helper_interruption",
+    "0077_chat_archive",
   ]
   assert second == first
 

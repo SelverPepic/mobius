@@ -16,7 +16,7 @@ def core_task(db, *, status="parked", reason="usage_limit"):
   row=models.Delegation(
     id="core-task",app_id=None,parent_chat_id=parent.id,parent_root_run_id="parent-run",
     task_key="bounded",child_chat_id=child.id,provider="codex",model="test-model",
-    scope="read",cwd="/data",prompt_sha256=hashlib.sha256(b"task").hexdigest(),
+    scope="write",cwd="/data",prompt_sha256=hashlib.sha256(b"task").hexdigest(),
     startup_prompt="task",
   )
   db.add_all([parent,child,row])
@@ -64,11 +64,11 @@ def test_core_limit_successor_keeps_exact_owned_lineage(db):
   assert delegations.limit_resume_successor_delegation(db,**kwargs) is None
 
 
-def test_core_policy_and_execution_token_preserve_scope_and_cancellation(client,owner_token,db):
+def test_core_policy_and_execution_token_preserve_ownership_and_cancellation(client,owner_token,db):
   row,child,run=core_task(db,status="running",reason=None)
   policy=delegations.policy_for_chat(db,child.id)
-  assert policy.app_id is None and policy.scope=="read"
-  assert "READ-ONLY" in policy.system_prompt
+  assert policy.app_id is None
+  assert "bounded task" in policy.system_prompt.lower()
   token=delegations.delegation_execution_token(db,policy,run_id=run.id)
   assert token
   from app.deps import get_delegation_principal
@@ -189,3 +189,20 @@ def test_actual_retry_admission_refuses_cancelled_core_work(db, monkeypatch, rea
   )) is False
   assert scheduled == []
   assert db.query(models.ChatRun).filter_by(chat_id=child.id).count() == 1
+
+
+def test_retired_core_helper_cannot_reenter_any_recovery(db):
+  row, child, run = core_task(db, status="running", reason=None)
+  run.restart_nonce = "approved"
+  row.scope = "read"
+  row.interrupted_at = now_naive_utc()
+  db.commit()
+  assert not delegations.delegation_recovery_allowed(
+    db, child_chat_id=child.id, initiated_by_app_id=None,
+  )
+  assert delegations.restart_resume_delegation(
+    db, child_chat_id=child.id, run_token=run.id,
+    initiated_by_app_id=None, restart_nonce="approved",
+  ) is None
+  with pytest.raises(RuntimeError, match="Legacy helper cannot resume"):
+    delegations.policy_for_chat(db, child.id)

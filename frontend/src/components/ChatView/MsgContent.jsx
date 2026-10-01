@@ -259,9 +259,8 @@ function MsgContentInner({
     // positions — and their keys — are stable mid-run too.)
     const entries = displayBlocks
       .map((block, i) => ({ item: block, rawIdx: i }))
-      // Deliverables render once in the dedicated post-answer surface below.
-      // Excluding that non-inline block here also keeps the actual visible
-      // tail authoritative for Resume/Try-now ownership.
+      // Deliverables are positioned separately below, so they do not change
+      // the visible tail used by Resume/Try-now ownership.
       .filter(({ item, rawIdx }) => (
         item.type !== 'generated_files' && !skipToolIdx.has(rawIdx)
       ))
@@ -592,12 +591,32 @@ function MsgContentInner({
     // arrive here after conversion to the same block shape, so the transcript
     // doesn't reshuffle on promote.
     const nodes = groupActivityRuns(foldAppActivityOperations(finalEntries))
+    const generatedFiles = msg.role === 'assistant' && !isStreaming
+      ? (msg.blocks || []).flatMap(block =>
+          block.type === 'generated_files' && Array.isArray(block.files)
+            ? block.files.map(file => ({ ...file, kind: 'generated' }))
+            : [],
+        )
+      : []
+    // The inbox is captured after the turn ends, which can be after a saved
+    // question. Place those files after the agent's last prose but before any
+    // terminal question card, including in already-saved transcripts.
+    const lastTextNode = nodes.findLastIndex(node => node.single?.item?.type === 'text')
+    const beforeQuestionNode = generatedFiles.length
+      ? nodes.findIndex((node, index) =>
+          index > lastTextNode && node.single?.item?.type === 'question',
+        )
+      : -1
+    const fileAttachments = generatedFiles.length
+      ? <Attachments key="generated-files" attachments={generatedFiles} chatId={chatId} />
+      : null
 
     return (
       <AssistantCopySurface msg={msg} markdownByIndex={assistantMarkdownByIndex}>
         <AnswerCause msg={msg} />
         {msg.role === 'user' && <Attachments attachments={msg.attachments} chatId={chatId} />}
-        {nodes.map((node, nodeIdx) => {
+        {nodes.flatMap((node, nodeIdx) => {
+          const before = nodeIdx === beforeQuestionNode ? [fileAttachments] : []
           if (node.group) {
             // A stretch is LIVE only when it's the trailing node of the
             // active answer while the TURN is running — the agent is working
@@ -614,7 +633,7 @@ function MsgContentInner({
             // swapping keys and forcing a delete+insert. Each entry inside the
             // stretch keeps its own key so a catch-up commit reconciles by
             // identity.
-            return (
+            return [...before, (
               <div
                 key={assistantBlockKey(node.group[0].item, node.group[0].idx)}
                 className="chat__tools"
@@ -629,12 +648,12 @@ function MsgContentInner({
                   onInternalNav={onInternalNav}
                 />
               </div>
-            )
+            )]
           }
-          return renderBlock(node.single.item, node.single.idx)
+          return [...before, renderBlock(node.single.item, node.single.idx)]
         })}
-        {/* One final attachment owns each deliverable; tool previews reuse it. */}
-        {generatedFiles.length > 0 && <Attachments attachments={generatedFiles} chatId={chatId} />}
+        {/* The final attachment owns each deliverable, before any terminal question. */}
+        {beforeQuestionNode < 0 && fileAttachments}
         {!isStreaming && <GoalHistory msg={msg} />}
         {!isStreaming && <StoppedWaits msg={msg} />}
       </AssistantCopySurface>

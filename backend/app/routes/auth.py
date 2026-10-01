@@ -1296,7 +1296,10 @@ async def _complete_mobius_enrollment(
     db.rollback()
     return _mobius_enroll_error_redirect()
   db.commit()
-  return RedirectResponse(url="/settings?section=ai-providers", status_code=303)
+  return RedirectResponse(
+    url="/settings?section=ai-providers&mobius_enroll_return=1",
+    status_code=303,
+  )
 
 
 @router.get("/mobius/login/start")

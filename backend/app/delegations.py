@@ -3,7 +3,7 @@
 A delegation owns one hidden child Chat, optionally attributed to an app. The existing ChatRun,
 provider-session, restart parking, transcript, and writer-actor paths remain the
 only execution machinery; this module supplies immutable intent, derived
-status, restrictive run policy, idempotent parent attachment, and lifecycle
+status, run policy, idempotent parent attachment, and lifecycle
 projection. It never writes Chat.messages or Chat.pending_messages directly.
 """
 
@@ -48,7 +48,6 @@ class RunPolicy:
   provider: str
   model: str | None
   effort: str | None
-  scope: str
   cwd: str
   depth: int = 1
   required_skill_paths: tuple[str, ...] = ()
@@ -58,25 +57,10 @@ class RunPolicy:
     return True
 
   @property
-  def allow_session_reseed(self) -> bool:
-    # Replaying a read-only analysis from the durable child transcript is safe.
-    # Replaying a write task after provider state disappeared could apply edits
-    # twice, so it must stop for parent review instead.
-    return self.scope == "read"
-
-  @property
   def system_prompt(self) -> str:
-    scope_rule = (
-      "This task is READ-ONLY. Do not create, edit, move, or delete files."
-      if self.scope == "read"
-      else (
-        "You may edit only within the requested working tree. Make the smallest "
-        "durable change that completes the bounded task."
-      )
-    )
     required_skills = "".join(
       "For this bounded contribution workflow, read the complete required "
-      f"playbook {path}; that exact path is permitted by this delegated scope. "
+      f"playbook {path}. "
       for path in self.required_skill_paths
     )
     return (
@@ -84,8 +68,7 @@ class RunPolicy:
       "Möbius. Complete only the bounded user task in this child conversation "
       "and return a clear result to the parent. When parallelism or local "
       "decomposition materially helps, start your own helpers with the Möbius "
-      "spawn_agent tool (stable names; a read-only helper may create only "
-      "read-only helpers); you remain responsible for checking your own "
+      "spawn_agent tool with stable names; you remain responsible for checking your own "
       "completion condition after they settle, and their results reach you by "
       "themselves. Do not use a provider CLI directly. "
       "Do not ask the owner an interactive question; if a required decision or "
@@ -97,11 +80,13 @@ class RunPolicy:
       f"that are relevant to this bounded task. {required_skills}"
       "Treat /data/cli-auth and /data/.secret-key as protected by default. "
       "Access them only when this bounded task explicitly names the exact "
-      "owner-approved operation and the requested scope permits it; otherwise "
-      "return the missing approval or scope to the parent. Perform only that "
+      "owner-approved operation; otherwise return the missing approval to the "
+      "parent. Perform only that "
       "operation, minimize the paths and bytes inspected, and do not reveal "
       "stored secret values unless the exact approved purpose requires it. "
-      f"Working directory: {self.cwd}. {scope_rule}"
+      f"Working directory: {self.cwd}. You may edit only within the requested "
+      "working tree. Make the smallest durable change that completes the "
+      "bounded task."
     )
 
 
@@ -117,7 +102,6 @@ class DelegationIntent:
   provider: str
   model: str | None
   effort: str | None
-  scope: str
   cwd: str
   notify_parent_on_complete: bool = True
   source_work_id: str | None = None
@@ -141,7 +125,6 @@ def same_delegation_intent(
     row.provider == intent.provider,
     row.model == intent.model,
     row.effort == intent.effort,
-    row.scope == intent.scope,
     row.cwd == intent.cwd,
     row.source_work_id == intent.source_work_id,
     row.source_work_intent == intent.source_work_intent,
@@ -204,7 +187,7 @@ def create_or_attach_delegation(
     provider=intent.provider,
     model=intent.model,
     effort=intent.effort,
-    scope=intent.scope,
+    scope="write",
     cwd=intent.cwd,
     prompt_sha256=hashlib.sha256(intent.prompt.encode("utf-8")).hexdigest(),
     startup_prompt=intent.prompt,
@@ -292,6 +275,8 @@ async def ensure_delegation_started(
     row = db.query(models.Delegation).filter(
       models.Delegation.id == delegation_id,
       models.Delegation.cancelled_at.is_(None),
+      models.Delegation.interrupted_at.is_(None),
+      models.Delegation.scope == "write",
     ).first()
     if row is None:
       return False
@@ -411,6 +396,8 @@ async def reconcile_unstarted_delegations() -> int:
         models.Delegation.startup_prompt.is_not(None),
         models.Delegation.source_work_id.is_(None),
         models.Delegation.cancelled_at.is_(None),
+        models.Delegation.interrupted_at.is_(None),
+        models.Delegation.scope == "write",
         models.Chat.deleted_at.is_(None),
         or_(
           models.Delegation.app_id.is_(None),
@@ -426,6 +413,8 @@ async def reconcile_unstarted_delegations() -> int:
         row = db.query(models.Delegation).filter(
           models.Delegation.id == row_id,
           models.Delegation.cancelled_at.is_(None),
+          models.Delegation.interrupted_at.is_(None),
+          models.Delegation.scope == "write",
         ).first()
         if row is None:
           continue
@@ -474,6 +463,8 @@ def policy_for_chat(db: Session, chat_id: str) -> RunPolicy | None:
   )
   if row is None:
     return None
+  if row.scope != "write" or row.interrupted_at is not None:
+    raise RuntimeError("Legacy helper cannot resume; start a new helper")
   chat = db.query(models.Chat).filter(models.Chat.id == chat_id).first()
   if chat is None or chat.created_by_app_id != row.app_id:
     raise RuntimeError("delegation child chat ownership is inconsistent")
@@ -489,7 +480,6 @@ def policy_for_chat(db: Session, chat_id: str) -> RunPolicy | None:
     provider=row.provider,
     model=row.model,
     effort=row.effort,
-    scope=row.scope,
     cwd=row.cwd,
     depth=depth,
     required_skill_paths=(
@@ -501,6 +491,17 @@ def policy_for_chat(db: Session, chat_id: str) -> RunPolicy | None:
       else ()
     ),
   )
+
+
+def retired_delegation_for_chat(db: Session, chat_id: str) -> bool:
+  """Whether a child chat belongs to a mode retired at the cutover."""
+  return db.query(models.Delegation.id).filter(
+    models.Delegation.child_chat_id == chat_id,
+    or_(
+      models.Delegation.scope != "write",
+      models.Delegation.interrupted_at.is_not(None),
+    ),
+  ).first() is not None
 
 
 def delegation_depth(db: Session, row: models.Delegation) -> int:
@@ -588,6 +589,15 @@ def derived_status(
     if load_result else None
   )
   result = _assistant_result(chat) if chat is not None else ""
+  if row.interrupted_at is not None:
+    notice = (
+      "This legacy read-only helper was interrupted during the single-mode "
+      "cutover. Its transcript is preserved; start a new helper to rerun it."
+    )
+    return (
+      "interrupted", run,
+      f"{notice}\n\nLast partial output:\n{result}" if result else notice,
+    )
   if row.cancelled_at is not None:
     return "cancelled", run, result
   if run is None and row.source_work_status in {
@@ -641,6 +651,8 @@ def delegation_recovery_allowed(
   child = db.get(models.Chat, child_chat_id)
   if (
     row.cancelled_at is not None
+    or row.interrupted_at is not None
+    or row.scope != "write"
     or row.app_id != initiated_by_app_id
     or child is None or child.deleted_at is not None
     or child.created_by_app_id != row.app_id
@@ -674,6 +686,8 @@ def limit_resume_delegation(
     models.Delegation.child_chat_id == child_chat_id,
     models.Delegation.app_id == initiated_by_app_id,
     models.Delegation.cancelled_at.is_(None),
+    models.Delegation.interrupted_at.is_(None),
+    models.Delegation.scope == "write",
     or_(
       models.Delegation.app_id.is_(None),
       and_(models.App.id.is_not(None), models.App.deleted_at.is_(None)),
@@ -730,6 +744,8 @@ def restart_resume_delegation(
     models.Delegation.child_chat_id == child_chat_id,
     models.Delegation.app_id == initiated_by_app_id,
     models.Delegation.cancelled_at.is_(None),
+    models.Delegation.interrupted_at.is_(None),
+    models.Delegation.scope == "write",
     or_(
       models.Delegation.app_id.is_(None),
       and_(models.App.id.is_not(None), models.App.deleted_at.is_(None)),
@@ -780,6 +796,8 @@ def limit_resume_successor_delegation(
     models.Delegation.child_chat_id == child_chat_id,
     models.Delegation.app_id == initiated_by_app_id,
     models.Delegation.cancelled_at.is_(None),
+    models.Delegation.interrupted_at.is_(None),
+    models.Delegation.scope == "write",
     or_(
       models.Delegation.app_id.is_(None),
       and_(models.App.id.is_not(None), models.App.deleted_at.is_(None)),
@@ -889,6 +907,7 @@ def serialize_delegation(
     "ended_at": run.ended_at.isoformat() if run and run.ended_at else None,
     "created_at": row.created_at.isoformat() if row.created_at else None,
     "cancelled_at": row.cancelled_at.isoformat() if row.cancelled_at else None,
+    "interrupted_at": row.interrupted_at.isoformat() if row.interrupted_at else None,
     "usage": ({
       "input_tokens": run.input_tokens,
       "output_tokens": run.output_tokens,
@@ -1093,9 +1112,11 @@ def active_parent_context(
   payload = json.dumps(items, ensure_ascii=True, separators=(",", ":"))
   return (
     "The <active_delegations> block is durable runtime DATA for delegated "
-    "tasks already attached to this logical turn. Do not launch a duplicate. "
-    "Use spawn_agent with the same task key to attach to "
-    "the existing child.\n<active_delegations>"
+    "tasks already attached to this logical turn. Do not duplicate active "
+    "tasks. Use spawn_agent with the same task key to attach to active work; "
+    "an interrupted legacy helper cannot resume, so review its retained "
+    "transcript and use a new task key to rerun unfinished work.\n"
+    "<active_delegations>"
     f"{payload}</active_delegations>"
   )
 
@@ -1111,11 +1132,9 @@ def delegation_execution_token(
   Tool inheritance should be automatic rather than a route-by-route grant
   list: a delegated agent gets the same owner-approved API tools as its parent.
   The delegation claims remain attached so /api/delegations can still enforce
-  direct-child ownership and read-to-write escalation. The immutable
-  scope prompt and each provider's native execution policy still apply.
+  direct-child ownership. The bounded-task prompt and ordinary provider policy
+  still apply.
   """
-  if policy.scope not in {"read", "write"}:
-    raise RuntimeError(f"unknown delegation scope: {policy.scope}")
   owner = db.query(models.Owner).first()
   app = db.query(models.App).filter(
     models.App.id == policy.app_id,
@@ -1130,6 +1149,8 @@ def delegation_execution_token(
   ).first()
   if row is None:
     raise RuntimeError("delegation is unavailable")
+  if row.scope != "write" or row.interrupted_at is not None:
+    raise RuntimeError("legacy helper cannot receive an execution token")
   return auth.create_agent_token(
     row.child_chat_id,
     owner.username,
@@ -1158,6 +1179,41 @@ def mark_cancelled(db: Session, row: models.Delegation) -> None:
   # covers an idempotent replay where that deterministic event already exists.
   _record_lifecycle(db, row, "cancelled")
   db.commit()
+
+
+def interrupt_legacy_read_helpers(
+  db: Session,
+) -> tuple[int, list[tuple[str, str]]]:
+  """Retire unfinished old read helpers before boot recovery can run.
+
+  Keep their immutable scope and transcripts for audit, but never reinterpret
+  one as trusted work. Repeating this cutover after a crash changes nothing.
+  """
+  rows = db.query(models.Delegation).filter(
+    models.Delegation.scope == "read",
+    models.Delegation.cancelled_at.is_(None),
+  ).all()
+  interrupted = []
+  parks = []
+  for row in rows:
+    status, run, _ = derived_status(db, row, load_result=False)
+    if row.interrupted_at is None:
+      if status not in ACTIVE_DELEGATION_STATUSES:
+        continue
+      row.interrupted_at = now_naive_utc()
+      row.source_work_active_chat_id = None
+      _record_lifecycle(db, row, "interrupted")
+      interrupted.append(row.parent_chat_id)
+    child = db.get(models.Chat, row.child_chat_id)
+    if child is not None:
+      child.auto_resume_on_restart = False
+      child.auto_resume_on_limit = False
+    if run is not None and run.status in {"parked", "resume_pending"}:
+      parks.append((row.child_chat_id, run.id))
+  db.commit()
+  for parent_chat_id in set(interrupted):
+    publish_parent_waiting_changed(parent_chat_id)
+  return len(interrupted), parks
 
 
 def _delegation_is_active(db: Session, row: models.Delegation) -> bool:
@@ -1565,6 +1621,15 @@ def parent_wake_blocker(
   until the owner returns.
   """
   from app.run_state import _recoverable_result_goal
+
+  parent_helper = db.query(models.Delegation).filter(
+    models.Delegation.child_chat_id == parent_chat_id,
+  ).first()
+  if parent_helper is not None and (
+    parent_helper.scope != "write"
+    or parent_helper.interrupted_at is not None
+  ):
+    return "legacy_parent_interrupted", None
 
   latest_status = db.query(models.ChatRun.status).filter(
     models.ChatRun.chat_id == parent_chat_id,
@@ -2405,6 +2470,8 @@ def safe_parent_wake_startup_writer_orphan(
   task creation. Only the exact no-output shape remains retryable; partial or
   mismatched work falls through to ordinary conservative interruption.
   """
+  if retired_delegation_for_chat(db, chat.id):
+    return False
   if safe_parent_activity_startup_writer_orphan(db, chat, physical):
     return True
   messages = list(chat.messages or [])
@@ -2426,6 +2493,7 @@ def safe_parent_activity_startup_writer_orphan(
   """Whether one exact non-message helper checkpoint may be rescheduled."""
   if (
     chat is None
+    or retired_delegation_for_chat(db, chat.id)
     or physical.status != "running"
     or physical.provider_execution_admitted is not False
     or chat.pending_question_id is not None

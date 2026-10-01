@@ -38,7 +38,7 @@ test('.chat__scroll contains its overscroll and is a positioning context', () =>
 
 test('nested chat readers allow browser-native vertical handoff to their transcript', () => {
   for (const selector of [
-    '.chat__tool-detail', '.chat__marker-body',
+    '.chat__tool-detail', '.chat__marker-body', '.chat__document-card-reader',
   ]) {
     assert.match(ruleBody(selector), /overscroll-behavior-y:\s*auto/)
   }

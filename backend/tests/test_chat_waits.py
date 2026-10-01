@@ -64,13 +64,13 @@ def _delegated_agent_run_auth(db, chat_id, run_id):
     id=delegation_id, app_id=app.id, parent_chat_id=parent.id,
     parent_root_run_id=parent.id, task_key="wait-boundary",
     child_chat_id=chat_id, provider="codex", model=None, effort=None,
-    scope="read", cwd="/data/platform",
+    scope="write", cwd="/data/platform",
     prompt_sha256=hashlib.sha256(b"check the wait boundary").hexdigest(),
   ))
   db.commit()
   token = delegation_execution_token(db, RunPolicy(
     delegation_id=delegation_id, app_id=app.id, provider="codex",
-    model=None, effort=None, scope="read", cwd="/data/platform",
+    model=None, effort=None, cwd="/data/platform",
   ), run_id=run_id)
   return {"Authorization": f"Bearer {token}"}
 
