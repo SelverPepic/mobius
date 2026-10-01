@@ -354,6 +354,7 @@ async def _run_claude_summarize_turn(
   )
   client = ClaudeSDKClient(options)
   parts: list[str] = []
+  errors: list[str] = []
   terminal_seen = False
   try:
     try:
@@ -368,14 +369,27 @@ async def _run_claude_summarize_turn(
         await client.query(prompt)
         async for msg in client.receive_response():
           if isinstance(msg, AssistantMessage):
+            if msg.error:
+              errors.append(msg.error)
+              errors.extend(
+                block.text for block in msg.content if isinstance(block, TextBlock)
+              )
             for block in msg.content:
               if isinstance(block, TextBlock):
                 parts.append(block.text)
           elif isinstance(msg, ResultMessage):
             terminal_seen = True
             if msg.is_error:
+              errors.extend(msg.errors or [])
+              if isinstance(msg.result, str):
+                errors.append(msg.result)
+              if msg.api_error_status in (401, 429):
+                errors.append(
+                  "authentication_failed" if msg.api_error_status == 401
+                  else "rate_limit"
+                )
               raise CompactionError(
-                "The incoming Claude agent could not compact the chat."
+                _provider_compaction_failure("\n".join(errors))
               )
     except asyncio.TimeoutError:
       raise CompactionError(
@@ -422,8 +436,44 @@ def _codex_agent_text(stdout: bytes) -> str:
   return "".join(parts)
 
 
+def _provider_compaction_failure(text: str) -> str:
+  """Return only fixed, actionable messages for known synthesis refusals."""
+  unchanged = " Your existing conversation is unchanged."
+  if re.search(
+    r"request body is too large|request_body_too_large|"
+    r"unexpected status 413\b|context_length_exceeded", text, re.IGNORECASE,
+  ):
+    return "The provider rejected the compaction request as too large." + unchanged
+  if re.search(
+    r"out of credits|insufficient[_ ]credits|insufficient_quota|"
+    r"credit balance is too low", text, re.IGNORECASE,
+  ):
+    return (
+      "The incoming provider is out of credits. Add credits for that provider, "
+      "then try switching again." + unchanged
+    )
+  if re.search(
+    r"rate[_ ]limit|usage[_ ]limit|weekly limit|session limit|"
+    r"too many requests", text, re.IGNORECASE,
+  ):
+    return (
+      "The incoming provider has reached a usage or rate limit. "
+      "Try switching again when its allowance is available." + unchanged
+    )
+  if re.search(
+    r"authentication_failed|authentication (?:failed|error)|"
+    r"invalid authentication credentials|invalid_api_key|unauthorized|"
+    r"login required|not logged in", text, re.IGNORECASE,
+  ):
+    return (
+      "The incoming provider could not sign in. Reconnect that provider in "
+      "Settings, then try switching again." + unchanged
+    )
+  return "The incoming provider could not compact the chat."
+
+
 def _codex_compaction_failure(stdout: bytes, stderr: bytes) -> str:
-  """Classify a rejected synthesis without exposing raw provider output."""
+  """Classify failure events, never assistant prose or raw provider output."""
   errors: list[str] = []
   for line in stdout.decode("utf-8", "replace").splitlines():
     try:
@@ -433,7 +483,9 @@ def _codex_compaction_failure(stdout: bytes, stderr: bytes) -> str:
     if not isinstance(event, dict) or event.get("type") not in {"error", "turn.failed"}:
       continue
     error = event.get("error", event)
-    if isinstance(error, dict):
+    if isinstance(error, str):
+      errors.append(error)
+    elif isinstance(error, dict):
       errors.extend(
         value for key in ("code", "message")
         if isinstance(value := error.get(key), str)
@@ -441,15 +493,7 @@ def _codex_compaction_failure(stdout: bytes, stderr: bytes) -> str:
   # Older CLI versions report their terminal failure only on stderr. Match
   # known refusals, but never return or log arbitrary text from that stream.
   text = "\n".join(errors) if errors else stderr.decode("utf-8", "replace")
-  if re.search(
-    r"request body is too large|request_body_too_large|"
-    r"unexpected status 413\b|context_length_exceeded", text, re.IGNORECASE,
-  ):
-    return (
-      "The provider rejected the compaction request as too large. "
-      "Your existing conversation is unchanged."
-    )
-  return "The incoming provider could not compact the chat."
+  return _provider_compaction_failure(text)
 
 
 async def _run_codex_summarize_turn(
