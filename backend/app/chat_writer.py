@@ -3519,18 +3519,6 @@ class ChatWriterActor:
       return StartTurnRecoveryChanged()
     from app.run_state import latest_run
     prior = latest_run(db, cmd.chat_id) if resuming else None
-    grant_id = cmd.browser_grant_id
-    grant_epoch = cmd.browser_grant_epoch
-    if resuming and prior is not None:
-      if grant_id is not None and (grant_id, grant_epoch) != (
-        prior.browser_grant_id, prior.browser_grant_epoch,
-      ):
-        raise _PersistFailed("Browser grant cannot resume a foreign run")
-      grant_id = prior.browser_grant_id
-      grant_epoch = prior.browser_grant_epoch
-    elif grant_id is None:
-      grant_id, grant_epoch = _delegation_browser_lineage(db, cmd.chat_id)
-    _require_browser_grant(db, grant_id, grant_epoch)
     if cmd.resume_run_id is not None and (
       not resuming or prior is None or prior.id != cmd.resume_run_id
     ):
@@ -3553,6 +3541,18 @@ class ChatWriterActor:
       if prior is None:
         db.rollback()
         return StartTurnRecoveryChanged()
+    grant_id = cmd.browser_grant_id
+    grant_epoch = cmd.browser_grant_epoch
+    if resuming and prior is not None:
+      if grant_id is not None and (grant_id, grant_epoch) != (
+        prior.browser_grant_id, prior.browser_grant_epoch,
+      ):
+        raise _PersistFailed("Browser grant cannot resume a foreign run")
+      grant_id = prior.browser_grant_id
+      grant_epoch = prior.browser_grant_epoch
+    elif grant_id is None:
+      grant_id, grant_epoch = _delegation_browser_lineage(db, cmd.chat_id)
+    _require_browser_grant(db, grant_id, grant_epoch)
     if not existing:
       chat.provider = cmd.default_provider or "claude"
     # Build the agent history as schemas.ChatMessage objects, exactly as the
@@ -5238,8 +5238,8 @@ class ChatWriterActor:
       for row, _status in _self_resuming_helper_rows(db, {chat.id})
     ):
       return None
-    from app.continuations import goal_settlement_attempted, GOAL_SETTLEMENT_UNFINISHED_MESSAGE
-    if goal_settlement_attempted(db, prior):
+    from app.continuations import recovery_attempted, GOAL_SETTLEMENT_UNFINISHED_MESSAGE
+    if recovery_attempted(db, prior, reason="goal_settlement"):
       # A broken execution is not a declaration that the owner's outcome is
       # impossible. Preserve intent and surface technical recovery, with no
       # unlimited provider loop and no manufactured success/capitulation.
@@ -5261,46 +5261,9 @@ class ChatWriterActor:
         raise _PersistFailed("Goal settlement recovery note did not persist")
       return {"history": [], "promoted": None, "session_id": chat.session_id,
               "settlement_error": note}
-    from app.continuations import (
-      continuation_control_envelope, continuation_protocol_source,
+    return self._admit_clean_recovery(
+      db, chat, prior, goal=goal, reason="goal_settlement",
     )
-    token = "goal-settlement-" + hashlib.sha256(prior.id.encode()).hexdigest()[:48]
-    source = continuation_protocol_source(
-      reason="goal_settlement", control_id=token, run_token=token,
-      source_work_id=prior.id, goal_id=goal.id,
-    )
-    source["ts"] = next_message_ts(list(chat.messages or []))
-    for key in ("viewport", "timezone"):
-      for message in reversed(chat.messages or []):
-        if message.get("role") == "user" and message.get(key) is not None:
-          source[key] = copy.deepcopy(message[key])
-          break
-    history = [schemas.ChatMessage(role=message.get("role", "user"),
-                                  content=message.get("content", "") or "")
-               for message in chat.messages or []]
-    history.append(schemas.ChatMessage(role="user", content=source["content"]))
-    now = datetime.now(UTC)
-    prior.status = "completed"
-    prior.ended_at = now
-    new_run = models.ChatRun(
-      id=token, chat_id=chat.id, status="running", provider=prior.provider,
-      root_run_id=prior.root_run_id or prior.id, started_at=now,
-      goal_id=goal.id, goal_objective=goal.objective,
-      browser_grant_id=prior.browser_grant_id,
-      browser_grant_epoch=prior.browser_grant_epoch,
-      continuation_json=continuation_control_envelope(
-        reason="goal_settlement", control_id=token, source_work_id=prior.id,
-        goal_id=goal.id, supersedes_run_token=prior.id,
-      ),
-    )
-    chat.updated_at = now
-    self._commit_admitted_run_start(
-      db, chat, new_run, source["ts"],
-      failure_message="Goal settlement attempt did not persist",
-    )
-    return {"history": history, "session_id": chat.session_id,
-            "promoted": {**source, "_messages": [], "_consumed_cids": [],
-                         "_goal_id": goal.id, "_goal_objective": goal.objective}}
 
   def _repair_quiet_writes(self, db, chat, cmd: PromotePending) -> dict | None:
     """Failures alone earn one model continuation at the existing queue drain.
@@ -5346,17 +5309,19 @@ class ChatWriterActor:
       # Retain the negative receipt for the next authorized turn. Removing the
       # Goal from the repair would bypass a hold by creating goal-less work.
       return None
-    return self._admit_clean_recovery(db, chat, prior,
-      goal=goal)
+    return self._admit_clean_recovery(
+      db, chat, prior, goal=goal, reason="quiet_write_failure",
+    )
 
-  def _admit_clean_recovery(self, db, chat, prior, *, goal) -> dict:
+  def _admit_clean_recovery(self, db, chat, prior, *, goal, reason) -> dict:
     """One actor-owned admission for bounded, provider-only clean recovery."""
     from app.continuations import (
       continuation_control_envelope, continuation_protocol_source,
     )
-    token = "write-repair-" + hashlib.sha256(prior.id.encode()).hexdigest()[:48]
+    prefixes = {"quiet_write_failure": "write-repair-", "goal_settlement": "goal-settlement-"}
+    token = prefixes[reason] + hashlib.sha256(prior.id.encode()).hexdigest()[:48]
     source = continuation_protocol_source(
-      reason="quiet_write_failure", control_id=token, run_token=token,
+      reason=reason, control_id=token, run_token=token,
       source_work_id=prior.id, goal_id=goal.id if goal else None,
     )
     source["ts"] = next_message_ts(list(chat.messages or []))
@@ -5375,12 +5340,13 @@ class ChatWriterActor:
     new_run = models.ChatRun(
       id=token, chat_id=chat.id, status="running", provider=prior.provider,
       root_run_id=prior.root_run_id or prior.id, started_at=now,
+      owner_input_at=prior.owner_input_at,
       goal_id=goal.id if goal else None, goal_objective=goal.objective if goal else None,
       initiated_by_app_id=prior.initiated_by_app_id,
       browser_grant_id=prior.browser_grant_id,
       browser_grant_epoch=prior.browser_grant_epoch,
       continuation_json=continuation_control_envelope(
-        reason="quiet_write_failure", control_id=token, source_work_id=prior.id,
+        reason=reason, control_id=token, source_work_id=prior.id,
         goal_id=goal.id if goal else None, supersedes_run_token=prior.id,
       ),
     )

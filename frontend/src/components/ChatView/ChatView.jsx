@@ -17,7 +17,7 @@ import { flushSync } from 'react-dom'
 import { useQueryClient } from '@tanstack/react-query'
 import Check from 'lucide-react/dist/esm/icons/check.mjs'
 import ArrowDown from 'lucide-react/dist/esm/icons/arrow-down.mjs'
-import { Chat, Flag } from '@openai/apps-sdk-ui/components/Icon'
+import { Chat, Flag, Play } from '@openai/apps-sdk-ui/components/Icon'
 import { api, apiFetch, getAuthHeaders, getToken, jsonOrThrow, BASE } from '../../api/client.js'
 import { sharedRuntimeRead } from './runtimeReads.js'
 import {
@@ -5975,6 +5975,7 @@ export default function ChatView({
       limitResetElapsed={last && limitResetElapsed}
       recoveryCredit={last ? pendingLimitRecoveryCredit : null}
       continuationWait={last ? continuationWait : null}
+      handoff={last ? serverHandoff : null}
       submissionBlocked={providerSwitching}
       liveQuestionId={answerableQuestionId}
       pendingQuestionRef={pendingQuestionRef}
@@ -6189,13 +6190,6 @@ export default function ChatView({
                 msg={renderedMsg}
                 chatId={chatId}
                 messageKey={dataKey}
-                onQuestionAnswer={doSendSilent}
-                onQuestionSubmitIntent={prepareQuestionSubmission}
-                onQuestionSubmitCancel={cancelQuestionSubmission}
-                onResume={handleResume}
-                resumeState={resumeState}
-                continuationWait={isLastMsg ? continuationWait : null}
-                handoff={isLastMsg ? serverHandoff : null}
                 onInternalNav={internalNav}
               />
               <MessageMetaRow

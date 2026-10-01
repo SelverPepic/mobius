@@ -347,3 +347,19 @@ def test_helper_can_read_failed_write_only_while_its_own_run_is_live(client,chat
   assert response.json()['arguments']=={'summary':'private contents'}
   submit(FinishRun(**reader,terminal_status='completed'))
   assert client.get(path,headers=headers).status_code==401
+
+
+def test_clean_write_recovery_inherits_original_owner_input_time(chat, db):
+  owner = {'chat_id': chat.id, 'run_token': 'owner-write-run'}
+  submit(StartTurn(**owner, user_msg={'role': 'user', 'content': 'Test', 'ts': 10},
+    owner_input=True, default_provider='claude'))
+  submit(AdmitProviderExecution(**owner))
+  outcome(owner)
+  db.expire_all()
+  admitted_at = db.get(models.ChatRun, owner['run_token']).owner_input_at
+  assert admitted_at is not None
+  result = promote(owner)
+  db.expire_all()
+  recovered = db.get(models.ChatRun, result['promoted']['_run_token'])
+  assert recovered.continuation_json['reason'] == 'quiet_write_failure'
+  assert recovered.owner_input_at == admitted_at

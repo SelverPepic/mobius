@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import Text, cast, func, literal_column, or_, text
+from sqlalchemy import Text, cast, literal_column, or_, text
 from sqlalchemy.orm import Session, load_only
 from starlette.concurrency import run_in_threadpool
 
@@ -432,7 +432,7 @@ def _latest_run_is_waiting_park(db: Session, chat_id: str) -> bool:
   return continuation_handoff_for_chat(db, chat_id)["kind"] == "automatic"
 
 
-def usage_limit_waiting_chat_ids(
+def parked_waiting_chat_ids(
   db: Session,
   chat_ids: Iterable[str],
 ) -> set[str]:

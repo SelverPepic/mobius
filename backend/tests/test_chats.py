@@ -233,7 +233,7 @@ def test_chat_reads_keep_goal_identity_after_a_mid_turn_question(
 
 @pytest.mark.parametrize("reason", ["usage_limit", "restart"])
 def test_waiting_marks_only_latest_park(chat, db, monkeypatch, reason):
-  from app.chat import usage_limit_waiting_chat_ids
+  from app.chat import parked_waiting_chat_ids
 
   base = datetime.now(UTC)
   chat.auto_resume_on_limit = True
@@ -249,14 +249,14 @@ def test_waiting_marks_only_latest_park(chat, db, monkeypatch, reason):
     parked.restart_nonce = "approved"
   db.add(parked)
   db.commit()
-  assert usage_limit_waiting_chat_ids(db, [chat.id]) == {chat.id}
+  assert parked_waiting_chat_ids(db, [chat.id]) == {chat.id}
 
   # resume_pending is still awaiting resume and counts.
   db.query(models.ChatRun).filter_by(id="usage-park").update(
     {"status": "resume_pending"}
   )
   db.commit()
-  assert usage_limit_waiting_chat_ids(db, [chat.id]) == {chat.id}
+  assert parked_waiting_chat_ids(db, [chat.id]) == {chat.id}
 
   # A newer running row supersedes the park (latest-run-wins) → not waiting.
   db.add(make_goal_run(db,
@@ -264,20 +264,19 @@ def test_waiting_marks_only_latest_park(chat, db, monkeypatch, reason):
     provider="claude", started_at=base + timedelta(seconds=1),
   ))
   db.commit()
-  assert usage_limit_waiting_chat_ids(db, [chat.id]) == set()
+  assert parked_waiting_chat_ids(db, [chat.id]) == set()
 
 
-def test_usage_limit_waiting_ignores_non_usage_parks(chat, db):
-  from app.chat import usage_limit_waiting_chat_ids
+def test_waiting_ignores_restart_without_authorized_nonce(chat, db):
+  from app.chat import parked_waiting_chat_ids
 
-  # A restart/resource park auto-continues and must not earn the usage-limit
-  # waiting mark.
+  # A restart without its exact approved nonce cannot promise an automatic wake.
   db.add(make_goal_run(db,
     id="restart-park", chat_id=chat.id, status="parked",
     provider="claude", park_reason="restart", started_at=datetime.now(UTC),
   ))
   db.commit()
-  assert usage_limit_waiting_chat_ids(db, [chat.id]) == set()
+  assert parked_waiting_chat_ids(db, [chat.id]) == set()
 
 
 @pytest.mark.parametrize("status", ["parked", "resume_pending"])

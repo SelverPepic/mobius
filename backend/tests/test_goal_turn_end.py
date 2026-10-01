@@ -264,7 +264,7 @@ async def test_second_unhanded_ending_preserves_goal_and_records_durable_recover
 
 
 def test_resource_and_restart_recovery_cannot_reset_the_settlement_budget(db, chat):
-  from app.continuations import goal_settlement_attempted
+  from app.continuations import recovery_attempted
   _add_goal_run(db, chat)
   first = get_writer().submit(PromotePending(
     chat_id=chat.id, run_token="provisional", ending_run_token="goal-run",
@@ -276,10 +276,10 @@ def test_resource_and_restart_recovery_cannot_reset_the_settlement_budget(db, ch
     status="running", continuation_json={"reason": "restart", "supersedes_run_token": token})
   db.add(recovered)
   db.commit()
-  assert goal_settlement_attempted(db, recovered) is True
+  assert recovery_attempted(db, recovered, reason="goal_settlement") is True
   recovered.continuation_json = {"reason": "manual", "supersedes_run_token": token}
   db.commit()
-  assert goal_settlement_attempted(db, recovered) is False
+  assert recovery_attempted(db, recovered, reason="goal_settlement") is False
 
 
 @pytest.mark.asyncio

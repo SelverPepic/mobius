@@ -50,34 +50,6 @@ GOAL_SETTLEMENT_UNFINISHED_MESSAGE = (
 )
 
 
-def goal_settlement_attempted(db, run) -> bool:
-  """A resource/restart recovery retains its settlement budget; owner Resume resets it.
-
-  Follow only exact physical recovery controls, never transcript prose or Goal
-  revisions. A fresh owner/result attempt has no predecessor control, so it
-  starts its own bounded responsibility. Cyclic/corrupt controls fail closed.
-  """
-  from app import models
-  seen = set()
-  while run is not None:
-    if run.id in seen:
-      return True
-    seen.add(run.id)
-    control = run.continuation_json or {}
-    if control.get("reason") == "goal_settlement":
-      return True
-    if control.get("reason") == "manual":
-      return False
-    predecessor = control.get("supersedes_run_token")
-    if not predecessor:
-      return False
-    previous = db.get(models.ChatRun, predecessor)
-    if previous is None or previous.chat_id != run.chat_id or previous.goal_id != run.goal_id:
-      return True
-    run = previous
-  return False
-
-
 def recovery_attempted(db, run, *, reason: str) -> bool:
   """Exact predecessor controls bound recovery; manual owner Resume resets it."""
   from app import models

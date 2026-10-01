@@ -277,8 +277,8 @@ async def promote_pending_messages_locked(
   if result.get("settlement_error"):
     raise GoalSettlementUnfinished(result["settlement_error"])
   if ending_status == "stopped":
-    # The superseded run's Goal was stopped in this commit, releasing its
-    # work claims; wake their followers off this locked path.
+    # Explicit Stop preparation may release exact Goal work claims; wake
+    # their followers off this locked path.
     from app.agent_coordination import schedule_claim_settlement
     schedule_claim_settlement(chat_id)
   promoted = result["promoted"]
