@@ -1,12 +1,14 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
+import { withChatArchive, withPendingChatArchives } from '../chatListProjection.js'
 
 const css = readFileSync(
   new URL('../workspace.css', import.meta.url),
   'utf8',
 )
 const shell = readFileSync(new URL('../Shell.jsx', import.meta.url), 'utf8')
+
 const shellChatLifecycle = readFileSync(
   new URL('../useShellChatRunLifecycle.js', import.meta.url),
   'utf8',
@@ -265,8 +267,9 @@ test('drawer lists distinguish loading, error, and confirmed empty data', () => 
   assert.match(shell, /chatsStatus=\{chatsStatus\}/)
   assert.match(drawer, /chatsStatus === 'loading' \|\| appsStatus === 'loading'/)
   assert.match(drawer, /chatsStatus === 'error' \|\| appsStatus === 'error'/)
-  assert.match(drawer, /Loading recents…/)
-  assert.match(drawer, /Recents unavailable\./)
+  assert.match(drawer, /Loading \{showingArchived \? 'archived chats' : 'recents'\}…/)
+  assert.match(drawer, /\{showingArchived \? 'Archived chats' : 'Recents'\} unavailable\./)
+  assert.match(drawer, /No archived chats\. Archive one from its menu to file it here\./)
   assert.match(drawer, /Nothing recent yet/)
 })
 
@@ -1499,4 +1502,124 @@ test('root recovery releases the authenticated launch cover', () => {
   )
   assert.match(app, /<ErrorBoundary label="app" onError=\{removeSplash\}>/)
   assert.match(boundary, /componentDidCatch\(error, info\)[\s\S]*?this\.props\.onError\?\.\(error\)/)
+})
+
+// Execute the Shell's actual callback with provider-free dependencies. This
+// catches promise-ordering regressions that source-shape assertions cannot.
+const source = shell
+const start = source.indexOf('  const setChatArchived = useCallback(')
+const end = source.indexOf('  const archivedChatIds =', start)
+assert.ok(start > 0 && end > start)
+const makeCallback = new Function('deps', `with (deps) { ${source.slice(start, end)} return setChatArchived }`)
+
+test('complete and scoped reads both preserve pending archive intent', () => {
+  assert.match(source, /const reconcileCreatedChats = useCallback\([\s\S]*?withPendingChatArchives\([\s\S]*?archiveActionsRef\.current/)
+  assert.match(source, /applyRows: \(ids, fresh\) => \{[\s\S]*?withPendingChatArchives\(fresh, archiveActionsRef\.current\)/)
+})
+
+function deferred() {
+  let resolve
+  const promise = new Promise(r => { resolve = r })
+  return { promise, resolve }
+}
+
+function harness() {
+  let rows = [{ id: 'a', archived_at: null, pinned_at: 'pin' }]
+  let server = { ...rows[0] }
+  const chatsRef = { current: rows }
+  const archiveActionsRef = { current: new Map() }
+  const archiveRequestsRef = { current: new Map() }
+  const calls = []
+  const toasts = []
+  const refreshes = []
+  const requests = []
+  const request = archived => {
+    const pending = deferred()
+    calls.push(archived ? 'archive' : 'restore')
+    requests.push({ ...pending, archived })
+    return pending.promise.then(response => {
+      if (response.ok) server = {
+        ...server,
+        archived_at: archived ? 'server-archive' : null,
+        pinned_at: archived ? null : server.pinned_at,
+      }
+      return response
+    })
+  }
+  const deps = {
+    useCallback: fn => fn,
+    chatsRef, archiveActionsRef, archiveRequestsRef, withChatArchive,
+    projectChatList(project) { rows = project(rows); chatsRef.current = rows },
+    api: { chats: { archive: () => request(true), unarchive: () => request(false) } },
+    refreshChatRows(id) {
+      refreshes.push(id)
+      rows = withPendingChatArchives([{ ...server }], archiveActionsRef.current)
+      chatsRef.current = rows
+    },
+    showToast(message, options) { toasts.push({ message, options }) },
+  }
+  return {
+    act: makeCallback(deps), calls, toasts, refreshes, requests,
+    get row() { return rows[0] },
+    fullRead(row) {
+      rows = withPendingChatArchives([row], archiveActionsRef.current)
+      chatsRef.current = rows
+    },
+  }
+}
+
+async function tick() { await Promise.resolve(); await Promise.resolve() }
+
+test('rapid archive then restore serializes writes; first failure cannot undo latest intent', async () => {
+  const h = harness()
+  const first = h.act('a', true)
+  const second = h.act('a', false)
+  assert.equal(h.row.archived_at, null, 'second intent projects immediately')
+  await tick()
+  assert.deepEqual(h.calls, ['archive'], 'restore waits for first write')
+  h.fullRead({ id: 'a', archived_at: 'stale-server', pinned_at: null })
+  assert.equal(h.row.archived_at, null, 'complete list read cannot clobber pending restore')
+  h.requests[0].resolve({ ok: false })
+  await first
+  await tick()
+  assert.deepEqual(h.calls, ['archive', 'restore'])
+  assert.equal(h.row.archived_at, null)
+  assert.deepEqual(h.refreshes, [], 'stale settlement cannot refresh or roll back')
+  h.requests[1].resolve({ ok: true })
+  await second
+  assert.deepEqual(h.refreshes, ['a'])
+  assert.equal(h.row.archived_at, null, 'last scoped read reflects committed server state')
+  assert.equal(h.toasts.length, 1)
+  assert.equal(h.toasts[0].options.action.label, 'Undo')
+})
+
+test('failed last intent refreshes server truth and successful archive retains Undo', async () => {
+  const h = harness()
+  const first = h.act('a', true)
+  await tick()
+  h.requests[0].resolve({ ok: true })
+  await first
+  assert.equal(h.row.archived_at, 'server-archive')
+  assert.equal(h.toasts[0].options.action.label, 'Undo')
+  const second = h.act('a', false)
+  await tick()
+  h.requests[1].resolve({ ok: false })
+  await second
+  assert.equal(h.row.archived_at, 'server-archive', 'failed restore uses authoritative scoped row')
+  assert.match(h.toasts[1].message, /Couldn’t restore/)
+})
+
+test('Undo reverses a committed archive without creating another Undo', async () => {
+  const h = harness()
+  const first = h.act('a', true)
+  await tick()
+  h.requests[0].resolve({ ok: true })
+  await first
+  h.toasts[0].options.action.onAction()
+  await tick()
+  assert.deepEqual(h.calls, ['archive', 'restore'])
+  h.requests[1].resolve({ ok: true })
+  await tick()
+  assert.equal(h.row.archived_at, null)
+  assert.equal(h.toasts.length, 1)
 })

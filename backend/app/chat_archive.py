@@ -18,7 +18,7 @@ from app.timeutil import now_naive_utc
 from sqlalchemy.orm import Session
 
 
-def _publish_archive_changed(chat: models.Chat) -> None:
+def publish_archive_changed(chat: models.Chat) -> None:
   """Tell every open shell to re-read this one chat's row."""
   get_system_broadcast().publish(
     {"type": "chat_archive_changed", "chatId": str(chat.id)}
@@ -38,7 +38,7 @@ def archive_chat(db: Session, chat: models.Chat) -> None:
     chat.archived_at = now_naive_utc()
     chat.pinned_at = None
     db.commit()
-  _publish_archive_changed(chat)
+  publish_archive_changed(chat)
 
 
 def unarchive_chat(db: Session, chat: models.Chat) -> None:
@@ -47,4 +47,14 @@ def unarchive_chat(db: Session, chat: models.Chat) -> None:
     return
   chat.archived_at = None
   db.commit()
-  _publish_archive_changed(chat)
+  publish_archive_changed(chat)
+
+
+def restore_on_accepted_input(chat: models.Chat, requested: bool) -> None:
+  """Join an accepted owner input's writer transaction; never commit here.
+
+  The writer calls this only after its command's duplicate and validation
+  gates. The route publishes the drawer change after the writer ack.
+  """
+  if requested and chat.archived_at is not None:
+    chat.archived_at = None

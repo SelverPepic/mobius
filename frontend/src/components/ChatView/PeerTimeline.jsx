@@ -32,12 +32,17 @@ export function usePeerTimeline(chatId, messages, enabled, activeTools, activeMi
     if (enabled && hasNextPage && !isFetching && !isError && oldestLoaded >= windowStart) void fetchNextPage()
   }, [enabled, hasNextPage, isFetching, isError, oldestLoaded, windowStart, fetchNextPage])
   return useMemo(
-    () => foldPeerActivity(
-      messages,
-      projectChatActivity(messages, events, chatId, activeTools),
-      chatId,
-      activeMirrorIndex,
-    ),
+    () => ({
+      ...foldPeerActivity(
+        messages,
+        projectChatActivity(messages, events, chatId, activeTools),
+        chatId,
+        activeMirrorIndex,
+      ),
+      // Source identity for the scroll handover; streaming projection alone
+      // must not schedule pre-paint geometry reads on every token.
+      activityEvents: events,
+    }),
     [messages, events, chatId, activeTools, activeMirrorIndex],
   )
 }

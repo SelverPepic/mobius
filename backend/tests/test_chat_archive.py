@@ -95,6 +95,140 @@ def test_owner_message_restores_an_archived_chat(
   assert chat.archived_at is None
 
 
+def test_owner_send_and_restore_share_the_writer_commit(
+  client, auth, chat, db, monkeypatch,
+):
+  from app import chat_writer
+
+  _noop_runner(monkeypatch)
+  client.post(f"/api/chats/{chat.id}/archive", headers=auth)
+  real_commit = chat_writer._commit_or_rollback
+  observed = []
+
+  def inspect_commit(session):
+    row = session.get(models.Chat, chat.id)
+    if any(m.get("content") == "atomic pickup" for m in row.messages or []):
+      observed.append(row.archived_at)
+    return real_commit(session)
+
+  monkeypatch.setattr(chat_writer, "_commit_or_rollback", inspect_commit)
+  response = client.post(
+    f"/api/chats/{chat.id}/messages",
+    json={"content": "atomic pickup", "cid": "archive-atomic"},
+    headers=auth,
+  )
+
+  assert response.status_code == 202, response.text
+  assert observed == [None], "the writer must commit message and restore together"
+  db.refresh(chat)
+  assert chat.archived_at is None
+
+
+def test_dropped_owner_send_commit_keeps_message_and_archive_together(
+  client, auth, chat, db, monkeypatch,
+):
+  from app import chat_writer
+
+  _noop_runner(monkeypatch)
+  client.post(f"/api/chats/{chat.id}/archive", headers=auth)
+  real_commit = chat_writer._commit_or_rollback
+
+  def drop_input_commit(session):
+    row = session.get(models.Chat, chat.id)
+    if any(m.get("content") == "dropped pickup" for m in row.messages or []):
+      session.rollback()
+      return False
+    return real_commit(session)
+
+  monkeypatch.setattr(chat_writer, "_commit_or_rollback", drop_input_commit)
+  response = client.post(
+    f"/api/chats/{chat.id}/messages",
+    json={"content": "dropped pickup", "cid": "archive-drop"},
+    headers=auth,
+  )
+
+  assert response.status_code == 503, response.text
+  db.refresh(chat)
+  assert chat.archived_at is not None
+  assert not any(m.get("content") == "dropped pickup" for m in chat.messages or [])
+
+
+def test_rejected_owner_send_keeps_an_archived_chat_archived(client, auth, chat, db):
+  chat.agent_settings_json = None
+  db.commit()
+  client.post(f"/api/chats/{chat.id}/archive", headers=auth)
+
+  response = client.post(
+    f"/api/chats/{chat.id}/messages",
+    json={"content": "keep this as a draft", "cid": "missing-model-archive"},
+    headers=auth,
+  )
+
+  assert response.status_code == 409, response.text
+  assert response.json()["detail"]["code"] == "model_selection_required"
+  db.refresh(chat)
+  assert chat.archived_at is not None
+  assert chat.messages == []
+  assert chat.pending_messages == []
+
+
+def test_rejected_restart_choice_keeps_an_archived_chat_archived(
+  client, auth, chat, db, monkeypatch,
+):
+  monkeypatch.setattr(
+    "app.platform_restart.restart_action_block",
+    lambda _chat, _qid: {"type": "question", "question_id": "restart-card"},
+  )
+  client.post(f"/api/chats/{chat.id}/archive", headers=auth)
+
+  response = client.post(
+    f"/api/chats/{chat.id}/messages",
+    json={"content": "", "hidden": True, "question_id": "restart-card",
+          "selected_options": {"restart": []}},
+    headers=auth,
+  )
+
+  assert response.status_code == 409, response.text
+  db.refresh(chat)
+  assert chat.archived_at is not None
+
+
+def test_duplicate_owner_send_does_not_restore_a_later_archive(
+  client, auth, chat, db, monkeypatch,
+):
+  _noop_runner(monkeypatch)
+  body = {"content": "one accepted message", "cid": "archive-retry"}
+  first = client.post(f"/api/chats/{chat.id}/messages", json=body, headers=auth)
+  assert first.status_code == 202, first.text
+  client.post(f"/api/chats/{chat.id}/archive", headers=auth)
+
+  retry = client.post(f"/api/chats/{chat.id}/messages", json=body, headers=auth)
+
+  assert retry.status_code in (200, 202), retry.text
+  db.refresh(chat)
+  assert chat.archived_at is not None
+
+
+def test_duplicate_queued_send_does_not_restore_a_later_archive(
+  client, auth, chat, db, monkeypatch,
+):
+  _noop_runner(monkeypatch)
+  monkeypatch.setattr("app.routes.chats_stream.is_chat_running", lambda _id: True)
+  body = {"content": "queued once", "cid": "archive-queued-retry"}
+  first = client.post(f"/api/chats/{chat.id}/messages", json=body, headers=auth)
+  assert first.status_code == 202, first.text
+  assert first.json()["status"] == "queued"
+  client.post(f"/api/chats/{chat.id}/archive", headers=auth)
+
+  retry = client.post(f"/api/chats/{chat.id}/messages", json=body, headers=auth)
+
+  assert retry.status_code == 202, retry.text
+  assert retry.json()["status"] == "queued"
+  db.refresh(chat)
+  assert chat.archived_at is not None
+  assert len(chat.pending_messages) == 1
+
+
 def test_agent_message_leaves_an_archived_chat_archived(
   client, auth, chat, db, monkeypatch,
 ):
@@ -456,6 +590,33 @@ def test_owner_answering_a_card_restores_an_archived_chat(
   assert response.status_code == 202, response.text
   db.expire_all()
   assert db.get(models.Chat, chat.id).archived_at is None
+
+
+def test_stale_question_answer_does_not_restore_an_archived_chat(
+  client, auth, chat, db,
+):
+  client.post(f"/api/chats/{chat.id}/archive", headers=auth)
+
+  response = _answer(client, chat.id, "missing-question", auth)
+
+  assert response.status_code in (409, 410), response.text
+  db.expire_all()
+  assert db.get(models.Chat, chat.id).archived_at is not None
+
+
+def test_exact_answer_retry_does_not_restore_a_later_archive(
+  client, auth, chat, db, monkeypatch,
+):
+  _archived_chat_with_open_card(client, auth, chat, db, monkeypatch, "q-retry")
+  first = _answer(client, chat.id, "q-retry", auth)
+  assert first.status_code == 202, first.text
+  client.post(f"/api/chats/{chat.id}/archive", headers=auth)
+
+  retry = _answer(client, chat.id, "q-retry", auth)
+
+  assert retry.status_code in (202, 409, 410), retry.text
+  db.expire_all()
+  assert db.get(models.Chat, chat.id).archived_at is not None
 
 
 def test_agent_answering_a_card_leaves_an_archived_chat_archived(

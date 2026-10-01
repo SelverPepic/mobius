@@ -57,9 +57,6 @@ export function withChatOwnerActivity(rows, chatId, at = new Date().toISOString(
   return withChatListRowPatch(rows, chatId, {
     has_messages: true,
     activity_at: activityAt,
-    // The owner writing into an archived chat restores it (the server applies
-    // the same rule in the send route), so it returns to Recents immediately.
-    archived_at: null,
   })
 }
 
@@ -68,6 +65,14 @@ export function withChatArchive(rows, chatId, { archivedAt, pinnedAt } = {}) {
   return withChatListRowPatch(rows, chatId, {
     archived_at: archivedAt || null,
     pinned_at: pinnedAt || null,
+  })
+}
+
+/** Keep an in-flight archive intent visible across complete and scoped reads. */
+export function withPendingChatArchives(rows, pending) {
+  return rows.map(row => {
+    const intent = pending.get(String(row.id))
+    return intent ? { ...row, archived_at: intent.archivedAt, pinned_at: intent.pinnedAt } : row
   })
 }
 

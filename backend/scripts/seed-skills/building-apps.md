@@ -270,9 +270,11 @@ manifest, layered by how always-on they are:
   as `POST /tools/<name>` with body `{"arguments": ..., "call": ...}` and the
   app's own authority (`backend/app/app_tools.py`). Only the platform reaches
   `tools/`: HTTP calls to the service there get 404, so `call` is trustworthy. Helpers get the tools too:
-  the request's `actor` has `delegated: true` for a helper and
-  `access: "read"` for a read-only one, so refuse any change for a read-only
-  caller. Tool calls run on their own concurrency lane that is NOT serialized
+  the request's `actor` has `delegated: true` for a helper. Current helpers
+  use one trusted mode and report `access: "write"`; `"read"` remains only as
+  a defensive value for a retired or orphaned delegated identity, not a
+  selectable read-only sandbox. Validate inputs and authority for every tool.
+  Tool calls run on their own concurrency lane that is NOT serialized
   per app (unlike a service's private/public requests), so several — from this
   chat, other chats, or helpers — can reach the service at once; a tool that
   writes must do its own file or database locking. Keep tools few.
@@ -897,6 +899,19 @@ useEffect(() => {
   ```
 
   Element fullscreen remains unavailable for this path on iOS. In a launch where `matchMedia('(display-mode: fullscreen)').matches`, skip the redundant request — but do not infer that iOS removed its own status bar.
+
+### Mouse-look and controllers
+
+App frames, including the shell, standalone, and public-link hosts, grant pointer
+lock and the Gamepad API directly, so a game uses the ordinary browser APIs:
+
+- **Pointer lock:** call `canvas.requestPointerLock()` from a click, then read
+  `movementX`/`movementY`. Esc always releases it; show a "click to play"
+  overlay on `pointerlockchange` when it is released. Phones have no pointer
+  lock, so keep touch controls as the mobile path.
+- **Gamepad:** poll `navigator.getGamepads()` each frame after a
+  `gamepadconnected` event. Controllers only report once the page has focus
+  and a button is pressed.
 
 ### Splash / status-bar color
 

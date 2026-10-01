@@ -201,10 +201,10 @@ test('a scoped row refresh replaces, adds, and drops only the requested chats', 
   assert.equal(next[0], rows[0])
 })
 
-test('the owner writing into an archived chat returns it to Recents', () => {
+test('generic activity cannot restore an archived chat without accepted owner input', () => {
   const archived = [{ ...rows[1], archived_at: '2026-09-28T08:00:00' }]
   const next = withChatOwnerActivity(archived, 'b', '2026-09-29T10:00:00Z')
-  assert.equal(next[0].archived_at, null)
+  assert.equal(next[0].archived_at, archived[0].archived_at)
   assert.equal(next[0].activity_at, '2026-09-29T10:00:00Z')
 })
 

@@ -1449,10 +1449,10 @@ export default function Drawer({
                       drawerRowGesturesRef={drawerRowGesturesRef}
                     />
                   )) : chatsStatus === 'loading' || appsStatus === 'loading' || projectsStatus === 'loading' ? (
-                    <p className="drawer__list-status" role="status">Loading recents…</p>
+                    <p className="drawer__list-status" role="status">Loading {showingArchived ? 'archived chats' : 'recents'}…</p>
                   ) : chatsStatus === 'error' || appsStatus === 'error' || projectsStatus === 'error' ? (
                     <div className="drawer__list-status" role="alert">
-                      <span>Recents unavailable.</span>
+                      <span>{showingArchived ? 'Archived chats' : 'Recents'} unavailable.</span>
                       <button
                         type="button"
                         onClick={() => {
