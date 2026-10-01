@@ -13,7 +13,7 @@ export function isSteeredUserMessage(message) {
 
 export function assistantReplyRoot(message) {
   return message?.role === 'assistant' && typeof message.id === 'string'
-    ? message.id.replace(/:assistant:\d+$/, '') : null
+    ? message.id.replace(/:assistant:[1-9][0-9]*$/, '') : null
 }
 
 export function isHiddenReplyCarrier(message, root) {
@@ -96,8 +96,8 @@ export function projectSteerContinuationMessage(
     return continuationMessage
   }
   if (sealedMessage.id && continuationMessage.id
-      && String(sealedMessage.id).replace(/:assistant:\d+$/, '')
-        !== String(continuationMessage.id).replace(/:assistant:\d+$/, '')) return continuationMessage
+      && assistantReplyRoot(sealedMessage)
+        !== assistantReplyRoot(continuationMessage)) return continuationMessage
   const prefix = terminalTextBlockContent(sealedMessage)
   if (!prefix) return continuationMessage
 

@@ -13,6 +13,26 @@ const { PeerTimelineRows } = await vite.ssrLoadModule('/src/components/ChatView/
 const { PeerTimelineContext } = await vite.ssrLoadModule('/src/components/ChatView/peerTimelineContext.js')
 const { _resetDisclosureStateForTests, persistDisclosureOpen } = await vite.ssrLoadModule('/src/components/ChatView/disclosureState.js')
 after(() => vite.close())
+test('hidden final segment leaves a visible recovery control and stable source owner', () => {
+  const first = { role: 'assistant', id: 'run', blocks: [
+    { type: 'text', content: 'Progress saved.' },
+    { type: 'error', message: 'Paused', resumable: true, pause: { kind: 'restart' } },
+  ] }
+  const hidden = { role: 'assistant', id: 'run:assistant:1', hidden: true, blocks: [] }
+  const group = assistantReplyGroups([
+    first,
+    { role: 'user', hidden: true, steered: true, source_work_id: 'run' },
+    hidden,
+  ]).get(0)
+  const html = render(Active, {
+    replyGroup: group, activeRowIndex: -1, activeMirrorMsg: hidden,
+    useDbActivePayload: true, chatId: 'chat', onResume: () => {},
+    isLastMsg: group.lastVisibleIndex === 0,
+  }, { tools: new Map(), positions: new Map() })
+  assert.match(html, /class="chat__resume chat__recovery-action"/)
+  assert.doesNotMatch(html, /data-key="run:assistant:1"/)
+  assert.match(html, /data-key="run"/)
+})
 const note = { id: 'incoming', sender_chat_id: 'peer', sender_name: 'Colleague', body: 'New information', created_at: 2000, display_position: { assistant_message_id: 'answer', block_index: 0, text_offset: 9 } }
 const context = { tools: new Map([['peer-incoming', [note]]]), positions: new Map([['answer', [note]]]) }
 const message = { id: 'answer', role: 'assistant', blocks: [{ type: 'text', content: 'Earlier\n\nLater response' }] }

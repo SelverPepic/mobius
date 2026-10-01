@@ -3,7 +3,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { assistantReplyGroups, presentAssistantReply } from '../assistantReplies.js'
 import { messageSources } from '../messageSources.js'
-import { projectSettledSteerContinuations } from '../steerContinuity.js'
+import { assistantReplyRoot, projectSettledSteerContinuations, projectSteerContinuationMessage } from '../steerContinuity.js'
 const assistant = (content, n = 0, extras = {}) => ({ role: 'assistant', id: n ? `run:assistant:${n}` : 'run', content, blocks: [{ type: 'text', content }], ...extras })
 const carrier = (kind = 'peer_message', extras = {}) => ({ role: 'user', hidden: true, steered: true, source_work_id: 'run', kind, ...extras })
 const rows = messages => assistantReplyGroups(messages).get(0).rows
@@ -69,6 +69,24 @@ test('multiple hidden carriers keep timeline notes; a folded source cannot swall
  const shown = presentAssistantReply(group.rows)
  assert.deepEqual(group.rows.flatMap(row => row.message.source_ref ? [row.message.source_ref.message_index] : []), [0, 5])
  assert.equal(shown[2].message.hidden, true)
+})
+
+test('a hidden final source leaves terminal controls on the preceding visible reply', () => {
+ const group = assistantReplyGroups([assistant('Saved work'), carrier(), assistant('', 1, { hidden: true })]).get(0)
+ assert.equal(group.end, 2, 'the hidden source retains its physical index')
+ assert.equal(group.lastVisibleIndex, 0)
+ assert.deepEqual(group.rows.map(row => row.key), ['run', 'run:assistant:1'])
+})
+
+test('only positive ASCII sink segments share a physical-run identity', () => {
+ const first = assistant('Prefix')
+ for (const suffix of ['0', '01', '-1', '١', 'notes']) {
+  const next = assistant('Prefix continued', 1, { id: `run:assistant:${suffix}` })
+  assert.equal(assistantReplyRoot(next), next.id)
+  assert.equal(assistantReplyGroups([first, carrier(), next]).get(0).rows.length, 1)
+  assert.equal(projectSteerContinuationMessage(first, next), next)
+ }
+ assert.equal(assistantReplyRoot(assistant('', 12)), 'run')
 })
 
 test('live prefix replay never hides the original and divergence reveals its entire text', () => {

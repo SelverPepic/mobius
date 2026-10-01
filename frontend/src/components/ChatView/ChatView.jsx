@@ -5917,7 +5917,7 @@ export default function ChatView({
     const continuingRun = !!(turnActive && replyRoot && replyRoot
       === assistantReplyRoot({ role: 'assistant', id: activeAssistantMessageId || streamAssistantMessageId }))
     const tail = group.rows.at(-1)
-    const last = active || group.end === lastVisibleMessageIndex
+    const last = active || group.lastVisibleIndex === lastVisibleMessageIndex
     return <AssistantReply
       key={group.rows[0].key}
       replyGroup={group}

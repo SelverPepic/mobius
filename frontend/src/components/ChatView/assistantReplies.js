@@ -29,7 +29,8 @@ export function assistantReplyGroups(messages, { offset = 0, slots = new Map(), 
       rows.push({ message: candidate, index: next, notes })
       end = next
     }
-    const group = { start, end, rows: rows.map(row => ({
+    const lastVisibleIndex = rows.findLast(row => !row.message.hidden)?.index ?? -1
+    const group = { start, end, lastVisibleIndex, rows: rows.map(row => ({
       ...row,
       key: row.index === activeIndex && activeKey ? activeKey
         : displayKeys.get(row.message.id) || messageKey(row.message, offset + row.index),
