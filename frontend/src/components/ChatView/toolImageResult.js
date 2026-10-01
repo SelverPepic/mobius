@@ -58,9 +58,7 @@ export function temporaryImageReference(input, chatId) {
 }
 
 /** A viewed deliverable previews through its final same-turn attachment.
- * New views match captured bytes. Older saved entries without a file digest
- * may supply a same-name candidate, but the route still checks a view digest.
- * Pre-fingerprint ViewImage rows have only a best-effort name match. */
+ * Only fingerprinted views can claim a content-matched preview. */
 export function generatedInboxImageName(input, chatId) {
   if (!chatId) return null
   const match = imagePathFromInput(input).match(GENERATED_IMAGE_PATH)
@@ -68,25 +66,22 @@ export function generatedInboxImageName(input, chatId) {
 }
 
 export function generatedImageReference(input, chatId, {
-  files = [], viewedDigest, legacyName = false, completed = false,
+  files = [], viewedDigest, completed = false,
 } = {}) {
   if (!completed) return null
   const name = generatedInboxImageName(input, chatId)
   if (!name) return null
-  const digestValid = typeof viewedDigest === 'string'
-    && /^[a-f0-9]{64}$/.test(viewedDigest)
+  if (typeof viewedDigest !== 'string' || !/^[a-f0-9]{64}$/.test(viewedDigest)) return null
   const file = files.find(candidate => (
     candidate?.previewable === true
     && INLINE_IMAGE_TYPES.has(candidate.mime_type)
-    && (digestValid
-      ? candidate.sha256 === viewedDigest
-        || (candidate.sha256 == null && candidate.name === name)
-      : viewedDigest == null && legacyName && candidate.name === name)
+    && (candidate.sha256 === viewedDigest
+      || (candidate.sha256 == null && candidate.name === name))
   ))
   if (!file) return null
   return {
     kind: 'generated', chatId, collection: 'generated-files', filename: file.name,
-    ...(digestValid ? { expectedSha256: viewedDigest } : {}),
+    expectedSha256: viewedDigest,
   }
 }
 

@@ -91,7 +91,7 @@ test('a viewed generated image resolves only to matching final attachment bytes'
   assert.equal(generatedImageReference(path, 'chat-123', { files, viewedDigest: digest }), null)
   assert.deepEqual(servedImageReference(path, 'chat-123', options), expected)
   assert.equal(generatedImageReference(path, 'chat-123', { files, viewedDigest: 'c'.repeat(64), completed: true }), null)
-  assert.equal(generatedImageReference(path, 'chat-123', { files, viewedDigest: '', legacyName: true, completed: true }), null)
+  assert.equal(generatedImageReference(path, 'chat-123', { files, viewedDigest: '', completed: true }), null)
   assert.equal(generatedImageReference(path, 'chat-123', { files }), null)
   assert.equal(generatedImageReference(path, 'another-chat', options), null)
   assert.equal(generatedImageReference('/data/chats/chat-123/deliverables/files/secret.png', 'chat-123', options), null)
@@ -112,14 +112,10 @@ test('a saved view with no file fingerprint still requires a serve-time byte mat
   }), null)
 })
 
-test('a historical ViewImage can use only a same-turn final attachment by name', () => {
+test('a historical image view without a fingerprint cannot claim a preview', () => {
   const path = '/data/chats/chat-123/deliverables/inbox/image.png'
   const files = [{ name: 'image.png', mime_type: 'image/png', previewable: true }]
-  assert.deepEqual(generatedImageReference(path, 'chat-123', { files, legacyName: true, completed: true }), {
-    kind: 'generated', chatId: 'chat-123', collection: 'generated-files', filename: 'image.png',
-  })
-  assert.equal(generatedImageReference(path, 'chat-123', { files }), null)
-  assert.equal(generatedImageReference(path, 'chat-123', { files: [], legacyName: true, completed: true }), null)
+  assert.equal(generatedImageReference(path, 'chat-123', { files, completed: true }), null)
 })
 
 test('a base64 image result is an explicit fallback for non-chat paths', () => {

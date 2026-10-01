@@ -156,7 +156,6 @@ function GenericToolBlock({
   const generatedImage = useMemo(() => ({
     files: generatedFiles,
     viewedDigest: t.viewed_image_sha256,
-    legacyName: t.tool === 'ViewImage' && t.viewed_image_sha256 == null,
     completed: t.status === 'done',
   }), [generatedFiles, t.viewed_image_sha256, t.tool, t.status])
   const servedImage = useMemo(() => (
