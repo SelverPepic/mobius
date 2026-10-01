@@ -1041,10 +1041,6 @@
 }
 
 /* ── Recents / Archived tabs ──────────────────────── */
-/* A text switch in the section heading's place: the tablist carries
-   .drawer__label, so it shares the "Pinned" heading's font, size (including
-   its desktop step), weight and line height. The selected list uses the
-   primary text colour; the other stays muted until hovered. */
 .drawer__tabs {
   gap: 2px;
   padding: 0 6px;
