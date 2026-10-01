@@ -117,6 +117,34 @@ def test_role_changes_apply_immediately_and_revocation_ends_the_session(
   assert "revoked" in denied.json()["detail"].lower()
 
 
+def test_project_file_download_requires_live_project_access(client, auth):
+  project = _project(client, auth)
+  other = _project(client, auth, "Another workspace")
+  saved = client.put(
+    f"/api/projects/{project['id']}/file?path=report.txt", headers=auth,
+    json={"content": "private report", "expected_revision": None},
+  )
+  assert saved.status_code == 200
+  _, secret = _invite(client, auth, project["id"], role="viewer")
+  session, guest = _redeem(client, secret)
+  url = f"/api/projects/{project['id']}/file?path=report.txt&download=true"
+
+  assert client.get(url).status_code == 401
+  allowed = client.get(url, headers=guest)
+  assert allowed.status_code == 200
+  assert allowed.content == b"private report"
+  assert client.get(
+    f"/api/projects/{other['id']}/file?path=report.txt&download=true",
+    headers=guest,
+  ).status_code == 404
+
+  assert client.delete(
+    f"/api/projects/{project['id']}/members/{session['member_id']}",
+    headers=auth,
+  ).status_code == 204
+  assert client.get(url, headers=guest).status_code == 401
+
+
 def test_presence_and_invite_revocation_are_visible_to_the_owner(client, auth):
   project = _project(client, auth)
   pending, _pending_secret = _invite(

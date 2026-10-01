@@ -1137,9 +1137,6 @@ export const api = {
       `/projects/${encodeURIComponent(projectId)}/file?path=${encodeURIComponent(path)}`,
       { method: 'DELETE' },
     ),
-    downloadUrl: (projectId, path) => (
-      `${BASE}/api/projects/${encodeURIComponent(projectId)}/file?path=${encodeURIComponent(path)}&download=true`
-    ),
     // Rename or move a file/dir within the project tree. The backend confines
     // both paths, rejects symlink escape / dst-exists / into-descendant, and
     // maps an os.replace failure to a 4xx rather than a 500 (see the build spec).
@@ -1227,6 +1224,21 @@ export const api = {
       await apiFetch(`/local-services/${encodeURIComponent(slug)}/surface`),
       'Service surface request failed',
     ),
+  },
+  // The instance-wide GitHub account. Settings owns connect/disconnect;
+  // apps only read status through their own github_connect grant.
+  github: {
+    status: (options = {}) => apiFetch('/github/status', options),
+    connectStart: (privateRepos, options = {}) => apiFetch('/github/connect/start', {
+      ...options, method: 'POST', body: JSON.stringify({ private_repos: !!privateRepos }),
+    }),
+    connectPoll: (attemptId, options = {}) => apiFetch('/github/connect/poll', {
+      ...options, method: 'POST', body: JSON.stringify({ attempt_id: attemptId }),
+    }),
+    connectCancel: (attemptId, options = {}) => apiFetch('/github/connect/cancel', {
+      ...options, method: 'POST', body: JSON.stringify({ attempt_id: attemptId }),
+    }),
+    disconnect: (options = {}) => apiFetch('/github/connect', { ...options, method: 'DELETE' }),
   },
   settings: {
     get: () => apiFetch('/settings'),

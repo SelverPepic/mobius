@@ -76,6 +76,7 @@ export function WaitCard({ wait, expanded, onToggle, onCancel }) {
       meta={presentation.summary}
       rows={[
         { label: 'Waiting for', value: presentation.condition, primary: true },
+        ...(wait.delivery_pending ? [{ label: 'Original condition', value: wait.description, primary: true }] : []),
         { label: 'Condition owner', value: presentation.owner },
         { label: 'Checker', value: presentation.checker },
         { label: 'Activity', value: presentation.activity },
@@ -83,7 +84,7 @@ export function WaitCard({ wait, expanded, onToggle, onCancel }) {
         { label: 'Agent usage', value: presentation.usage },
       ]}
     >
-      {wait.kind !== 'platform_activation' && <button
+      {wait.kind !== 'platform_activation' && !wait.delivery_pending && <button
         type="button"
         className="chat__wait-cancel"
         onPointerDown={(event) => event.preventDefault()}

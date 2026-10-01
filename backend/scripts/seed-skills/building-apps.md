@@ -276,6 +276,19 @@ manifest, layered by how always-on they are:
   per app (unlike a service's private/public requests), so several — from this
   chat, other chats, or helpers — can reach the service at once; a tool that
   writes must do its own file or database locking. Keep tools few.
+- **Python dependencies for a service or Python job.** Without a declaration,
+  these run on the platform's interpreter and borrow its libraries, which can
+  change on any platform update, and anything installed live disappears when
+  the container is replaced. To own them, commit a complete
+  `pip-compile --generate-hashes` lock (list it in `source_files`) and declare
+  `"python": {"lock": "requirements.lock"}`. Apply or install then builds the
+  app's own environment on `/data` from wheels only. It checks the environment
+  by running the service's setup code, which is your code, unsandboxed. The
+  service and every job then run with the environment first on `PATH`, and a
+  `#!/usr/bin/env python3` job uses its interpreter. If a package fails to
+  build, the Apply fails and names it. After a platform update that changes
+  Python, the service returns 503 and jobs fail until you Apply again. Details
+  are in `CAPABILITIES.md`.
 
 Anything that depends on your app being installed belongs in its fragment (the
 always-on default) and/or its skill (the how-to). A not-installed app then
@@ -884,6 +897,19 @@ useEffect(() => {
   ```
 
   Element fullscreen remains unavailable for this path on iOS. In a launch where `matchMedia('(display-mode: fullscreen)').matches`, skip the redundant request — but do not infer that iOS removed its own status bar.
+
+### Mouse-look and controllers
+
+App frames, including the shell, standalone, and public-link hosts, grant pointer
+lock and the Gamepad API directly, so a game uses the ordinary browser APIs:
+
+- **Pointer lock:** call `canvas.requestPointerLock()` from a click, then read
+  `movementX`/`movementY`. Esc always releases it; show a "click to play"
+  overlay on `pointerlockchange` when it is released. Phones have no pointer
+  lock, so keep touch controls as the mobile path.
+- **Gamepad:** poll `navigator.getGamepads()` each frame after a
+  `gamepadconnected` event. Controllers only report once the page has focus
+  and a button is pressed.
 
 ### Splash / status-bar color
 

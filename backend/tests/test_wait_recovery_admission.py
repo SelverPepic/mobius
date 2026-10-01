@@ -50,7 +50,8 @@ def test_modern_wait_queues_behind_manual_restart_hold(client, chat, db, monkeyp
   assert asyncio.run(chat_waits._deliver_resume(row.id)) is False
   assert asyncio.run(chat_waits._deliver_resume(row.id)) is False
   _assert_queued_once(db, chat.id, row)
-  assert chat_mod.programmatic_start_blocked(db, chat.id)
+  assert chat_mod.programmatic_start_blocker(db, chat.id) == "manual_resume"
+  assert chat_waits.serialize_wait(row, db=db)["resume_blocker"] == "manual_resume"
   assert db.get(models.ChatRun, "restart-manual-hold").status == "interrupted"
 
 
@@ -97,6 +98,7 @@ def test_modern_wait_queues_behind_saved_owner_input(client, chat, db, tmp_path,
     assert asyncio.run(chat_waits._deliver_resume(row.id)) is False
     assert asyncio.run(chat_waits._deliver_resume(row.id)) is False
     _assert_queued_once(db, chat.id, row)
+    assert chat_waits.serialize_wait(row, db=db)["resume_blocker"] == "owner_input"
     assert db.get(models.Chat, chat.id).pending_question_id == question_id
     if card == "secure":
       assert db.get(models.SavedSecureInput, question_id).status == "pending"

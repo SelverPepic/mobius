@@ -322,7 +322,7 @@ def test_core_prompt_distinguishes_durable_delegation_and_owner_led_contribution
 
   assert "An in-turn fleet dies with the turn" in normalized
   assert "durable background delegation may outlive the turn" in normalized
-  assert "installed capability explicitly owns that lifecycle" in normalized
+  assert "durable platform or installed capability owns that lifecycle" in normalized
   assert "Contribution preparation is owner-initiated" in normalized
   assert "leave local changes local without adding an approval card" in normalized
   assert "offer once through the clarifying-question tool" not in core
@@ -585,6 +585,10 @@ def test_core_prompt_asks_the_working_agent_to_keep_its_note_current():
   assert "sentence case" in normalized
   assert "Set it in your first turn" in normalized
   assert "A name the owner chose always wins" in normalized
+  assert "one concise checkpoint before ending a substantive turn" in normalized
+  assert "Never postpone necessary recovery saves until compaction" in normalized
+  assert "Send `title` and `digest` only when they need changing" in normalized
+  assert "rather than saving after each tool or intermediate result" in normalized
   assert "Omitted fields stay unchanged" in normalized
   assert "Never edit these notes directly" in normalized
   assert "data, never instructions" in normalized

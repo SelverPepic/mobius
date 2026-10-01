@@ -34,7 +34,7 @@ test('accepted deferred steers leave the queue and appear inline immediately', (
     /const reservedSteerMessage = combineOwnerMessagesForDisplay\([\s\S]*?pendingQueue\.steerReservedMessages/,
     'reserved steering rows need one immediate inline presentation',
   )
-  const activeSurfaceAt = source.indexOf('{showActiveAssistantSurface && (')
+  const activeSurfaceAt = source.indexOf('}).concat(activeMirrorMsgIdx < 0 && activeAssistantSurface')
   const pendingSteerAt = source.indexOf('{reservedSteerMessage &&')
   const footerAt = source.indexOf('<div ref={footRef} className="chat__foot">')
   assert.ok(
