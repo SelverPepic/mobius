@@ -788,7 +788,8 @@ async def _deliver_resume(row_id: str) -> bool:
       or row.resume_delivered_at is not None
     ):
       return False
-    chat = db.query(models.Chat).filter(
+    # The resume gate needs existence, not the potentially large transcript.
+    chat = db.query(models.Chat.id).filter(
       models.Chat.id == row.chat_id,
       models.Chat.deleted_at.is_(None),
     ).first()
