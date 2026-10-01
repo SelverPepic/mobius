@@ -1038,7 +1038,7 @@ def _delegated_limit_park(
       id=f"delegation-{cid}", app_id=app.id,
       parent_chat_id=parent_id, parent_root_run_id="parent-root",
       task_key="bounded", child_chat_id=cid, provider="claude",
-      model="claude-opus-4-8", effort="low", scope="read", cwd="/data",
+      model="claude-opus-4-8", effort="low", scope="write", cwd="/data",
       prompt_sha256="digest",
     ))
     db.commit()
@@ -1307,7 +1307,7 @@ def test_sweep_auto_resumes_an_active_delegation_under_its_original_identity(
       parent_chat_id="sweep-delegation-parent",
       parent_root_run_id="parent-root", task_key="bounded",
       child_chat_id=cid, provider="claude", model="claude-opus-4-8",
-      effort="low", scope="read", cwd="/data",
+      effort="low", scope="write", cwd="/data",
       prompt_sha256="digest",
     ))
     db.commit()

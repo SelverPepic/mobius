@@ -64,13 +64,13 @@ def _delegated_agent_run_auth(db, chat_id, run_id):
     id=delegation_id, app_id=app.id, parent_chat_id=parent.id,
     parent_root_run_id=parent.id, task_key="wait-boundary",
     child_chat_id=chat_id, provider="codex", model=None, effort=None,
-    scope="read", cwd="/data/platform",
+    scope="write", cwd="/data/platform",
     prompt_sha256=hashlib.sha256(b"check the wait boundary").hexdigest(),
   ))
   db.commit()
   token = delegation_execution_token(db, RunPolicy(
     delegation_id=delegation_id, app_id=app.id, provider="codex",
-    model=None, effort=None, scope="read", cwd="/data/platform",
+    model=None, effort=None, cwd="/data/platform",
   ), run_id=run_id)
   return {"Authorization": f"Bearer {token}"}
 
@@ -2211,3 +2211,47 @@ def test_undelivered_history_does_not_claim_follow_up_completed(client, owner_to
   assert summary["delivery_pending"] is True
   _a_turn_carrying_it_succeeds(db, chat_id, row.id)
   assert chat_waits_mod.terminal_wait_summaries_by_message_index(db, chat_id, messages)[0][0]["delivery_pending"] is False
+
+
+@pytest.mark.parametrize("deleted", [False, True], ids=["settled-resume", "deleted-chat"])
+def test_wait_resume_existence_gate_does_not_load_chat_payloads(
+  client, owner_token, db, monkeypatch, deleted,
+):
+  from sqlalchemy import event
+
+  chat_id = _owner_chat(client, owner_token)
+  declaring_run = _seed_declaring_run(db, chat_id)
+  row = _command_wait(
+    db, chat_id=chat_id, description="settled wait", command="true",
+    created_by_run_id=declaring_run,
+  )
+  row.status = "met"
+  row.met_at = now_naive_utc()
+  db.add(models.ChatRun(
+    id=f"wait-resume-{row.id}", chat_id=chat_id,
+    status="completed", provider="claude",
+  ))
+  if deleted:
+    db.get(models.Chat, chat_id).deleted_at = now_naive_utc()
+  db.commit()
+  wait_id = row.id
+  starts = _capture_starts(monkeypatch)
+  queries = []
+
+  def capture(_conn, _cursor, statement, _parameters, _context, _many):
+    normalized = " ".join(statement.lower().split())
+    if normalized.startswith("select ") and " from chats " in normalized:
+      queries.append(normalized)
+
+  engine = db.get_bind()
+  event.listen(engine, "before_cursor_execute", capture)
+  try:
+    assert asyncio.run(chat_waits_mod._deliver_resume(wait_id)) is False
+  finally:
+    event.remove(engine, "before_cursor_execute", capture)
+  assert len(queries) == 1
+  projection = queries[0].split(" from chats ")[0]
+  assert projection == "select chats.id as chats_id"
+  assert starts == []
+  db.expire_all()
+  assert db.get(models.ChatWait, wait_id).status == ("cancelled" if deleted else "met")

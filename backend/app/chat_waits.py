@@ -710,6 +710,9 @@ def safe_startup_writer_orphan(
   still open; any drift or partial output falls through to conservative normal
   crash recovery.
   """
+  from app.delegations import retired_delegation_for_chat
+  if retired_delegation_for_chat(db, chat.id):
+    return False
   activation = physical.id.startswith("activation-resume-")
   prefix = "activation-resume-" if activation else "wait-resume-"
   if (
@@ -788,7 +791,8 @@ async def _deliver_resume(row_id: str) -> bool:
       or row.resume_delivered_at is not None
     ):
       return False
-    chat = db.query(models.Chat).filter(
+    # The resume gate needs existence, not the potentially large transcript.
+    chat = db.query(models.Chat.id).filter(
       models.Chat.id == row.chat_id,
       models.Chat.deleted_at.is_(None),
     ).first()

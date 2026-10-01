@@ -5626,6 +5626,23 @@ def _allow_chat_owned_delegations(eng) -> None:
     raw.close()
 
 
+def _add_legacy_helper_interruption(eng) -> None:
+  """Store the one-time cutover verdict without changing historical scope."""
+  from sqlalchemy import inspect as sa_inspect, text
+
+  inspector = sa_inspect(eng)
+  if "delegations" not in inspector.get_table_names():
+    return
+  if "interrupted_at" in {
+    column["name"] for column in inspector.get_columns("delegations")
+  }:
+    return
+  with eng.begin() as conn:
+    conn.execute(text(
+      "ALTER TABLE delegations ADD COLUMN interrupted_at DATETIME NULL"
+    ))
+
+
 _SCHEMA_MIGRATIONS = (
   # Full IDs are permanent identities, not sequence positions. Append new
   # work in execution order; never renumber a shipped ID to reconcile sources.
@@ -5711,6 +5728,7 @@ _SCHEMA_MIGRATIONS = (
   ("0073_schedule_provenance", _record_schedule_provenance),
   ("0074_chat_owned_delegations", _allow_chat_owned_delegations),
   ("0075_notification_seen_at", _add_notification_seen_at),
+  ("0076_legacy_helper_interruption", _add_legacy_helper_interruption),
 )
 
 

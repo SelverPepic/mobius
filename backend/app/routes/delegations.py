@@ -6,6 +6,7 @@ import re
 import json
 from contextlib import AsyncExitStack
 from pathlib import Path
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
@@ -46,7 +47,8 @@ class DelegationSubmit(BaseModel):
   provider: str
   model: str | None = Field(default=None, max_length=256)
   effort: str | None = Field(default=None, max_length=32)
-  scope: str
+  # An older app may send this field. Reject read, never silently promote it.
+  scope: Literal["write"] | None = None
   cwd: str | None = Field(default=None, max_length=1024)
   # The parent Goal plan task this helper works on; omitted means the plan's
   # single running task, if there is exactly one.
@@ -80,13 +82,6 @@ class DelegationSubmit(BaseModel):
       raise ValueError("unknown provider")
     return value
 
-  @field_validator("scope")
-  @classmethod
-  def _valid_scope(cls, value: str) -> str:
-    if value not in ("read", "write"):
-      raise ValueError("scope must be read or write")
-    return value
-
 
 def _require_submitter(
   db: Session, principal: Principal, body: DelegationSubmit,
@@ -118,11 +113,8 @@ def _require_submitter(
     raise HTTPException(status_code=403, detail="Delegated work must stay under its parent child chat.")
   if body.app_id is not None and body.app_id != parent.app_id:
     raise HTTPException(status_code=403, detail="Delegated work must keep its parent app owner.")
-  if parent.scope == "read" and body.scope != "read":
-    raise HTTPException(
-      status_code=403,
-      detail="A read-only delegated owner cannot create write-capable children.",
-    )
+  if parent.scope != "write" or parent.interrupted_at is not None:
+    raise HTTPException(status_code=409, detail="Legacy helper cannot delegate new work.")
   return parent
 
 
@@ -271,7 +263,6 @@ async def submit_or_attach(
       provider=body.provider,
       model=selection["model"],
       effort=selection.get("effort"),
-      scope=body.scope,
       cwd=cwd,
       notify_parent_on_complete=body.notify_parent_on_complete,
     )
@@ -549,6 +540,8 @@ async def message_delegation(
   status, _, _ = derived_status(db, row, load_result=False)
   if status == "cancelled":
     raise HTTPException(status_code=409, detail="This helper was stopped.")
+  if status == "interrupted" or row.scope != "write":
+    raise HTTPException(status_code=409, detail="This helper cannot resume; start a new helper.")
   if status in ACTIVE_DELEGATION_STATUSES:
     raise HTTPException(
       status_code=409,
@@ -559,8 +552,8 @@ async def message_delegation(
   async with chat_queue.get_transition_lock(row.child_chat_id):
     db.rollback()
     row = _row_for_principal(db, delegation_id, principal)
-    if row.cancelled_at is not None:
-      raise HTTPException(status_code=409, detail="This helper was stopped.")
+    if row.cancelled_at is not None or row.interrupted_at is not None or row.scope != "write":
+      raise HTTPException(status_code=409, detail="This helper cannot resume; start a new helper.")
     row.notify_parent_on_complete = True
     db.commit()
     started = await start_programmatic_chat_turn(

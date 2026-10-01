@@ -25,7 +25,7 @@ it, so nothing run- or helper-specific may live there. Each helper turn gets:
   the file's path is ever handed to the provider, which may persist settings in
   its session history.
 
-Hosts are keyed by (parent chat, provider, access scope, working directory,
+Hosts are keyed by (parent chat, provider, working directory,
 connected-services plan), so one chat's crash, secrets, or permissions never
 reach another chat's helpers. A host shuts down after it has been idle for
 ``HOST_IDLE_SECONDS``; a dead host is replaced on next use.
@@ -110,14 +110,15 @@ def split_env(env: dict[str, str]) -> tuple[dict[str, str], dict[str, str]]:
 class HostKey:
   parent_chat_id: str
   provider_id: str
-  scope: str
   cwd: str
   setup: str  # digest of the host-level configuration (connectors, overrides)
 
   @property
   def digest(self) -> str:
     raw = json.dumps(
-      [self.parent_chat_id, self.provider_id, self.scope, self.cwd, self.setup],
+      # Preserve the pre-cutover write-host identity across a restart. The
+      # literal is historical identity, not a selectable execution mode.
+      [self.parent_chat_id, self.provider_id, "write", self.cwd, self.setup],
     ).encode()
     return hashlib.sha256(raw).hexdigest()[:24]
 

@@ -62,7 +62,7 @@ def _capture_api(control, monkeypatch, responses):
 def _row(**overrides):
   row = {
     "id": "del-1", "task_key": "review", "provider": "claude", "model": "m",
-    "scope": "read", "status": "running",
+    "scope": "write", "status": "running",
   }
   row.update(overrides)
   return row
@@ -76,7 +76,7 @@ def test_spawn_starts_a_background_helper_with_subagents_defaults(monkeypatch):
   )})
 
   result = control._call_spawn_agent({
-    "name": "review", "task": "  Review the diff.  ", "access": "read",
+    "name": "review", "task": "  Review the diff.  ",
   })
 
   method, path, body = calls[-1]
@@ -84,9 +84,14 @@ def test_spawn_starts_a_background_helper_with_subagents_defaults(monkeypatch):
   assert body == {
     "app_id": None, "parent_chat_id": "parent-1", "task_key": "review",
     "prompt": "Review the diff.", "provider": "claude", "model": "claude-default",
-    "effort": "medium", "scope": "read", "notify_parent_on_complete": True,
+    "effort": "medium", "scope": "write", "notify_parent_on_complete": True,
   }
   assert result["helper"] == "review" and "do not poll" in result["note"]
+
+  with pytest.raises(ValueError, match="no longer takes access"):
+    control._call_spawn_agent({
+      "name": "old-call", "task": "Inspect.", "access": "read",
+    })
 
 
 def test_spawn_honours_a_paused_provider_only_when_named(monkeypatch):
@@ -95,9 +100,9 @@ def test_spawn_honours_a_paused_provider_only_when_named(monkeypatch):
   _capture_api(control, monkeypatch, {"/api/delegations": _row()})
 
   with pytest.raises(RuntimeError, match="paused"):
-    control._call_spawn_agent({"name": "a", "task": "t", "access": "read"})
+    control._call_spawn_agent({"name": "a", "task": "t"})
   assert control._call_spawn_agent({
-    "name": "a", "task": "t", "access": "read", "provider": "claude",
+    "name": "a", "task": "t", "provider": "claude",
   })["helper_id"] == "del-1"
 
 
@@ -106,7 +111,7 @@ def test_spawn_can_use_mobius_models_on_the_codex_harness(monkeypatch):
   _fake_capabilities(control)
   calls = _capture_api(control, monkeypatch, {"/api/delegations": _row()})
   control._call_spawn_agent({
-    "name": "m", "task": "t", "access": "write", "provider": "mobius", "model": "spark",
+    "name": "m", "task": "t", "provider": "mobius", "model": "spark",
   })
   assert calls[-1][2]["provider"] == "mobius" and calls[-1][2]["model"] == "spark"
 
