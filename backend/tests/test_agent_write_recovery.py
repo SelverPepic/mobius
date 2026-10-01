@@ -257,7 +257,7 @@ def test_app_owned_helper_repair_reuses_delegation_ownership_guard(chat,db,condi
     assert db.get(models.ChatRun,source['_run_token']).initiated_by_app_id==app.id
 
 
-@pytest.mark.parametrize('continuation',['quiet_write_failure','restart','manual','unrelated-root','different-chat','cycle'])
+@pytest.mark.parametrize('continuation',['quiet_write_failure','restart','manual','unrelated-root','different-chat','different-browser','different-browser-epoch','cycle'])
 def test_helper_result_preserves_findings_only_for_exact_write_repair_lineage(chat,db,continuation):
   from datetime import UTC,datetime,timedelta
   from app.delegations import _result_with_write_repair
@@ -283,6 +283,11 @@ def test_helper_result_preserves_findings_only_for_exact_write_repair_lineage(ch
   elif continuation=='different-chat':
     db.add(models.Chat(id='foreign',title='Foreign',messages=[]));db.flush()
     original.chat_id='foreign'
+  elif continuation=='different-browser':
+    repair.browser_grant_id='another-browser';repair.browser_grant_epoch=0
+  elif continuation=='different-browser-epoch':
+    original.browser_grant_id=repair.browser_grant_id='same-browser'
+    original.browser_grant_epoch=0;repair.browser_grant_epoch=1
   elif continuation=='cycle':
     repair.continuation_json={**repair.continuation_json,'source_work_id':'repair',
                              'supersedes_run_token':'repair'}

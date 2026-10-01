@@ -14,6 +14,7 @@ import {
   flushPersistedQueryCache,
 } from '../../queryClient.js'
 import * as paneModel from './paneModel.js'
+import { sharedBrowserRoutePath } from '../../lib/sharedBrowserWorkspace.js'
 
 export function deriveShellReloadState({ workspace, activeView, drawerOpen }) {
   const content = paneModel.activeContentRoute(workspace)
@@ -56,6 +57,7 @@ export default function useShellUpdateController(inputs) {
       workspaceStateRef,
       activeViewRef,
       drawerOpenRef,
+      sharedBrowserAccess,
     } = inputsRef.current
 
     let registration = null
@@ -66,23 +68,28 @@ export default function useShellUpdateController(inputs) {
     } catch { /* online document navigation remains authoritative */ }
 
     win.dispatchEvent(new win.Event(BEFORE_SHELL_RELOAD_EVENT))
-    await awaitCacheFlushBeforeReload(flushPersistedQueryCache(queryClient))
+    if (!sharedBrowserAccess) {
+      await awaitCacheFlushBeforeReload(flushPersistedQueryCache(queryClient))
+    }
     persistWorkspaceSnapshot()
-    writeShellReload(storage, deriveShellReloadState({
-      workspace: workspaceStateRef.current.ws,
-      activeView: activeViewRef.current,
-      drawerOpen: drawerOpenRef.current,
-    }))
+    if (!sharedBrowserAccess) {
+      writeShellReload(storage, deriveShellReloadState({
+        workspace: workspaceStateRef.current.ws,
+        activeView: activeViewRef.current,
+        drawerOpen: drawerOpenRef.current,
+      }))
+    }
 
     // The new document restores the current workspace from the one-shot state
     // above. Online shell navigation owns freshness; releasing the worker only
     // advances the coherent offline generation.
-    replaceNavEntry('base', '/shell/')
+    const routePath = sharedBrowserAccess ? sharedBrowserRoutePath() : '/shell/'
+    replaceNavEntry('base', routePath)
     releaseWaitingShellUpdate(registration)
     const transitionPrepared = (
       win.__mobiusPrepareShellReloadTransition?.() === true
     )
-    const navigate = () => win.location.replace('/shell/')
+    const navigate = () => win.location.replace(routePath)
     if (transitionPrepared && typeof win.requestAnimationFrame === 'function') {
       // Give Chromium one rendering boundary to activate the cross-document
       // transition before the owner-approved replacement starts.

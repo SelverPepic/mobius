@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 from app import connectors as core
 from app import connector_oauth as connector_oauth_mod
 from app import models
-from app.database import get_db
+from app.database import SessionLocal, get_db
 from app.deps import (
   get_owner_or_app_with_connections_manage,
   require_nondelegated_owner_or_app_control,
@@ -71,10 +71,13 @@ class _BrokerSnapshot:
   url: str
   auth_header: str | None
   secret: str | None
+  connector_id: int | None = None
   # Connector identity authenticated by the broker capability. Passing it to
   # token refresh prevents a deleted/recreated numeric id from refreshing a
   # replacement connection's grant.
   generation: str | None = None
+  # Signed capability claims, checked again while a long response streams.
+  lineage: dict | None = None
   # Non-secret static headers the provider requires alongside auth — currently
   # only Google Cloud's ``x-goog-user-project`` billing/quota project. A tuple
   # of (name, value) pairs keeps the frozen snapshot cleanly copyable through
@@ -263,10 +266,11 @@ def _snapshot_broker_row(
   if row is None:
     raise HTTPException(status_code=404, detail="MCP connection unavailable.")
   try:
-    core.verify_broker_capability(
+    lineage = core.verify_broker_capability(
       capability,
       connector_id,
       row.capability_id,
+      db=db,
     )
   except core.ConnectorError as exc:
     raise HTTPException(
@@ -313,7 +317,9 @@ def _snapshot_broker_row(
     url=str(row.url),
     auth_header=auth_header,
     secret=secret,
+    connector_id=connector_id,
     generation=str(row.capability_id),
+    lineage=lineage,
     extra_headers=extra_headers,
   )
 
@@ -446,7 +452,11 @@ async def _open_broker_upstream(
       (declared_length is not None and declared_length != "0")
       or "transfer-encoding" in request.headers
     )
-    content = request.stream() if has_body else None
+    content = (
+      _revocable_broker_upload(request, snapshot.connector_id, snapshot)
+      if has_body and snapshot.connector_id is not None else
+      request.stream() if has_body else None
+    )
     upstream_request = client.build_request(
       request.method,
       pinned_url,
@@ -475,6 +485,50 @@ async def _open_broker_upstream(
   except BaseException:
     await client.aclose()
     raise
+
+
+def _broker_lineage_active(connector_id: int, snapshot: _BrokerSnapshot) -> bool:
+  """Fresh broker-side check; a copied provider token is never grant authority."""
+  with SessionLocal() as db:
+    row = db.get(models.Connector, connector_id)
+    if (row is None or not row.enabled or row.status != "ok"
+        or row.capability_id != snapshot.generation):
+      return False
+    try:
+      core.validate_broker_lineage(db, snapshot.lineage or {})
+    except core.ConnectorError:
+      return False
+  return True
+
+
+async def _revocable_broker_upload(
+  request: Request, connector_id: int, snapshot: _BrokerSnapshot,
+):
+  """Stop forwarding a long request body as soon as its grant disappears."""
+  iterator = request.stream()
+  next_chunk = None
+  try:
+    while True:
+      if not _broker_lineage_active(connector_id, snapshot):
+        raise HTTPException(status_code=401, detail="MCP broker capability rejected.")
+      next_chunk = asyncio.create_task(anext(iterator))
+      while True:
+        done, _ = await asyncio.wait({next_chunk}, timeout=1.0)
+        if not _broker_lineage_active(connector_id, snapshot):
+          raise HTTPException(status_code=401, detail="MCP broker capability rejected.")
+        if done:
+          break
+      try:
+        chunk = next_chunk.result()
+      except StopAsyncIteration:
+        return
+      next_chunk = None
+      yield chunk
+  finally:
+    if next_chunk is not None and not next_chunk.done():
+      next_chunk.cancel()
+      await asyncio.gather(next_chunk, return_exceptions=True)
+    await iterator.aclose()
 
 
 @router.api_route("/{connector_id}/broker", methods=["GET", "POST", "DELETE"])
@@ -513,13 +567,35 @@ async def broker_connector(
   finally:
     db.close()
 
+  if not _broker_lineage_active(connector_id, snapshot):
+    raise HTTPException(status_code=401, detail="MCP broker capability rejected.")
   client, upstream = await _open_broker_upstream(request, snapshot)
 
   async def stream():
+    iterator = _redacted_broker_stream(upstream, snapshot)
+    next_chunk = None
     try:
-      async for chunk in _redacted_broker_stream(upstream, snapshot):
+      while True:
+        if not _broker_lineage_active(connector_id, snapshot):
+          return
+        next_chunk = asyncio.create_task(anext(iterator))
+        while True:
+          done, _ = await asyncio.wait({next_chunk}, timeout=1.0)
+          if not _broker_lineage_active(connector_id, snapshot):
+            return
+          if done:
+            break
+        try:
+          chunk = next_chunk.result()
+        except StopAsyncIteration:
+          return
+        next_chunk = None
         yield chunk
     finally:
+      if next_chunk is not None and not next_chunk.done():
+        next_chunk.cancel()
+        await asyncio.gather(next_chunk, return_exceptions=True)
+      await iterator.aclose()
       await upstream.aclose()
       await client.aclose()
 

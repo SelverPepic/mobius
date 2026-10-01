@@ -1,6 +1,7 @@
 import useAgentRepair from '../../hooks/useAgentRepair.js'
 import { BASE } from '../../api/client.js'
 import { repairChatPath } from '../../lib/errorRecovery.js'
+import { sharedBrowserShellHref } from '../../lib/sharedBrowserWorkspace.js'
 import './ErrorBoundary.css'
 
 // `/api/version` reports which tree is ACTUALLY serving. Two fallbacks exist,
@@ -80,7 +81,7 @@ export default function PlatformDegradedNotice({ onContinue, variant = 'backend'
   const repairFailed = attempt?.phase === 'agent-failed'
   const handleRepair = () => {
     if (repairDirected) {
-      window.location.assign(repairChatPath(repairChatId, BASE))
+      window.location.assign(sharedBrowserShellHref(repairChatPath(repairChatId, BASE)))
       return
     }
     void repair()

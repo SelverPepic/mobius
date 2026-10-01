@@ -73,9 +73,12 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
-from app import connect_outbound, connect_runner, connect_output, models
+from app import browser_access, connect_outbound, connect_runner, connect_output, models
 from app.config import get_settings
+from app.database import SessionLocal
 from app.deps import (
+  Principal,
+  get_principal,
   get_owner_or_app_with_connect_manage,
   reject_cross_site,
   require_nondelegated_owner_or_app_control,
@@ -288,6 +291,10 @@ class _ActiveCommand:
     state: str = "dispatching",
     not_after: float | None = None,
     fingerprint: str | None = None,
+    browser_grant_id: str | None = None,
+    browser_grant_epoch: int | None = None,
+    browser_owner_id: int | None = None,
+    browser_owner_token_epoch: int | None = None,
   ) -> None:
     loop = asyncio.get_running_loop()
     self.request_id = request_id
@@ -303,6 +310,10 @@ class _ActiveCommand:
     self.fingerprint = fingerprint or _command_fingerprint(
       cmd, cwd, timeout, script=script, shell=shell,
     )
+    self.browser_grant_id = browser_grant_id
+    self.browser_grant_epoch = browser_grant_epoch
+    self.browser_owner_id = browser_owner_id
+    self.browser_owner_token_epoch = browser_owner_token_epoch
     self.started = asyncio.Event()
     if started_at is not None:
       self.started.set()
@@ -332,6 +343,10 @@ class _ActiveCommand:
         if record.get("not_after") is not None else None
       ),
       fingerprint=str(record.get("fingerprint") or ""),
+      browser_grant_id=record.get("browser_grant_id"),
+      browser_grant_epoch=record.get("browser_grant_epoch"),
+      browser_owner_id=record.get("browser_owner_id"),
+      browser_owner_token_epoch=record.get("browser_owner_token_epoch"),
     )
 
   def record(self) -> dict:
@@ -344,6 +359,11 @@ class _ActiveCommand:
       "not_after": self.not_after,
       "fingerprint": self.fingerprint,
     }
+    if self.browser_grant_id is not None:
+      record["browser_grant_id"] = self.browser_grant_id
+      record["browser_grant_epoch"] = self.browser_grant_epoch
+      record["browser_owner_id"] = self.browser_owner_id
+      record["browser_owner_token_epoch"] = self.browser_owner_token_epoch
     # Replay needs the command only during the short pre-start dispatch window.
     # Do not retain command text (which may contain sensitive arguments) for the
     # remainder of a long-running command.
@@ -498,6 +518,52 @@ async def _request_command_cancel(
   if ch is not None:
     await ch.queue.put({"type": "cancel", "request_id": command.request_id})
   return True
+
+
+def browser_grant_pending_commands(grant_id: str) -> list[dict]:
+  """Read unfinished attributed commands without sending or requesting a stop."""
+  return [
+    {"host_id": host["id"], "request_id": command.request_id,
+     "state": command.state, "remote_confirmed": False}
+    for host in _list_hosts()
+    for command in _host_commands(host["id"]).values()
+    if command.browser_grant_id == grant_id
+  ]
+
+
+def cancel_browser_grant_commands(grant_id: str) -> list[dict]:
+  """Request cancellation of only this grant's active commands.
+
+  Returns unfinished commands, never a claim that a remote stop succeeded.
+  The canceling state survives restart and reconnect; offline commands are
+  deliberately not forgotten or replayed as fresh execs.
+  """
+  if not isinstance(grant_id, str) or not grant_id:
+    return []
+  pending: list[dict] = []
+  for host in _list_hosts():
+    host_id = host["id"]
+    changed = False
+    for command in _host_commands(host_id).values():
+      if command.browser_grant_id != grant_id:
+        continue
+      if command.state != "canceling":
+        command.state = "canceling"
+        changed = True
+      channel = _channels.get(host_id)
+      if channel is not None:
+        channel.queue.put_nowait({
+          "type": "cancel", "request_id": command.request_id,
+        })
+      pending.append({
+        "host_id": host_id,
+        "request_id": command.request_id,
+        "state": "canceling",
+        "remote_confirmed": False,
+      })
+    if changed:
+      _persist_commands(host_id)
+  return pending
 
 
 _channels: dict[str, _Channel] = {}
@@ -1052,12 +1118,54 @@ def _started_response(command: _ActiveCommand) -> dict:
   return {"request_id": command.request_id, "state": command.state}
 
 
+def _browser_command_authority(principal: Principal | None) -> tuple[str | None, int | None, int | None, int | None]:
+  """Bind command admission to the live recipient grant, not just a JWT."""
+  if not isinstance(principal, Principal) or principal.browser_grant_id is None:
+    return None, None, None, None
+  with SessionLocal() as db:
+    owner = db.get(models.Owner, principal.owner.id)
+    if owner is None or owner.token_epoch != principal.owner.token_epoch:
+      raise HTTPException(status_code=401, detail="Browser access unavailable.")
+    browser_access.validate_grant(
+      db, principal.browser_grant_id, principal.browser_grant_epoch, owner.id,
+    )
+    if principal.browser_session_id is not None:
+      browser_access.validate_session(
+        db, principal.browser_session_id, principal.browser_grant_id, owner.id,
+      )
+  return (
+    principal.browser_grant_id, principal.browser_grant_epoch,
+    principal.owner.id, principal.owner.token_epoch,
+  )
+
+
+def _command_grant_active(command: _ActiveCommand) -> bool:
+  """Recheck durable guest authority before a recovered exec can be replayed."""
+  if command.browser_grant_id is None:
+    return True
+  with SessionLocal() as db:
+    owner = db.get(models.Owner, command.browser_owner_id)
+    if owner is None or owner.token_epoch != command.browser_owner_token_epoch:
+      return False
+    try:
+      browser_access.validate_grant(
+        db, command.browser_grant_id, command.browser_grant_epoch, owner.id,
+      )
+    except HTTPException:
+      return False
+  return True
+
+
 @router.post("/hosts/{host_id}/exec")
 async def exec_on_host(
   host_id: str,
   body: ExecBody,
   _owner: models.Owner = Depends(get_owner_or_app_with_connect_manage),
+  _principal: Principal = Depends(get_principal),
 ) -> dict:
+  browser_grant_id, browser_grant_epoch, browser_owner_id, browser_owner_token_epoch = (
+    _browser_command_authority(_principal)
+  )
   host = _load_host(host_id)
   if host is None:
     raise HTTPException(status_code=404, detail="No such host.")
@@ -1137,6 +1245,10 @@ async def exec_on_host(
     cwd=body.cwd,
     not_after=not_after,
     fingerprint=fingerprint,
+    browser_grant_id=browser_grant_id,
+    browser_grant_epoch=browser_grant_epoch,
+    browser_owner_id=browser_owner_id,
+    browser_owner_token_epoch=browser_owner_token_epoch,
   )
   commands[request_id] = command
   _persist_commands(host_id)
@@ -1338,6 +1450,10 @@ async def _reconcile_runner(
     str(item) for item in (hello.get("pending_result_ids") or []) if item
   }
   for command in list(_host_commands(host_id).values()):
+    if command.browser_grant_id is not None and not _command_grant_active(command):
+      if command.state != "canceling":
+        command.state = "canceling"
+        _persist_commands(host_id)
     if command.request_id in runner_active:
       _mark_command_started(host_id, command.request_id)
       if command.state == "canceling":
@@ -1469,6 +1585,16 @@ async def stream(request: Request, inventory: StreamInventory | None = None) -> 
         )
         try:
           evt = await asyncio.wait_for(ch.queue.get(), timeout=wait_seconds)
+          if evt.get("type") == "exec":
+            command = _find_command(host_id, evt.get("request_id"))
+            if (
+              command is None or command.state != "dispatching"
+              or not _command_grant_active(command)
+            ):
+              if command is not None and command.state == "dispatching":
+                command.state = "canceling"
+                _persist_commands(host_id)
+              continue
           yield f"data: {json.dumps(evt)}\n\n"
         except asyncio.TimeoutError:
           if ch.closed.is_set() or (

@@ -1,7 +1,13 @@
+import { currentSharedBrowserStorage, isSharedBrowserRoute } from '../../lib/sharedBrowserWorkspace.js'
+
 const QUESTION_DRAFT_PREFIX = 'qa-draft:'
 
 
 function browserDraftStorages() {
+  if (isSharedBrowserRoute()) {
+    const store = currentSharedBrowserStorage()
+    return store ? [store] : []
+  }
   // A question choice is unfinished user input, not disposable view state.
   // Android may recreate a standalone PWA after a long offline/background
   // spell, which drops sessionStorage even though the chat itself comes back.

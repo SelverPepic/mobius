@@ -446,12 +446,18 @@ def issue_media_token(
       app_nonce=principal.app_instance_id,
       chat_id=chat_id,
       session_id=principal.embed_session_id,
+      browser_grant_id=principal.browser_grant_id,
+      browser_grant_epoch=principal.browser_grant_epoch,
+      browser_session_id=principal.browser_session_id,
     )
   else:
     token = auth.create_media_token(
       chat_id=chat_id,
       owner_username=principal.owner.username,
       token_epoch=principal.owner.token_epoch,
+      browser_grant_id=principal.browser_grant_id,
+      browser_grant_epoch=principal.browser_grant_epoch,
+      browser_session_id=principal.browser_session_id,
     )
   return {"token": token, "expires_in": 900}
 

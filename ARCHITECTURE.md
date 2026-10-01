@@ -1663,7 +1663,9 @@ owner data.
 
 `agent_write_tools` launches the existing control dispatcher with the exact
 already-materialized run/delegation environment; payloads cannot choose caller
-identity. Installed app eligibility comes from the accepted manifest contract;
+identity. Browser grants are revalidated at admission and claim; failure repair
+retains the same grant and cannot renew revoked access. Installed app eligibility
+comes from the accepted manifest contract;
 the platform declares its own eligible controls. Success receipts reach only
 the activity sink/journal, not a provider result or continuation. Result-bearing
 tools and calls whose outcome determines the next action remain ordinary.
@@ -1884,3 +1886,48 @@ cover it deterministically.
 
 - **Build / test / run commands and the dev loop:** `CONTRIBUTING.md`. (The #1 deploy gotcha — a stale `/data/platform/frontend/dist` masking a fresh image — is covered under *Frontend serving priority* above.)
 - **Subsystem deep-dives are inlined above** as their own sections: *Stop-chat contract*, *AskUserQuestion interception*, *Chat persistence — single-writer actor*, *Navigation back-stack + drawer model*, *Service worker + offline*, and *Mini-app manifest (mobius.json)*. (The chat-persistence v2 design + staged-rollout notes remain internal/gitignored — the as-built contract is the section above.)
+
+### Trusted shared-browser access
+
+Connect manages per-recipient access to this instance, not screen mirroring or
+isolated accounts. `browser_access.py` owns grants (until explicitly revoked),
+hashed one-use invitations (one day), and hashed renewal sessions (30-day idle
+window). Recipient labels are owner-assigned attribution, not verified account
+identities. The invitation is a possession credential and must be delivered
+privately. The feature requires the configured HTTPS origin.
+
+`routes/browser_access.py` owns invitation management and the same-origin
+cookie exchange. A 15-minute bearer stays in memory; the renewal credential is
+HttpOnly/Secure/SameSite=Strict and path-confined to the session routes. Accepting
+a new invitation atomically retires the previous session presented by its cookie.
+Cookie exchanges use an origin-scoped Web Lock across live tabs; browsers without
+that capability fail visibly before sending an exchange. A tab dying mid-request
+can still interrupt cookie ordering; server-side grant validation remains the
+authority boundary. If cleanup of a superseded redemption fails, its cookie may
+remain restorable; the page must not imply server sign-out succeeded. Independent
+browsers may hold separate sessions.
+This never replaces the installation owner's login. `/shell/shared` owns an
+independent query cache and grant/tab-scoped navigation and drafts. Leaving ends
+that browser session, while revoking the recipient ends all their sessions.
+
+Every bearer descendant retains `browser_grant` and its epoch. Browser-derived
+app, embedded-chat and media tokens also retain the originating session. The
+central resolver checks the live grant/session rather than trusting JWT expiry.
+Guest-started agent runs and child delegations retain durable grant lineage;
+renewing or resuming work cannot manufacture installation-owner authority.
+Turn-issued MCP broker capabilities also carry owner/grant lineage; upload and
+response streams stop forwarding after their authority is revoked. Bytes already
+forwarded to a remote service cannot be recalled.
+Installation identity, credential, access administration and lifecycle controls
+remain separately gated; ordinary readable owner-input cards retain their
+existing participant-answer contract.
+
+Revocation commits access denial first, then cancels attributed app-service
+invocations, chat runs, queued input and Connect commands. Rejected queued input
+keeps its content and identity. A remote stop is not claimed until confirmed:
+202 means access is revoked but some work is still stopping. Cancellation state
+survives Connect reconnection. This is trusted full workspace access, not a
+hostile-tenant sandbox: it cannot undo copied data, completed writes, publication,
+external actions or deliberate persistent machine changes. No screen relay,
+private-network tunnel, verified mobius.you guest identity, or automatic grant
+expiry is included in this version.
