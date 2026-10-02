@@ -10,12 +10,9 @@ const held = {
 
 test('deferred work has a visible continuation without claiming new permission', () => {
   const handoff = goalContinuationHandoff(held)
-  assert.equal(handoff.goalId, held.id)
-  assert.equal(handoff.label, 'On hold')
   assert.equal(handoff.actionLabel, 'Continue this work')
   assert.equal(handoff.description, held.hold_reason)
   assert.match(handoff.boundary, /does not approve/)
-  assert.match(handoff.next, /whenever you choose/)
   assert.deepEqual(held.handoff, { kind: 'none' })
 })
 
@@ -30,8 +27,6 @@ test('saved questions, recovery controls and unrelated live work never get a com
 
 test('unknown interruption is not attributed to the owner or mistaken for deliberate deferral', () => {
   const handoff = goalContinuationHandoff({ ...held, pause_reason: 'unknown', hold_reason: null })
-  assert.equal(handoff.state, 'recovery')
-  assert.equal(handoff.label, 'Interrupted')
   assert.equal(handoff.actionLabel, 'Resume this work')
   assert.match(handoff.description, /not complete/)
 })

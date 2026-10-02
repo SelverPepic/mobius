@@ -8,20 +8,21 @@ import { goalContinuationHandoff } from '../chatHandoffPresentation.js'
 const vite = await createServer({ appType: 'custom', logLevel: 'error', server: { middlewareMode: true, hmr: false, ws: false }, ssr: { noExternal: ['@openai/apps-sdk-ui'] } })
 after(() => vite.close())
 const { default: CompactHandoff } = await vite.ssrLoadModule('/src/components/ChatView/CompactHandoff.jsx')
-const { default: GoalHandoff } = await vite.ssrLoadModule('/src/components/ChatView/GoalHandoff.jsx')
+const { default: ProgressRail } = await vite.ssrLoadModule('/src/components/ChatView/ProgressRail.jsx')
 const { default: GoalHistoryCard } = await vite.ssrLoadModule('/src/components/ChatView/GoalHistoryCard.jsx')
-const { RetainedGoalContext } = await vite.ssrLoadModule('/src/components/ChatView/retainedGoalContext.js')
 const { WaitCard } = await vite.ssrLoadModule('/src/components/ChatView/WaitingChip.jsx')
 const goal = { id: 'goal-a', revision: 4, objective: 'Verify release', status: 'paused', pause_reason: 'deferred', hold_reason: 'Paid verification was deferred.', handoff: { kind: 'none' } }
 
-test('compact hold keeps the reason and Continue visible while detail starts closed', () => {
-  const html = render(h(GoalHandoff, { goal, handoff: goalContinuationHandoff(goal), resumeState: {}, onContinue: () => {} }))
-  assert.match(html, /On hold/)
-  assert.match(html, /Paid verification was deferred/)
+test('a held Goal uses the existing expandable panel with one continuation action', () => {
+  const handoff = goalContinuationHandoff(goal)
+  const html = render(h(ProgressRail, { items: [{ key: 'goal', label: 'Goal · On hold · 1/2',
+    expandable: true, details: h('p', null, handoff.description), actionLabel: handoff.actionLabel,
+  }], onActionItem: () => {} }))
+  assert.match(html, /chat__progress-rail/)
+  assert.match(html, /Goal · On hold/)
   assert.match(html, /Continue this work/)
-  assert.match(html, /No answer needed now/)
   assert.match(html, /aria-expanded="false"/)
-  assert.doesNotMatch(html, /<dl|role="alert"/)
+  assert.doesNotMatch(html, /chat__handoff|role="alert"/)
 })
 
 test('details explain action scope without changing the action', () => {
@@ -34,12 +35,11 @@ test('details explain action scope without changing the action', () => {
   assert.match(html, /Continue this work/)
 })
 
-test('pending, unavailable and failed exact continuation remain visible and honest', () => {
-  for (const resumeState of [{ pending: true }, { unavailable: true }]) {
-    const html = render(h(GoalHandoff, { goal, handoff: goalContinuationHandoff(goal), resumeState }))
-    assert.match(html, /disabled=""/)
-  }
-  const html = render(h(GoalHandoff, { goal, handoff: goalContinuationHandoff(goal), resumeState: { error: 'This Goal changed. Review its latest state.' } }))
+test('Goal panel preserves disabled actions and shows exact continuation failures', () => {
+  const item = { key: 'goal', label: 'Goal · On hold', expandable: true,
+    actionLabel: 'Continue this work', actionDisabled: true, actionError: 'This Goal changed.' }
+  const html = render(h(ProgressRail, { items: [item], onActionItem: () => {} }))
+  assert.match(html, /disabled=""/)
   assert.match(html, /role="alert"/)
   assert.match(html, /This Goal changed/)
 })
@@ -52,15 +52,15 @@ test('completed outcome remains a transcript receipt after leaving the current p
 })
 
 
-test('only the exact retained terminal receipt exposes Clear, never a historical sibling', () => {
+test('all finished Goals are read-only records with an expandable plan', () => {
   for (const status of ['completed', 'cannot_complete', 'cancelled']) {
-    const summary = { id: 'goal-a', objective: 'Verify release', status }
-    const retained = { id: 'goal-a', onClear: () => {} }
-    const html = render(h(RetainedGoalContext.Provider, { value: retained }, h(GoalHistoryCard, { summary })))
-    assert.match(html, /Clear retained Goal/)
-    assert.doesNotMatch(html, /Confirm clear Goal/)
-    const other = render(h(RetainedGoalContext.Provider, { value: { ...retained, id: 'goal-b' } }, h(GoalHistoryCard, { summary })))
-    assert.doesNotMatch(other, /Clear retained Goal/)
+    const summary = { id: 'goal-a', objective: 'Verify release', status,
+      plan: { tasks: [{ id: 'check', title: 'Check release', status: 'completed' }] } }
+    const html = render(h(GoalHistoryCard, { summary }))
+    assert.match(html, /Verify release/)
+    assert.match(html, /View plan/)
+    assert.match(html, /Check release/)
+    assert.doesNotMatch(html, /<button|Clear|Abandon|Continue this work/)
   }
 })
 

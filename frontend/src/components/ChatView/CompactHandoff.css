@@ -110,20 +110,3 @@
   padding: 0;
   gap: 0;
 }
-
-.chat__goal-history-clear {
-  align-self: flex-start;
-  min-height: 44px;
-  padding: 8px 0;
-  border: 0;
-  background: transparent;
-  color: var(--muted);
-  font: inherit;
-  font-size: 12px;
-  cursor: pointer;
-}
-
-.chat__goal-history-clear:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}

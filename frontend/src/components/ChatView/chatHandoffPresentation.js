@@ -20,15 +20,10 @@ export function goalContinuationHandoff(goal, {
   const deferred = goal.pause_reason === 'deferred'
   const interrupted = !['deferred', 'owner', 'agent'].includes(goal.pause_reason)
   return {
-    key: `goal-handoff-${goal.id}`,
-    goalId: goal.id,
-    state: interrupted ? 'recovery' : 'on_hold',
-    label: goalStatusLabel(goal),
     description: deferred ? goal.hold_reason || 'The remaining work was deliberately deferred.'
       : interrupted ? 'The work was interrupted. Its outcome is not complete.'
         : 'The work is saved and will not continue automatically.',
     actionLabel: deferred ? 'Continue this work' : 'Resume this work',
-    next: interrupted ? 'Resume to inspect saved work and continue.' : 'Continue whenever you choose.',
     boundary: deferred
       ? 'Continuing reopens this work. It does not approve a previously declined action.'
       : 'Resume continues this exact Goal; unrelated work is not reopened.',

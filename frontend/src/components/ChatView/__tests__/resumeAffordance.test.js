@@ -143,9 +143,8 @@ test('restart recovery waits for a durable run identity instead of showing a fal
     'the interrupted-turn card explains the short restart handoff')
   assert.match(msgContent, /resumeState\?\.pending \|\| resumeState\?\.unavailable/,
     'the recovery action cannot be invoked before its identity is durable')
-  const goalHandoff = readFileSync(new URL('../GoalHandoff.jsx', import.meta.url), 'utf8')
-  assert.match(goalHandoff, /resumeState\.pending \|\| resumeState\.unavailable/,
-    'the compact exact-Goal control cannot run before its identity is durable')
+  assert.match(chatView, /goalResumeState\.pending \|\| goalResumeState\.unavailable/,
+    'the exact-Goal rail action cannot run before its identity is durable')
 })
 
 test('MsgContent memo compares onResume so a stable ref skips re-render', () => {

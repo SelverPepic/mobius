@@ -657,10 +657,12 @@ test('the goal rail confirms and clears directly, sourced domain-neutrally', () 
     /resume: handleResumeGoal, state: goalResumeState[\s\S]{0,200}goalId: actionableGoalPresentation\?\.id,[\s\S]{0,100}goalRevision: actionableGoalPresentation\?\.revision/,
     'Goal Resume targets its exact revision through the acknowledged lifecycle action',
   )
-  assert.match(chatView, /onContinue=\{handleResumeGoal\}/,
-    'the compact handoff routes Continue to the exact Goal Resume owner')
-  assert.doesNotMatch(chatView, /actionKind: 'resume'/,
-    'the rail must not add a second continuation action')
+  assert.match(chatView, /item\?\.actionKind === 'resume-goal'[\s\S]*?handleResumeGoal\(\)/,
+    'the familiar Goal rail routes continuation to the exact Goal Resume owner')
+  assert.match(chatView, /\.\.\.\(continuationHandoff \? \{[\s\S]*?actionKind: 'resume-goal'/,
+    'saved questions, recovery and live-work guards still own action availability')
+  assert.doesNotMatch(chatView, /<GoalHandoff|RetainedGoalContext/,
+    'no duplicate continuation card or terminal mutation context remains')
   assert.match(chatView, /actionKind: 'owner-question'[\s\S]*?actionLabel: 'View question'/,
     'an owner-required Goal should expose the existing question surface')
   assert.match(chatView, /revealPendingQuestion\(pendingQuestionEl\)/,
