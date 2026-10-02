@@ -413,6 +413,18 @@ COPY backend/runtime ./runtime/
 COPY skill/ ./skill/
 COPY protected-files.txt ./protected-files.txt
 
+# One-way storage steps (ONE_WAY_UPGRADES_DESIGN.md): runtime/ comes from the
+# build context while the baked fallback is the checkout at BUILD_SHA. A step
+# release advances both together; refuse a build whose context claims a
+# different level than the baked fallback actually understands.
+RUN python3 -P -c 'import importlib.util, json; \
+spec = importlib.util.spec_from_file_location("compat", "/app/app/compat.py"); \
+compat = importlib.util.module_from_spec(spec); spec.loader.exec_module(compat); \
+claimed = json.load(open("/app/runtime/one_way_capability.json"))["level"]; \
+baked = compat.baked_image_level(); \
+assert type(claimed) is int and claimed == baked, \
+  f"runtime/one_way_capability.json level {claimed!r} != baked COMPAT_LEVEL {baked}"'
+
 # The restart supervisor imports no mutable platform code.
 RUN chmod -R a-w /app/runtime
 RUN chmod +x ./scripts/entrypoint.sh

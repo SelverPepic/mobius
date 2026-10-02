@@ -444,7 +444,11 @@ def test_a_healthy_rollback_to_the_wrong_image_is_not_settled(tmp_path, monkeypa
   monkeypatch.setattr(host, "write_status", lambda _c, **fields: writes.append(fields))
   monkeypatch.setattr(host, "restart_ledger", lambda *a, **k: True)
   monkeypatch.setattr(host, "compose", lambda *a, **k: None)
-  monkeypatch.setattr(host, "wait_healthy", lambda *a: True)
+  # Keep the real floor comparison; isolate only its Docker probe seams.
+  monkeypatch.setattr(host, "fence_app", lambda *a: True)
+  monkeypatch.setattr(host, "rollback_image_level", lambda *a: 1)
+  monkeypatch.setattr(host, "read_database_floor", lambda *a: 0)
+  monkeypatch.setattr(host, "wait_ready", lambda *a: ("ready", None))
   monkeypatch.setattr(host, "app_container", lambda _c: ("cid", "sha256:" + "e" * 64))
   assert host.rollback({}, TXN["operation_id"], TXN["expected_sha"], "x", "y",
                        TXN["previous_image"]) == 1

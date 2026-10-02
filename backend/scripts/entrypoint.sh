@@ -224,8 +224,11 @@ _served_sha="${BUILD_SHA:-unknown}"
 # (app_git, platform_update, the /data repo) at the wrong repository, and a
 # stray PYTHONPATH could shadow app.main. SECRET_KEY/DATABASE_URL/DATA_DIR are
 # preserved (env -u removes only the named vars) so `import app.main` still
-# resolves settings exactly as the served process does.
-_env_scrub="env -u PYTHONPATH -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY -u GIT_COMMON_DIR -u GIT_NAMESPACE -u MOBIUS_SSO_CLIENT_SECRET -u MOBIUS_COMPUTE_INSTANCE_TOKEN -u MOBIUS_IDENTITY_BOOTSTRAP"
+# resolves settings exactly as the served process does. The update
+# validators' candidate-image variables (app/compat.py) exist only in their own
+# child processes; a boot probe or the served process must never honour one, so
+# they are dropped here too.
+_env_scrub="env -u PYTHONPATH -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY -u GIT_COMMON_DIR -u GIT_NAMESPACE -u MOBIUS_SSO_CLIENT_SECRET -u MOBIUS_COMPUTE_INSTANCE_TOKEN -u MOBIUS_IDENTITY_BOOTSTRAP -u MOBIUS_CANDIDATE_VALIDATION -u MOBIUS_CANDIDATE_IMAGE_LEVEL"
 
 _platform_git_valid() {
   [ -d /data/platform/.git ] || return 1
@@ -270,7 +273,9 @@ _platform_import_probe() {
 # decides what may run on it. `activate` swaps in an update prepared for this
 # exact image (or reverts one swapped in for another image) and merges late
 # edits back; `revert` returns a swapped-in update that failed its probe to
-# its saved previous state; `guard` is the fail-closed clean-tree check.
+# its saved previous state, compare-and-swap under the reconcile lock (it
+# refuses, touching nothing, unless the checkout is exactly the update this
+# boot left); `guard` is the fail-closed clean-tree check.
 _platform_boot() {
   su -s /bin/sh mobius -c \
     "cd /app/platform-baked/backend && $_env_scrub PYTHONDONTWRITEBYTECODE=1 timeout 900 python3 -m app.platform_boot $1"
@@ -512,10 +517,14 @@ chown -R mobius:mobius /data/platform 2>/dev/null || true
 
 # One boot transaction, in this order, so the probe and uvicorn see the same
 # bytes, and no served code runs before the probe: the image settles the source
-# it may run (and its activation bookkeeping and trusted hooks), the fail-closed
-# guard, then the decisive probe. A probe failure returns a swapped-in update
-# to its saved previous state and checks that tree the same way. A fresh seed
-# takes the same path, so every served boot publishes the transaction.
+# it may run (checkout recovery of an interrupted transition, then the update
+# record, activation bookkeeping and trusted hooks), the fail-closed guard, then
+# the one authoritative probe on that final tree. Nothing moves the checkout
+# after it. A probe failure returns a swapped-in update to its saved previous
+# state only through the CAS-safe revert, then guards and probes that tree the
+# same way; a refused revert or a second failure serves the baked platform with
+# /data/platform left as it is. A fresh seed takes the same path, so every
+# served boot publishes the transaction.
 _platform_serve_checkout() {
   if ! _platform_boot activate 2>&1; then
     echo "Platform layer: this image could not establish a platform state it may run; refusing to start." >&2

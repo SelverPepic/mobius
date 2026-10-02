@@ -950,8 +950,81 @@ def _clear_upstream(repo: Path) -> None:
   )
 
 
-def _import_probe(repo: Path = PLATFORM_REPO, timeout: int = _PROBE_TIMEOUT):
-  """Run ``import app.main`` as a fresh subprocess with cwd the served backend.
+_COMPAT_SOURCE_PATH = "backend/app/compat.py"
+
+
+def candidate_image_level(repo: Path, target: str) -> int:
+  """The ``COMPAT_LEVEL`` the reviewed target's own image will provide.
+
+  Parsed, never imported, from ``backend/app/compat.py`` in the target commit
+  itself (the tree that image bakes as its fallback), not from the merged
+  candidate, so local edits cannot raise it. A target without the file or the
+  name predates the levels (0). A target that does not resolve, or whose value
+  is not a literal non-negative integer, raises ``ValueError``.
+  """
+  from app import compat
+
+  commit = _rev(repo, target)
+  if not commit:
+    raise ValueError(f"candidate target {target!r} is not a commit in {repo}")
+  listed = _git(
+    "ls-tree", "--name-only", commit, "--", _COMPAT_SOURCE_PATH,
+    repo=repo, check=False,
+  )
+  if listed.returncode != 0:
+    raise ValueError(f"cannot read the tree of candidate target {_short(commit)}")
+  if not listed.stdout.strip():
+    return 0
+  source = _git_blob(repo, commit, _COMPAT_SOURCE_PATH)
+  if source is None:
+    raise ValueError(f"cannot read {_COMPAT_SOURCE_PATH} at {_short(commit)}")
+  try:
+    level = compat.declared_level(source.decode("utf-8"))
+  except (SyntaxError, UnicodeDecodeError) as exc:
+    raise ValueError(
+      f"{_COMPAT_SOURCE_PATH} at {_short(commit)} is malformed: {exc}",
+    ) from exc
+  return 0 if level is None else level
+
+
+def candidate_validation_env(
+  env: dict[str, str], repo: Path, candidate_target: str | None,
+) -> dict[str, str]:
+  """Set, or strip, the candidate-validation contract in a CHILD's env.
+
+  Only the reviewed image-requiring update paths name a ``candidate_target``:
+  the child then judges the source against that target's image level instead
+  of the running (older) image's baked level. Every other validation strips
+  both variables, so a stray value can never widen a generic check. Never
+  touches this process's own environment.
+  """
+  from app import compat
+
+  env.pop(compat.CANDIDATE_MARKER_ENV, None)
+  env.pop(compat.CANDIDATE_LEVEL_ENV, None)
+  if candidate_target is not None:
+    level = candidate_image_level(repo, candidate_target)
+    env[compat.CANDIDATE_MARKER_ENV] = "1"
+    env[compat.CANDIDATE_LEVEL_ENV] = str(level)
+  return env
+
+
+# The same verdict the entrypoint's probe and ``validate_restart_source`` apply:
+# ``app.main`` imports, and the router registry reports no caught failure.
+IMPORT_VERDICT = (
+  "import app.main; "
+  "from app.routes import require_all_routers_loaded; "
+  "require_all_routers_loaded()"
+)
+
+
+def _import_probe(
+  repo: Path = PLATFORM_REPO,
+  timeout: int = _PROBE_TIMEOUT,
+  *,
+  candidate_target: str | None = None,
+):
+  """Run the boot import verdict as a fresh subprocess with cwd the served backend.
 
   Single-source probe for both boot and post-merge: it MUST be a subprocess (not
   an in-process import) so the reconcile process — which already imported the OLD
@@ -960,7 +1033,9 @@ def _import_probe(repo: Path = PLATFORM_REPO, timeout: int = _PROBE_TIMEOUT):
   ``PYTHONPATH`` (no stray path may shadow ``app``) and the ``GIT_*`` pointers,
   and keeps ``DATABASE_URL`` / ``DATA_DIR`` so settings resolve as the served
   process does; the withheld signing key is replaced by an import-only
-  placeholder. Returns ``(ok, error)``.
+  placeholder. ``candidate_target`` (a reviewed commit) is passed only by an
+  Apply whose incoming release needs a new image; see
+  :func:`candidate_validation_env`. Returns ``(ok, error)``.
   """
   backend = repo / "backend"
   env = dict(os.environ)
@@ -971,8 +1046,12 @@ def _import_probe(repo: Path = PLATFORM_REPO, timeout: int = _PROBE_TIMEOUT):
     env.pop(var, None)
   import_probe_env(env)
   try:
+    candidate_validation_env(env, repo, candidate_target)
+  except ValueError as exc:
+    return False, f"candidate image level unreadable: {exc}"
+  try:
     proc = subprocess.run(
-      [sys.executable or "python3", "-c", "import app.main"],
+      [sys.executable or "python3", "-c", IMPORT_VERDICT],
       cwd=str(backend), capture_output=True, text=True, timeout=timeout, env=env,
     )
   except subprocess.TimeoutExpired:
@@ -2339,6 +2418,7 @@ def _reconcile_pass(
   target_ref: str,
   fetch_remote: bool,
   progress: Callable[[PlatformUpdatePhase], None] | None,
+  candidate_target: str | None = None,
 ) -> ReconcileResult:
   """One reconcile pass; see :func:`reconcile_clone` for the contract."""
   if not (repo / ".git").exists():
@@ -2462,7 +2542,7 @@ def _reconcile_pass(
     return _finalize_update(
       repo, local, pre=pre, tip=candidate, target=target,
       progress=progress, reconciliation=reconciliation,
-      overlay=overlay_summary,
+      overlay=overlay_summary, candidate_target=candidate_target,
     )
   except Exception as exc:  # unexpected git failure — never serve a half-tree
     _abort_interrupted(repo)
@@ -2505,6 +2585,7 @@ def _finalize_update(
   progress: Callable[[PlatformUpdatePhase], None] | None,
   reconciliation: app_git.ReconciliationReceipt,
   overlay: dict | None,
+  candidate_target: str | None = None,
 ) -> ReconcileResult:
   """Move the served branch to a complete candidate and run every gate.
 
@@ -2515,7 +2596,8 @@ def _finalize_update(
   caller gets every gate, so a resolver-finished merge can never land with
   fewer checks than owner Apply. A rejected candidate rolls back to ``pre``
   (restoring the previous declared dependency versions) exactly like any
-  other failed update.
+  other failed update. ``candidate_target`` is set only by a reviewed Apply
+  whose incoming release needs a new image (see ``_reconcile_under_lock``).
   """
   changed = _activation_paths_between(repo, pre, tip)
   frontend_changed = any(path in _FRONTEND_DEPENDENCY_INPUTS for path in changed)
@@ -2537,7 +2619,7 @@ def _finalize_update(
   if platform_activation.backend_import_probe_required(changed):
     if progress:
       progress(PlatformUpdatePhase.VALIDATING)
-    ok, err = _import_probe(repo)
+    ok, err = _import_probe(repo, candidate_target=candidate_target)
     if not ok:
       return _roll_back_update(
         repo, local, pre, tip, target, err, err,
@@ -2599,6 +2681,7 @@ def reconcile_clone(
   target_ref: str = DEFAULT_TARGET_REF,
   fetch_remote: bool = True,
   progress: Callable[[PlatformUpdatePhase], None] | None = None,
+  candidate_target: str | None = None,
 ) -> ReconcileResult:
   """Reconcile the served clone onto ``target_ref``, safely.
 
@@ -2613,7 +2696,7 @@ def reconcile_clone(
   """
   result = _reconcile_pass(
     repo, target_ref=target_ref, fetch_remote=fetch_remote,
-    progress=progress,
+    progress=progress, candidate_target=candidate_target,
   )
   if result.status == "skipped":
     return result
@@ -2913,9 +2996,14 @@ def _prepare(
   )
   # This image's import verdict decides source it will run. Source for
   # another image is judged by that image's own boot probe, which reverts it.
+  # An image-requiring update still validated here (an image without the boot
+  # transaction swaps it at its cutover) is judged against the reviewed
+  # target's image level, since this older image's is by definition too low.
   if not (requires_image and image_activates_updates()):
     try:
-      validate_restart_source(checkout)
+      validate_restart_source(
+        checkout, candidate_target=target if requires_image else None,
+      )
     except RestartSourceInvalid as exc:
       raise PlatformUpdateError(str(exc)) from exc
   _git("update-ref", _PREPARED_REF, prepared, repo=repo)
@@ -3465,21 +3553,63 @@ _REPLACEMENT_NOT_KEPT = (
 
 def revert_failed_update(repo: Path = PLATFORM_REPO) -> bool:
   """Boot, after the swapped-in update failed its import probe: return to the
-  swap's own saved previous state. Returns whether anything was reverted."""
+  swap's own saved previous state. Returns whether anything was reverted.
+
+  Compare-and-swap, never a blind reset: under the reconcile lock the
+  checkout must stand exactly where this boot's transaction left the update
+  (``_revert_refusal``). Anything else raises ``BootTransactionError`` with
+  the checkout and record untouched; the entrypoint then serves the baked
+  platform and the work stays in place. The record leaves ``swapped`` in one
+  atomic write only after the checkout provably reached the saved state, so a
+  crash in between leaves a swapped record the next boot settles again.
+  """
   with _reconcile_flock():
     record = read_prepared_update()
     if record is None or record["state"] != "swapped" or not record["late"]:
       return False
-    _revert_swap(repo, record, reason=_FAILED_STARTUP_CHECK)
+    refusal = _revert_refusal(repo, record)
+    if refusal:
+      raise BootTransactionError(
+        f"not reverting the failed update: {refusal}; the checkout is left as it is",
+      )
+    _revert_swap(repo, record, reason=_FAILED_STARTUP_CHECK, confirm_reset=True)
     return True
 
 
-def _revert_swap(repo: Path, record: PreparedUpdate, *, reason: str) -> None:
+def _revert_refusal(repo: Path, record: PreparedUpdate) -> str | None:
+  """Why the checkout is not the swapped update this revert may discard.
+
+  HEAD, attached to the working branch, must be the tip the swap recorded:
+  its merge-back when one ran, otherwise the prepared update itself. The
+  working tree must be clean at that tip or exactly the tree the merge-back
+  restored (the carried in-progress edits the updater owns). No merge or
+  branch transition may be in flight.
+  """
+  local = _local_branch(repo)
+  expected = record["replayed"] or record["prepared"]
+  head, branch = _rev(repo, "HEAD"), _rev(repo, local)
+  if not expected or head != expected or branch != expected:
+    return (
+      f"HEAD {_short(head)} (branch {_short(branch)}) is not the swapped "
+      f"update {_short(expected)}"
+    )
+  if _reconcile_in_progress(repo) or RECONCILE_PRE_FLAG.exists():
+    return "another checkout transition is in progress"
+  tree = _working_tree_oid(repo, head)
+  if tree not in {_commit_tree_oid(repo, head), record["booted_tree"]}:
+    return "the working tree holds changes the update did not make"
+  return None
+
+
+def _revert_swap(
+  repo: Path, record: PreparedUpdate, *, reason: str, confirm_reset: bool = False,
+) -> None:
   """Reset to the swap's saved ``late`` state and keep the update prepared.
 
   Anything made on the update since it booted is set aside first, never
   discarded. The reset precedes the record write, so a crash leaves a still
-  swapped record the next boot reverts again.
+  swapped record the next boot reverts again. With ``confirm_reset`` the
+  record is settled only once the branch provably reached ``late``.
   """
   local = _local_branch(repo)
   resolver_work = None
@@ -3497,6 +3627,10 @@ def _revert_swap(repo: Path, record: PreparedUpdate, *, reason: str) -> None:
   _abort_interrupted(repo)
   set_aside = _set_aside_unsaved_update_work(repo, local, record)
   _reset_hard_to(repo, local, record["late"])
+  if confirm_reset and _rev(repo, "HEAD") != record["late"]:
+    raise BootTransactionError(
+      "the checkout did not return to the saved previous state",
+    )
   _clear_reconcile_pre()
   _settle_reverted(
     repo, record, reason=reason,
@@ -4007,6 +4141,7 @@ def _reconcile_under_lock(
   """
   guard = contextlib.nullcontext() if lock_already_held else _reconcile_flock()
   with guard:
+    candidate_target: str | None = None
     if plan_id is not None:
       if current_sha is None:
         raise PlatformUpdateError("update_plan_invalid")
@@ -4017,18 +4152,23 @@ def _reconcile_under_lock(
         target_sha=target_ref,
         image_digest=image_digest,
       )
-      if not allow_image_activation:
-        base = _git(
-          "merge-base", current_sha, target_ref, repo=repo, check=False,
-        ).stdout.strip() or current_sha
-        # Existing local image drift is an independent remainder. It must not
-        # turn an unrelated source-only update into an agent-only dead end.
-        # Refuse only when the reviewed incoming release itself needs an image.
-        impact = _incoming_activation_impact(repo, base, target_ref)
-        if platform_activation.ActivationLevel.IMAGE_REBUILD.value in (
-          impact["required_actions"]
-        ):
+      base = _git(
+        "merge-base", current_sha, target_ref, repo=repo, check=False,
+      ).stdout.strip() or current_sha
+      # Existing local image drift is an independent remainder. It must not
+      # turn an unrelated source-only update into an agent-only dead end.
+      # Only the reviewed incoming release itself decides.
+      impact = _incoming_activation_impact(repo, base, target_ref)
+      if platform_activation.ActivationLevel.IMAGE_REBUILD.value in (
+        impact["required_actions"]
+      ):
+        if not allow_image_activation:
           raise PlatformUpdateError("image_rebuild_required")
+        # A host install (install_platform_release.py, reached from
+        # deploy-prod.sh) installs the release's source on the old image just
+        # before its own image replaces this one: the post-merge probe judges
+        # it against that reviewed target's image level.
+        candidate_target = target_ref
     result = reconcile_clone(
       repo,
       target_ref=target_ref,
@@ -4037,6 +4177,7 @@ def _reconcile_under_lock(
       # Unreviewed operator calls refresh first; a shallow replay may deepen.
       fetch_remote=plan_id is None,
       progress=progress,
+      candidate_target=candidate_target,
     )
     # `upstream` is moved only by a successful/contained reconcile to the
     # fetched release target. Capture its immutable oid before releasing the
@@ -4967,6 +5108,7 @@ async def spawn_platform_conflict_chat(
 
   from app import models, providers
   from app.chat_start import start_programmatic_chat_turn
+  from app.chat_writer import create_chat
   from app.config import get_settings
   from app.push import notify_owner
   from app.run_state import running_chat_ids
@@ -5007,7 +5149,7 @@ async def spawn_platform_conflict_chat(
   )
 
   chat_id = str(uuid.uuid4())
-  chat = models.Chat(
+  chat = create_chat(
     id=chat_id, title=title, messages=[], pending_messages=[],
     provider=provider, agent_settings_json=agent_settings,
     created_by_app_id=None,

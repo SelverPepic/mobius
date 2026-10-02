@@ -383,6 +383,8 @@ def test_replacement_drains_then_rolls_back_after_cutover_error(tmp_path, monkey
 
   monkeypatch.setattr(host, "compose", compose)
   monkeypatch.setattr(host, "wait_healthy", lambda *_args, **_kwargs: True)
+  monkeypatch.setattr(host, "rollback_preflight", lambda *_args: None)
+  monkeypatch.setattr(host, "wait_ready", lambda *_args, **_kwargs: ("ready", {"ready": True}))
   statuses = []
   monkeypatch.setattr(
     host, "write_status", lambda _config, **fields: statuses.append(fields) or fields,
@@ -456,6 +458,8 @@ def test_healthy_rollback_reports_degraded_chat_handoff(
   monkeypatch.setattr(host, "app_container", lambda _config: ("cid", "old"))
   monkeypatch.setattr(host, "compose", lambda *_args, **_kwargs: None)
   monkeypatch.setattr(host, "wait_healthy", lambda *_args, **_kwargs: True)
+  monkeypatch.setattr(host, "rollback_preflight", lambda *_args: None)
+  monkeypatch.setattr(host, "wait_ready", lambda *_args, **_kwargs: ("ready", {"ready": True}))
 
   def ledger(_config, _cid, command, _operation, **_kwargs):
     assert _operation == operation

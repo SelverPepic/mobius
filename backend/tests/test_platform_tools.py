@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app import platform_tools
+from app import app_tools, platform_tools
 
 
 @pytest.mark.parametrize("top_level,coordination", [(True, True), (True, False), (False, True)])

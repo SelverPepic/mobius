@@ -19,6 +19,7 @@ uncommitted; an offline fetch keeps serving unchanged; a crash-interrupted
 reconcile is cleaned up on the next pass; and a merge-shaped legacy history is
 left untouched with an explicit normalization error.
 """
+from app.chat_writer import create_chat
 
 import asyncio
 import hashlib
@@ -71,6 +72,7 @@ def _write_backend(root: Path, main_py: str = _MAIN_PY, foo_py: str | None = _FO
   app_dir.mkdir(parents=True, exist_ok=True)
   (app_dir / "__init__.py").write_text("")
   (app_dir / "main.py").write_text(main_py)
+  (app_dir / "routes.py").write_text("def require_all_routers_loaded():\n  return None\n")
   if foo_py is not None:
     (app_dir / "foo.py").write_text(foo_py)
 
@@ -197,7 +199,7 @@ def clone_env(tmp_path, monkeypatch):
   # The real startup check imports the full platform; these fixture clones
   # carry only a minimal backend, so the check is exercised separately.
   monkeypatch.setattr(
-    "app.restart_util.validate_restart_source", lambda platform_root=None: None,
+    "app.restart_util.validate_restart_source", lambda platform_root=None, **_kwargs: None,
   )
   monkeypatch.setenv("BUILD_SHA", "test-sha")
   # This boot's image runs the boot transaction; tests of images before it
@@ -1244,7 +1246,7 @@ def test_an_answer_that_fails_the_startup_check_is_never_prepared(
   (platform / "backend/app/foo.py").write_text("VALUE = 'DIRTY'\n")
   from app import restart_util
 
-  def fails(platform_root=None):
+  def fails(platform_root=None, **_kwargs):
     raise restart_util.RestartSourceInvalid("startup check failed")
 
   monkeypatch.setattr("app.restart_util.validate_restart_source", fails)
@@ -1553,7 +1555,7 @@ def test_failed_candidate_never_rolls_back_a_newer_concurrent_writer(
   _advance_origin(origin, edits={"backend/app/foo.py": "VALUE = 'update'\n"})
   raced: dict[str, str] = {}
 
-  def fail_after_concurrent_commit(repo=platform, timeout=pu._PROBE_TIMEOUT):
+  def fail_after_concurrent_commit(repo=platform, timeout=pu._PROBE_TIMEOUT, **_kwargs):
     raced["sha"] = _local_commit(
       platform, edits={"concurrent.txt": "newer owner\n"},
       msg="concurrent writer after activation",
@@ -2339,7 +2341,7 @@ def test_reconcile_pins_upstream_hook_source_before_unlock(monkeypatch, tmp_path
     events.append("unlocked")
 
   def fake_reconcile(
-    repo_path, *, target_ref, fetch_remote, progress,
+    repo_path, *, target_ref, fetch_remote, progress, candidate_target=None,
   ):
     assert events == ["locked"]
     assert repo_path == repo
