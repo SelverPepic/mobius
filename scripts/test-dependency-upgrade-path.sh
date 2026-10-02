@@ -81,7 +81,7 @@ new_owned=true
 build_image "$new_image" "$new_sha"
 
 echo "fixture: ${old_sha:0:12} (Python 3.12.13) -> ${new_sha:0:12} (Python 3.12.14 + colorama)"
-echo "fixture: injecting wrong-image replacement to verify prepared-snapshot rollback"
+echo "fixture: booting target image, then wrong-image rollback to verify the prepared snapshot"
 UPGRADE_PYTHON_BEFORE=3.12.13 UPGRADE_PYTHON_AFTER=3.12.14 \
   UPGRADE_LOCK_PACKAGE=colorama==0.4.6 UPGRADE_FORCE_ROLLBACK=1 \
   "$root/scripts/test-upgrade-path.sh" "$old_image" "$new_image" "$source_dir"

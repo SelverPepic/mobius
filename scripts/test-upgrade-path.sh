@@ -282,9 +282,29 @@ if [ "$needs_image" = True ]; then
     || fail "the previous release could not drain for the cutover"
   ledger accept-cutover || fail "the previous release's supervisor did not accept the handoff"
   if [ "$force_rollback" = 1 ]; then
-    echo "5. inject a wrong-image replacement; the old image must restore the prepared snapshot"
+    echo "5. boot the candidate, then roll back to the wrong image before verification"
+    # Images with a boot transaction leave image-requiring source prepared at
+    # cutover. Only the matching new image may swap it in. Exercise that real
+    # activation before testing the old image's boot-time snapshot reversion.
+    [ "$(as_mobius python3 -c "import json; print(json.load(open('$record'))['state'])")" = prepared ] \
+      || fail "cutover did not leave the image-requiring update prepared"
+    [[ $(as_mobius git -C /data/platform rev-parse HEAD) == "$old_head" ]] \
+      || fail "cutover moved source before the target image booted"
+    docker stop -t 60 "$name" >/dev/null
+    docker rm "$name" >/dev/null
+    container_owned=false
+    start "$CANDIDATE"
     [ "$(as_mobius python3 -c "import json; print(json.load(open('$record'))['state'])")" = swapped ] \
-      || fail "cutover did not swap the prepared source before rollback"
+      || fail "target image boot did not swap the prepared source"
+    as_mobius git -C /data/platform merge-base --is-ancestor "$candidate" HEAD \
+      || fail "target image boot did not activate the candidate source"
+    [[ $(python_version) == "$after_python" ]] \
+      || fail "target image boot does not run Python $after_python"
+    [[ $(package_version "$package") == "$package_target" ]] \
+      || fail "target image boot did not install $lock_package"
+    as_mobius grep -Fq "$lock_package" /data/platform/backend/requirements.lock \
+      || fail "target image boot did not activate the candidate lock"
+    verify_fixture_service "$candidate" "$(as_mobius git -C /data/platform rev-parse HEAD)"
     docker stop -t 60 "$name" >/dev/null
     docker rm "$name" >/dev/null
     container_owned=false

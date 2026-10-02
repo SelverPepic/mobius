@@ -233,6 +233,30 @@ esac
             self.assertIn(required, script)
         self.assertEqual(script.count('"$root/scripts/test-upgrade-path.sh"'), 2)
 
+    def test_rollback_replays_target_image_activation_before_wrong_image_boot(self):
+        script = (HERE / "test-upgrade-path.sh").read_text()
+        rollback = script.split('if [ "$force_rollback" = 1 ]; then', 1)[1].split(
+            'write_status replacing "Rebuilding the container."', 1
+        )[0]
+        # The outgoing image's cutover deliberately leaves an image-requiring
+        # update prepared. The candidate image boots and swaps it; only then
+        # may a boot of the previous (wrong) image exercise real reversion.
+        ordered = (
+            "cutover did not leave the image-requiring update prepared",
+            'start "$CANDIDATE"',
+            "target image boot did not swap the prepared source",
+            'verify_fixture_service "$candidate"',
+            'start "$PREVIOUS"',
+            "the old image did not restore the pre-update source snapshot",
+        )
+        positions = [rollback.index(value) for value in ordered]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn('[[ $(python_version) == "$after_python" ]]', rollback)
+        self.assertIn('[[ $(python_version) == "$before_python" ]]', rollback)
+        self.assertIn('grep -Fq "$lock_package" /data/platform/backend/requirements.lock', rollback)
+        self.assertIn('rollback does not run the previous image', rollback)
+        self.assertIn('the rolled-back update is not kept prepared for retry', rollback)
+
 
 if __name__ == "__main__":
     unittest.main()
