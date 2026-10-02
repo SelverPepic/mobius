@@ -1330,3 +1330,125 @@ async def test_failed_codex_compaction_discards_partial_text_and_redacts_logs(
   assert "secret-must-not-leak" not in caplog.text
   assert "partial-private-briefing" not in caplog.text
   assert "private prompt" not in caplog.text
+
+
+def _write_bound_manual_note(chat_id, messages, summary="Keep the original files."):
+  from app.chat_continuity import apply_checkpoint, checkpoint_coverage, note_path, write_note
+  path = note_path(get_settings().data_dir, chat_id)
+  note = apply_checkpoint(
+    None, name="Compaction fixture", summary=summary,
+    coverage=checkpoint_coverage(messages, "new-run"),
+  )
+  write_note(path, note)
+  return path
+
+
+@pytest.mark.parametrize("coverage", ["valid", "missing", "changed_prefix", "changed_note"])
+def test_manual_compaction_uses_verified_note_or_keeps_full_history(
+  client, auth, db, monkeypatch, coverage,
+):
+  chat_id = _make_chat_with_messages(client, auth, [
+    {"role": "user", "content": "Keep originals."},
+    {"role": "assistant", "id": "old", "content": "Saved previous work."},
+    {"role": "user", "content": "New correction: do not publish."},
+  ])
+  row = db.get(models.Chat, chat_id)
+  row.session_id = "previous-session"
+  db.commit()
+  messages = list(row.messages)
+  path = _write_bound_manual_note(chat_id, messages)
+  if coverage == "missing":
+    path.unlink()
+  elif coverage == "changed_prefix":
+    # Bind to a different history, not this chat's immutable input.
+    other = [{**messages[0], "content": "Different history"}, *messages[1:]]
+    _write_bound_manual_note(chat_id, other)
+  elif coverage == "changed_note":
+    path.write_text(path.read_text().replace("Keep the original files.", "Changed handoff."))
+  seen = []
+  async def fake(source, **kwargs):
+    seen.append((source, kwargs))
+    return "Keep originals; do not publish."
+  monkeypatch.setattr(compaction, "summarize_chat", fake)
+  response = client.post(f"/api/chats/{chat_id}/compact", headers=auth)
+  assert response.status_code == 200, response.text
+  assert seen[0][0] == (messages[2:] if coverage == "valid" else messages)
+  db.expire_all()
+  assert row.messages[:-1] == messages
+  assert row.session_id is None
+
+
+@pytest.mark.parametrize("change", ["note", "missing_note", "messages"])
+def test_manual_compaction_cannot_commit_after_covered_source_changes(
+  client, auth, db, monkeypatch, change,
+):
+  chat_id = _make_chat_with_messages(client, auth, [
+    {"role": "user", "content": "Keep originals."},
+    {"role": "assistant", "id": "old", "content": "Previous work."},
+    {"role": "user", "content": "Unsummarized correction."},
+  ])
+  row = db.get(models.Chat, chat_id)
+  row.session_id = "previous-session"
+  db.commit()
+  messages = list(row.messages)
+  path = _write_bound_manual_note(chat_id, messages)
+  async def fake(source, **kwargs):
+    if change == "note":
+      path.write_text(path.read_text() + "\nConcurrent update\n")
+    elif change == "missing_note":
+      path.unlink()
+    else:
+      get_writer().submit(ReplaceTranscript(
+        chat_id=chat_id, messages=[*messages, {"role": "user", "content": "New input"}],
+      )).result(5)
+    return "A now-stale briefing."
+  monkeypatch.setattr(compaction, "summarize_chat", fake)
+  response = client.post(f"/api/chats/{chat_id}/compact", headers=auth)
+  assert response.status_code == 409, response.text
+  db.expire_all()
+  assert row.session_id == "previous-session"
+  assert not any(m.get("kind") == "compaction" for m in row.messages)
+
+
+@pytest.mark.parametrize("large_part", ["covered_history", "uncovered_tail", "full_digest"])
+def test_manual_note_compaction_retains_existing_work_limits(
+  client, auth, db, monkeypatch, large_part,
+):
+  from app import providers
+  large = "detail " * 100_000
+  chat_id = _make_chat_with_messages(client, auth, [
+    {"role": "user", "content": "Keep originals."},
+    {"role": "assistant", "id": "old",
+     "content": large if large_part == "covered_history" else "Previous work."},
+    {"role": "user",
+     "content": large if large_part == "uncovered_tail" else "Do not publish."},
+  ])
+  row = db.get(models.Chat, chat_id)
+  row.session_id = "previous-session"
+  db.commit()
+  messages = list(row.messages)
+  _write_bound_manual_note(
+    chat_id, messages, large if large_part == "full_digest" else "Keep originals.",
+  )
+  async def ensure_auth(*args):
+    pass
+  monkeypatch.setattr(providers, "get_provider", lambda _: SimpleNamespace(
+    check_auth=lambda _: None, ensure_auth=ensure_auth,
+  ))
+  calls = []
+  async def fake(prompt, **kwargs):
+    calls.append(prompt)
+    return "Keep originals; do not publish."
+  monkeypatch.setattr(compaction, "_run_provider_summarize_turn", fake)
+  response = client.post(f"/api/chats/{chat_id}/compact", headers=auth)
+  db.expire_all()
+  if large_part == "covered_history":
+    assert response.status_code == 200, response.text
+    assert len(calls) == 1
+    assert "Do not publish." in calls[0]
+    assert row.messages[:-1] == messages
+  else:
+    assert response.status_code == 422, response.text
+    assert calls == []
+    assert row.session_id == "previous-session"
+    assert row.messages == messages
