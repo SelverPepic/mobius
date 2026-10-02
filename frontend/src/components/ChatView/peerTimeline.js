@@ -1,4 +1,5 @@
 /* Project retained peer mail onto transcript boundaries without changing delivery or stored messages. */
+import { waitWokeItsAnswer } from './waitHistory.js'
 /** Stored coordinates of one projected block. Recorded positions name a
  * boundary in the stored message's blocks; projections that renumber those
  * blocks (the compact transcript and assistant-fragment folding) declare the
@@ -118,6 +119,7 @@ const isActivityBlock = block => (
   block?.type === 'tool'
   || block?.type === 'thinking'
   || block?.type === 'activity'
+  || block?.type === 'helper_result'
   || isTransparentActivitySeparator(block)
 )
 
@@ -159,6 +161,8 @@ export function foldAssistantActivityFragments(
       const targetBlocks = target.blocks || []
       const candidate = rendered[candidateIndex]
       const candidateBlocks = candidate.blocks || []
+      if (target.goal_summaries?.length || target.wait_summaries?.length
+          || candidate.continuation_reason || candidate.wait_summaries?.some(waitWokeItsAnswer)) break
       if (!isActivityBlock(targetBlocks.at(-1)) || !isActivityBlock(candidateBlocks[0])) break
       let activityEnd = 0
       while (activityEnd < candidateBlocks.length && isActivityBlock(candidateBlocks[activityEnd])) {
@@ -168,7 +172,8 @@ export function foldAssistantActivityFragments(
       // stored index its recorded positions refer to; moved blocks also name
       // the stored message they came from.
       const storedCandidate = candidateBlocks.map((block, storedIndex) => (
-        storedBlockRange(block) ? block : { ...block, raw_index: storedIndex }
+        storedBlockRange(block) || projectedActivityId(block)
+          ? block : { ...block, raw_index: storedIndex }
       ))
       const leadingActivity = storedCandidate
         .slice(0, activityEnd)
@@ -181,11 +186,12 @@ export function foldAssistantActivityFragments(
       rendered[targetIndex] = target
       const rawBoundary = storedCandidate
         .slice(0, activityEnd)
-        .reduce((boundary, block) => Math.max(boundary, storedBlockRange(block).end), 0)
+        .reduce((boundary, block) => Math.max(boundary, storedBlockRange(block)?.end ?? 0), 0)
       const candidateNotes = positions.get(candidate.id) || []
       const movingNotes = candidateNotes.filter(note => (
         Number.isInteger(note.display_position?.block_index)
-        && note.display_position.block_index < rawBoundary
+        && (note.display_position.block_index < rawBoundary
+          || (activityEnd === candidateBlocks.length && note.display_position.block_index === rawBoundary))
       ))
       if (movingNotes.length) {
         positions.set(target.id, [
@@ -215,15 +221,12 @@ export function foldAssistantActivityFragments(
   return { messages: rendered, positions }
 }
 
-export function foldPeerActivity(messages, projection, chatId, activeMirrorIndex = -1) {
+export function foldPeerActivity(messages, projection, chatId) {
   const rendered = [...messages]
   const slots = new Map(projection.slots)
   const tools = new Map(projection.tools)
   const prepended = new Map()
   for (const [index, notes] of slots) {
-    // Helper results own a standalone disclosure. Keep a mixed timestamp slot
-    // intact rather than folding only its peer rows across that ordering seam.
-    if (notes.some(note => note.type === 'helper_result')) continue
     let next = index
     while (next < messages.length && messages[next].hidden) next++
     let prev = index - 1
@@ -233,67 +236,66 @@ export function foldPeerActivity(messages, projection, chatId, activeMirrorIndex
     if (!before && !after) continue
     const target = before ? next : prev
     const blocks = notes.map(note => {
+      if (note.type === 'helper_result') return note
       const tool = { ...peerRecordTool(note, chatId), tool_use_id: `peer-${note.id}` }
       tools.set(tool.tool_use_id, [note])
       return tool
     })
     const prefixLength = prepended.get(target) || 0
+    // Recorded positions count stored blocks, never the synthetic mail rows
+    // inserted here. Preserve that coordinate before prepending any activity.
+    const stored = rendered[target].blocks.map((block, index) => (
+      storedBlockRange(block) || projectedActivityId(block)
+        ? block : { ...block, raw_index: index }
+    ))
     rendered[target] = { ...rendered[target], blocks: before
-      ? [...rendered[target].blocks.slice(0, prefixLength), ...blocks, ...rendered[target].blocks.slice(prefixLength)]
-      : [...rendered[target].blocks, ...blocks] }
+      ? [...stored.slice(0, prefixLength), ...blocks, ...stored.slice(prefixLength)]
+      : [...stored, ...blocks] }
     if (before) prepended.set(target, prefixLength + blocks.length)
     slots.delete(index)
   }
-  const folded = foldAssistantActivityFragments(
-    rendered,
-    slots,
-    activeMirrorIndex,
-    projection.positions,
-  )
-  return {
-    messages: folded.messages,
-    slots,
-    tools,
-    positions: folded.positions,
-  }
+  // Cross-fragment folding happens in AssistantReply, after the authoritative
+  // live payload has been selected. A saved partial must never replace it.
+  return { messages: rendered, slots, tools, positions: projection.positions }
 }
 
-const peerToolId = block => (
-  block?.type === 'tool'
-  && block.tool === 'PeerMessage'
-  && typeof block.tool_use_id === 'string'
-  && block.tool_use_id.startsWith('peer-')
-    ? block.tool_use_id
-    : null
-)
+const projectedActivityId = block => {
+  if (block?.type === 'helper_result') return block.activityId || block.id
+  return block?.type === 'tool' && block.tool === 'PeerMessage'
+    && typeof block.tool_use_id === 'string' && block.tool_use_id.startsWith('peer-')
+    ? block.tool_use_id : null
+}
 
 const blockIdentity = block => block?.tool_use_id
   || block?.thinking_id
   || block?.question_id
   || null
 
-const sameBlock = (left, right) => left === right || (
+const sameBlock = (left, right, rawIndex) => left === right || (
   blockIdentity(left) && blockIdentity(left) === blockIdentity(right)
+) || (
+  // Projection stamps source coordinates even on id-less prose/card blocks.
+  // Those copies must still locate the raw mirror inside its boundary rows.
+  left?.type === right?.type
+  && storedBlockRange(right)?.start === (storedBlockRange(left)?.start ?? rawIndex)
 )
 
-/** Carry boundary peer rows from the read-only timeline projection into the
- * live payload without replacing the stream's newer tool/thinking state.
- * foldPeerActivity only adds peer tools at a message boundary, so the raw
- * mirror identifies whether they belong before or after its blocks. */
-export function mergeProjectedPeerActivity(liveBlocks = [], projectedBlocks = [], rawBlocks = []) {
-  if (!projectedBlocks.length || projectedBlocks.length <= rawBlocks.length) return liveBlocks
-  const extra = projectedBlocks.length - rawBlocks.length
-  let peers = []
-  let atStart = false
-  if (rawBlocks.every((block, index) => sameBlock(block, projectedBlocks[index + extra]))) {
-    peers = projectedBlocks.slice(0, extra).filter(peerToolId)
-    atStart = true
-  } else if (rawBlocks.every((block, index) => sameBlock(block, projectedBlocks[index]))) {
-    peers = projectedBlocks.slice(rawBlocks.length).filter(peerToolId)
-  }
-  if (!peers.length) return liveBlocks
-  const existing = new Set(liveBlocks.map(peerToolId).filter(Boolean))
-  const missing = peers.filter(block => !existing.has(peerToolId(block)))
-  if (!missing.length) return liveBlocks
-  return atStart ? [...missing, ...liveBlocks] : [...liveBlocks, ...missing]
+/** Carry projected peer/helper rows around the selected live payload. The raw
+ * mirror locates both boundaries; its older tool state never replaces live data. */
+export function mergeProjectedActivity(liveBlocks = [], projectedBlocks = [], rawBlocks = []) {
+  if (projectedBlocks.length <= rawBlocks.length) return liveBlocks
+  const start = rawBlocks.length
+    ? projectedBlocks.findIndex((_, index) => rawBlocks.every((block, offset) => sameBlock(block, projectedBlocks[index + offset], offset)))
+    : projectedBlocks.length
+  if (start < 0) return liveBlocks
+  const existing = new Set(liveBlocks.map(projectedActivityId).filter(Boolean))
+  const missing = blocks => blocks.filter(block => {
+    const id = projectedActivityId(block)
+    if (!id || existing.has(id)) return false
+    existing.add(id)
+    return true
+  })
+  const before = missing(projectedBlocks.slice(0, start))
+  const after = missing(projectedBlocks.slice(start + rawBlocks.length))
+  return before.length || after.length ? [...before, ...liveBlocks, ...after] : liveBlocks
 }

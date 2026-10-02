@@ -1,4 +1,5 @@
 /* Present hidden same-run interruptions as one reply without rewriting source rows. */
+import { foldAssistantActivityFragments } from './peerTimeline.js'
 import { assistantAnchorKey, messageKey } from '../../lib/chatDetailCache.js'
 import { assistantReplyRoot, isHiddenReplyCarrier, projectSteerContinuationMessage } from './steerContinuity.js'
 
@@ -103,4 +104,25 @@ export function presentAssistantReply(rows, { activeIndex = -1, positions = new 
     }
   }
   return presented
+}
+
+/** Join activity only after each source row has chosen its current live/DB
+ * payload. Source rows remain as anchors; the display never becomes a source. */
+export function presentAssistantActivity(rows, { activeIndex = -1, positions = new Map() } = {}) {
+  const messages = rows.map((row, index) => {
+    if (index !== activeIndex || !row.message.blocks?.length) return row.message
+    const blocks = [...row.message.blocks]
+    const last = blocks.findLastIndex(block => !(block.type === 'text' && !block.content?.trim()))
+    if (last < 0 || !['tool', 'thinking', 'activity', 'helper_result'].includes(blocks[last].type)) return row.message
+    blocks[last] = { ...blocks[last], reply_activity_live: true }
+    return { ...row.message, blocks }
+  })
+  const slots = new Map(rows.flatMap((row, index) => row.notes.length ? [[index, row.notes]] : []))
+  const folded = foldAssistantActivityFragments(messages, slots, -1, positions)
+  return {
+    positions: folded.positions,
+    rows: rows.map((row, index) => ({ ...row, message: folded.messages[index]._folded_activity_fragment
+      ? { ...folded.messages[index], hidden: row.message.hidden, content: '', blocks: [] }
+      : folded.messages[index] })),
+  }
 }

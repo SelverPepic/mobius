@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import {
   carrierMessages,
   foldAssistantActivityFragments,
-  mergeProjectedPeerActivity,
+  mergeProjectedActivity,
   peerRecordTool,
   peerTime,
   projectPeerTimeline,
@@ -111,11 +111,11 @@ test('projected peer rows join a newer live payload once without replacing it', 
   const later = { type: 'thinking', thinking_id: 'later' }
   const peer = { type: 'tool', tool: 'PeerMessage', tool_use_id: 'peer-note' }
   assert.deepEqual(
-    mergeProjectedPeerActivity([bash, later], [peer, bash], [bash]),
+    mergeProjectedActivity([bash, later], [peer, bash], [bash]),
     [peer, bash, later],
   )
   assert.deepEqual(
-    mergeProjectedPeerActivity([peer, bash, later], [peer, bash], [bash]),
+    mergeProjectedActivity([peer, bash, later], [peer, bash], [bash]),
     [peer, bash, later],
   )
 })
