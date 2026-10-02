@@ -76,6 +76,7 @@ function sessionHistory({ wedged = false, navigationApi = true } = {}) {
       }
     },
     back() { queued += 1 },
+    forward() { commitOneTraversal(1) },
   }
 
   const mirrorAt = position => ({
@@ -101,6 +102,10 @@ function sessionHistory({ wedged = false, navigationApi = true } = {}) {
     get currentEntry() {
       if (wedged) throw new Error(WEDGED)
       return mirrorAt(index)
+    },
+    entries() {
+      if (wedged) throw new Error(WEDGED)
+      return entries.map((_, position) => mirrorAt(position))
     },
   } : null
 
@@ -163,6 +168,50 @@ function sessionHistory({ wedged = false, navigationApi = true } = {}) {
     get depth() { return index },
   }
 }
+
+for (const [path, options] of [
+  ['Navigation API', {}],
+  ['popstate fallback', { navigationApi: false }],
+]) {
+  test(`${path} keeps chat Back and Forward owned across reloads`, async () => {
+    const engine = sessionHistory(options)
+    let mounted = await mountNavigation(engine, { tab: { kind: 'chat', id: 'a' } })
+    assert.equal(mounted.result.current.recordChatNavigation('b'), true)
+    assert.equal(engine.currentState.route.chatId, 'b')
+    mounted.unmount()
+
+    mounted = await mountNavigation(engine, { tab: { kind: 'chat', id: 'b' } })
+    assert.equal(engine.currentState.kind, 'nav', 'reload keeps the B entry rather than replacing it with base')
+    assert.equal(engine.currentState.index, 1)
+    assert.equal(mounted.result.current.navigateBackward(), true)
+    engine.settle()
+    assert.equal(engine.currentState.route.chatId, 'a')
+    mounted.unmount()
+
+    mounted = await mountNavigation(engine, { tab: { kind: 'chat', id: 'a' } })
+    assert.equal(engine.currentState.index, 0, 'Back reload keeps the base entry')
+    assert.equal(mounted.result.current.navigateForward(), true)
+    assert.equal(engine.currentState.route.chatId, 'b')
+    assert.equal(mounted.result.current.navigateBackward(), true)
+    engine.settle()
+    assert.equal(engine.currentState.route.chatId, 'a', 'the round trip retains its Back edge')
+    assert.equal(mounted.result.current.recordChatNavigation('c'), true)
+    assert.equal(engine.currentState.route.chatId, 'c')
+    assert.equal(mounted.result.current.navigateForward(), false, 'a new branch discards B')
+    mounted.unmount()
+  })
+}
+
+test('Forward shortcut refuses an iframe-owned physical cursor', async () => {
+  const engine = sessionHistory({ navigationApi: false })
+  const mounted = await mountNavigation(engine, { tab: { kind: 'chat', id: 'a' } })
+  mounted.result.current.recordChatNavigation('b')
+  engine.userBack()
+  engine.pushIframeEntry()
+  assert.equal(mounted.result.current.navigateForward(), false)
+  assert.deepEqual(engine.currentState, { iframe: true })
+  mounted.unmount()
+})
 
 async function mountNavigation(engine, {
   tab = { kind: 'chat', id: 'c1' }, frames = null, dragActiveRef = { current: false },
@@ -304,19 +353,20 @@ for (const [path, options] of [
       if (direction === 'Back') engine.userBack()
       else engine.userForward()
       const destination = direction === 'Back' ? original : next
-      assert.deepEqual(engine.currentState, destination, 'the browser traversed to the intended route')
+      const routeEntry = ({ hasShellForward, ...entry }) => entry
+      assert.deepEqual(routeEntry(engine.currentState), routeEntry(destination), 'the browser traversed to the intended route')
       const depth = engine.depth
 
       frames.advance()
       assert.equal(result.current.drawerOpen, false, 'the restored route stays free of the cancelled drawer')
-      assert.deepEqual(engine.currentState, destination, 'no drawer sentinel replaces the restored entry')
+      assert.deepEqual(routeEntry(engine.currentState), routeEntry(destination), 'no drawer sentinel replaces the restored entry')
       assert.equal(engine.depth, depth, 'the cancelled commit cannot add a history step')
       assert.equal(frames.pending, 0)
 
       // A late drawer push would also truncate Forward history after Back.
       if (direction === 'Back') engine.userForward()
       else engine.userBack()
-      assert.deepEqual(engine.currentState, direction === 'Back' ? next : original,
+      assert.deepEqual(routeEntry(engine.currentState), routeEntry(direction === 'Back' ? next : original),
         'the cancelled drawer leaves the route history reversible')
     })
   }

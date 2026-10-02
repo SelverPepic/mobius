@@ -3845,10 +3845,12 @@ export default function ChatView({
   ])
 
   useEffect(() => {
-    if (hidden) return
+    if (hidden || provisionalNewChat) return
     const request = pendingComposerSubmit
     if (!request || submittedComposerRequestTokenRef.current === request.token) return
-    if (loading || loadError) return
+    // Do not consume durable intent until doSend can accept it. A restored
+    // chat can have cached content while its activation is still pending.
+    if (loading || loadError || !activationSettled || providerSwitching) return
     const text = request.text.trim()
     if (!text) {
       setPendingComposerSubmit(null)
@@ -3860,7 +3862,13 @@ export default function ChatView({
     if (request.storedHandoff) {
       // Consume before sending so a failed/reloaded attempt becomes a visible
       // recoverable draft, never an automatic retry loop.
-      consumeComposerHandoff(chatId, request.text, { autoSend: true })
+      if (!consumeComposerHandoff(chatId, request.text, { autoSend: true })) {
+        // A remounted draft and a retained-composer request can name the
+        // same intent with different UI tokens. Only its durable claimant
+        // may send; acknowledging the other request must not duplicate it.
+        onComposerRequestHandled?.(request.token)
+        return
+      }
     }
     doSend(text)
     // A stored handoff can also be an explicit Shell request from the still-
@@ -3870,6 +3878,9 @@ export default function ChatView({
     onComposerRequestHandled?.(request.token)
   }, [
     pendingComposerSubmit,
+    provisionalNewChat,
+    activationSettled,
+    providerSwitching,
     loading,
     loadError,
     doSend,

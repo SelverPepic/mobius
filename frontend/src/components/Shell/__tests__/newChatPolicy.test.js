@@ -110,7 +110,7 @@ test('a superseded create waiter cannot rotate the reopened New Chat draft', () 
   )?.[1] || ''
 
   const ownerCheck = rotate.indexOf(
-    'if (!draftFirstPresentationIsCurrent(presentation)) return',
+    'if (!draftFirstPresentationIsCurrent(presentation)) {',
   )
   const intentCheck = rotate.indexOf(
     "if (String(newChatIntentRef.current?.chatId ?? '') !== intentId) return",
@@ -196,14 +196,15 @@ test('a provisional Send becomes one durable handoff and retries on proven recov
 })
 
 test('a queued first Send continues in the same ChatView after allocation', () => {
-  const settle = shellSource.match(
-    /async function settleDraftFirstNewChat\(presentation\) \{([\s\S]*?)\n  \}\n\n  settleDraftFirstNewChatRef\.current/,
-  )?.[1] || ''
-  assert.match(
-    settle,
-    /const autoSendDraft = readComposerHandoff\(intentId\)\.autoSendDraft[\s\S]*current\.submitted && autoSendDraft[\s\S]*requestComposer\(intentId, \{[\s\S]*draft: autoSendDraft,[\s\S]*submit: true/,
-    'allocation resumes the verified queued send through the already-mounted view',
-  )
+  assert.match(shellSource,
+    /if \(!session\?\.materialized \|\| !session\.submitted[\s\S]*activeView !== 'chat'[\s\S]*String\(activeChatId\) !== String\(session\.chatId\)[\s\S]*readComposerHandoff\(session\.chatId\)\.autoSendDraft[\s\S]*requestComposer\(session\.chatId, \{[\s\S]*draft: autoSendDraft,[\s\S]*submit: true/,
+    'a queued send resumes when its own materialized chat becomes visible, not only at allocation completion')
+  assert.match(chatViewSource,
+    /if \(hidden \|\| provisionalNewChat\) return\s*const request = pendingComposerSubmit/,
+    'a restored stored handoff must not send before its chat row exists')
+  assert.match(chatViewSource,
+    /if \(loading \|\| loadError \|\| !activationSettled \|\| providerSwitching\) return[\s\S]*consumeComposerHandoff\(chatId, request\.text/,
+    'durable queued intent is not consumed before the restored runtime can accept it')
   assert.match(chatViewSource,
     /onSubmit=\{provisionalNewChat \? handleProvisionalNewChatSubmit : handleSubmit\}/,
     'the one composer switches from provisional queueing to ordinary Send without remounting')

@@ -34,11 +34,9 @@ export function failedNewChatPresentation(current, verdict, recoveryGeneration) 
 /**
  * Whether an immediate New Chat surface still owns what the user is seeing.
  *
- * Allocation is allowed to finish only while the route generation, layout
- * world, and drawer-history ownership captured by the tap are unchanged. A
- * provisional client UUID is still allocation-owned. Once the server row is
- * accepted, the concrete chat route is the simpler authority: it owns the
- * cover until that ChatView reports a painted frame.
+ * Allocation can finish while another route is visible. These presentation
+ * hints authorize only focus and route changes, never the lifetime of the
+ * unfinished row. Drawer visibility does not change that ownership.
  */
 export function newChatPresentationIsCurrent(presentation, {
   viewMode,

@@ -9,6 +9,9 @@
 //           fallback distinguish Back from Forward without guessing.
 //   route — the restorable shell view at this entry. Forward traversal cannot
 //           be reconstructed from the destructive navStack alone.
+//   hasShellForward — a shell push marked this source entry as having a
+//           continuation, surviving reload where classic History has no
+//           enumeration API. A fresh push truncates the old branch.
 //   kind  — base | drawer | dismissible | app | nav. Drawer, transient
 //           dismissibles, and reversible app entries carry the semantics needed
 //           to consume Back without accidentally popping a shell route.
@@ -175,6 +178,15 @@ export function pushNavEntry(kind, route = null, {
   entryId = null,
 } = {}) {
   const current = navEntryIndex(currentState)
+  // The History API cannot enumerate Forward entries after a document reload.
+  // Leave a shell-owned continuation on the source entry before pushing so a
+  // reloaded popstate-only browser can still offer Forward without guessing
+  // from navigation.canGoForward (which also includes non-shell entries).
+  if (isMobiusNavState(history.state)) {
+    const source = { ...history.state, hasShellForward: true }
+    history.replaceState(source, '')
+    mirrorCurrentEntry(source)
+  }
   const state = navState(kind, {
     index: current == null ? 0 : current + 1,
     route,

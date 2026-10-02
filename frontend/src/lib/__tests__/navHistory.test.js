@@ -266,6 +266,22 @@ test('pushes increment from the current shell position and retain routes', () =>
   }
 })
 
+test('a shell push leaves a reload-safe Forward marker only on its tagged source', () => {
+  const { history } = installBrowserMocks({ withNavigation: false })
+  try {
+    replaceNavEntry('base', '/shell/', { view: 'chat', chatId: 'a' })
+    pushNavEntry('nav', { view: 'chat', chatId: 'b' })
+    assert.equal(history.calls[1].state.hasShellForward, true)
+    assert.equal(history.state.hasShellForward, undefined)
+    history.state = { iframe: true }
+    const before = history.calls.length
+    pushNavEntry('nav', { view: 'chat', chatId: 'c' })
+    assert.equal(history.calls.length, before + 1, 'an iframe phantom is never retagged as shell history')
+  } finally {
+    clearBrowserMocks()
+  }
+})
+
 test('app entries retain reversible runtime correlation for Forward', () => {
   const { history } = installBrowserMocks({ withNavigation: false })
   try {
