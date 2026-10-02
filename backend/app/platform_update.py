@@ -756,9 +756,10 @@ def _read_reconcile_pre() -> tuple[str | None, str | None]:
 def boot_guard_clean_served_tree(repo: Path = PLATFORM_REPO) -> str:
   """Recover an interrupted checkout only after retaining its working state.
 
-  Boot has no agent writers. Git's reverse checkout still runs first, but a
-  partial write can leave the worktree different from its unchanged index.
-  Preserve both before the boot-only repair that restores a coherent source.
+  Recovery runs before agent writers start. Git's reverse checkout still runs
+  first, but a partial write can leave the worktree different from its index.
+  Preserve both before the boot-only repair. This is not exclusion of arbitrary
+  external filesystem writers, which must coordinate with the boot transaction.
   """
   if not (repo / ".git").exists():
     return "boot_guard[skipped] no_git"
@@ -902,15 +903,15 @@ def _checkout_matches_transition_target(repo: Path, target: str, other: str) -> 
   return all(path in present or not os.path.lexists(repo / path) for path in paths)
 
 
-def _preserve_checkout_state(repo: Path, current: str, restoring: str) -> tuple[str | None, str]:
-  """Keep worktree bytes and every staged blob in existing recovery refs.
+def _ignored_checkout_obstructions(repo: Path, target: str) -> list[str]:
+  """Ignored owner files a checkout of target could overwrite or remove.
 
-  Conflict stages cannot be written as one ordinary Git tree. A recovery
-  tree names their original stages and retains the raw index for exact repair;
-  naming each blob also keeps it reachable through Git garbage collection.
+  Native read-tree deliberately permits ignored collisions. Include both
+  directions of file/directory replacement, without passing the target's
+  entire tracked path list through command-line arguments.
   """
   target_paths = set(_git("ls-tree", "-r", "--name-only", "-z",
-                          restoring, repo=repo).stdout.split("\0")) - {""}
+                          target, repo=repo).stdout.split("\0")) - {""}
   target_parents = {str(parent) for path in target_paths for parent in Path(path).parents}
   ignored = []
   for path in _git("ls-files", "--others", "--ignored", "--exclude-standard",
@@ -918,6 +919,29 @@ def _preserve_checkout_state(repo: Path, current: str, restoring: str) -> tuple[
     if path and (path in target_paths or path in target_parents
                  or any(str(parent) in target_paths for parent in Path(path).parents)):
       ignored.append(path)
+  return ignored
+
+
+def _checkout_transition(repo: Path, before: str, target: str, *, dry_run: bool = False) -> None:
+  """Refuse destructive local collisions at every native checkout boundary.
+
+  Git owns index locking and ordinary staged/worktree conflict detection; this
+  adds the ignored-file preservation it deliberately omits. A dry run is not
+  permission for the later checkout: both inspect the then-current files.
+  """
+  if _ignored_checkout_obstructions(repo, target):
+    raise PlatformUpdateError("checkout_blocked_by_ignored_work")
+  _git("read-tree", *(["-n"] if dry_run else []), "-m", "-u", before, target, repo=repo)
+
+
+def _preserve_checkout_state(repo: Path, current: str, restoring: str) -> tuple[str | None, str]:
+  """Keep worktree bytes and every staged blob in existing recovery refs.
+
+  Conflict stages cannot be written as one ordinary Git tree. A recovery
+  tree names their original stages and retains the raw index for exact repair;
+  naming each blob also keeps it reachable through Git garbage collection.
+  """
+  ignored = _ignored_checkout_obstructions(repo, restoring)
   working = _working_tree_oid(repo, current, force_paths=ignored)
   work_ref = None
   if working != _commit_tree_oid(repo, current):
@@ -960,7 +984,7 @@ def _activate_candidate(repo: Path, local: str, pre_sha: str, tip: str) -> None:
   # checkout repeats these native checks, so a write after this preflight is
   # still refused rather than treated as permission to overwrite.
   try:
-    _git("read-tree", "-n", "-m", "-u", pre_sha, tip, repo=repo)
+    _checkout_transition(repo, pre_sha, tip, dry_run=True)
   except Exception:
     # The earlier capture marker owns no checkout yet. A dry-run refusal
     # cannot have changed files; leaving it would make boot discard staging.
@@ -975,7 +999,7 @@ def _activate_candidate(repo: Path, local: str, pre_sha: str, tip: str) -> None:
     _clear_reconcile_pre()  # nothing moved; the newer writer keeps its tree
     raise
   try:
-    _git("read-tree", "-m", "-u", pre_sha, tip, repo=repo)
+    _checkout_transition(repo, pre_sha, tip)
     if not _checkout_matches_transition_target(repo, tip, pre_sha):
       raise PlatformUpdateError("candidate_checkout_incoherent")
   except Exception:
@@ -991,8 +1015,8 @@ def _restore_working_edits(repo: Path, local: str) -> bool:
 
   Uncommitted edits are carried through a reconcile as a commit tagged with
   the ``working-tree`` unit so the candidate can move them; once the served tree
-  has settled (updated, rolled back, or conflicted) that commit is unwound so
-  the owner's ``git status`` reads exactly as it did before the update.
+  has settled (updated, rolled back, or conflicted) that commit is unwound
+  without changing working files or discarding staging made after capture.
   """
   head = _rev(repo, "HEAD")
   # An unsettled activation still needs its carried commit: the boot guard
@@ -1012,14 +1036,22 @@ def _restore_working_edits(repo: Path, local: str) -> bool:
     or not _rev(repo, "HEAD~1")
   ):
     return False
-  _git("checkout", "-q", local, repo=repo, check=False)
-  _git("reset", "-q", "--mixed", "HEAD~1", repo=repo, check=False)
-  return True
+  parent = _rev(repo, "HEAD~1")
+  if _rev(repo, local) != head or _head_detached(repo):
+    return False
+  # A mixed reset replaces the entire index, including later staged-only
+  # versions and flags. An index-only two-tree merge unwinds just the captured
+  # WIP delta, preserving independent staging and refusing actual overlap.
+  unwound = _git("read-tree", "-m", "-i", head, parent, repo=repo, check=False)
+  if unwound.returncode:
+    log.warning("platform: working overlay retained; newer staging overlaps its unwind")
+    return False
+  return _git("update-ref", f"refs/heads/{local}", parent, head,
+              repo=repo, check=False).returncode == 0
 
 
 def _reset_hard_to(repo: Path, local: str, sha: str) -> None:
-  """Return the working branch to ``sha`` (the pre-reconcile served commit),
-  updating the working tree. Used to serve OLD after a conflict/rollback."""
+  """Boot-only forced repair; the caller must first preserve displaced state."""
   _git("checkout", "-q", local, repo=repo)
   _git("reset", "--hard", sha, repo=repo)
 
@@ -1039,9 +1071,11 @@ def _restore_candidate(repo: Path, local: str, tip: str, pre: str) -> bool:
     return False
   if _rev(repo, local) != pre:
     return False
-  return _git(
-    "read-tree", "-m", "-u", tip, pre, repo=repo, check=False,
-  ).returncode == 0 and _checkout_matches_transition_target(repo, pre, tip)
+  try:
+    _checkout_transition(repo, tip, pre)
+  except Exception:
+    return False
+  return _checkout_matches_transition_target(repo, pre, tip)
 
 
 def _set_upstream(repo: Path, target: str) -> None:
@@ -2666,9 +2700,36 @@ def _finalize_update(
         repo, local, pre, tip, target, err, err,
       )
 
-  # Success: main now carries the update plus all local edits. Advance the
-  # upstream marker and clear conflict/rollback flags. Owner Apply records
-  # the remaining activation through its caller.
+  previous_upstream_sha = _rev(repo, UPSTREAM_BRANCH) or None
+  result = ReconcileResult(
+    "updated", pre, tip, target, error=None,
+    reconciliation=reconciliation,
+    overlay=overlay,
+  )
+  if touched_frontend:
+    # Source moved without a watcher event. Dropping the build stamp makes the
+    # watcher's startup check (and /api/version's freshness fact) see the
+    # served bundle as behind the source until a rebuild actually publishes.
+    _invalidate_frontend_build_stamp(repo)
+    if progress:
+      progress(PlatformUpdatePhase.BUILDING)
+    try:
+      if frontend_changed:
+        deps_ok, deps_err = _sync_frontend_dependencies(repo)
+        if not deps_ok:
+          raise RuntimeError(f"frontend dependency install failed: {deps_err}")
+      _rebuild_frontend(repo, result)
+    except Exception as exc:
+      log.warning(
+        "frontend build rejected platform update %s: %r", _short(target), exc,
+      )
+      return _roll_back_failed_frontend_build(
+        repo, result, previous_upstream_sha, exc,
+        frontend_changed=frontend_changed,
+      )
+  # Commit completion only after every rollback-capable gate has passed.
+  # Until then the recovery marker still owns the ref/index/worktree transition;
+  # provenance and the upstream marker must describe the previous generation.
   try:
     app_git.carry_equivalent_change_sources(repo, pre, tip)
     app_git.retire_landed_equivalent_changes(repo, target)
@@ -2677,38 +2738,10 @@ def _finalize_update(
     # harmless and can be retired by the next update; never turn housekeeping
     # into a false failed-update report after source has moved.
     log.warning("platform: could not update contribution provenance", exc_info=True)
-  previous_upstream_sha = _rev(repo, UPSTREAM_BRANCH) or None
   _set_upstream(repo, target)
   CONFLICT_FLAG.unlink(missing_ok=True)
   ROLLED_BACK_FLAG.unlink(missing_ok=True)
   _clear_reconcile_pre()
-  result = ReconcileResult(
-    "updated", pre, tip, target, error=None,
-    reconciliation=reconciliation,
-    overlay=overlay,
-  )
-  if not touched_frontend:
-    return result
-  # Source moved without a watcher event. Dropping the build stamp makes the
-  # watcher's startup check (and /api/version's freshness fact) see the
-  # served bundle as behind the source until a rebuild actually publishes.
-  _invalidate_frontend_build_stamp(repo)
-  if progress:
-    progress(PlatformUpdatePhase.BUILDING)
-  try:
-    if frontend_changed:
-      deps_ok, deps_err = _sync_frontend_dependencies(repo)
-      if not deps_ok:
-        raise RuntimeError(f"frontend dependency install failed: {deps_err}")
-    _rebuild_frontend(repo, result)
-  except Exception as exc:
-    log.warning(
-      "frontend build rejected platform update %s: %r", _short(target), exc,
-    )
-    return _roll_back_failed_frontend_build(
-      repo, result, previous_upstream_sha, exc,
-      frontend_changed=frontend_changed,
-    )
   return result
 
 
@@ -3618,34 +3651,53 @@ def _revert_swap(repo: Path, record: PreparedUpdate, *, reason: str) -> None:
     ))
     app_git.remove_overlay_worktree(repo, worktree)
     CONFLICT_FLAG.unlink(missing_ok=True)
-  _abort_interrupted(repo)
+  # Snapshot before aborting any merge: abort also replaces conflict stages.
   set_aside = _set_aside_unsaved_update_work(repo, local, record)
+  current = _rev(repo, local)
+  # The swap record owns the operation; the checkout marker owns its files
+  # until forced repair is proved complete, including a crash after HEAD moves.
+  _write_reconcile_pre(record["late"], current)
+  _abort_interrupted(repo)
   _reset_hard_to(repo, local, record["late"])
+  if not _checkout_matches_transition_target(repo, record["late"], current):
+    raise BootTransactionError("Image rollback checkout incomplete; recovery marker retained")
   _clear_reconcile_pre()
   _settle_reverted(
     repo, record, reason=reason,
-    set_aside=" and ".join(ref for ref in (set_aside, resolver_work) if ref) or None,
+    set_aside=" and ".join(set_aside + ([resolver_work] if resolver_work else [])) or None,
   )
 
 
 def _set_aside_unsaved_update_work(
   repo: Path, local: str, record: PreparedUpdate,
-) -> str | None:
-  """Keep the checkout's commits and working tree under a durable ref when
-  they hold anything the saved previous state does not."""
+) -> list[str]:
+  """Keep new files, staging and index flags before the image's forced revert.
+
+  Unchanged boot state is already saved. A working-tree-only comparison misses
+  staged-only blobs, intent-to-add and ignored obstructions the reset removes.
+  """
   head = _rev(repo, local) or _rev(repo, "HEAD")
   if not head or not record["late"]:
-    return None
+    return []
+  staged = _git("ls-files", "--stage", "-z", repo=repo).stdout
+  committed = _git("ls-tree", "-r", "-z",
+                   "--format=%(objectmode) %(objectname) 0%x09%(path)",
+                   head, repo=repo).stdout
+  index_flags = _git("ls-files", "-v", "-z", repo=repo).stdout.split("\0")
+  if (staged != committed or any(entry and entry[0] != "H" for entry in index_flags)
+      or _ignored_checkout_obstructions(repo, record["late"])):
+    work_ref, index_ref = _preserve_checkout_state(repo, head, record["late"])
+    return [ref for ref in (work_ref, index_ref) if ref]
   tree = _working_tree_oid(repo, head)
   # The saved previous state and the tree the update booted with are already
   # kept; set aside only what was made after that boot.
   if tree in {_commit_tree_oid(repo, record["late"]), record["booted_tree"]}:
-    return None
+    return []
   commit = app_git._run(
     repo, "commit-tree", tree, "-p", head, "-m",
     "platform: work set aside when an update's image was not kept",
   ).stdout.strip()
-  return _keep_set_aside(repo, commit)
+  return [_keep_set_aside(repo, commit)]
 
 
 def _set_aside_resolver_work(repo: Path) -> str | None:

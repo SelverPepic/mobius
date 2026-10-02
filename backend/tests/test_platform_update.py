@@ -6559,3 +6559,396 @@ def test_marker_free_interrupted_merge_reports_saved_work_and_index(clone_env):
   assert saved_work in pu._read_rolled_back_flag()["error"]
   assert saved_index in pu._read_rolled_back_flag()["error"]
   assert _served_sha(platform) == pre
+
+
+# Composition regressions: a native checkout refusal is not enough if a later
+# final gate drops recovery ownership or unwinding an earlier WIP loses staging.
+
+def _reported_private_recovery_refs(platform: Path, receipt: str = "") -> list[str]:
+  """Recovery is useful only when its durable private ref is reported back."""
+  report = receipt + " " + str(pu.platform_status(platform).get("rollback_error") or "")
+  return [
+    ref for ref in _git(platform, "for-each-ref", "--format=%(refname)", "refs/mobius").stdout.splitlines()
+    if ref in report
+  ]
+
+
+@pytest.mark.parametrize("gate", ["backend_import", "frontend_install", "frontend_build"])
+def test_failed_final_gate_recovers_late_work_instead_of_booting_a_mixed_checkout(
+  clone_env, monkeypatch, gate,
+):
+  """A late write rejects the reverse checkout *after* its ref moved to PRE.
+
+  Every final gate must still own recovery. Boot must either recover the known
+  transition with reachable work/index receipts, or refuse to serve it; saying
+  'clean' while the index and files still carry the rejected candidate is unsafe.
+  """
+  origin, platform = clone_env
+  before = _served_sha(platform)
+  original_foo = (platform / "backend/app/foo.py").read_text()
+  edits = {
+    "backend/app/foo.py": "VALUE = 'candidate'\n",
+    "frontend/src/App.jsx": "export default 'candidate'\n",
+  }
+  if gate == "frontend_install":
+    edits["frontend/package-lock.json"] = "{}\n"
+  _advance_origin(origin, edits=edits)
+  staged = "VALUE = 'late staged during final gate'\n"
+  working = "VALUE = 'late working during final gate'\n"
+  observed = {}
+
+  def late_write():
+    observed["marker_at_gate"] = pu.RECONCILE_PRE_FLAG.exists()
+    (platform / "backend/app/foo.py").write_text(staged)
+    _git(platform, "add", "backend/app/foo.py")
+    (platform / "backend/app/foo.py").write_text(working)
+    observed["index_oid"] = _git(platform, "hash-object", str(platform / ".git/index")).stdout.strip()
+
+  def import_gate(*_args, **_kwargs):
+    if gate == "backend_import":
+      late_write()
+      return False, "final import rejected"
+    return True, ""
+
+  def dependency_gate(_repo):
+    if gate == "frontend_install":
+      late_write()
+      return False, "final dependency install rejected"
+    return True, ""
+
+  def build_gate(_repo, _result):
+    assert gate == "frontend_build"
+    late_write()
+    raise RuntimeError("final frontend build rejected")
+
+  monkeypatch.setattr(pu, "_import_probe", import_gate)
+  monkeypatch.setattr(pu, "_sync_frontend_dependencies", dependency_gate)
+  monkeypatch.setattr(pu, "_rebuild_frontend", build_gate)
+  result = pu.reconcile_clone(platform)
+
+  assert result.status == "error"  # overlapping late work makes rollback refuse
+  assert _served_sha(platform) == before  # CAS succeeded; the checkout did not
+  assert (platform / "backend/app/foo.py").read_text() == working
+  assert _git(platform, "show", ":backend/app/foo.py").stdout == staged
+  problems = []
+  if not observed["marker_at_gate"]:
+    problems.append(f"{gate} ran after recovery ownership had already been cleared")
+  if not pu.RECONCILE_PRE_FLAG.exists():
+    problems.append("ref is PRE but refused reverse checkout has no recovery marker")
+
+  receipt = pu.boot_guard_clean_served_tree(platform)
+  refs = _reported_private_recovery_refs(platform, receipt)
+  if receipt.startswith("boot_guard[clean]"):
+    problems.append(f"boot incorrectly accepted the mixed checkout: {receipt}")
+  if (platform / "backend/app/foo.py").read_text() != original_foo:
+    problems.append("boot left late/candidate working bytes on the old served ref")
+  if _git(platform, "diff", "--cached", "--quiet", before, "--", check=False).returncode:
+    problems.append("boot left a candidate/late index on the old served ref")
+  if (platform / "frontend/src/App.jsx").exists():
+    problems.append("boot left rejected frontend source on the old served ref")
+  assert _served_sha(platform) == before
+  assert not pu.RECONCILE_PRE_FLAG.exists()
+
+  # Reflogs are not a preservation receipt. The reported private refs must
+  # retain both distinct versions and the exact index even after immediate GC.
+  _git(platform, "reflog", "expire", "--expire=now", "--all")
+  _git(platform, "gc", "--prune=now")
+  work_refs = [ref for ref in refs if _git(
+    platform, "show", ref + ":backend/app/foo.py", check=False,
+  ).stdout == working]
+  index_refs = [ref for ref in refs if (
+    _git(platform, "show", ref + ":stage-0/backend/app/foo.py", check=False).stdout == staged
+    and _git(platform, "rev-parse", ref + ":original-index", check=False).stdout.strip() == observed["index_oid"]
+    and _git(platform, "cat-file", "-e", ref + ":original-index", check=False).returncode == 0
+  )]
+  if not work_refs:
+    problems.append("no reported GC-durable private ref retains the late working bytes")
+  if not index_refs:
+    problems.append("no reported GC-durable private ref retains the late staged bytes/raw index")
+  assert not problems, "\n".join(problems)
+
+
+@pytest.mark.parametrize("index_flag", [None, "--assume-unchanged", "--skip-worktree"])
+def test_wip_preflight_refusal_preserves_late_staged_only_content_and_flags(
+  clone_env, monkeypatch, index_flag,
+):
+  """An earlier uncommitted edit must not authorize losing a *later* index.
+
+  A clean-start staged-overlap test misses this: the final WIP unwind is a
+  mixed reset. The later staged-only version is absent from the working tree
+  and from every commit, so a lost index makes it genuinely GC-unreachable.
+  """
+  origin, platform = clone_env
+  before = _served_sha(platform)
+  earlier = _MAIN_PY.replace("LINE_A = 1", "LINE_A = 'earlier uncommitted work'")
+  (platform / "backend/app/main.py").write_text(earlier)
+  original_foo = (platform / "backend/app/foo.py").read_text()
+  _advance_origin(origin, edits={"backend/app/foo.py": "VALUE = 'candidate'\n"})
+  staged = "VALUE = 'late staged-only owner work'\n"
+  captured = {}
+  activate = pu._activate_candidate
+
+  def stage_after_capture(repo, local, pre_sha, tip):
+    (platform / "backend/app/foo.py").write_text(staged)
+    _git(platform, "add", "backend/app/foo.py")
+    (platform / "backend/app/foo.py").write_text(original_foo)
+    if index_flag:
+      _git(platform, "update-index", index_flag, "backend/app/foo.py")
+    captured["blob"] = _git(platform, "rev-parse", ":backend/app/foo.py").stdout.strip()
+    captured["flags"] = _git(platform, "ls-files", "-v", "backend/app/foo.py").stdout
+    captured["raw_index"] = _git(platform, "hash-object", str(platform / ".git/index")).stdout.strip()
+    activate(repo, local, pre_sha, tip)
+
+  monkeypatch.setattr(pu, "_activate_candidate", stage_after_capture)
+  result = pu.reconcile_clone(platform)
+
+  assert result.status == "error"
+  assert _served_sha(platform) == before
+  assert (platform / "backend/app/main.py").read_text() == earlier
+  assert (platform / "backend/app/foo.py").read_text() == original_foo
+  assert " M backend/app/main.py" in _git(platform, "status", "--porcelain").stdout.splitlines()
+  actual_staged = _git(platform, "show", ":backend/app/foo.py").stdout
+  actual_flags = _git(platform, "ls-files", "-v", "backend/app/foo.py").stdout
+  in_index = actual_staged == staged and actual_flags == captured["flags"]
+  refs = _reported_private_recovery_refs(platform)
+  saved = [ref for ref in refs if (
+    _git(platform, "rev-parse", ref + ":stage-0/backend/app/foo.py", check=False).stdout.strip() == captured["blob"]
+    and _git(platform, "rev-parse", ref + ":original-index", check=False).stdout.strip() == captured["raw_index"]
+  )]
+  problems = []
+  if not (in_index or saved):
+    problems.append(
+      f"late staging/flags lost without a reported recovery receipt: "
+      f"stage={actual_staged!r}, flags={actual_flags!r}, expected_flags={captured['flags']!r}"
+    )
+  _git(platform, "reflog", "expire", "--expire=now", "--all")
+  _git(platform, "gc", "--prune=now")
+  if _git(platform, "cat-file", "-p", captured["blob"], check=False).stdout != staged:
+    problems.append("the late staged-only blob was pruned: neither the live index nor a durable private ref retained it")
+  for ref in saved:
+    assert _git(platform, "show", ref + ":stage-0/backend/app/foo.py").stdout == staged
+    assert _git(platform, "cat-file", "-e", ref + ":original-index").returncode == 0
+  assert not problems, "\n".join(problems)
+
+
+@pytest.mark.parametrize("carried_wip", [False, True])
+def test_successful_update_keeps_unrelated_late_staged_and_working_versions(
+  clone_env, monkeypatch, carried_wip,
+):
+  """The collision fix must not reject safe paths or flatten their staging."""
+  origin, platform = clone_env
+  earlier = _MAIN_PY.replace("LINE_A = 1", "LINE_A = 'earlier work'") if carried_wip else _MAIN_PY
+  (platform / "backend/app/main.py").write_text(earlier)
+  target = _advance_origin(origin, edits={"backend/app/foo.py": "VALUE = 'candidate'\n"})
+  staged = "STAGED = True\n"
+  unstaged = "STAGED = False  # newer working version\n"
+  late_main = earlier.replace("LINE_B = 2", "LINE_B = 'late working edit'")
+  activate = pu._activate_candidate
+
+  def independent_writes(repo, local, pre_sha, tip):
+    (platform / "backend/app/__init__.py").write_text(staged)
+    _git(platform, "add", "backend/app/__init__.py")
+    (platform / "backend/app/__init__.py").write_text(unstaged)
+    (platform / "backend/app/main.py").write_text(late_main)
+    (platform / "independent.txt").write_text("late untracked work\n")
+    activate(repo, local, pre_sha, tip)
+
+  monkeypatch.setattr(pu, "_activate_candidate", independent_writes)
+  result = pu.reconcile_clone(platform)
+
+  assert result.status == "updated"
+  assert _served_sha(platform) == target == result.new_sha
+  assert (platform / "backend/app/foo.py").read_text() == "VALUE = 'candidate'\n"
+  assert (platform / "backend/app/__init__.py").read_text() == unstaged
+  assert (platform / "backend/app/main.py").read_text() == late_main
+  assert (platform / "independent.txt").read_text() == "late untracked work\n"
+  assert _git(platform, "show", ":backend/app/__init__.py").stdout == staged
+  assert _git(platform, "status", "--porcelain").stdout.splitlines() == [
+    "MM backend/app/__init__.py", " M backend/app/main.py", "?? independent.txt",
+  ]
+  assert not pu.RECONCILE_PRE_FLAG.exists()
+
+
+@pytest.mark.parametrize("collision", ["same_path", "ignored_ancestor", "ignored_child"])
+@pytest.mark.parametrize("arrival", ["after_capture", "after_preflight"])
+def test_activation_preserves_late_ignored_file_and_directory_collisions(
+  clone_env, monkeypatch, collision, arrival,
+):
+  """Ignored does not mean disposable, including either side of a D/F swap.
+
+  Native two-tree checkout protects ordinary untracked files, but treats
+  ignored ones as overwriteable even when they arrive after its dry run.
+  """
+  origin, platform = clone_env
+  before = _served_sha(platform)
+  candidate_path = "new.txt/module.py" if collision == "ignored_ancestor" else "new.txt"
+  owner_path = "new.txt/private.bin" if collision == "ignored_child" else "new.txt"
+  _advance_origin(origin, edits={candidate_path: "candidate addition\n"})
+  (platform / ".git/info/exclude").write_text("new.txt\n")
+  owner_bytes = b"ignored owner bytes\x00not disposable\xff\n"
+  path = platform / owner_path
+  arrived = False
+
+  def write_ignored_work():
+    nonlocal arrived
+    assert not arrived
+    arrived = True
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(owner_bytes)
+    assert _git(platform, "check-ignore", owner_path).returncode == 0
+    assert _git(platform, "ls-files", "--", owner_path).stdout == ""
+
+  if arrival == "after_capture":
+    activate = pu._activate_candidate
+
+    def write_then_activate(repo, local, pre_sha, tip):
+      write_ignored_work()
+      activate(repo, local, pre_sha, tip)
+
+    monkeypatch.setattr(pu, "_activate_candidate", write_then_activate)
+  else:
+    git = pu._git
+
+    def write_after_native_preflight(*args, **kwargs):
+      proc = git(*args, **kwargs)
+      if kwargs.get("repo") == platform and args[:4] == ("read-tree", "-n", "-m", "-u"):
+        write_ignored_work()
+      return proc
+
+    monkeypatch.setattr(pu, "_git", write_after_native_preflight)
+
+  result = pu.reconcile_clone(platform)
+
+  assert arrived
+  assert path.is_file() and path.read_bytes() == owner_bytes, (
+    f"{collision} {arrival}: ignored local bytes overwritten; "
+    f"result={result.status}, HEAD={_served_sha(platform)}, PRE={before}"
+  )
+  if result.status != "updated":
+    assert result.status == "error"
+    assert _served_sha(platform) == before
+
+
+def test_wip_unwind_refuses_overlapping_staging_without_discarding_it(clone_env):
+  """Unwind is not permission to reset staging on the WIP's own paths."""
+  _origin, platform = clone_env
+  path = platform / "backend/app/main.py"
+  earlier = _MAIN_PY.replace("LINE_A = 1", "LINE_A = 'captured work'")
+  path.write_text(earlier)
+  carried = pu._carry_working_edits(platform, pu._local_branch(platform))
+  staged = earlier.replace("LINE_B = 2", "LINE_B = 'later staging'")
+  path.write_text(staged)
+  _git(platform, "add", "backend/app/main.py")
+  path.write_text(earlier)
+  blob = _git(platform, "rev-parse", ":backend/app/main.py").stdout.strip()
+
+  assert not pu._restore_working_edits(platform, pu._local_branch(platform))
+  assert _served_sha(platform) == carried.pre
+  assert path.read_text() == earlier
+  assert _git(platform, "show", ":backend/app/main.py").stdout == staged
+  _git(platform, "reflog", "expire", "--expire=now", "--all")
+  _git(platform, "gc", "--prune=now")
+  assert _git(platform, "cat-file", "-p", blob).stdout == staged
+
+
+def test_wip_unwind_keeps_late_intent_to_add_entry(clone_env):
+  """Tree equality alone does not capture an intent-to-add index entry."""
+  _origin, platform = clone_env
+  before = _served_sha(platform)
+  earlier = _MAIN_PY.replace("LINE_A = 1", "LINE_A = 'captured work'")
+  (platform / "backend/app/main.py").write_text(earlier)
+  pu._carry_working_edits(platform, pu._local_branch(platform))
+  (platform / "unfinished.txt").write_text("not staged yet\n")
+  _git(platform, "add", "-N", "unfinished.txt")
+  flags = _git(platform, "ls-files", "--debug", "unfinished.txt").stdout.split("flags: ")[-1]
+
+  assert pu._restore_working_edits(platform, pu._local_branch(platform))
+  assert _served_sha(platform) == before
+  assert (platform / "backend/app/main.py").read_text() == earlier
+  assert (platform / "unfinished.txt").read_text() == "not staged yet\n"
+  assert _git(platform, "ls-files", "--debug", "unfinished.txt").stdout.split("flags: ")[-1] == flags
+  assert _git(platform, "diff", "--cached", "--quiet", check=False).returncode == 0
+
+
+@pytest.mark.parametrize("edit", ["staged_only", "intent_to_add", "ignored_ancestor", "ignored_child"])
+def test_image_revert_preserves_index_and_ignored_work_before_forced_checkout(clone_env, edit):
+  """An image rollback has the same preservation duty as interrupted boot."""
+  origin, platform = clone_env
+  if edit == "ignored_ancestor":
+    _local_commit(platform, edits={"layout/module.py": "old directory source\n"})
+  elif edit == "ignored_child":
+    _local_commit(platform, edits={"layout": "old file source\n"})
+  record = _prepare_package_update(platform, origin)
+  _boot_image(record["target"])
+  assert pu.settle_prepared_update_for_this_image(platform) == "replayed"
+  original_foo = (platform / "backend/app/foo.py").read_text()
+  staged = "VALUE = 'staged-only after candidate boot'\n"
+  ignored = b"ignored rollback work\x00\xff\n"
+  if edit == "staged_only":
+    (platform / "backend/app/foo.py").write_text(staged)
+    _git(platform, "add", "backend/app/foo.py")
+    (platform / "backend/app/foo.py").write_text(original_foo)
+  elif edit == "intent_to_add":
+    (platform / "unfinished.txt").write_text("intent to add after candidate boot\n")
+    _git(platform, "add", "-N", "unfinished.txt")
+  else:
+    _git(platform, "rm", "-q", "layout/module.py" if edit == "ignored_ancestor" else "layout")
+    if edit == "ignored_child":
+      (platform / "layout").mkdir()
+      (platform / "layout/module.py").write_text("candidate directory source\n")
+      _git(platform, "add", "layout/module.py")
+    _git(platform, "commit", "-q", "-m", "candidate layout change")
+    (platform / ".git/info/exclude").write_text("layout\n")
+    path = platform / ("layout" if edit == "ignored_ancestor" else "layout/private.bin")
+    path.write_bytes(ignored)
+  raw_index = _git(platform, "hash-object", str(platform / ".git/index")).stdout.strip()
+
+  assert pu.revert_failed_update(platform)
+  assert pu.read_prepared_update()["state"] == "prepared"
+  refs = _reported_private_recovery_refs(platform)
+  _git(platform, "reflog", "expire", "--expire=now", "--all")
+  _git(platform, "gc", "--prune=now")
+  if edit in {"staged_only", "intent_to_add"}:
+    indexes = [ref for ref in refs if _git(
+      platform, "rev-parse", ref + ":original-index", check=False,
+    ).stdout.strip() == raw_index]
+    assert indexes, "forced image rollback lost the exact index without a reported recovery ref"
+    if edit == "staged_only":
+      assert _git(platform, "show", indexes[0] + ":stage-0/backend/app/foo.py").stdout == staged
+  else:
+    owner_path = "layout" if edit == "ignored_ancestor" else "layout/private.bin"
+    assert any(subprocess.run(
+      ["git", "-C", str(platform), "show", ref + ":" + owner_path],
+      capture_output=True,
+    ).stdout == ignored for ref in refs), "forced image rollback discarded ignored owner bytes"
+
+
+@pytest.mark.parametrize("killed", [False, True])
+def test_partial_image_revert_retains_checkout_ownership_until_boot_repairs_it(
+  clone_env, monkeypatch, killed,
+):
+  origin, platform = clone_env
+  _advance_origin(origin, edits={"backend/app/foo.py": "VALUE = 'candidate'\n"})
+  record = _prepare_package_update(platform, origin)
+  _boot_image(record["target"])
+  assert pu.settle_prepared_update_for_this_image(platform) == "replayed"
+  late = pu.read_prepared_update()["late"]
+  original = _git(platform, "show", late + ":backend/app/foo.py").stdout
+  reset = pu._reset_hard_to
+
+  def partial(repo, local, sha):
+    reset(repo, local, sha)
+    (repo / "backend/app/foo.py").write_text("VALUE = 'incomplete image revert'\n")
+    if killed:
+      raise _Killed("revert checkout")
+
+  monkeypatch.setattr(pu, "_reset_hard_to", partial)
+  with pytest.raises(_Killed if killed else pu.BootTransactionError):
+    pu.revert_failed_update(platform)
+  assert pu.RECONCILE_PRE_FLAG.exists()
+  assert pu.read_prepared_update()["state"] == "swapped"
+  monkeypatch.setattr(pu, "_reset_hard_to", reset)
+  _boot_image(record["snapshot"])
+  assert pu.settle_prepared_update_for_this_image(platform) == "reverted"
+  assert (platform / "backend/app/foo.py").read_text() == original
+  assert not pu.RECONCILE_PRE_FLAG.exists()
