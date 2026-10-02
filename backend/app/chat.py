@@ -645,8 +645,9 @@ async def _finish_run(
 def _after_terminal_status(chat_id: str, terminal_status: str) -> None:
   """Post-commit follow-up for a durable Stop of this chat's work.
 
-  FinishRun released the stopped Goal's work claims in its own commit; the
-  followers are woken off this lifecycle path, which may still hold locks.
+  Explicit Stop preparation released the Goal's claims before interruption;
+  wake its followers off this lifecycle path, which may still hold locks.
+  A physical run ending by itself supplies no Goal-stop intent.
   """
   if terminal_status == "stopped":
     from app.agent_coordination import schedule_claim_settlement
