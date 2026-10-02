@@ -7316,3 +7316,65 @@ def test_boot_forced_checkout_keeps_marker_free_conflict_stages_and_hidden_flags
   assert not pu.RECONCILE_PRE_FLAG.exists()
   ok, error = pu._import_probe(platform)
   assert ok, error
+
+
+@pytest.mark.parametrize("history", ["change_revert", "empty"])
+@pytest.mark.parametrize("boot_state", ["once", "repeat", "missing_tree"])
+def test_image_revert_keeps_same_tree_owner_commits_reachable_after_gc(
+  clone_env, history, boot_state,
+):
+  """Content equality cannot stand in for the identity of owner history."""
+  origin, platform = clone_env
+  record = _prepare_package_update(platform, origin)
+  _boot_image(record["target"])
+  assert pu.settle_prepared_update_for_this_image(platform) == "replayed"
+  booted = pu.read_prepared_update()
+  path = platform / "backend/app/foo.py"
+  original = path.read_text()
+  commits = []
+  if history == "change_revert":
+    commits.append(_local_commit(platform, edits={
+      "backend/app/foo.py": "VALUE = 'owner history after boot'\n",
+    }))
+    commits.append(_local_commit(platform, edits={"backend/app/foo.py": original}))
+  else:
+    _git(platform, "commit", "-q", "--allow-empty", "-m", "owner checkpoint after boot")
+    commits.append(_served_sha(platform))
+  assert pu._working_tree_oid(platform, _served_sha(platform)) == booted["booted_tree"]
+  if boot_state != "once":
+    if boot_state == "missing_tree":
+      # An older/incomplete record may know the merge-back without its tree.
+      pu._write_prepared_update({**pu.read_prepared_update(), "booted_tree": None})
+    assert pu.settle_prepared_update_for_this_image(platform) == "replayed"
+    assert pu.read_prepared_update()["replayed"] == booted["replayed"], (
+      "a repeat boot must not redefine new owner commits as the update's merge-back"
+    )
+  _boot_image(record["snapshot"])
+  assert pu.settle_prepared_update_for_this_image(platform) == "reverted"
+  refs = pu.platform_status(platform)["recovery_refs"]
+  receipt = pu.platform_status(platform)["rollback_error"]
+  assert refs and all(ref in receipt for ref in refs)
+  _git(platform, "reflog", "expire", "--expire=now", "--all")
+  _git(platform, "gc", "--prune=now")
+  for commit in commits:
+    assert _git(platform, "cat-file", "-t", commit).stdout.strip() == "commit"
+    assert any(pu._is_ancestor(platform, commit, _git(platform, "rev-parse", ref).stdout.strip())
+               for ref in refs), "owner history must have a named GC-durable recovery root"
+  assert pu.read_prepared_update()["state"] == "prepared"
+  assert not pu.RECONCILE_PRE_FLAG.exists()
+  assert path.read_text() == original
+
+
+def test_platform_status_recovery_details_are_additive_to_existing_response_contract(clone_env):
+  """An optional diagnostic must not reject an otherwise valid old producer."""
+  from pydantic import TypeAdapter
+
+  _origin, platform = clone_env
+  status = pu.platform_status(platform)
+  assert status["recovery_refs"] == []
+  existing_response = {key: value for key, value in status.items() if key != "recovery_refs"}
+  adapter = TypeAdapter(pu.PlatformStatus)
+  assert adapter.validate_python(existing_response) == existing_response
+  with_details = {**existing_response, "recovery_refs": ["refs/mobius/set-aside/synthetic-recovery"]}
+  assert adapter.validate_python(with_details)["recovery_refs"] == with_details["recovery_refs"]
+  assert "recovery_refs" not in adapter.json_schema().get("required", [])

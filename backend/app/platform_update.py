@@ -63,7 +63,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Literal, TypedDict
+from typing import Callable, Literal, NotRequired, TypedDict
 
 from sqlalchemy.orm import Session
 
@@ -337,7 +337,7 @@ class PlatformStatus(TypedDict):
   rollback_error: str | None
   # Private GC-durable work/index snapshots, including successful captures.
   # Preservation alone is not a rollback or an update requiring repair.
-  recovery_refs: list[str]
+  recovery_refs: NotRequired[list[str]]
   # While set, Settings offers only Finish update for this exact release and
   # no newer release is offered or accepted.
   unfinished_update: UnfinishedUpdate | None
@@ -3713,10 +3713,12 @@ def _settle_swap(repo: Path, record: PreparedUpdate) -> str:
     return _replay_late_edits(repo, record)
   if position == "replayed":
     head = _rev(repo, local)
-    if record["replayed"] != head or not record["booted_tree"]:
+    if not record["replayed"] or not record["booted_tree"]:
       # Died after the merge-back moved the checkout, before recording it.
+      # Once recorded, keep that identity: descendants may be owner commits,
+      # which a later image rollback must not mistake for the original boot.
       _write_prepared_update(PreparedUpdate(**{
-        **record, "replayed": head,
+        **record, "replayed": record["replayed"] or head,
         "booted_tree": record["booted_tree"] or _working_tree_oid(repo, head),
       }))
     return "replayed"
@@ -3803,7 +3805,7 @@ def _revert_swap(repo: Path, record: PreparedUpdate, *, reason: str) -> None:
 def _set_aside_unsaved_update_work(
   repo: Path, local: str, record: PreparedUpdate,
 ) -> list[str]:
-  """Keep new files, staging and index flags before the image's forced revert.
+  """Keep owner history, files, staging and index flags before forced revert.
 
   Unchanged boot state is already saved. A working-tree-only comparison misses
   staged-only blobs, intent-to-add and ignored obstructions the reset removes.
@@ -3816,10 +3818,15 @@ def _set_aside_unsaved_update_work(
     work_ref, index_ref = _preserve_checkout_state(repo, head, record["late"])
     return [ref for ref in (work_ref, index_ref) if ref]
   tree = _working_tree_oid(repo, head)
-  # The saved previous state and the tree the update booted with are already
-  # kept; set aside only what was made after that boot.
-  if tree in {_commit_tree_oid(repo, record["late"]), record["booted_tree"]}:
+  # No new work means both the original swap identity and its saved tree.
+  # Equal contents alone miss empty commits and changes followed by reverts.
+  swap_heads = {record["late"], record["late_committed"], record["prepared"], record["replayed"]}
+  if (head in swap_heads
+      and tree in {_commit_tree_oid(repo, record["late"]), record["booted_tree"]}):
     return []
+  if tree == _commit_tree_oid(repo, head):
+    # The existing tip roots all intervening owner history; no snapshot needed.
+    return [_keep_set_aside(repo, head)]
   commit = app_git._run(
     repo, "commit-tree", tree, "-p", head, "-m",
     "platform: work set aside when an update's image was not kept",
