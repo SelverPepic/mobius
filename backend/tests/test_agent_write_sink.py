@@ -68,7 +68,7 @@ def test_quiet_checkpoint_uses_existing_title_digest_summary_handler_once(
     assert extract_cumulative_summary(note).count(args['summary'])==1
     # The ordinary checkpoint route still binds the cumulative handoff, not
     # the short digest, to its exact source history for recovery.
-    summary,_tail=recovery_source(note,list(list(transcript_rows.history(db.get(models.Chat, chat.id))) or []))
+    summary,_tail=recovery_source(note,list(transcript_rows.history(db.get(models.Chat, chat.id))))
     assert args['summary'] in summary and 'Current digest.' not in summary
     assert calls==[args,{'digest':'Current digest.'}]
   asyncio.run(scenario())

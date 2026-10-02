@@ -434,7 +434,7 @@ def test_direct_mail_never_mutates_owner_transcripts_or_pending_messages(
   chats["builder"].pending_messages = []
   db.commit()
   before = {
-    chat.id: (list(list(transcript_rows.history(chat)) or []), list(chat.pending_messages or []))
+    chat.id: (list(transcript_rows.history(chat)), list(chat.pending_messages or []))
     for chat in (chats["scout"], chats["builder"])
   }
   sent = client.post(

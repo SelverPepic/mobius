@@ -234,7 +234,7 @@ def test_provider_only_resume_preserves_durable_goal_without_transcript_control(
     goal_id = original.goal_id
     goal = db.get(models.ChatGoal, goal_id)
     goal.status = goal_status
-    before = list(list(transcript_rows.history(db.get(models.Chat, chat.id))))
+    before = list(transcript_rows.history(db.get(models.Chat, chat.id)))
     db.commit()
 
   result = writer.submit(StartTurn(

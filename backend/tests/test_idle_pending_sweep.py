@@ -85,7 +85,7 @@ def _read(chat_id: str):
         if run is not None and run.status in models.NONTERMINAL_RUN_STATUSES
         else None
       ),
-      list(list(transcript_rows.history(chat)) or []),
+      list(transcript_rows.history(chat)),
       list(chat.pending_messages or []),
     )
   finally:

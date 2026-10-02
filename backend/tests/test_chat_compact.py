@@ -246,7 +246,7 @@ def test_provider_switch_writer_rechecks_hidden_pin_at_commit(chat, db):
     "drawer_hidden": True,
   }
   db.commit()
-  source_messages = list(list(transcript_rows.history(chat)))
+  source_messages = list(transcript_rows.history(chat))
 
   result = get_writer().submit(SwitchProviderWithCompaction(
     chat_id=chat.id,
@@ -516,7 +516,7 @@ def test_synthesis_failure_leaves_provider_session_settings_and_messages(
   row = db.query(models.Chat).filter(models.Chat.id == chat_id).one()
   row.session_id = "old-session"
   row.agent_settings_json = {"model": "claude-sonnet-4-6"}
-  before_messages = list(list(transcript_rows.history(row)))
+  before_messages = list(transcript_rows.history(row))
   db.commit()
 
   response = client.post(
@@ -1360,7 +1360,7 @@ def test_manual_compaction_uses_verified_note_or_keeps_full_history(
   row = db.get(models.Chat, chat_id)
   row.session_id = "previous-session"
   db.commit()
-  messages = list(list(transcript_rows.history(row)))
+  messages = list(transcript_rows.history(row))
   path = _write_bound_manual_note(chat_id, messages)
   if coverage == "missing":
     path.unlink()
@@ -1395,7 +1395,7 @@ def test_manual_compaction_cannot_commit_after_covered_source_changes(
   row = db.get(models.Chat, chat_id)
   row.session_id = "previous-session"
   db.commit()
-  messages = list(list(transcript_rows.history(row)))
+  messages = list(transcript_rows.history(row))
   path = _write_bound_manual_note(chat_id, messages)
   async def fake(source, **kwargs):
     if change == "note":
@@ -1431,7 +1431,7 @@ def test_manual_note_compaction_retains_existing_work_limits(
   row = db.get(models.Chat, chat_id)
   row.session_id = "previous-session"
   db.commit()
-  messages = list(list(transcript_rows.history(row)))
+  messages = list(transcript_rows.history(row))
   _write_bound_manual_note(
     chat_id, messages, large if large_part == "full_digest" else "Keep originals.",
   )

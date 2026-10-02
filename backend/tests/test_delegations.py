@@ -1222,7 +1222,7 @@ def test_child_completion_starts_one_non_message_checkpoint_for_waiting_parent(
   )
   root_run_id = _seed_idle_parent_wake_root(db, delegation_id)
   starts = _capture_activity_starts(monkeypatch)
-  before = list(list(transcript_rows.history(db.get(models.Chat, parent_id))) or [])
+  before = list(transcript_rows.history(db.get(models.Chat, parent_id)))
 
   asyncio.run(delegations_mod.wake_parent_after_child_settled(child_id))
 
@@ -1331,7 +1331,7 @@ def test_activity_continuation_writer_changes_run_state_not_messages(db):
   )
   root_run_id = _seed_idle_parent_wake_root(db, delegation_id)
   parent = db.get(models.Chat, parent_id)
-  before_messages = list(list(transcript_rows.history(parent)) or [])
+  before_messages = list(transcript_rows.history(parent))
   before_pending = list(parent.pending_messages or [])
   run_token = delegations_mod._activity_continuation_run_id(
     db, db.get(models.Delegation, delegation_id),
@@ -2221,7 +2221,7 @@ def test_failed_finalize_keeps_injected_activity_result_redeliverable(
 
   db.expire_all()
   parent = db.get(models.Chat, parent_id)
-  durable_messages = list(list(transcript_rows.history(parent)) or [])
+  durable_messages = list(transcript_rows.history(parent))
   delivery_after_failure = delegations_mod.build_delegation_result_context(
     db, parent_id,
   )
@@ -2639,7 +2639,7 @@ def test_legacy_completion_carrier_is_recognized_without_rewriting_history(db):
   parent = db.get(models.Chat, parent_id)
   transcript_rows.replace_all(object_session(parent), parent, [carrier])
   db.commit()
-  before = list(list(transcript_rows.history(parent)))
+  before = list(transcript_rows.history(parent))
 
   # The turn that carries it records the result in its envelope (latched at
   # its Finalize) without rendering it a second time.

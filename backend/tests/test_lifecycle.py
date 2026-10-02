@@ -170,13 +170,13 @@ def test_hard_purge_removes_derived_search_transcript_without_later_search(
 
   assert db.execute(
     chat_search.sql(
-      "SELECT count(*) FROM chat_search_docs WHERE chat_id = :chat_id"
+      "SELECT count(*) FROM chat_search_docs_v2 WHERE chat_id = :chat_id"
     ),
     {"chat_id": chat_id},
   ).scalar_one() == 0
   assert db.execute(
     chat_search.sql(
-      "SELECT count(*) FROM chat_search_state WHERE chat_id = :chat_id"
+      "SELECT count(*) FROM chat_search_state_v2 WHERE chat_id = :chat_id"
     ),
     {"chat_id": chat_id},
   ).scalar_one() == 0

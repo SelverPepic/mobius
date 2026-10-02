@@ -73,7 +73,7 @@ def _state(chat_id):
         else None
       ),
       list(c.pending_messages or []),
-      list(list(transcript_rows.history(c)) or []),
+      list(transcript_rows.history(c)),
       c.live_assistant,
     )
   finally:

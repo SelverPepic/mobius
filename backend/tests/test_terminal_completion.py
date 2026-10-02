@@ -108,7 +108,7 @@ def _load(chat_id):
       models.ChatRun.status == "running",
     ).first() is not None
     return None if chat is None else {
-      "messages": list(list(transcript_rows.history(chat)) or []),
+      "messages": list(transcript_rows.history(chat)),
       "pending_messages": list(chat.pending_messages or []),
       "running": running,
     }

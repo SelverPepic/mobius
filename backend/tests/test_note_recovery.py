@@ -40,7 +40,7 @@ def _start(chat, db, *, run="run"):
   )).result(timeout=5)
   db.expire_all()
   row = db.get(models.Chat, chat.id)
-  write_note(note_path(get_settings().data_dir, chat.id), _bound(list(list(transcript_rows.history(row))), run))
+  write_note(note_path(get_settings().data_dir, chat.id), _bound(list(transcript_rows.history(row)), run))
   return row
 
 
@@ -373,7 +373,7 @@ def test_missing_note_and_app_work_never_claim_automatic_recovery(client, chat, 
   assert _begin(chat) is None
   db.expire_all()
   row = db.get(models.Chat, chat.id)
-  write_note(path, _bound(list(list(transcript_rows.history(row)))))
+  write_note(path, _bound(list(transcript_rows.history(row))))
   # A hidden app-owned job must not gain reseed permission from this feature.
   run = db.get(models.ChatRun, "run")
   app = models.App(name="job", slug="job", source_dir="/unused/job")
@@ -453,13 +453,13 @@ def test_checkpoint_route_binds_detailed_note_without_renaming_or_changing_save_
                          json={"summary": "Owner also forbids publication.", "digest": "Drafting."})
   assert response.status_code == 204
   path = note_path(get_settings().data_dir, chat.id)
-  summary, tail = recovery_source(path.read_text(), list(list(transcript_rows.history(row))))
+  summary, tail = recovery_source(path.read_text(), list(transcript_rows.history(row)))
   assert "Preserve old files" in summary and "forbids publication" in summary
-  assert tail == list(list(transcript_rows.history(row)))[2:]
+  assert tail == list(transcript_rows.history(row))[2:]
   response = client.post("/api/chat/continuity/checkpoints", headers=headers,
                          json={"digest": "Shorter."})
   assert response.status_code == 204
-  assert recovery_source(path.read_text(), list(list(transcript_rows.history(row)))) == (summary, tail)
+  assert recovery_source(path.read_text(), list(transcript_rows.history(row))) == (summary, tail)
 
 
 @pytest.mark.parametrize("when", ["before_synthesis", "before_commit"])

@@ -1,7 +1,7 @@
 """The one-way step gate, exercised with a test-only toy step.
 
-ONE_WAY_UPGRADES_DESIGN.md §2. Release F registers no steps; these tests
-register a small step against its own database to pin the framework's
+ONE_WAY_UPGRADES_DESIGN.md §2. These tests register a small step against
+its own database to pin the framework's
 guarantees: legacy data untouched until activation, resumable fingerprinted
 conversion, a short schema-only activation lock, fail-closed refusals, the
 cleanup trigger, and post-activation completion.
