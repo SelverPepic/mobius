@@ -343,7 +343,7 @@ def _delegation_tree(
   db: Session, physical: models.ChatRun, root: models.ChatGoal,
 ) -> list[dict[str, Any]]:
   """Project durable immediate-child ownership without copying transcripts."""
-  from app.delegations import derived_status
+  from app.delegations import delegation_statuses
 
   run_ids = {root.id}
   if physical.goal_id:
@@ -382,17 +382,20 @@ def _delegation_tree(
       children_by_parent.setdefault(child.parent_chat_id, []).append(child)
       frontier.append(child.child_chat_id)
 
+  statuses = delegation_statuses(db, roots + [
+    child for children in children_by_parent.values() for child in children
+  ])
+
   def project(row: models.Delegation, seen: set[str]) -> dict[str, Any]:
     if row.id in seen:
       return {"id": row.id, "task_key": row.task_key, "status": "failed", "children": []}
-    status, _run, _result = derived_status(db, row, load_result=False)
     children = children_by_parent.get(row.child_chat_id, [])
     return {
       "id": row.id,
       "task_key": row.task_key,
       "plan_task": row.goal_task_id,
       "provider": row.provider,
-      "status": status,
+      "status": statuses[row.id],
       "children": [project(child, seen | {row.id}) for child in children],
     }
 
