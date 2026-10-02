@@ -769,6 +769,15 @@ def boot_guard_clean_served_tree(repo: Path = PLATFORM_REPO) -> str:
   saved_work = saved_index = None
   if (pre and _rev(repo, pre) and current in {pre, tip}) or interrupted:
     saved_work, saved_index = _preserve_checkout_state(repo, current, pre or current)
+  def receipt(summary: str) -> str:
+    refs = ", ".join(ref for ref in (saved_work, saved_index) if ref)
+    if refs:
+      _write_rolled_back_flag(tip or pre or current,
+                             f"Interrupted checkout recovered. Saved work: {refs}.")
+    return summary + (f" saved_work={saved_work}" if saved_work else "") + (
+      f" saved_index={saved_index}" if saved_index else ""
+    )
+
   _abort_interrupted(repo)
   if pre and _rev(repo, pre):
     current = _rev(repo, local)
@@ -789,24 +798,19 @@ def boot_guard_clean_served_tree(repo: Path = PLATFORM_REPO) -> str:
       if restored:
         _clear_reconcile_pre()
         _restore_working_edits(repo, local)
-        return f"boot_guard[preserved] pre={_short(pre)}"
+        return receipt(f"boot_guard[preserved] pre={_short(pre)}")
     if not restored:
       raise BootTransactionError("Interrupted checkout needs source recovery; marker retained")
     _clear_reconcile_pre()
     _restore_working_edits(repo, local)
-    if saved_work or saved_index:
-      refs = ", ".join(ref for ref in (saved_work, saved_index) if ref)
-      _write_rolled_back_flag(tip or pre, f"Interrupted checkout recovered. Saved work: {refs}.")
-    return f"boot_guard[reset] pre={_short(pre)}" + (
-      f" saved_work={saved_work}" if saved_work else ""
-    ) + (f" saved_index={saved_index}" if saved_index else "")
+    return receipt(f"boot_guard[reset] pre={_short(pre)}")
   if interrupted:
     _reset_hard_to(repo, local, current)
     if _git("diff", "--quiet", current, "--", repo=repo, check=False).returncode:
       raise BootTransactionError("Interrupted merge needs source recovery")
   _clear_reconcile_pre()
   _restore_working_edits(repo, local)
-  return "boot_guard[clean]"
+  return receipt("boot_guard[clean]")
 
 
 def _fetch(
@@ -898,7 +902,7 @@ def _checkout_matches_transition_target(repo: Path, target: str, other: str) -> 
   return all(path in present or not os.path.lexists(repo / path) for path in paths)
 
 
-def _preserve_checkout_state(repo: Path, current: str, restoring: str) -> tuple[str | None, str | None]:
+def _preserve_checkout_state(repo: Path, current: str, restoring: str) -> tuple[str | None, str]:
   """Keep worktree bytes and every staged blob in existing recovery refs.
 
   Conflict stages cannot be written as one ordinary Git tree. A recovery
@@ -915,31 +919,32 @@ def _preserve_checkout_state(repo: Path, current: str, restoring: str) -> tuple[
                  or any(str(parent) in target_paths for parent in Path(path).parents)):
       ignored.append(path)
   working = _working_tree_oid(repo, current, force_paths=ignored)
-  work_ref = index_ref = None
+  work_ref = None
   if working != _commit_tree_oid(repo, current):
     snapshot = app_git._run(repo, "commit-tree", working, "-p", current,
                             "-m", "platform: work preserved from an interrupted checkout").stdout.strip()
     work_ref = _keep_set_aside(repo, snapshot)
-  if _git("diff", "--cached", "--quiet", current, "--", repo=repo, check=False).returncode:
-    staged = _git("ls-files", "--stage", "-z", repo=repo).stdout.split("\0")
-    entries = []
-    for entry in staged:
-      if not entry:
-        continue
-      meta, path = entry.split("\t", 1)
-      mode, oid, stage = meta.split()
-      entries.append(f"{mode} {oid}\tstage-{stage}/{path}\0")
-    raw_index = _git("rev-parse", "--git-path", "index", repo=repo).stdout.strip()
-    index_blob = _git("hash-object", "-w", raw_index, repo=repo).stdout.strip()
-    entries.append(f"100644 {index_blob}\toriginal-index\0")
-    with tempfile.TemporaryDirectory(prefix="mobius-recovery-index-") as tmp:
-      index = Path(tmp) / "index"
-      app_git._run_with_index(repo, index, "read-tree", "--empty")
-      app_git._run_with_index(repo, index, "update-index", "-z", "--index-info", input="".join(entries))
-      tree = app_git._run_with_index(repo, index, "write-tree").stdout.strip()
-    snapshot = app_git._run(repo, "commit-tree", tree, "-p", current,
-                            "-m", "platform: index preserved from an interrupted checkout").stdout.strip()
-    index_ref = _keep_set_aside(repo, snapshot)
+  # Cached-tree equality misses intent-to-add and index flags. Keep the raw
+  # index on every repair, even when its staged contents match the commit.
+  staged = _git("ls-files", "--stage", "-z", repo=repo).stdout.split("\0")
+  entries = []
+  for entry in staged:
+    if not entry:
+      continue
+    meta, path = entry.split("\t", 1)
+    mode, oid, stage = meta.split()
+    entries.append(f"{mode} {oid}\tstage-{stage}/{path}\0")
+  raw_index = _git("rev-parse", "--git-path", "index", repo=repo).stdout.strip()
+  index_blob = _git("hash-object", "-w", raw_index, repo=repo).stdout.strip()
+  entries.append(f"100644 {index_blob}\toriginal-index\0")
+  with tempfile.TemporaryDirectory(prefix="mobius-recovery-index-") as tmp:
+    index = Path(tmp) / "index"
+    app_git._run_with_index(repo, index, "read-tree", "--empty")
+    app_git._run_with_index(repo, index, "update-index", "-z", "--index-info", input="".join(entries))
+    tree = app_git._run_with_index(repo, index, "write-tree").stdout.strip()
+  snapshot = app_git._run(repo, "commit-tree", tree, "-p", current,
+                          "-m", "platform: index preserved from an interrupted checkout").stdout.strip()
+  index_ref = _keep_set_aside(repo, snapshot)
   return work_ref, index_ref
 
 

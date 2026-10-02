@@ -423,6 +423,7 @@ def _run_with_index(
   *args: str,
   check: bool = True,
   read_only: bool = False,
+  input: str | None = None,
 ) -> subprocess.CompletedProcess:
   """Run Git against a temporary index while sharing this repo's object DB."""
   env = _git_env(repo, read_only=read_only)
@@ -436,7 +437,7 @@ def _run_with_index(
   ]
   return subprocess.run(
     cmd, capture_output=True, text=True, timeout=_GIT_TIMEOUT,
-    check=check, env=env,
+    check=check, env=env, input=input,
   )
 
 

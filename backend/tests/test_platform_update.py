@@ -1364,7 +1364,7 @@ def test_an_incomplete_swap_rollback_leaves_the_live_state_for_boot(
   receipt = pu.boot_guard_clean_served_tree(platform)
   assert _served_sha(platform) == served
   assert dirty.read_text() == "VALUE = 'KEEP ME'\n"
-  saved = receipt.split(" saved_work=", 1)[1]
+  saved = receipt.split(" saved_work=", 1)[1].split()[0]
   assert _git(platform, "show", saved + ":backend/app/foo.py").stdout == "VALUE = 'PARTIAL CHECKOUT'\n"
   assert saved in pu._read_rolled_back_flag()["error"]
 
@@ -6522,3 +6522,40 @@ def test_failed_recovery_snapshot_keeps_source_index_and_marker(clone_env, monke
   assert path.read_text() == "VALUE = 'must survive'\n"
   assert (platform / ".git/index").read_bytes() == index
   assert pu.RECONCILE_PRE_FLAG.exists()
+
+
+def test_boot_recovery_preserves_intent_to_add_index_entry(clone_env):
+  _origin, platform = clone_env
+  pre = _served_sha(platform)
+  (platform / "new.txt").write_text("new unstaged work\n")
+  _git(platform, "add", "-N", "new.txt")
+  assert _git(platform, "diff", "--cached", "--quiet", pre, "--").returncode == 0
+  index_oid = _git(platform, "hash-object", str(platform / ".git/index")).stdout.strip()
+  pu._write_reconcile_pre(pre, pre)
+
+  receipt = pu.boot_guard_clean_served_tree(platform)
+
+  saved = receipt.split(" saved_index=", 1)[1].split()[0]
+  assert _git(platform, "rev-parse", saved + ":original-index").stdout.strip() == index_oid
+  assert (platform / "new.txt").read_text() == "new unstaged work\n"
+  assert saved in pu._read_rolled_back_flag()["error"]
+
+
+def test_marker_free_interrupted_merge_reports_saved_work_and_index(clone_env):
+  _origin, platform = clone_env
+  _git(platform, "checkout", "-q", "-b", "other")
+  _local_commit(platform, edits={"backend/app/foo.py": "VALUE = 'other'\n"})
+  _git(platform, "checkout", "-q", "main")
+  pre = _local_commit(platform, edits={"backend/app/foo.py": "VALUE = 'main'\n"})
+  assert _git(platform, "merge", "other", check=False).returncode == 1
+  assert not pu.RECONCILE_PRE_FLAG.exists()
+  working = (platform / "backend/app/foo.py").read_text()
+
+  receipt = pu.boot_guard_clean_served_tree(platform)
+
+  saved_work = receipt.split(" saved_work=", 1)[1].split()[0]
+  saved_index = receipt.split(" saved_index=", 1)[1].split()[0]
+  assert _git(platform, "show", saved_work + ":backend/app/foo.py").stdout == working
+  assert saved_work in pu._read_rolled_back_flag()["error"]
+  assert saved_index in pu._read_rolled_back_flag()["error"]
+  assert _served_sha(platform) == pre
