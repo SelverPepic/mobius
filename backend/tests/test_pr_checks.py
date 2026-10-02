@@ -123,7 +123,7 @@ def test_replaced_head_is_diagnostic(tmp_path):
     _, value = fixture_run(tmp_path, replies)
     assert value["state"] == "failed" and "error" not in value
     shell = fixture_run(tmp_path, replies, shell=True)
-    assert shell.returncode == 2 and "head changed" in shell.stderr
+    assert shell.returncode == 2 and "not the published" in shell.stderr
 
 
 @pytest.mark.parametrize("change", [
@@ -147,3 +147,23 @@ def test_bad_evidence_is_safe_and_visible(tmp_path, change):
 def test_no_checks_remains_pending(tmp_path):
     _, value = fixture_run(tmp_path, base([]))
     assert (value["state"], value["completed"], value["total"]) == ("pending", 0, 0)
+
+
+def test_head_changed_during_observation_never_reports_finished(monkeypatch):
+    spec = importlib.util.spec_from_file_location("pr_checks", SCRIPTS / "pr-checks.py")
+    checker = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(checker)
+    replies = base([run_item(1)])
+    pull_reads = 0
+
+    def fake_api(path, deadline):
+        nonlocal pull_reads
+        if path == "repos/owner/repo/pulls/7":
+            pull_reads += 1
+            return {"head": {"sha": SHA if pull_reads == 1 else OTHER}}
+        return replies[path]
+
+    monkeypatch.setattr(checker, "api", fake_api)
+    value = checker.observe("owner/repo", "7", SHA)
+    assert value["state"] == "failed"
+    assert "changed during" in value["summary"]

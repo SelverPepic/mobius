@@ -4128,6 +4128,9 @@
 }
 
 .chat__wait-details {
+  max-height: min(50dvh, 480px);
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
   display: flex;
   flex-direction: column;
   align-items: stretch;

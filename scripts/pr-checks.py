@@ -123,7 +123,7 @@ def observe(repo, pr, expected_sha):
     if not isinstance(head, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", head):
         raise CheckError("GitHub did not provide a valid PR head; try again later.")
     if not head.lower().startswith(expected_sha.lower()):
-        return result("failed", "The PR head changed; this wait targets an older commit.", 0, 0)
+        return result("failed", "The requested commit is not the published pull-request head.", 0, 0)
     runs = list_runs(repo, head, deadline)
     statuses = list_statuses(repo, head, deadline)
     final_pull = api(f"repos/{repo}/pulls/{pr}", deadline)
