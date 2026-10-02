@@ -6952,3 +6952,367 @@ def test_partial_image_revert_retains_checkout_ownership_until_boot_repairs_it(
   assert pu.settle_prepared_update_for_this_image(platform) == "reverted"
   assert (platform / "backend/app/foo.py").read_text() == original
   assert not pu.RECONCILE_PRE_FLAG.exists()
+
+
+@pytest.mark.parametrize("index_flag", ["--skip-worktree", "--assume-unchanged", "sparse_checkout"])
+def test_forced_image_revert_restores_unchanged_tracked_source_hidden_by_flags(
+  clone_env, index_flag,
+):
+  origin, platform = clone_env
+  record = _prepare_package_update(platform, origin)
+  _boot_image(record["target"])
+  assert pu.settle_prepared_update_for_this_image(platform) == "replayed"
+  late = pu.read_prepared_update()["late"]
+  original = _git(platform, "show", late + ":backend/app/foo.py").stdout
+  bad = "raise ImportError('candidate-only hidden source')\n"
+  if index_flag == "sparse_checkout":
+    _git(platform, "config", "core.sparseCheckout", "true")
+    (platform / ".git/info/sparse-checkout").write_text("/backend/app/main.py\n")
+    _git(platform, "read-tree", "-m", "-u", "HEAD")
+  else:
+    _git(platform, "update-index", index_flag, "backend/app/foo.py")
+  (platform / "backend/app/foo.py").write_text(bad)
+  raw_index = _git(platform, "hash-object", str(platform / ".git/index")).stdout.strip()
+  (platform / "independent.txt").write_text("independent untracked work\n")
+
+  assert pu.revert_failed_update(platform)
+  _boot_image(record["snapshot"])
+  assert pu.settle_prepared_update_for_this_image(platform) == "waiting"
+  assert (platform / "backend/app/foo.py").read_text() == original
+  assert _git(platform, "show", ":backend/app/foo.py").stdout == original
+  assert _git(platform, "ls-files", "-v", "backend/app/foo.py").stdout.startswith("H ")
+  assert (platform / "independent.txt").read_text() == "independent untracked work\n"
+  if index_flag == "sparse_checkout":
+    assert _git(platform, "config", "core.sparseCheckout").stdout.strip() == "true"
+  assert not pu.RECONCILE_PRE_FLAG.exists()
+  assert not (platform / "backend/app/uses_new_package.py").exists()
+  ok, error = pu._import_probe(platform)
+  assert ok, error
+  refs = _reported_private_recovery_refs(platform)
+  _git(platform, "reflog", "expire", "--expire=now", "--all")
+  _git(platform, "gc", "--prune=now")
+  assert any(_git(platform, "show", ref + ":backend/app/foo.py", check=False).stdout == bad
+             for ref in refs)
+  assert any(_git(platform, "rev-parse", ref + ":original-index", check=False).stdout.strip() == raw_index
+             for ref in refs)
+
+
+@pytest.mark.parametrize("name", [
+  "_write_reconcile_pre", "_keep_set_aside", "_reset_hard_to",
+  "_write_rolled_back_flag", "_write_prepared_update", "_clear_reconcile_pre",
+])
+@pytest.mark.parametrize("after", [False, True])
+def test_image_revert_receipt_keeps_saved_identity_across_transaction_death(
+  clone_env, monkeypatch, name, after,
+):
+  origin, platform = clone_env
+  record = _prepare_package_update(platform, origin)
+  _boot_image(record["target"])
+  assert pu.settle_prepared_update_for_this_image(platform) == "replayed"
+  original = (platform / "backend/app/foo.py").read_text()
+  staged = "VALUE = 'cached-only before forced revert'\n"
+  (platform / "backend/app/foo.py").write_text(staged)
+  _git(platform, "add", "backend/app/foo.py")
+  (platform / "backend/app/foo.py").write_text(original)
+  (platform / "draft.txt").write_text("working version before forced revert\n")
+  raw_index = _git(platform, "hash-object", str(platform / ".git/index")).stdout.strip()
+  _kill_once(monkeypatch, name, after=after)
+
+  with pytest.raises(_Killed):
+    pu.revert_failed_update(platform)
+  refs = _git(platform, "for-each-ref", "--format=%(refname)", pu._SET_ASIDE_PREFIX).stdout.split()
+  ownership_retained = pu.RECONCILE_PRE_FLAG.exists()
+  _git(platform, "reflog", "expire", "--expire=now", "--all")
+  _git(platform, "gc", "--prune=now")
+  _boot_image(record["snapshot"])
+  pu.settle_prepared_update_for_this_image(platform)
+
+  assert pu.read_prepared_update()["state"] == "prepared"
+  assert not pu.RECONCILE_PRE_FLAG.exists()
+  report = pu.platform_status(platform)["rollback_error"] or ""
+  assert all(ref in report for ref in refs), "a durable snapshot with no surfaced identity is not recovery"
+  if name in {"_reset_hard_to", "_write_rolled_back_flag", "_write_prepared_update"}:
+    assert ownership_retained, "source repair does not retire receipt ownership"
+  refs = _reported_private_recovery_refs(platform)
+  assert any(_git(platform, "show", ref + ":stage-0/backend/app/foo.py", check=False).stdout == staged
+             and _git(platform, "rev-parse", ref + ":original-index", check=False).stdout.strip() == raw_index
+             for ref in refs)
+  assert any(_git(platform, "show", ref + ":draft.txt", check=False).stdout == "working version before forced revert\n"
+             for ref in refs)
+  assert (platform / "backend/app/foo.py").read_text() == original
+  assert not (platform / "backend/app/uses_new_package.py").exists()
+
+
+@pytest.mark.parametrize("edit", ["staged_only", "staged_and_working", "intent_to_add", "flagged_staging"])
+def test_initial_index_is_gc_recoverable_after_disjoint_platform_capture(clone_env, edit):
+  origin, platform = clone_env
+  path = platform / "backend/app/foo.py"
+  original = path.read_text()
+  staged = "VALUE = 'initial cached-only owner version'\n"
+  if edit == "intent_to_add":
+    (platform / "unfinished.txt").write_text("initial intent to add\n")
+    _git(platform, "add", "-N", "unfinished.txt")
+    stage_path = "unfinished.txt"
+  else:
+    path.write_text(staged)
+    _git(platform, "add", "backend/app/foo.py")
+    path.write_text(original)
+    stage_path = "backend/app/foo.py"
+    if edit == "flagged_staging":
+      _git(platform, "update-index", "--skip-worktree", stage_path)
+  if edit == "staged_and_working":
+    original = "VALUE = 'different initial working version'\n"
+    path.write_text(original)
+  blob = _git(platform, "rev-parse", ":" + stage_path).stdout.strip()
+  raw_index = _git(platform, "hash-object", str(platform / ".git/index")).stdout.strip()
+  target = _advance_origin(origin, edits={"readme.txt": "disjoint release\n"})
+
+  result = pu.reconcile_clone(platform)
+
+  assert result.status == "updated"
+  assert _served_sha(platform) == target
+  assert path.read_text() == original
+  assert not pu.RECONCILE_PRE_FLAG.exists()
+  assert not pu.ROLLED_BACK_FLAG.exists(), "index preservation is not a failed update"
+  status = pu.platform_status(platform)
+  refs = status.get("recovery_refs", [])
+  _git(platform, "reflog", "expire", "--expire=now", "--all")
+  _git(platform, "gc", "--prune=now")
+  assert _git(platform, "cat-file", "-e", blob, check=False).returncode == 0, "capture discarded the initial staged blob"
+  assert any(_git(platform, "rev-parse", ref + ":original-index", check=False).stdout.strip() == raw_index
+             and _git(platform, "rev-parse", ref + ":stage-0/" + stage_path, check=False).stdout.strip() == blob
+             for ref in refs), "initial index needs a surfaced exact recovery copy"
+
+
+@pytest.mark.parametrize("after", [False, True])
+def test_initial_index_capture_is_gc_recoverable_if_commit_process_dies(
+  clone_env, monkeypatch, after,
+):
+  _origin, platform = clone_env
+  path = platform / "backend/app/foo.py"
+  original = path.read_text()
+  staged = "VALUE = 'cached-only before capture process death'\n"
+  path.write_text(staged)
+  _git(platform, "add", "backend/app/foo.py")
+  path.write_text(original)
+  raw_index = _git(platform, "hash-object", str(platform / ".git/index")).stdout.strip()
+  capture = app_git.commit_local
+
+  def die(repo, message):
+    if after:
+      capture(repo, message)
+    raise _Killed("platform capture")
+
+  monkeypatch.setattr(app_git, "commit_local", die)
+  with pytest.raises(_Killed):
+    pu._carry_working_edits(platform, pu._local_branch(platform))
+  refs = pu.platform_status(platform)["recovery_refs"]
+  assert not pu.ROLLED_BACK_FLAG.exists()
+  _git(platform, "reflog", "expire", "--expire=now", "--all")
+  _git(platform, "gc", "--prune=now")
+  assert any(_git(platform, "show", ref + ":stage-0/backend/app/foo.py", check=False).stdout == staged
+             and _git(platform, "rev-parse", ref + ":original-index", check=False).stdout.strip() == raw_index
+             for ref in refs)
+  assert path.read_text() == original
+
+
+@pytest.mark.parametrize("disjoint_update", [False, True])
+def test_initial_conflict_stages_and_flags_are_kept_before_capture_or_abort(clone_env, disjoint_update):
+  origin, platform = clone_env
+  _git(platform, "checkout", "-q", "-b", "other")
+  _local_commit(platform, edits={"backend/app/foo.py": "VALUE = 'other'\n"})
+  _git(platform, "checkout", "-q", "main")
+  pre = _local_commit(platform, edits={"backend/app/foo.py": "VALUE = 'main'\n"})
+  assert _git(platform, "merge", "other", check=False).returncode == 1
+  _git(platform, "update-index", "--assume-unchanged", "backend/app/__init__.py")
+  stages = _git(platform, "ls-files", "--stage", "backend/app/foo.py").stdout.splitlines()
+  raw_index = _git(platform, "hash-object", str(platform / ".git/index")).stdout.strip()
+  working = (platform / "backend/app/foo.py").read_text()
+
+  if disjoint_update:
+    _advance_origin(origin, edits={"readme.txt": "disjoint release while merge is interrupted\n"})
+    assert pu.reconcile_clone(platform).status == "updated"
+    assert not pu._merge_in_progress(platform)
+  else:
+    carried = pu._carry_working_edits(platform, pu._local_branch(platform))
+    assert carried.pre == carried.served == pre and carried.working is None
+    assert _git(platform, "hash-object", str(platform / ".git/index")).stdout.strip() == raw_index
+  refs = pu.platform_status(platform)["recovery_refs"]
+  _git(platform, "reflog", "expire", "--expire=now", "--all")
+  _git(platform, "gc", "--prune=now")
+  saved = [ref for ref in refs if _git(platform, "rev-parse", ref + ":original-index", check=False).stdout.strip() == raw_index]
+  assert saved
+  assert len(stages) == 3
+  for entry in stages:
+    metadata, path = entry.split("\t", 1)
+    _mode, oid, stage = metadata.split()
+    assert _git(platform, "rev-parse", f"{saved[0]}:stage-{stage}/{path}").stdout.strip() == oid
+  assert (platform / "backend/app/foo.py").read_text() == ("VALUE = 'main'\n" if disjoint_update else working)
+  assert any(_git(platform, "show", ref + ":backend/app/foo.py", check=False).stdout == working for ref in refs)
+
+
+def test_forced_revert_preserves_a_newer_branch_owner_after_journal_admission(clone_env, monkeypatch):
+  origin, platform = clone_env
+  record = _prepare_package_update(platform, origin)
+  _boot_image(record["target"])
+  assert pu.settle_prepared_update_for_this_image(platform) == "replayed"
+  preserve = pu._set_aside_unsaved_update_work
+  advanced = {}
+
+  def newer_writer(repo, local, swapped):
+    refs = preserve(repo, local, swapped)
+    advanced["head"] = _local_commit(platform, edits={"newer.txt": "newer writer source\n"})
+    advanced["index"] = (platform / ".git/index").read_bytes()
+    return refs
+
+  monkeypatch.setattr(pu, "_set_aside_unsaved_update_work", newer_writer)
+  with pytest.raises(pu.BootTransactionError, match="branch changed"):
+    pu.revert_failed_update(platform)
+  assert _served_sha(platform) == advanced["head"]
+  assert (platform / ".git/index").read_bytes() == advanced["index"]
+  assert (platform / "newer.txt").read_text() == "newer writer source\n"
+  assert pu.RECONCILE_PRE_FLAG.exists()
+  assert pu.read_prepared_update()["state"] == "swapped"
+  monkeypatch.setattr(pu, "_set_aside_unsaved_update_work", preserve)
+  with pytest.raises(pu.BootTransactionError, match="branch changed"):
+    pu.boot_guard_clean_served_tree(platform)
+  assert _served_sha(platform) == advanced["head"]
+  assert (platform / ".git/index").read_bytes() == advanced["index"]
+
+
+@pytest.mark.parametrize("after", [False, True])
+def test_boot_checkout_receipt_survives_death_before_marker_retirement(clone_env, monkeypatch, after):
+  _origin, platform = clone_env
+  pre = _served_sha(platform)
+  original = (platform / "backend/app/foo.py").read_text()
+  staged = "VALUE = 'boot cached-only recovery'\n"
+  (platform / "backend/app/foo.py").write_text(staged)
+  _git(platform, "add", "backend/app/foo.py")
+  (platform / "backend/app/foo.py").write_text(original)
+  raw_index = _git(platform, "hash-object", str(platform / ".git/index")).stdout.strip()
+  pu._write_reconcile_pre(pre, pre)
+  _kill_once(monkeypatch, "_write_rolled_back_flag", after=after)
+  with pytest.raises(_Killed):
+    pu.boot_guard_clean_served_tree(platform)
+  assert pu.RECONCILE_PRE_FLAG.exists()
+  refs = pu.platform_status(platform)["recovery_refs"]
+  _git(platform, "reflog", "expire", "--expire=now", "--all")
+  _git(platform, "gc", "--prune=now")
+  pu.boot_guard_clean_served_tree(platform)
+  receipt = pu._read_rolled_back_flag()["error"]
+  assert all(ref in receipt for ref in refs)
+  assert any(_git(platform, "show", ref + ":stage-0/backend/app/foo.py", check=False).stdout == staged
+             and _git(platform, "rev-parse", ref + ":original-index", check=False).stdout.strip() == raw_index
+             for ref in refs)
+  assert not pu.RECONCILE_PRE_FLAG.exists()
+
+
+@pytest.mark.parametrize("entry", ["revert_failed_update", "complete_platform_swap"])
+@pytest.mark.parametrize("after", [False, True])
+def test_every_swap_settlement_entry_resumes_the_owning_revert_receipt(
+  clone_env, monkeypatch, entry, after,
+):
+  origin, platform = clone_env
+  record = _prepare_package_update(platform, origin)
+  _boot_image(record["target"])
+  assert pu.settle_prepared_update_for_this_image(platform) == "replayed"
+  original = (platform / "backend/app/foo.py").read_text()
+  staged = "VALUE = 'staged before settlement entry death'\n"
+  (platform / "backend/app/foo.py").write_text(staged)
+  _git(platform, "add", "backend/app/foo.py")
+  (platform / "backend/app/foo.py").write_text(original)
+  _kill_once(monkeypatch, "_write_prepared_update", after=after)
+  with pytest.raises(_Killed):
+    pu.revert_failed_update(platform)
+  refs = pu.platform_status(platform)["recovery_refs"]
+  _git(platform, "reflog", "expire", "--expire=now", "--all")
+  _git(platform, "gc", "--prune=now")
+
+  assert getattr(pu, entry)(platform) == (True if entry == "revert_failed_update" else "reverted")
+
+  receipt = pu.platform_status(platform)["rollback_error"]
+  assert all(ref in receipt for ref in refs)
+  assert not pu.RECONCILE_PRE_FLAG.exists()
+  assert pu.read_prepared_update()["state"] == "prepared"
+  assert (platform / "backend/app/foo.py").read_text() == original
+  assert any(_git(platform, "show", ref + ":stage-0/backend/app/foo.py", check=False).stdout == staged for ref in refs)
+
+
+@pytest.mark.parametrize("working", [False, True])
+def test_ordinary_platform_capture_needs_no_private_index_recovery_or_rollback(clone_env, working):
+  origin, platform = clone_env
+  before = _served_sha(platform)
+  if working:
+    (platform / "backend/app/foo.py").write_text("VALUE = 'ordinary unstaged edit'\n")
+  target = _advance_origin(origin, edits={"readme.txt": "independent release\n"})
+
+  result = pu.reconcile_clone(platform)
+
+  assert result.status == "updated"
+  assert _served_sha(platform) == target
+  assert pu.platform_status(platform)["recovery_refs"] == []
+  assert not pu.ROLLED_BACK_FLAG.exists()
+  assert not pu.RECONCILE_PRE_FLAG.exists()
+  assert (platform / "backend/app/foo.py").read_text() == (
+    "VALUE = 'ordinary unstaged edit'\n" if working else _FOO_PY
+  )
+  assert pu._is_ancestor(platform, before, _served_sha(platform))
+
+
+def test_forced_checkout_cas_refuses_a_writer_after_snapshot_before_branch_move(clone_env, monkeypatch):
+  origin, platform = clone_env
+  record = _prepare_package_update(platform, origin)
+  _boot_image(record["target"])
+  assert pu.settle_prepared_update_for_this_image(platform) == "replayed"
+  git = pu._git
+  advanced = {}
+
+  def writer_before_cas(*args, **kwargs):
+    if not advanced and args[:2] == ("update-ref", "refs/heads/main"):
+      advanced["head"] = _local_commit(platform, edits={"newer.txt": "a newer branch owner\n"})
+      advanced["index"] = (platform / ".git/index").read_bytes()
+    return git(*args, **kwargs)
+
+  monkeypatch.setattr(pu, "_git", writer_before_cas)
+  with pytest.raises(subprocess.CalledProcessError):
+    pu.revert_failed_update(platform)
+  assert _served_sha(platform) == advanced["head"]
+  assert (platform / ".git/index").read_bytes() == advanced["index"]
+  assert (platform / "newer.txt").read_text() == "a newer branch owner\n"
+  assert pu.RECONCILE_PRE_FLAG.exists()
+  assert pu.read_prepared_update()["state"] == "swapped"
+
+
+def test_boot_forced_checkout_keeps_marker_free_conflict_stages_and_hidden_flags(clone_env):
+  _origin, platform = clone_env
+  _git(platform, "checkout", "-q", "-b", "other")
+  _local_commit(platform, edits={"backend/app/foo.py": "VALUE = 'other'\n"})
+  _git(platform, "checkout", "-q", "main")
+  pre = _local_commit(platform, edits={"backend/app/foo.py": "VALUE = 'main'\n"})
+  assert _git(platform, "merge", "other", check=False).returncode == 1
+  # An unmerged index may survive without a sequencer (e.g. read-tree -m).
+  (platform / ".git/MERGE_HEAD").unlink()
+  _git(platform, "update-index", "--skip-worktree", "backend/app/__init__.py")
+  (platform / "backend/app/__init__.py").write_text("raise ImportError('hidden owner work')\n")
+  stages = _git(platform, "ls-files", "--stage", "backend/app/foo.py").stdout.splitlines()
+  raw_index = _git(platform, "hash-object", str(platform / ".git/index")).stdout.strip()
+  pu._write_reconcile_pre(pre, pre)
+
+  pu.boot_guard_clean_served_tree(platform)
+
+  refs = pu.platform_status(platform)["recovery_refs"]
+  _git(platform, "reflog", "expire", "--expire=now", "--all")
+  _git(platform, "gc", "--prune=now")
+  saved = [ref for ref in refs if _git(platform, "rev-parse", ref + ":original-index", check=False).stdout.strip() == raw_index]
+  assert saved
+  for entry in stages:
+    metadata, path = entry.split("\t", 1)
+    _mode, oid, stage = metadata.split()
+    assert _git(platform, "rev-parse", f"{saved[0]}:stage-{stage}/{path}").stdout.strip() == oid
+  assert (platform / "backend/app/foo.py").read_text() == "VALUE = 'main'\n"
+  assert (platform / "backend/app/__init__.py").read_text() == ""
+  assert _git(platform, "ls-files", "-v", "backend/app/__init__.py").stdout.startswith("H ")
+  assert not _git(platform, "ls-files", "--unmerged").stdout
+  assert not pu.RECONCILE_PRE_FLAG.exists()
+  ok, error = pu._import_probe(platform)
+  assert ok, error

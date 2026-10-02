@@ -335,6 +335,9 @@ class PlatformStatus(TypedDict):
   newer_updates_available: bool
   rollback_target_sha: str | None
   rollback_error: str | None
+  # Private GC-durable work/index snapshots, including successful captures.
+  # Preservation alone is not a rollback or an update requiring repair.
+  recovery_refs: list[str]
   # While set, Settings offers only Finish update for this exact release and
   # no newer release is offered or accepted.
   unfinished_update: UnfinishedUpdate | None
@@ -726,11 +729,18 @@ def _abort_interrupted(repo: Path = PLATFORM_REPO) -> None:
     _git("merge", "--abort", repo=repo, check=False)
 
 
-def _write_reconcile_pre(pre: str, tip: str | None = None) -> None:
-  """Record the only branch transition boot recovery may reverse."""
+def _write_reconcile_pre(
+  pre: str, tip: str | None = None, *, saved_refs: list[str] | None = None,
+  revert: dict | None = None,
+) -> None:
+  """Own one checkout transition and its recovery receipt until settlement."""
+  journal = {"pre": pre, "tip": tip}
+  if saved_refs:
+    journal["saved_refs"] = saved_refs
+  if revert is not None:
+    journal["revert"] = revert
   _atomic_write_text(
-    RECONCILE_PRE_FLAG,
-    json.dumps({"pre": pre, "tip": tip}, separators=(",", ":")) + "\n",
+    RECONCILE_PRE_FLAG, json.dumps(journal, separators=(",", ":")) + "\n",
   )
 
 
@@ -738,19 +748,21 @@ def _clear_reconcile_pre() -> None:
   RECONCILE_PRE_FLAG.unlink(missing_ok=True)
 
 
-def _read_reconcile_pre() -> tuple[str | None, str | None]:
+def _read_reconcile_journal() -> dict:
   if not RECONCILE_PRE_FLAG.exists():
-    return None, None
+    return {}
   raw = RECONCILE_PRE_FLAG.read_text().strip()
   try:
     value = json.loads(raw)
   except json.JSONDecodeError:
-    # Legacy markers recorded only PRE. They can clean a tree still at PRE,
-    # but cannot prove ownership of any later branch tip.
-    return raw or None, None
-  if not isinstance(value, dict):
-    return None, None
-  return value.get("pre") or None, value.get("tip") or None
+    # Legacy PRE alone cannot prove ownership of any later branch tip.
+    return {"pre": raw or None, "tip": None}
+  return value if isinstance(value, dict) else {}
+
+
+def _read_reconcile_pre() -> tuple[str | None, str | None]:
+  journal = _read_reconcile_journal()
+  return journal.get("pre") or None, journal.get("tip") or None
 
 
 def boot_guard_clean_served_tree(repo: Path = PLATFORM_REPO) -> str:
@@ -764,14 +776,27 @@ def boot_guard_clean_served_tree(repo: Path = PLATFORM_REPO) -> str:
   if not (repo / ".git").exists():
     return "boot_guard[skipped] no_git"
   local = _local_branch(repo)
+  journal = _read_reconcile_journal()
+  if journal.get("revert"):
+    # A forced image revert owns source AND receipt, even after the prepared
+    # record was written. Do not reinterpret its old source as a fresh swap.
+    revert = journal["revert"]
+    _revert_swap(repo, revert["record"], reason=revert["reason"])
+    return "boot_guard[reverted]"
   pre, tip = _read_reconcile_pre()
   interrupted = _reconcile_in_progress(repo)
   current = _rev(repo, local)
   saved_work = saved_index = None
   if (pre and _rev(repo, pre) and current in {pre, tip}) or interrupted:
     saved_work, saved_index = _preserve_checkout_state(repo, current, pre or current)
+    saved_refs = list(dict.fromkeys([
+      *journal.get("saved_refs", []), *[ref for ref in (saved_work, saved_index) if ref],
+    ]))
+    _write_reconcile_pre(pre or current, tip if pre else current, saved_refs=saved_refs)
+  else:
+    saved_refs = journal.get("saved_refs", [])
   def receipt(summary: str) -> str:
-    refs = ", ".join(ref for ref in (saved_work, saved_index) if ref)
+    refs = ", ".join(saved_refs)
     if refs:
       _write_rolled_back_flag(tip or pre or current,
                              f"Interrupted checkout recovered. Saved work: {refs}.")
@@ -787,31 +812,34 @@ def boot_guard_clean_served_tree(repo: Path = PLATFORM_REPO) -> str:
       restored = _restore_candidate(repo, local, tip, pre)
       if not restored and _rev(repo, local) == pre:
         _reset_hard_to(repo, local, pre)
-        restored = _checkout_matches_transition_target(repo, pre, tip)
+        restored = _forced_checkout_matches_target(repo, pre, tip)
     elif current == pre:
       _reset_hard_to(repo, local, pre)
-      restored = _checkout_matches_transition_target(repo, pre, tip or pre)
+      restored = _forced_checkout_matches_target(repo, pre, tip or pre)
     else:
       # A newer branch owner is not ours to reset. Clear the old marker only
       # when its checkout is coherent on every possibly changed path.
       restored = all(_checkout_matches_transition_target(repo, current, endpoint)
                      for endpoint in (pre, tip) if endpoint)
       if restored:
+        summary = receipt(f"boot_guard[preserved] pre={_short(pre)}")
         _clear_reconcile_pre()
         _restore_working_edits(repo, local)
-        return receipt(f"boot_guard[preserved] pre={_short(pre)}")
+        return summary
     if not restored:
       raise BootTransactionError("Interrupted checkout needs source recovery; marker retained")
+    summary = receipt(f"boot_guard[reset] pre={_short(pre)}")
     _clear_reconcile_pre()
     _restore_working_edits(repo, local)
-    return receipt(f"boot_guard[reset] pre={_short(pre)}")
+    return summary
   if interrupted:
     _reset_hard_to(repo, local, current)
-    if _git("diff", "--quiet", current, "--", repo=repo, check=False).returncode:
+    if not _forced_checkout_matches_target(repo, current, current):
       raise BootTransactionError("Interrupted merge needs source recovery")
+  summary = receipt("boot_guard[clean]")
   _clear_reconcile_pre()
   _restore_working_edits(repo, local)
-  return receipt("boot_guard[clean]")
+  return summary
 
 
 def _fetch(
@@ -901,6 +929,44 @@ def _checkout_matches_transition_target(repo: Path, target: str, other: str) -> 
   # Git diff ignores ignored additions. They cannot survive from a partial
   # candidate as an untracked source file on a path absent from target.
   return all(path in present or not os.path.lexists(repo / path) for path in paths)
+
+
+def _forced_checkout_matches_target(repo: Path, target: str, displaced: str) -> bool:
+  """Prove every tracked target byte and the whole index after forced repair.
+
+  A fresh index trusts no flags/stat cache from the displaced checkout.
+  Independent untracked files are not candidate source; only removed tracked
+  paths must be absent (directories may now hold independent owner files).
+  """
+  index_tree = _git("write-tree", repo=repo, check=False)
+  target_tree = _commit_tree_oid(repo, target)
+  if (_rev(repo, "HEAD") != target or index_tree.returncode
+      or index_tree.stdout.strip() != target_tree):
+    return False
+  with tempfile.TemporaryDirectory(prefix="mobius-forced-proof-") as tmp:
+    index = Path(tmp) / "index"
+    app_git._run_with_index(repo, index, "-c", "core.sparseCheckout=false", "read-tree", target)
+    refreshed = app_git._run_with_index(
+      repo, index, "-c", "core.sparseCheckout=false", "add", "-u", ".", check=False,
+    )
+    if (refreshed.returncode
+        or app_git._run_with_index(repo, index, "write-tree").stdout.strip() != target_tree):
+      return False
+  target_paths = set(_git("ls-tree", "-r", "--name-only", "-z", target, repo=repo).stdout.split("\0"))
+  displaced_paths = set(_git("ls-tree", "-r", "--name-only", "-z", displaced, repo=repo).stdout.split("\0"))
+  return all(not os.path.lexists(repo / path) or (
+    (repo / path).is_dir() and not (repo / path).is_symlink()
+  ) for path in displaced_paths - target_paths)
+
+
+def _index_needs_preservation(repo: Path, head: str) -> bool:
+  """Tree equality misses cached-only versions, intent-to-add and flags."""
+  staged = _git("ls-files", "--stage", "-z", repo=repo).stdout
+  committed = _git("ls-tree", "-r", "-z",
+                   "--format=%(objectmode) %(objectname) 0%x09%(path)",
+                   head, repo=repo).stdout
+  flags = _git("ls-files", "-v", "-z", repo=repo).stdout.split("\0")
+  return staged != committed or any(entry and entry[0] != "H" for entry in flags)
 
 
 def _ignored_checkout_obstructions(repo: Path, target: str) -> list[str]:
@@ -1051,9 +1117,44 @@ def _restore_working_edits(repo: Path, local: str) -> bool:
 
 
 def _reset_hard_to(repo: Path, local: str, sha: str) -> None:
-  """Boot-only forced repair; the caller must first preserve displaced state."""
-  _git("checkout", "-q", local, repo=repo)
-  _git("reset", "--hard", sha, repo=repo)
+  """Boot-only reset-hard equivalent, with a compare-and-swap branch move.
+
+  Callers must first preserve displaced state under the checkout journal.
+  Separating ref mutation from forced read-tree avoids reset --hard's
+  unconditional ref write over a branch that moved after preservation.
+  """
+  expected = _rev(repo, local)
+  pre, tip = _read_reconcile_pre()
+  if expected not in {pre, tip}:
+    raise BootTransactionError("Forced checkout branch changed; recovery marker retained")
+  _git("update-ref", f"refs/heads/{local}", sha, expected, repo=repo)
+  # These flags can make reset --hard retain unchanged tracked working
+  # bytes. Clear them only here, after callers durably save the raw index.
+  # Command-local sparse overrides establish all tracked source, without
+  # changing the owner's repository configuration.
+  index = Path(_git("rev-parse", "--git-path", "index", repo=repo).stdout.strip())
+  if not index.is_absolute():
+    index = repo / index
+  # Flag operations address stage zero, not unmerged entries. Those stages
+  # remain untouched until forced read-tree replaces the preserved index.
+  paths = []
+  for entry in _git("ls-files", "--stage", "-z", repo=repo).stdout.split("\0"):
+    if entry:
+      metadata, path = entry.split("\t", 1)
+      if metadata.endswith(" 0"):
+        paths.append(path)
+  path_input = "\0".join(paths) + ("\0" if paths else "")
+  for flag in ("--no-skip-worktree", "--no-assume-unchanged"):
+    app_git._run_with_index(
+      repo, index, "-c", "core.sparseCheckout=false", "update-index", flag,
+      "-z", "--stdin", input=path_input,
+    )
+  _git("symbolic-ref", "HEAD", f"refs/heads/{local}", repo=repo)
+  _git("-c", "core.sparseCheckout=false", "read-tree", "--reset", "-u", sha, repo=repo)
+  # read-tree can retain same-blob working bytes after clearing sparse flags.
+  # Forced repair owns every tracked target entry, not just changed entries.
+  _git("-c", "core.sparseCheckout=false", "checkout-index", "--all", "--force",
+       "--ignore-skip-worktree-bits", repo=repo)
 
 
 def _restore_candidate(repo: Path, local: str, tip: str, pre: str) -> bool:
@@ -2463,6 +2564,15 @@ class _Carried:
 
 def _carry_working_edits(repo: Path, local: str) -> _Carried:
   served = _rev(repo, local)
+  # Platform capture stages working bytes; a version already in the index
+  # is a separate owner input, not permission to flatten it. Retain its exact
+  # index/stages/flags and GC roots before commit_local touches that index.
+  if _index_needs_preservation(repo, served):
+    _preserve_checkout_state(repo, served, served)
+  if _unmerged_paths(repo):
+    # Platform capture is not the owner of another merge's resolution.
+    # Preserve its stages but let native checkout refuse the unresolved index.
+    return _Carried(served=served, pre=served, working=None)
   app_git.commit_local(repo, app_git.overlay_message(
     "platform: working edits carried across update",
     unit=app_git.OVERLAY_WORKING_UNIT, disposition="wip",
@@ -2475,11 +2585,13 @@ def _working_tree_oid(repo: Path, base: str, *, force_paths: list[str] | None = 
   """Snapshot tracked and unignored files without changing the shared index."""
   with tempfile.TemporaryDirectory(prefix="mobius-platform-index-") as tmp:
     index = Path(tmp) / "index"
-    app_git._run_with_index(repo, index, "read-tree", base)
-    app_git._run_with_index(repo, index, "add", "-A", ".")
+    app_git._run_with_index(repo, index, "-c", "core.sparseCheckout=false", "read-tree", base)
+    app_git._run_with_index(repo, index, "-c", "core.sparseCheckout=false", "add", "-A", ".")
     if force_paths:
-      app_git._run_with_index(repo, index, "add", "-f", "--pathspec-from-file=-",
-                              "--pathspec-file-nul", input="\0".join(force_paths) + "\0")
+      app_git._run_with_index(
+        repo, index, "-c", "core.sparseCheckout=false", "add", "-f",
+        "--pathspec-from-file=-", "--pathspec-file-nul", input="\0".join(force_paths) + "\0",
+      )
     return app_git._run_with_index(repo, index, "write-tree").stdout.strip()
 
 
@@ -2495,8 +2607,10 @@ def _reconcile_pass(
     return ReconcileResult.unchanged("skipped", None, error="no_git")
 
   local = _local_branch(repo)
-  # Crash-safety FIRST: a mid-reconcile crash must be aborted before anything reads
-  # the tree, so we reconcile from the committed pre-crash tip.
+  # Abort before capturing runnable source, but abort itself displaces index
+  # stages and working bytes. Keep that interrupted transaction first.
+  if _reconcile_in_progress(repo):
+    _preserve_checkout_state(repo, _rev(repo, "HEAD"), _rev(repo, local))
   _abort_interrupted(repo)
   pre = _rev(repo, local)
 
@@ -3429,6 +3543,8 @@ def settle_prepared_update_for_this_image(repo: Path = PLATFORM_REPO) -> str:
   with _reconcile_flock():
     recovery = boot_guard_clean_served_tree(repo)
     outcome = _settle_update_record(repo, image)
+    if recovery == "boot_guard[reverted]" and outcome == "waiting":
+      outcome = "reverted"
     _refuse_source_newer_than_image_packages(repo, image)
     _normalize_activation_marker()
     _complete_boot_activation(repo)
@@ -3624,6 +3740,11 @@ def revert_failed_update(repo: Path = PLATFORM_REPO) -> bool:
   """Boot, after the swapped-in update failed its import probe: return to the
   swap's own saved previous state. Returns whether anything was reverted."""
   with _reconcile_flock():
+    journal = _read_reconcile_journal()
+    if journal.get("revert"):
+      revert = journal["revert"]
+      _revert_swap(repo, revert["record"], reason=revert["reason"])
+      return True
     record = read_prepared_update()
     if record is None or record["state"] != "swapped" or not record["late"]:
       return False
@@ -3632,40 +3753,51 @@ def revert_failed_update(repo: Path = PLATFORM_REPO) -> bool:
 
 
 def _revert_swap(repo: Path, record: PreparedUpdate, *, reason: str) -> None:
-  """Reset to the swap's saved ``late`` state and keep the update prepared.
+  """Own a forced return to saved late source through receipt settlement.
 
-  Anything made on the update since it booted is set aside first, never
-  discarded. The reset precedes the record write, so a crash leaves a still
-  swapped record the next boot reverts again.
+  The existing checkout journal retains the swap and every recovery identity
+  across abort/reset, receipt publication and retirement of the swapped record.
+  A death after writing prepared therefore still finishes this same revert.
   """
   local = _local_branch(repo)
-  resolver_work = None
+  journal = _read_reconcile_journal()
+  if journal.get("revert"):
+    saved = journal["revert"]
+    if saved["record"]["prepared"] != record["prepared"]:
+      raise BootTransactionError("Another image revert owns checkout recovery")
+    record, reason = saved["record"], saved["reason"]
+  else:
+    current = _rev(repo, local)
+    if _swap_position(repo, record, current) == "unknown":
+      raise BootTransactionError("Image rollback does not own the served branch")
+    _write_reconcile_pre(record["late"], current,
+                         revert={"record": record, "reason": reason})
+    journal = _read_reconcile_journal()
+  if _rev(repo, local) not in {journal["pre"], journal["tip"]}:
+    raise BootTransactionError("Image rollback branch changed; recovery marker retained")
+  # Snapshots are journaled by _keep_set_aside before they return, including
+  # a resolver answer whose worktree may be removed before a process dies.
   if _replay_parked(record):
-    # Keep the resolver's answer, then drop its merge while the record still
-    # says swapped: a crash from here on repeats this revert, and a settled
-    # record never sits beside a stale late-edit conflict.
-    resolver_work = _set_aside_resolver_work(repo)
+    _set_aside_resolver_work(repo)
     flag = _read_conflict_flag() or {}
     worktree = Path(str(
       (flag.get("overlay") or {}).get("worktree") or _overlay_candidate_path(repo)
     ))
     app_git.remove_overlay_worktree(repo, worktree)
     CONFLICT_FLAG.unlink(missing_ok=True)
-  # Snapshot before aborting any merge: abort also replaces conflict stages.
-  set_aside = _set_aside_unsaved_update_work(repo, local, record)
-  current = _rev(repo, local)
-  # The swap record owns the operation; the checkout marker owns its files
-  # until forced repair is proved complete, including a crash after HEAD moves.
-  _write_reconcile_pre(record["late"], current)
+  _set_aside_unsaved_update_work(repo, local, record)
   _abort_interrupted(repo)
+  if _rev(repo, local) not in {journal["pre"], journal["tip"]}:
+    raise BootTransactionError("Image rollback branch changed; recovery marker retained")
   _reset_hard_to(repo, local, record["late"])
-  if not _checkout_matches_transition_target(repo, record["late"], current):
+  if not _forced_checkout_matches_target(repo, record["late"], journal["tip"]):
     raise BootTransactionError("Image rollback checkout incomplete; recovery marker retained")
+  refs = _read_reconcile_journal().get("saved_refs", [])
+  _settle_reverted(repo, record, reason=reason, set_aside=" and ".join(refs) or None)
   _clear_reconcile_pre()
-  _settle_reverted(
-    repo, record, reason=reason,
-    set_aside=" and ".join(set_aside + ([resolver_work] if resolver_work else [])) or None,
-  )
+  # Only after checkout and receipt settlement may the saved WIP unwind.
+  # A death here is handled by the ordinary marker-free boot unwind.
+  _restore_working_edits(repo, local)
 
 
 def _set_aside_unsaved_update_work(
@@ -3679,12 +3811,7 @@ def _set_aside_unsaved_update_work(
   head = _rev(repo, local) or _rev(repo, "HEAD")
   if not head or not record["late"]:
     return []
-  staged = _git("ls-files", "--stage", "-z", repo=repo).stdout
-  committed = _git("ls-tree", "-r", "-z",
-                   "--format=%(objectmode) %(objectname) 0%x09%(path)",
-                   head, repo=repo).stdout
-  index_flags = _git("ls-files", "-v", "-z", repo=repo).stdout.split("\0")
-  if (staged != committed or any(entry and entry[0] != "H" for entry in index_flags)
+  if (_index_needs_preservation(repo, head)
       or _ignored_checkout_obstructions(repo, record["late"])):
     work_ref, index_ref = _preserve_checkout_state(repo, head, record["late"])
     return [ref for ref in (work_ref, index_ref) if ref]
@@ -3722,6 +3849,11 @@ def _keep_set_aside(repo: Path, commit: str) -> str:
   stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
   ref = f"{_SET_ASIDE_PREFIX}/{stamp}"
   _git("update-ref", ref, commit, repo=repo)
+  journal = _read_reconcile_journal()
+  if journal.get("revert"):
+    _write_reconcile_pre(journal["pre"], journal["tip"],
+                         saved_refs=[*journal.get("saved_refs", []), ref],
+                         revert=journal["revert"])
   return ref
 
 
@@ -3730,7 +3862,6 @@ def _settle_reverted(
 ) -> PreparedUpdate:
   """The previous version is back: keep the update prepared, so the owner can
   retry Finish or cancel it, and say what happened."""
-  _restore_working_edits(repo, _local_branch(repo))
   restore = record["restore"]
   if restore is not None:
     # The previous version's own bookkeeping, not the update's.
@@ -3746,10 +3877,15 @@ def _settle_reverted(
     **record, "state": "prepared", "late": None, "late_committed": None,
     "replayed": None, "operation": None, "restore": None, "booted_tree": None,
   })
-  _write_prepared_update(prepared)
   if set_aside:
     reason += f" Work made on the new version is kept at {set_aside}."
+  # The receipt must name the saved refs before the swapped record retires;
+  # the checkout journal is cleared by its owner only after both writes.
   _write_rolled_back_flag(record["target"], reason)
+  _write_prepared_update(prepared)
+  # Legacy reverted records have no checkout journal. Journal-owned reverts
+  # cannot unwind yet: _restore_working_edits refuses while that owner exists.
+  _restore_working_edits(repo, _local_branch(repo))
   return prepared
 
 
@@ -3761,9 +3897,14 @@ def complete_platform_swap(repo: Path = PLATFORM_REPO) -> str | None:
   the late edits back first. Returns ``replayed``, ``conflict`` (parked for
   the resolver), ``reverted``, ``not_swapped``, ``unknown``, or None.
   """
-  if read_prepared_update() is None:
+  if read_prepared_update() is None and not RECONCILE_PRE_FLAG.exists():
     return None  # Nothing to finish; no lock, as on most boots.
   with _reconcile_flock():
+    journal = _read_reconcile_journal()
+    if journal.get("revert"):
+      revert = journal["revert"]
+      _revert_swap(repo, revert["record"], reason=revert["reason"])
+      return "reverted"
     record = read_prepared_update()
     if record is None:
       return None
@@ -4402,6 +4543,10 @@ def platform_status(
   "available".
   """
   local = _update_source_tip(repo)
+  recovery_refs = (
+    _git("for-each-ref", "--format=%(refname)", _SET_ASIDE_PREFIX, repo=repo).stdout.splitlines()
+    if (repo / ".git").exists() else []
+  )
   image_sha = current_build_sha()
   upstream_sha = recorded_upstream_sha(repo)
   conflict = CONFLICT_FLAG.exists() or _reconcile_in_progress(repo)
@@ -4465,6 +4610,7 @@ def platform_status(
       conflict_paths=paths, conflict_chat_id=flag.get("chat_id"),
       newer_updates_available=newer_available,
       rollback_target_sha=None, rollback_error=None,
+      recovery_refs=recovery_refs,
       unfinished_update=unfinished_update(repo),
       )
 
@@ -4501,6 +4647,7 @@ def platform_status(
     newer_updates_available=False,
     rollback_target_sha=(rollback or {}).get("target"),
     rollback_error=(rollback or {}).get("error"),
+    recovery_refs=recovery_refs,
     unfinished_update=unfinished_update(repo),
   )
 
