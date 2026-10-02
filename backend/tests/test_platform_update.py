@@ -1270,14 +1270,14 @@ def test_a_failed_swap_keeps_the_live_checkout_and_the_prepared_update(
   original_git = pu._git
   failed = False
 
-  def fail_first_candidate_reset(*args, **kwargs):
+  def fail_first_candidate_checkout(*args, **kwargs):
     nonlocal failed
-    if not failed and kwargs.get("repo") == platform and args[:2] == ("reset", "--hard"):
+    if not failed and kwargs.get("repo") == platform and args[:3] == ("read-tree", "-m", "-u"):
       failed = True
-      raise RuntimeError("candidate reset failed after the branch moved")
+      raise RuntimeError("candidate checkout failed after the branch moved")
     return original_git(*args, **kwargs)
 
-  monkeypatch.setattr(pu, "_git", fail_first_candidate_reset)
+  monkeypatch.setattr(pu, "_git", fail_first_candidate_checkout)
   assert pu.swap_in_prepared_update(cutover=True, repo=platform) is False
   monkeypatch.setattr(pu, "_git", original_git)
 
@@ -1308,7 +1308,7 @@ def test_boot_recovers_the_live_state_after_a_swap_killed_midway(
     pass
 
   def kill_after_branch_move(*args, **kwargs):
-    if kwargs.get("repo") == platform and args[:2] == ("reset", "--hard"):
+    if kwargs.get("repo") == platform and args[:3] == ("read-tree", "-m", "-u"):
       raise Killed()
     return original_git(*args, **kwargs)
 
@@ -1348,12 +1348,12 @@ def test_an_incomplete_swap_rollback_leaves_the_live_state_for_boot(
 
   def fail_activation_and_rollback(*args, **kwargs):
     nonlocal resets
-    if kwargs.get("repo") == platform and args[:2] == ("reset", "--hard"):
+    if kwargs.get("repo") == platform and args[:3] == ("read-tree", "-m", "-u"):
       resets += 1
       if resets == 1:
         dirty.write_text("VALUE = 'PARTIAL CHECKOUT'\n")
-        raise RuntimeError("activation reset failed")
-      return SimpleNamespace(returncode=1, stdout="", stderr="reset blocked")
+        raise RuntimeError("activation checkout failed")
+      return SimpleNamespace(returncode=1, stdout="", stderr="checkout blocked")
     return original_git(*args, **kwargs)
 
   monkeypatch.setattr(pu, "_git", fail_activation_and_rollback)
@@ -1361,9 +1361,12 @@ def test_an_incomplete_swap_rollback_leaves_the_live_state_for_boot(
   monkeypatch.setattr(pu, "_git", original_git)
 
   assert pu.RECONCILE_PRE_FLAG.exists()
-  pu.boot_guard_clean_served_tree(platform)
+  receipt = pu.boot_guard_clean_served_tree(platform)
   assert _served_sha(platform) == served
   assert dirty.read_text() == "VALUE = 'KEEP ME'\n"
+  saved = receipt.split(" saved_work=", 1)[1]
+  assert _git(platform, "show", saved + ":backend/app/foo.py").stdout == "VALUE = 'PARTIAL CHECKOUT'\n"
+  assert saved in pu._read_rolled_back_flag()["error"]
 
 
 def test_a_concurrent_writer_keeps_the_branch_and_the_update_stays_prepared(
@@ -6258,3 +6261,264 @@ def test_accepted_working_edit_replay_is_not_pending_when_head_equals_prepared(c
   head = _served_sha(platform)
   record = {"prepared": head, "replayed": head, "late": None, "late_committed": None}
   assert pu._swap_position(platform, record, head) == "replayed"
+
+
+@pytest.mark.parametrize('edit', ['tracked', 'untracked', 'delete'])
+def test_activation_preserves_uncommitted_edits_arriving_after_capture(
+  clone_env, monkeypatch, edit,
+):
+  origin, platform = clone_env
+  path = platform / ('new.txt' if edit == 'untracked' else 'backend/app/foo.py')
+  if edit == 'delete':
+    _advance_origin(origin, deletes=['backend/app/foo.py'])
+  else:
+    _advance_origin(origin, edits={str(path.relative_to(platform)): "VALUE = 'update'\n"})
+  before = _served_sha(platform)
+  original = pu._activate_candidate
+
+  def dirty_then_activate(repo, local, pre_sha, tip):
+    path.write_text("VALUE = 'arrived after snapshot'\n")
+    original(repo, local, pre_sha, tip)
+
+  monkeypatch.setattr(pu, '_activate_candidate', dirty_then_activate)
+  result = pu.reconcile_clone(platform)
+
+  assert path.read_text() == "VALUE = 'arrived after snapshot'\n"
+  assert _served_sha(platform) == before
+  assert result.status == 'error'
+
+
+def test_rollback_preserves_uncommitted_edits_arriving_after_activation(
+  clone_env, monkeypatch,
+):
+  origin, platform = clone_env
+  _advance_origin(origin, edits={'backend/app/foo.py': "VALUE = 'update'\n"})
+  path = platform / 'backend/app/foo.py'
+
+  def changed_then_fail(repo=platform, timeout=pu._PROBE_TIMEOUT):
+    path.write_text("VALUE = 'arrived after activation'\n")
+    return False, 'candidate rejected'
+
+  monkeypatch.setattr(pu, '_import_probe', changed_then_fail)
+  result = pu.reconcile_clone(platform)
+
+  assert path.read_text() == "VALUE = 'arrived after activation'\n"
+  assert result.status == 'error'
+
+
+@pytest.mark.parametrize('staged', [False, True])
+def test_activation_keeps_independent_edits_arriving_after_capture(
+  clone_env, monkeypatch, staged,
+):
+  origin, platform = clone_env
+  _advance_origin(origin, edits={'backend/app/foo.py': "VALUE = 'update'\n"})
+  path = platform / 'independent.txt'
+  original = pu._activate_candidate
+
+  def edit_then_activate(repo, local, pre_sha, tip):
+    path.write_text('independent work\n')
+    if staged:
+      _git(platform, 'add', 'independent.txt')
+    original(repo, local, pre_sha, tip)
+
+  monkeypatch.setattr(pu, '_activate_candidate', edit_then_activate)
+  result = pu.reconcile_clone(platform)
+  assert result.status == 'updated'
+  assert path.read_text() == 'independent work\n'
+  assert _git(platform, 'status', '--porcelain').stdout.splitlines() == [
+    'A  independent.txt' if staged else '?? independent.txt',
+  ]
+  assert not pu.RECONCILE_PRE_FLAG.exists()
+
+
+def test_activation_preserves_new_staged_overlap_without_leaving_a_crash_marker(
+  clone_env, monkeypatch,
+):
+  origin, platform = clone_env
+  _advance_origin(origin, edits={'backend/app/foo.py': "VALUE = 'update'\n"})
+  before = _served_sha(platform)
+  original = pu._activate_candidate
+
+  def edit_then_activate(repo, local, pre_sha, tip):
+    (platform / 'backend/app/foo.py').write_text("VALUE = 'new staged work'\n")
+    _git(platform, 'add', 'backend/app/foo.py')
+    original(repo, local, pre_sha, tip)
+
+  monkeypatch.setattr(pu, '_activate_candidate', edit_then_activate)
+  result = pu.reconcile_clone(platform)
+  assert result.status == 'error'
+  assert _served_sha(platform) == before
+  assert _git(platform, 'show', ':backend/app/foo.py').stdout == "VALUE = 'new staged work'\n"
+  assert (platform / 'backend/app/foo.py').read_text() == "VALUE = 'new staged work'\n"
+  assert not pu.RECONCILE_PRE_FLAG.exists()
+
+
+def test_checkout_rechecks_a_write_after_its_non_destructive_preflight(
+  clone_env, monkeypatch,
+):
+  origin, platform = clone_env
+  _advance_origin(origin, edits={'backend/app/foo.py': "VALUE = 'update'\n"})
+  before = _served_sha(platform)
+  path = platform / 'backend/app/foo.py'
+  original = pu._git
+  edited = False
+
+  def edit_before_checkout(*args, **kwargs):
+    nonlocal edited
+    if not edited and kwargs.get('repo') == platform and args[:3] == ('read-tree', '-m', '-u'):
+      edited = True
+      path.write_text("VALUE = 'newer than preflight'\n")
+    return original(*args, **kwargs)
+
+  monkeypatch.setattr(pu, '_git', edit_before_checkout)
+  result = pu.reconcile_clone(platform)
+  assert result.status == 'error'
+  assert _served_sha(platform) == before
+  assert path.read_text() == "VALUE = 'newer than preflight'\n"
+  # Once the real checkout was attempted, native failure alone cannot prove
+  # no partial files changed. Retain recovery ownership and the new bytes.
+  assert pu.RECONCILE_PRE_FLAG.exists()
+
+
+def test_reverse_checkout_success_does_not_clear_partial_source_marker(clone_env, monkeypatch):
+  origin, platform = clone_env
+  before = _served_sha(platform)
+  tip = _advance_origin(origin, edits={'backend/app/foo.py': "VALUE = 'candidate'\n"})
+  _git(platform, 'fetch', '-q', 'origin')
+  original = pu._git
+  forward = True
+  def half_written(*args, **kwargs):
+    nonlocal forward
+    if forward and kwargs.get('repo') == platform and args[:3] == ('read-tree', '-m', '-u'):
+      forward = False
+      (platform / 'backend/app/foo.py').write_text("VALUE = 'candidate'\n")
+      raise RuntimeError('interrupted before index write')
+    return original(*args, **kwargs)
+  monkeypatch.setattr(pu, '_git', half_written)
+  with pytest.raises(RuntimeError, match='interrupted'):
+    pu._activate_candidate(platform, pu._local_branch(platform), before, tip)
+  assert _served_sha(platform) == before
+  assert (platform / 'backend/app/foo.py').read_text() == "VALUE = 'candidate'\n"
+  assert pu.RECONCILE_PRE_FLAG.exists()
+  monkeypatch.setattr(pu, '_git', original)
+  receipt = pu.boot_guard_clean_served_tree(platform)
+  saved = receipt.split(' saved_work=', 1)[1].split()[0]
+  assert _git(platform, 'show', saved + ':backend/app/foo.py').stdout == "VALUE = 'candidate'\n"
+  assert (platform / 'backend/app/foo.py').read_text() == _git(platform, 'show', before + ':backend/app/foo.py').stdout
+  assert not pu.RECONCILE_PRE_FLAG.exists()
+
+
+def test_boot_recovery_preserves_staged_only_blob_and_raw_index(clone_env):
+  _origin, platform = clone_env
+  pre = _served_sha(platform)
+  original = (platform / 'backend/app/foo.py').read_text()
+  (platform / 'backend/app/foo.py').write_text("VALUE = 'staged only'\n")
+  _git(platform, 'add', 'backend/app/foo.py')
+  (platform / 'backend/app/foo.py').write_text(original)
+  pu._write_reconcile_pre(pre, pre)
+  receipt = pu.boot_guard_clean_served_tree(platform)
+  saved = receipt.split(' saved_index=', 1)[1].split()[0]
+  assert _git(platform, 'show', saved + ':stage-0/backend/app/foo.py').stdout == "VALUE = 'staged only'\n"
+  assert _git(platform, 'cat-file', '-s', saved + ':original-index').returncode == 0
+  _git(platform, 'reflog', 'expire', '--expire=now', '--all')
+  _git(platform, 'gc', '--prune=now')
+  assert _git(platform, 'show', saved + ':stage-0/backend/app/foo.py').stdout == "VALUE = 'staged only'\n"
+
+
+def test_unknown_partial_checkout_retains_marker_instead_of_serving(clone_env):
+  _origin, platform = clone_env
+  pre = _served_sha(platform)
+  advanced = _local_commit(platform, edits={'backend/app/foo.py': "VALUE = 'new owner'\n"})
+  (platform / 'backend/app/foo.py').write_text("VALUE = 'half written'\n")
+  pu._write_reconcile_pre(pre, pre)
+  with pytest.raises(pu.BootTransactionError, match='marker retained'):
+    pu.boot_guard_clean_served_tree(platform)
+  assert pu.RECONCILE_PRE_FLAG.exists()
+  assert _served_sha(platform) == advanced
+  assert (platform / 'backend/app/foo.py').read_text() == "VALUE = 'half written'\n"
+
+
+def test_boot_recovery_keeps_ignored_untracked_file_obstructing_old_source(clone_env):
+  _origin, platform = clone_env
+  pre = _local_commit(platform, edits={'layout': 'old file\n'})
+  (platform / 'layout').unlink()
+  (platform / 'layout').mkdir()
+  (platform / 'layout/module.py').write_text('NEW = True\n')
+  _git(platform, 'add', '-A', '.')
+  _git(platform, 'commit', '-q', '-m', 'candidate file to directory')
+  tip = _served_sha(platform)
+  _git(platform, 'config', 'core.excludesFile', str(platform / '.git/info/exclude'))
+  (platform / '.git/info/exclude').write_text('private.bin\n')
+  (platform / 'layout/private.bin').write_text('untracked ignored work\n')
+  pu._write_reconcile_pre(pre, tip)
+  receipt = pu.boot_guard_clean_served_tree(platform)
+  saved = receipt.split(' saved_work=', 1)[1].split()[0]
+  assert _git(platform, 'show', saved + ':layout/private.bin').stdout == 'untracked ignored work\n'
+  assert (platform / 'layout').read_text() == 'old file\n'
+  assert not pu.RECONCILE_PRE_FLAG.exists()
+
+
+def test_boot_recovery_keeps_ignored_ancestor_file_obstructing_old_directory(clone_env):
+  _origin, platform = clone_env
+  pre = _local_commit(platform, edits={'layout/module.py': 'OLD = True\n'})
+  (platform / 'layout/module.py').unlink()
+  (platform / 'layout').rmdir()
+  _git(platform, 'add', '-A', '.')
+  _git(platform, 'commit', '-q', '-m', 'candidate removes directory')
+  tip = _served_sha(platform)
+  (platform / '.git/info/exclude').write_text('layout\n')
+  (platform / 'layout').write_text('ignored ancestor work\n')
+  pu._write_reconcile_pre(pre, tip)
+  receipt = pu.boot_guard_clean_served_tree(platform)
+  saved = receipt.split(' saved_work=', 1)[1].split()[0]
+  assert _git(platform, 'show', saved + ':layout').stdout == 'ignored ancestor work\n'
+  assert (platform / 'layout/module.py').read_text() == 'OLD = True\n'
+  assert not pu.RECONCILE_PRE_FLAG.exists()
+
+
+def test_boot_recovery_keeps_every_conflict_stage_and_exact_index(clone_env):
+  _origin, platform = clone_env
+  _git(platform, "checkout", "-q", "-b", "other")
+  _local_commit(platform, edits={"backend/app/foo.py": "VALUE = 'other'\n"})
+  _git(platform, "checkout", "-q", "main")
+  pre = _local_commit(platform, edits={"backend/app/foo.py": "VALUE = 'main'\n"})
+  assert _git(platform, "merge", "other", check=False).returncode == 1
+  stages = _git(platform, "ls-files", "--stage", "backend/app/foo.py").stdout.splitlines()
+  index_oid = _git(platform, "hash-object", str(platform / ".git/index")).stdout.strip()
+  working = (platform / "backend/app/foo.py").read_text()
+  pu._write_reconcile_pre(pre, pre)
+
+  receipt = pu.boot_guard_clean_served_tree(platform)
+
+  saved_index = receipt.split(" saved_index=", 1)[1].split()[0]
+  saved_work = receipt.split(" saved_work=", 1)[1].split()[0]
+  assert len(stages) == 3
+  for entry in stages:
+    metadata, path = entry.split("\t", 1)
+    _mode, oid, stage = metadata.split()
+    assert _git(platform, "rev-parse", f"{saved_index}:stage-{stage}/{path}").stdout.strip() == oid
+  assert _git(platform, "rev-parse", saved_index + ":original-index").stdout.strip() == index_oid
+  assert _git(platform, "show", saved_work + ":backend/app/foo.py").stdout == working
+  assert _served_sha(platform) == pre
+  assert not pu.RECONCILE_PRE_FLAG.exists()
+
+
+def test_failed_recovery_snapshot_keeps_source_index_and_marker(clone_env, monkeypatch):
+  _origin, platform = clone_env
+  pre = _served_sha(platform)
+  path = platform / "backend/app/foo.py"
+  path.write_text("VALUE = 'must survive'\n")
+  _git(platform, "add", "backend/app/foo.py")
+  index = (platform / ".git/index").read_bytes()
+  pu._write_reconcile_pre(pre, pre)
+
+  def unavailable(*_args):
+    raise pu.PlatformUpdateError("recovery snapshot unavailable")
+
+  monkeypatch.setattr(pu, "_keep_set_aside", unavailable)
+  with pytest.raises(pu.PlatformUpdateError, match="snapshot unavailable"):
+    pu.boot_guard_clean_served_tree(platform)
+  assert _served_sha(platform) == pre
+  assert path.read_text() == "VALUE = 'must survive'\n"
+  assert (platform / ".git/index").read_bytes() == index
+  assert pu.RECONCILE_PRE_FLAG.exists()

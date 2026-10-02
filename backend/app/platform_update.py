@@ -754,36 +754,56 @@ def _read_reconcile_pre() -> tuple[str | None, str | None]:
 
 
 def boot_guard_clean_served_tree(repo: Path = PLATFORM_REPO) -> str:
-  """Post-timeout boot guard: never let uvicorn import a half-applied tree.
+  """Recover an interrupted checkout only after retaining its working state.
 
-  The normal reconcile path cleans up after itself. This guard is for the harder
-  case where the outer shell timeout SIGKILLed that process before Python could
-  abort/reset. If the transient pre-mutation marker remains, restore that exact
-  committed tip. Otherwise still abort any sequencer state and hard-reset the
-  working branch to its current committed tip so conflict markers cannot be
-  served.
+  Boot has no agent writers. Git's reverse checkout still runs first, but a
+  partial write can leave the worktree different from its unchanged index.
+  Preserve both before the boot-only repair that restores a coherent source.
   """
   if not (repo / ".git").exists():
     return "boot_guard[skipped] no_git"
   local = _local_branch(repo)
   pre, tip = _read_reconcile_pre()
   interrupted = _reconcile_in_progress(repo)
+  current = _rev(repo, local)
+  saved_work = saved_index = None
+  if (pre and _rev(repo, pre) and current in {pre, tip}) or interrupted:
+    saved_work, saved_index = _preserve_checkout_state(repo, current, pre or current)
   _abort_interrupted(repo)
   if pre and _rev(repo, pre):
     current = _rev(repo, local)
     restored = False
     if current == tip:
       restored = _restore_candidate(repo, local, tip, pre)
+      if not restored and _rev(repo, local) == pre:
+        _reset_hard_to(repo, local, pre)
+        restored = _checkout_matches_transition_target(repo, pre, tip)
     elif current == pre:
       _reset_hard_to(repo, local, pre)
-      restored = True
+      restored = _checkout_matches_transition_target(repo, pre, tip or pre)
+    else:
+      # A newer branch owner is not ours to reset. Clear the old marker only
+      # when its checkout is coherent on every possibly changed path.
+      restored = all(_checkout_matches_transition_target(repo, current, endpoint)
+                     for endpoint in (pre, tip) if endpoint)
+      if restored:
+        _clear_reconcile_pre()
+        _restore_working_edits(repo, local)
+        return f"boot_guard[preserved] pre={_short(pre)}"
+    if not restored:
+      raise BootTransactionError("Interrupted checkout needs source recovery; marker retained")
     _clear_reconcile_pre()
     _restore_working_edits(repo, local)
-    state = "reset" if restored else "preserved"
-    return f"boot_guard[{state}] pre={_short(pre)}"
+    if saved_work or saved_index:
+      refs = ", ".join(ref for ref in (saved_work, saved_index) if ref)
+      _write_rolled_back_flag(tip or pre, f"Interrupted checkout recovered. Saved work: {refs}.")
+    return f"boot_guard[reset] pre={_short(pre)}" + (
+      f" saved_work={saved_work}" if saved_work else ""
+    ) + (f" saved_index={saved_index}" if saved_index else "")
   if interrupted:
-    _git("checkout", "-q", local, repo=repo, check=False)
-    _git("reset", "--hard", local, repo=repo, check=False)
+    _reset_hard_to(repo, local, current)
+    if _git("diff", "--quiet", current, "--", repo=repo, check=False).returncode:
+      raise BootTransactionError("Interrupted merge needs source recovery")
   _clear_reconcile_pre()
   _restore_working_edits(repo, local)
   return "boot_guard[clean]"
@@ -854,12 +874,95 @@ def _commit_tree_oid(repo: Path, commit: str) -> str | None:
   return oid if re.fullmatch(r"[0-9a-f]{40}", oid) else None
 
 
+def _checkout_matches_transition_target(repo: Path, target: str, other: str) -> bool:
+  """Prove index and worktree agree with target on the transition's paths.
+
+  Independent dirty paths are allowed. A successful two-tree reverse alone
+  is not this proof: with an old index it may keep partially written files.
+  """
+  def changed_paths(left: str, right: str) -> set[str]:
+    return set(_git("diff-tree", "--no-commit-id", "--name-only", "-r", "-z",
+                    left, right, repo=repo).stdout.split("\0")) - {""}
+  paths = changed_paths(target, other)
+  if not paths:
+    return True
+  index = _git("write-tree", repo=repo, check=False)
+  if index.returncode:
+    return False  # An unmerged index cannot prove a coherent checkout.
+  working = _working_tree_oid(repo, target)
+  if paths & (changed_paths(target, index.stdout.strip()) | changed_paths(target, working)):
+    return False
+  present = set(_git("ls-tree", "-r", "--name-only", "-z", target, repo=repo).stdout.split("\0"))
+  # Git diff ignores ignored additions. They cannot survive from a partial
+  # candidate as an untracked source file on a path absent from target.
+  return all(path in present or not os.path.lexists(repo / path) for path in paths)
+
+
+def _preserve_checkout_state(repo: Path, current: str, restoring: str) -> tuple[str | None, str | None]:
+  """Keep worktree bytes and every staged blob in existing recovery refs.
+
+  Conflict stages cannot be written as one ordinary Git tree. A recovery
+  tree names their original stages and retains the raw index for exact repair;
+  naming each blob also keeps it reachable through Git garbage collection.
+  """
+  target_paths = set(_git("ls-tree", "-r", "--name-only", "-z",
+                          restoring, repo=repo).stdout.split("\0")) - {""}
+  target_parents = {str(parent) for path in target_paths for parent in Path(path).parents}
+  ignored = []
+  for path in _git("ls-files", "--others", "--ignored", "--exclude-standard",
+                   "-z", repo=repo).stdout.split("\0"):
+    if path and (path in target_paths or path in target_parents
+                 or any(str(parent) in target_paths for parent in Path(path).parents)):
+      ignored.append(path)
+  working = _working_tree_oid(repo, current, force_paths=ignored)
+  work_ref = index_ref = None
+  if working != _commit_tree_oid(repo, current):
+    snapshot = app_git._run(repo, "commit-tree", working, "-p", current,
+                            "-m", "platform: work preserved from an interrupted checkout").stdout.strip()
+    work_ref = _keep_set_aside(repo, snapshot)
+  if _git("diff", "--cached", "--quiet", current, "--", repo=repo, check=False).returncode:
+    staged = _git("ls-files", "--stage", "-z", repo=repo).stdout.split("\0")
+    entries = []
+    for entry in staged:
+      if not entry:
+        continue
+      meta, path = entry.split("\t", 1)
+      mode, oid, stage = meta.split()
+      entries.append(f"{mode} {oid}\tstage-{stage}/{path}\0")
+    raw_index = _git("rev-parse", "--git-path", "index", repo=repo).stdout.strip()
+    index_blob = _git("hash-object", "-w", raw_index, repo=repo).stdout.strip()
+    entries.append(f"100644 {index_blob}\toriginal-index\0")
+    with tempfile.TemporaryDirectory(prefix="mobius-recovery-index-") as tmp:
+      index = Path(tmp) / "index"
+      app_git._run_with_index(repo, index, "read-tree", "--empty")
+      app_git._run_with_index(repo, index, "update-index", "-z", "--index-info", input="".join(entries))
+      tree = app_git._run_with_index(repo, index, "write-tree").stdout.strip()
+    snapshot = app_git._run(repo, "commit-tree", tree, "-p", current,
+                            "-m", "platform: index preserved from an interrupted checkout").stdout.strip()
+    index_ref = _keep_set_aside(repo, snapshot)
+  return work_ref, index_ref
+
+
 def _activate_candidate(repo: Path, local: str, pre_sha: str, tip: str) -> None:
   """Move the served branch to a complete candidate, compare-and-swap.
 
   The update refuses if another writer moved the local branch after
   ``pre_sha``; only after that succeeds does the checked-out tree follow.
+  A two-tree checkout preserves independent index/worktree edits and refuses
+  an overlapping edit or untracked collision instead of discarding it.
   """
+  # Expected local conflicts need no ref mutation or crash marker. The real
+  # checkout repeats these native checks, so a write after this preflight is
+  # still refused rather than treated as permission to overwrite.
+  try:
+    _git("read-tree", "-n", "-m", "-u", pre_sha, tip, repo=repo)
+  except Exception:
+    # The earlier capture marker owns no checkout yet. A dry-run refusal
+    # cannot have changed files; leaving it would make boot discard staging.
+    captured_pre, captured_tip = _read_reconcile_pre()
+    if captured_pre == pre_sha and captured_tip is None:
+      _clear_reconcile_pre()
+    raise
   _write_reconcile_pre(pre_sha, tip)
   try:
     _git("update-ref", f"refs/heads/{local}", tip, pre_sha, repo=repo)
@@ -867,14 +970,13 @@ def _activate_candidate(repo: Path, local: str, pre_sha: str, tip: str) -> None:
     _clear_reconcile_pre()  # nothing moved; the newer writer keeps its tree
     raise
   try:
-    _git("checkout", "-q", local, repo=repo)
-    _git("reset", "--hard", tip, repo=repo)
+    _git("read-tree", "-m", "-u", pre_sha, tip, repo=repo)
+    if not _checkout_matches_transition_target(repo, tip, pre_sha):
+      raise PlatformUpdateError("candidate_checkout_incoherent")
   except Exception:
     # Keep the marker unless PRE's bytes are provably back: boot recovery
     # resets to PRE, and PRE may hold carried working edits.
-    if _restore_candidate(repo, local, tip, pre_sha) and _git(
-      "diff", "--quiet", pre_sha, "--", repo=repo, check=False,
-    ).returncode == 0:
+    if _restore_candidate(repo, local, tip, pre_sha):
       _clear_reconcile_pre()
     raise
 
@@ -913,15 +1015,16 @@ def _restore_working_edits(repo: Path, local: str) -> bool:
 def _reset_hard_to(repo: Path, local: str, sha: str) -> None:
   """Return the working branch to ``sha`` (the pre-reconcile served commit),
   updating the working tree. Used to serve OLD after a conflict/rollback."""
-  _git("checkout", "-q", local, repo=repo, check=False)
-  _git("reset", "--hard", sha, repo=repo, check=False)
+  _git("checkout", "-q", local, repo=repo)
+  _git("reset", "--hard", sha, repo=repo)
 
 
 def _restore_candidate(repo: Path, local: str, tip: str, pre: str) -> bool:
   """Roll back only the exact candidate this update published.
 
   A failed compare-and-swap means another writer owns the branch now. Never
-  reset that writer's commit or working tree.
+  reset that writer's commit or working tree. The reverse checkout likewise
+  refuses to replace newer uncommitted work; the marker then owns recovery.
   """
   moved = _git(
     "update-ref", f"refs/heads/{local}", pre, tip,
@@ -929,10 +1032,11 @@ def _restore_candidate(repo: Path, local: str, tip: str, pre: str) -> bool:
   )
   if moved.returncode != 0:
     return False
-  _git("checkout", "-q", local, repo=repo, check=False)
-  if _rev(repo, local) == pre:
-    _git("reset", "--hard", pre, repo=repo, check=False)
-  return True
+  if _rev(repo, local) != pre:
+    return False
+  return _git(
+    "read-tree", "-m", "-u", tip, pre, repo=repo, check=False,
+  ).returncode == 0 and _checkout_matches_transition_target(repo, pre, tip)
 
 
 def _set_upstream(repo: Path, target: str) -> None:
@@ -2273,7 +2377,11 @@ def _roll_back_failed_frontend_build(
       return replace(
         res,
         status="error",
-        error="rollback_ref_changed: a newer writer owns the served branch",
+        error=(
+          "rollback_ref_changed: a newer writer owns the served branch"
+          if _rev(repo, _local_branch(repo)) != res.pre_sha else
+          "rollback_incomplete: checkout changed; recovery marker retained"
+        ),
       )
   if previous_upstream_sha:
     _set_upstream(repo, previous_upstream_sha)
@@ -2324,12 +2432,15 @@ def _carry_working_edits(repo: Path, local: str) -> _Carried:
   return _Carried(served=served, pre=pre, working=pre if pre != served else None)
 
 
-def _working_tree_oid(repo: Path, base: str) -> str:
+def _working_tree_oid(repo: Path, base: str, *, force_paths: list[str] | None = None) -> str:
   """Snapshot tracked and unignored files without changing the shared index."""
   with tempfile.TemporaryDirectory(prefix="mobius-platform-index-") as tmp:
     index = Path(tmp) / "index"
     app_git._run_with_index(repo, index, "read-tree", base)
     app_git._run_with_index(repo, index, "add", "-A", ".")
+    if force_paths:
+      app_git._run_with_index(repo, index, "add", "-f", "--pathspec-from-file=-",
+                              "--pathspec-file-nul", input="\0".join(force_paths) + "\0")
     return app_git._run_with_index(repo, index, "write-tree").stdout.strip()
 
 
@@ -2466,15 +2577,18 @@ def _reconcile_pass(
     )
   except Exception as exc:  # unexpected git failure — never serve a half-tree
     _abort_interrupted(repo)
-    if _rev(repo, local) == pre:
-      _reset_hard_to(repo, local, pre)
+    # A rejected checkout may mean a newer working edit, not a corrupt tree.
+    # Never turn a non-destructive refusal into a destructive cleanup. An
+    # incomplete transition retains its marker for the boot recovery owner.
     # Nothing here is actionable by a resolver, and any earlier flag belonged
     # to an attempt this pass already superseded: leave the served tree at PRE
     # with no stale conflict/rollback state to mislead the next status read.
     app_git.remove_overlay_worktree(repo, _overlay_candidate_path(repo))
     CONFLICT_FLAG.unlink(missing_ok=True)
     ROLLED_BACK_FLAG.unlink(missing_ok=True)
-    if _git("diff", "--quiet", pre, "--", repo=repo, check=False).returncode == 0:
+    marked_pre, marked_tip = _read_reconcile_pre()
+    if (marked_pre == pre and (marked_tip is None
+        or _checkout_matches_transition_target(repo, pre, marked_tip))):
       _clear_reconcile_pre()
     return ReconcileResult.unchanged("error", pre, target, error=repr(exc))
 
@@ -2487,7 +2601,11 @@ def _roll_back_update(
   if not _restore_candidate(repo, local, tip, pre):
     return ReconcileResult.unchanged(
       "error", pre, target,
-      error="rollback_ref_changed: a newer writer owns the served branch",
+      error=(
+        "rollback_ref_changed: a newer writer owns the served branch"
+        if _rev(repo, local) != pre else
+        "rollback_incomplete: checkout changed; recovery marker retained"
+      ),
     )
   _write_rolled_back_flag(target, message)
   CONFLICT_FLAG.unlink(missing_ok=True)
@@ -2607,9 +2725,10 @@ def reconcile_clone(
   not repeat network work or change the selected release. A success that
   changes backend code still needs a restart. Never raises for an operational
   failure (offline, conflict, import-broken) — it returns a
-  :class:`ReconcileResult` describing the outcome and always leaves
-  ``/data/platform`` in a clean, served state (either the update, or the pre-
-  reconcile code) with the owner's uncommitted edits back in the working tree.
+  :class:`ReconcileResult` describing the outcome and normally leaves
+  the update or pre-reconcile source with local edits preserved. An interrupted
+  checkout that cannot be proved coherent retains its marker for boot recovery;
+  it must not be imported as a settled source.
   """
   result = _reconcile_pass(
     repo, target_ref=target_ref, fetch_remote=fetch_remote,
