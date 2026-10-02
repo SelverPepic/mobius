@@ -52,18 +52,20 @@ export default function useSessionNotices(open = false) {
     )))
   }, [open])
 
-  const markRead = useCallback((id) => {
+  const markRead = useCallback((ids = rowsRef.current.map(row => row.id)) => {
+    const selected = new Set(ids)
     const timestamp = new Date().toISOString()
     setRows(current => current.map(row => (
-      id == null || row.id === id ? { ...row, read_at: timestamp, seen_at: timestamp } : row
+      selected.has(row.id) ? { ...row, read_at: timestamp, seen_at: timestamp } : row
     )))
   }, [])
 
   const dismiss = useCallback((id) => {
     setRows(current => current.filter(row => row.id !== id))
   }, [])
-  const clearAll = useCallback(() => {
-    setRows(current => current.filter(row => row.sessionAction))
+  const clearAll = useCallback((ids = rowsRef.current.map(row => row.id)) => {
+    const selected = new Set(ids)
+    setRows(current => current.filter(row => !selected.has(row.id) || row.sessionAction))
   }, [])
 
   const runAction = useCallback(async (id) => {

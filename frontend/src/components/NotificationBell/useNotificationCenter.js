@@ -30,18 +30,19 @@ export default function useNotificationCenter(queryClient) {
   }, [queryClient])
 
   const markAllRead = useCallback(async () => {
+    const noticeIds = session.rows.map(row => row.id)
     await api.notifications.readAll()
-    session.markRead()
+    session.markRead(noticeIds)
     await Promise.all([
       notificationQueries.list.invalidate(queryClient),
       notificationQueries.unreadCount.invalidate(queryClient),
       notificationQueries.newCount.invalidate(queryClient),
     ])
-  }, [queryClient, session.markRead])
+  }, [queryClient, session.markRead, session.rows])
 
   const markRead = useCallback(async (notificationId) => {
     if (session.rows.some(row => row.id === notificationId)) {
-      session.markRead(notificationId)
+      session.markRead([notificationId])
       return
     }
     await api.notifications.read(notificationId)
@@ -53,14 +54,16 @@ export default function useNotificationCenter(queryClient) {
   }, [queryClient, session.markRead, session.rows])
 
   const clearAll = useCallback(async () => {
+    // Arrivals during the remote sweep belong to the next history.
+    const noticeIds = session.rows.map(row => row.id)
     await api.notifications.clearAll()
-    session.clearAll()
+    session.clearAll(noticeIds)
     await Promise.all([
       queryClient.resetQueries({ queryKey: notificationQueries.list.key }),
       notificationQueries.unreadCount.invalidate(queryClient),
       notificationQueries.newCount.invalidate(queryClient),
     ])
-  }, [session.clearAll, queryClient])
+  }, [session.clearAll, session.rows, queryClient])
 
   const dismiss = useCallback(async (notificationId) => {
     if (session.rows.some(row => row.id === notificationId)) {

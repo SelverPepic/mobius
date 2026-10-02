@@ -25,7 +25,7 @@ test('opening acknowledges arrivals without marking them read; open-panel arriva
   result.current.addNotice('Chat restored')
   assert.equal(result.current.newCount, 0)
   assert.equal(result.current.unreadCount, 2)
-  result.current.markRead(result.current.rows[0].id)
+  result.current.markRead([result.current.rows[0].id])
   assert.equal(result.current.unreadCount, 1)
   rerender(false)
   result.current.addNotice('Another notice')
@@ -130,3 +130,70 @@ test('dismissing a pending Undo never resurrects its row when the action settles
   await action
   assert.equal(result.current.rows.length, 0)
 })
+
+// Stub only the remote boundary; exercise the real center and session hooks together.
+const { registerHooks } = await import('node:module')
+const remote = { notifications: {} }
+const queries = Object.fromEntries(['unreadCount', 'newCount', 'list'].map(name => [name, {
+  key: [name], useQuery: () => ({ data: 0 }), invalidate: async () => {},
+}]))
+globalThis.__sessionNoticeBoundary = { api: remote, notificationQueries: queries }
+const boundary = registerHooks({
+  resolve(specifier, context, nextResolve) {
+    if (context.parentURL?.endsWith('/NotificationBell/useNotificationCenter.js')
+      && ['../../api/client.js', '../../hooks/queries.js'].includes(specifier)) {
+      const name = specifier.endsWith('/client.js') ? 'api' : 'notificationQueries'
+      return {
+        url: `data:text/javascript,export const ${name}=globalThis.__sessionNoticeBoundary.${name}`,
+        shortCircuit: true,
+      }
+    }
+    return nextResolve(specifier, context)
+  },
+})
+const { default: useNotificationCenter } = await import('../../NotificationBell/useNotificationCenter.js')
+boundary.deregister()
+delete globalThis.__sessionNoticeBoundary
+const queryClient = {
+  resetQueries: async () => {}, cancelQueries: async () => {}, setQueryData: () => {},
+}
+
+for (const operation of ['clearAll', 'markAllRead']) {
+  test(`${operation} only affects its starting snapshot, preserving arrivals while the remote request is pending`, async () => {
+    let finish
+    remote.notifications[operation === 'clearAll' ? 'clearAll' : 'readAll'] = () => new Promise(resolve => { finish = resolve })
+    const { result } = renderHook(() => useNotificationCenter(queryClient))
+    result.current.actions.addNotice('Existing ordinary feedback')
+    result.current.actions.addNotice('Chat archived', { action: { label: 'Undo', onAction: () => true } })
+    const pending = result.current.actions[operation]()
+    result.current.actions.addNotice('New ordinary feedback')
+    const arrival = result.current.state.sessionNotices[0]
+    finish()
+    await pending
+    const rows = result.current.state.sessionNotices
+    assert.ok(rows.some(row => row.id === arrival.id))
+    assert.equal(rows.find(row => row.id === arrival.id).read_at, null)
+    assert.equal(result.current.state.newCount, operation === 'clearAll' ? 2 : 1)
+    assert.ok(rows.find(row => row.title === 'Chat archived').sessionAction)
+    if (operation === 'clearAll') {
+      assert.equal(rows.length, 2)
+    } else {
+      assert.equal(rows.length, 3)
+      assert.equal(result.current.state.unreadCount, 1)
+    }
+  })
+
+  test(`${operation} failure leaves both earlier feedback and new arrivals untouched`, async () => {
+    let reject
+    remote.notifications[operation === 'clearAll' ? 'clearAll' : 'readAll'] = () => new Promise((resolve, fail) => { reject = fail })
+    const { result } = renderHook(() => useNotificationCenter(queryClient))
+    result.current.actions.addNotice('Existing feedback')
+    const pending = result.current.actions[operation]()
+    result.current.actions.addNotice('New feedback')
+    reject(new Error('Remote operation failed'))
+    await assert.rejects(pending, /Remote operation failed/)
+    assert.equal(result.current.state.sessionNotices.length, 2)
+    assert.equal(result.current.state.newCount, 2)
+    assert.equal(result.current.state.unreadCount, 2)
+  })
+}
