@@ -1,5 +1,4 @@
 /* Project retained peer mail onto transcript boundaries without changing delivery or stored messages. */
-import { waitWokeItsAnswer } from './waitHistory.js'
 /** Stored coordinates of one projected block. Recorded positions name a
  * boundary in the stored message's blocks; projections that renumber those
  * blocks (the compact transcript and assistant-fragment folding) declare the
@@ -106,16 +105,11 @@ export function peerRecordTool(note, chatId) {
 
 // Join mail to adjoining tool stretches in the render projection only. Prose,
 // questions, and owner messages remain boundaries; hidden carriers are not UI.
-const assistantFragmentRoot = message => {
-  if (message?.role !== 'assistant' || typeof message.id !== 'string') return null
-  return message.id.replace(/:assistant:\d+$/, '')
-}
-
 const isTransparentActivitySeparator = block => (
   block?.type === 'text' && typeof block.content === 'string' && !block.content.trim()
 )
 
-const isActivityBlock = block => (
+export const isActivityBlock = block => (
   block?.type === 'tool'
   || block?.type === 'thinking'
   || block?.type === 'activity'
@@ -123,102 +117,10 @@ const isActivityBlock = block => (
   || isTransparentActivitySeparator(block)
 )
 
-/** Join the activity-only seam between saved fragments of one assistant turn.
- * Hidden delivery carriers may sit between the fragments, but prose, cards,
- * errors, owner messages, or an unplaced timeline row remain hard boundaries. */
-export function foldAssistantActivityFragments(
-  messages,
-  slots,
-  activeMirrorIndex = -1,
-  sourcePositions = new Map(),
-) {
-  const rendered = [...messages]
-  const positions = new Map(sourcePositions)
-  const nextVisible = start => {
-    let index = start
-    while (index < rendered.length && rendered[index]?.hidden) index += 1
-    return index
-  }
-  const hasSlotBetween = (start, end) => {
-    for (let index = start + 1; index <= end; index += 1) {
-      if (slots.has(index)) return true
-    }
-    return false
-  }
-  for (let index = 0; index < rendered.length; index += 1) {
-    if (index === activeMirrorIndex || rendered[index]?.hidden) continue
-    const root = assistantFragmentRoot(rendered[index])
-    if (!root) continue
-    let targetIndex = index
-    let target = rendered[targetIndex]
-    let candidateIndex = nextVisible(targetIndex + 1)
-    while (
-      candidateIndex < rendered.length
-      && candidateIndex !== activeMirrorIndex
-      && assistantFragmentRoot(rendered[candidateIndex]) === root
-      && !hasSlotBetween(targetIndex, candidateIndex)
-    ) {
-      const targetBlocks = target.blocks || []
-      const candidate = rendered[candidateIndex]
-      const candidateBlocks = candidate.blocks || []
-      if (target.goal_summaries?.length || target.wait_summaries?.length
-          || candidate.continuation_reason || candidate.wait_summaries?.some(waitWokeItsAnswer)) break
-      if (!isActivityBlock(targetBlocks.at(-1)) || !isActivityBlock(candidateBlocks[0])) break
-      let activityEnd = 0
-      while (activityEnd < candidateBlocks.length && isActivityBlock(candidateBlocks[activityEnd])) {
-        activityEnd += 1
-      }
-      // Folding renumbers the candidate's blocks, so each one carries the
-      // stored index its recorded positions refer to; moved blocks also name
-      // the stored message they came from.
-      const storedCandidate = candidateBlocks.map((block, storedIndex) => (
-        storedBlockRange(block) || projectedActivityId(block)
-          ? block : { ...block, raw_index: storedIndex }
-      ))
-      const leadingActivity = storedCandidate
-        .slice(0, activityEnd)
-        .filter(block => !isTransparentActivitySeparator(block))
-        .map(block => ({
-          ...block,
-          source_message_id: block.source_message_id ?? candidate.id,
-        }))
-      target = { ...target, blocks: [...targetBlocks, ...leadingActivity] }
-      rendered[targetIndex] = target
-      const rawBoundary = storedCandidate
-        .slice(0, activityEnd)
-        .reduce((boundary, block) => Math.max(boundary, storedBlockRange(block)?.end ?? 0), 0)
-      const candidateNotes = positions.get(candidate.id) || []
-      const movingNotes = candidateNotes.filter(note => (
-        Number.isInteger(note.display_position?.block_index)
-        && (note.display_position.block_index < rawBoundary
-          || (activityEnd === candidateBlocks.length && note.display_position.block_index === rawBoundary))
-      ))
-      if (movingNotes.length) {
-        positions.set(target.id, [
-          ...(positions.get(target.id) || []),
-          ...movingNotes.map(note => ({
-            ...note,
-            display_position: {
-              ...note.display_position,
-              assistant_message_id: target.id,
-              source_message_id: note.display_position.source_message_id ?? candidate.id,
-            },
-          })),
-        ])
-        const movingIds = new Set(movingNotes.map(note => note.id))
-        const stayingNotes = candidateNotes.filter(note => !movingIds.has(note.id))
-        if (stayingNotes.length) positions.set(candidate.id, stayingNotes)
-        else positions.delete(candidate.id)
-      }
-      const remaining = storedCandidate.slice(activityEnd)
-      rendered[candidateIndex] = remaining.length
-        ? { ...candidate, blocks: remaining }
-        : { ...candidate, hidden: true, _folded_activity_fragment: true }
-      if (remaining.length) break
-      candidateIndex = nextVisible(candidateIndex + 1)
-    }
-  }
-  return { messages: rendered, positions }
+/** Synthetic mail has no stored index. Other projected copies keep theirs. */
+export function withStoredBlockIndex(block, index) {
+  return storedBlockRange(block) || projectedActivityId(block)
+    ? block : { ...block, raw_index: index }
 }
 
 export function foldPeerActivity(messages, projection, chatId) {
@@ -244,10 +146,7 @@ export function foldPeerActivity(messages, projection, chatId) {
     const prefixLength = prepended.get(target) || 0
     // Recorded positions count stored blocks, never the synthetic mail rows
     // inserted here. Preserve that coordinate before prepending any activity.
-    const stored = rendered[target].blocks.map((block, index) => (
-      storedBlockRange(block) || projectedActivityId(block)
-        ? block : { ...block, raw_index: index }
-    ))
+    const stored = rendered[target].blocks.map(withStoredBlockIndex)
     rendered[target] = { ...rendered[target], blocks: before
       ? [...stored.slice(0, prefixLength), ...blocks, ...stored.slice(prefixLength)]
       : [...stored, ...blocks] }

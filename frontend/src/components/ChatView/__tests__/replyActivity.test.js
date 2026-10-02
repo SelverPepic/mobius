@@ -112,3 +112,72 @@ test('projected helper boundaries survive saved prose with stamped source coordi
   }, 'chat').messages[0].blocks
   assert.deepEqual(mergeProjectedActivity(live, projected, raw), [...live, helper])
 })
+
+
+test('a delivered wait before the first fragment does not split its continuing tools', () => {
+  const before = [row(0, [tool('a')], { wait_summaries: [{ status: 'met', delivery_pending: false }] }), row(1, [tool('b')])]
+  const { rows } = presentAssistantActivity(before)
+  assert.deepEqual(rows[0].message.blocks.map(b => b.tool_use_id), ['a', 'b'])
+  assert.deepEqual(rows[1].message.blocks, [])
+  assert.deepEqual(rows[0].message.wait_summaries, before[0].message.wait_summaries)
+})
+
+test('an absorbed middle fragment keeps following tools after its trailing outcome', () => {
+  for (const outcome of [{ goal_summaries: [{ id: 'goal' }] },
+    { wait_summaries: [{ status: 'cancelled' }] },
+    { wait_summaries: [{ status: 'met', delivery_pending: true }] }]) {
+    const before = [row(0, [tool('a')]), row(1, [tool('b')], outcome), row(2, [tool('c')])]
+    const { rows } = presentAssistantActivity(before)
+    assert.deepEqual(rows[0].message.blocks.map(b => b.tool_use_id), ['a', 'b'])
+    assert.deepEqual(rows[1].message.blocks, [])
+    assert.deepEqual(rows[2].message.blocks.map(b => b.tool_use_id), ['c'])
+    for (const key of Object.keys(outcome)) assert.deepEqual(rows[1].message[key], outcome[key])
+  }
+})
+
+test('reply notes and leading causes remain boundaries across selected fragments', () => {
+  const before = [row(0, [tool('a')]), { ...row(1, [tool('b')]), notes: [{ id: 'boundary' }] }, row(2, [tool('c')])]
+  const { rows } = presentAssistantActivity(before)
+  assert.deepEqual(rows[0].message.blocks.map(b => b.tool_use_id), ['a'])
+  assert.deepEqual(rows[1].message.blocks.map(b => b.tool_use_id), ['b', 'c'])
+  assert.deepEqual(rows[1].notes, before[1].notes)
+})
+
+test('saved activity crosses empty source anchors but stops at an error', () => {
+  const activity = id => ({ type: 'activity', activity_id: id, entries: [] })
+  const before = [row(0, [{ type: 'text', content: 'Intro' }, activity('one')]),
+    row(1, [{ type: 'text', content: '' }, activity('two')]),
+    row(2, [activity('three'), { type: 'error', content: 'Paused' }])]
+  const { rows } = presentAssistantActivity(before)
+  assert.deepEqual(rows[0].message.blocks.map(b => b.activity_id || b.type), ['text', 'one', 'two', 'three'])
+  assert.deepEqual(rows[1].message.blocks, [])
+  assert.equal(rows[1].key, before[1].key)
+  assert.deepEqual(rows[2].message.blocks.map(b => b.type), ['error'])
+  assert.deepEqual(before[0].message.blocks.map(b => b.activity_id || b.type), ['text', 'one'])
+})
+
+test('a partially folded compact fragment keeps its source range and remaining prose coordinate', () => {
+  const run = start => ({ type: 'activity', activity_id: `a${start}`, start, end: start + 4, entries: [] })
+  const before = [row(0, [run(0), { type: 'text', content: 'Middle.', raw_index: 4 }, run(5)]),
+    row(1, [run(0), { type: 'text', content: 'Fragment prose.', raw_index: 4 }])]
+  const note = { id: 'inside', activityId: 'inside', type: 'helper_result', status: 'completed',
+    display_position: { assistant_message_id: before[1].message.id, block_index: 2 } }
+  const { rows, positions } = presentAssistantActivity(before, { positions: new Map([[before[1].message.id, [note]]]) })
+  const target = rows[0].message
+  const [moved] = positions.get(target.id)
+  assert.equal(moved.display_position.source_message_id, before[1].message.id)
+  const output = insertPositionedActivity(target.blocks.map((item, idx) => ({ item, idx })), [moved], target.blocks, 'chat')
+  assert.equal(output[0].item.positioned_entries, undefined)
+  assert.equal(output.at(-1).item.positioned_entries[0].positionIndex, 2)
+  assert.deepEqual(rows[1].message.blocks.map(b => [b.type, b.raw_index]), [['text', 4]])
+})
+
+
+test('a partial middle fragment owns its remaining tail when the next fragment joins', () => {
+  const before = [row(0, [tool('a')]), row(1, [tool('b'), { type: 'text', content: 'Next phase' }, tool('c')]), row(2, [tool('d')])]
+  const { rows } = presentAssistantActivity(before)
+  assert.deepEqual(rows[0].message.blocks.map(b => b.tool_use_id), ['a', 'b'])
+  assert.deepEqual(rows[1].message.blocks.map(b => b.tool_use_id || b.type), ['text', 'c', 'd'])
+  assert.deepEqual(rows[2].message.blocks, [])
+  assert.equal(rows[1].message.blocks.at(-1).source_message_id, before[2].message.id)
+})

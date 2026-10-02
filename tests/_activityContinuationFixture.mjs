@@ -100,3 +100,74 @@ export async function checkActivityContinuation(page, chat, base, { compact = fa
   await expect(surface.getByText(/echo verify/, { exact: false }).first()).toBeVisible()
   return { headers, surface, detailReads }
 }
+
+/** Lifecycle metadata has a real position: waking waits lead an answer;
+ * outcomes trail it, including when all of that row's tools move earlier. */
+export async function checkActivityBoundaries(page, chat, base, { outcome = false } = {}) {
+  const root = 'rt-activity-boundaries'
+  const tool = id => ({ type: 'tool', tool: 'Bash', input: `echo ${id}`, tool_use_id: id, status: 'done' })
+  const carrier = n => ({ role: 'user', hidden: true, steered: true, kind: 'delegation_result',
+    source_work_id: 'logical-goal', cid: `cut-${n}`, content: '', ts: n })
+  const wait = { id: 'boundary-wait', description: 'Check completed', status: outcome ? 'cancelled' : 'met', delivery_pending: false }
+  const messages = [
+    { role: 'user', cid: 'request', content: 'Check activity boundaries', ts: 1 },
+    { role: 'assistant', id: root, content: '', ts: 2,
+      blocks: [{ type: 'text', content: 'Independent work stays together.' }, tool('first'), tool('second')],
+      ...(!outcome && { wait_summaries: [wait] }) },
+    carrier(3),
+    { role: 'assistant', id: `${root}:assistant:1`, content: '', ts: 4,
+      blocks: [tool('third'), tool('fourth')], ...(outcome && { wait_summaries: [wait] }) },
+    carrier(5),
+    { role: 'assistant', id: `${root}:assistant:2`, content: '', ts: 6,
+      blocks: [tool('fifth'), tool('sixth')] },
+  ]
+  const runtime = runtimeSnapshot({ running: false, run_status: 'completed', runtime_revision: 10000000 })
+  await page.route(new RegExp(`/api/chats/${chat.id}(?:\\?.*)?$`), route => route.fulfill({ json: {
+    ...chat, provider: 'codex', ...testChatAgentSettings(), ...runtime, messages, total: messages.length, offset: 0,
+  } }))
+  await page.route(`**/api/chats/${chat.id}/runtime`, route => route.fulfill({ json: runtime }))
+  await page.route(`**/api/chats/${chat.id}/activity*`, route => route.fulfill({ json: { events: [], next_before: null } }))
+  await page.route(`**/api/chats/${chat.id}/stream`, route => route.fulfill({ status: 204, body: '' }))
+  await page.route(`**/api/chats/${chat.id}/messages`, route => route.abort())
+  await page.goto(`${base}/shell/?chat=${chat.id}`, { waitUntil: 'domcontentloaded' })
+  const surface = page.locator('[data-chat-surface="painted"]')
+  const headers = surface.locator('.chat__activity-header[aria-expanded]')
+  await expect(headers).toHaveCount(outcome ? 2 : 1)
+  const waitCard = surface.locator('.chat__wait-history')
+  await expect(waitCard).toHaveCount(1)
+  const firstBox = await headers.first().boundingBox()
+  const waitBox = await waitCard.boundingBox()
+  if (outcome) {
+    const lastBox = await headers.last().boundingBox()
+    expect(waitBox.y).toBeGreaterThanOrEqual(firstBox.y + firstBox.height)
+    expect(lastBox.y).toBeGreaterThanOrEqual(waitBox.y + waitBox.height)
+  } else {
+    expect(firstBox.y).toBeGreaterThanOrEqual(waitBox.y + waitBox.height)
+  }
+  // Empty source anchors must not accumulate visual gaps or obscure the rows.
+  const margins = await surface.locator('.chat__reply-rows > .chat__msg').evaluateAll(rows => rows.map(row => parseFloat(getComputedStyle(row).marginBlockStart)))
+  expect(margins.every(margin => margin >= 0)).toBe(true)
+  return { headers, surface }
+}
+
+/** Exercise both owners of the same row markup with the loaded shell CSS. */
+export async function checkActivitySpacing(page) {
+  const gaps = await page.evaluate(() => {
+    const host = document.createElement('div')
+    host.style.cssText = 'position:fixed;left:-2000px;top:0;width:600px;visibility:hidden'
+    const row = '<li class="chat__msg chat__msg--assistant"><div class="chat__assistant-copy-surface"><div class="chat__tools"><div class="chat__activity"><div class="chat__activity-header">Tool activity</div></div></div></div></li>'
+    const anchor = '<li class="chat__msg chat__msg--assistant"><div class="chat__assistant-copy-surface"></div></li>'
+    host.innerHTML = `<ul class="chat__list">${row}${row}</ul><ul class="chat__reply-rows">${row}${row}</ul><ul class="chat__reply-rows">${row}${anchor}${row}</ul>`
+    document.body.append(host)
+    try {
+      return [...host.children].map(list => {
+        const headers = [...list.querySelectorAll('.chat__activity-header')].map(element => element.getBoundingClientRect())
+        const scale = list.getBoundingClientRect().width / list.offsetWidth
+        return (headers[1].top - headers[0].bottom) / scale
+      })
+    } finally { host.remove() }
+  })
+  expect(gaps[0]).toBeCloseTo(4, 1)
+  expect(gaps[1]).toBeCloseTo(8, 1)
+  expect(gaps[2]).toBe(gaps[1])
+}
