@@ -64,17 +64,29 @@ test('all finished Goals are read-only records with an expandable plan', () => {
   }
 })
 
-test('successful Goal evidence is available on demand, not a second completion report', () => {
-  const result = 'Verified build abc123.\n\nChecked desktop and phone layouts.'
+test('completed Goals show the checklist without repeating the final reply', () => {
+  for (const result of ['The release is ready.', { summary: 'The release is ready.' }]) {
+    const summary = {
+      objective: 'Prepare the release', status: 'completed', result,
+      plan: { tasks: [{ id: 'prepare', title: 'Check the release', status: 'completed' }] },
+    }
+    const original = structuredClone(summary)
+    const html = render(h(GoalHistoryCard, { summary }))
+    assert.match(html, /Prepare the release/)
+    assert.match(html, /<summary>View details<\/summary>/)
+    assert.match(html, /Check the release/)
+    assert.doesNotMatch(html, /The release is ready|chat__goal-result|<button/)
+    assert.deepEqual(summary, original)
+  }
+})
+
+test('a completed Goal with only a result has no empty disclosure or clipped objective', () => {
   const html = render(h(GoalHistoryCard, { summary: {
-    objective: 'Prepare the release', status: 'completed', result,
+    objective: 'Prepare the release', status: 'completed', result: 'The release is ready.',
   } }))
-  const [visible, details] = html.split('<details')
-  assert.match(visible, /Prepare the release/)
-  assert.doesNotMatch(visible, /abc123|Checked desktop/)
-  assert.match(details, /<summary>View details<\/summary>/)
-  assert.match(details, /Verified build abc123\.\n\nChecked desktop and phone layouts\./)
-  assert.doesNotMatch(html, /<button|<details[^>]*open/)
+  assert.match(html, /Prepare the release/)
+  assert.match(html, /Completed/)
+  assert.doesNotMatch(html, /The release is ready|<details|objective--preview/)
 })
 
 test('cancellation and unsuccessful Goal reasons remain visible without opening details', () => {

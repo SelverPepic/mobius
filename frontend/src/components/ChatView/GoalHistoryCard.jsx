@@ -7,7 +7,7 @@ import { goalHistoryViewModel } from './goalHistory.js'
 export default function GoalHistoryCard({ summary }) {
   const view = goalHistoryViewModel(summary)
   if (!view) return null
-  const hasDetails = view.hasPlan || (view.completed && !!view.reason)
+  const hasDetails = view.hasPlan
 
   return (
     <aside
@@ -25,7 +25,7 @@ export default function GoalHistoryCard({ summary }) {
         {hasDetails && (
           <details className="chat__goal-history-details">
             <summary>View details</summary>
-            <GoalPlanDetails plan={summary.plan} result={view.completed ? summary.result : null} />
+            <GoalPlanDetails plan={summary.plan} />
           </details>
         )}
       </div>
