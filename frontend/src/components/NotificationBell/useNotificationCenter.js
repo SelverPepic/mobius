@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from '../../api/client.js'
 import { notificationQueries } from '../../hooks/queries.js'
+import useSessionNotices from './useSessionNotices.js'
 
 // Owns the small amount of state behind the shell notification preview. Keeping
 // this out of Shell is deliberate: notifications can grow into an app later
@@ -13,9 +14,18 @@ export default function useNotificationCenter(queryClient) {
   openRef.current = open
 
   const unreadQuery = notificationQueries.unreadCount.useQuery()
-  const unreadCount = unreadQuery.data ?? 0
+  const serverUnreadCount = unreadQuery.data ?? 0
   const newQuery = notificationQueries.newCount.useQuery()
-  const newCount = newQuery.data ?? 0
+  const session = useSessionNotices()
+  const {
+    rows: sessionNotices, addNotice, acknowledge: acknowledgeSession,
+    markRead: readSession, dismiss: dismissSession, clearAll: clearSession,
+    runAction: runNoticeAction,
+  } = session
+  const unreadCount = serverUnreadCount + session.unreadCount
+  const newCount = (newQuery.data ?? 0) + session.newCount
+
+  useEffect(() => { acknowledgeSession(open) }, [acknowledgeSession, open])
 
   const acknowledgeNew = useCallback(async () => {
     await queryClient.cancelQueries({ queryKey: notificationQueries.newCount.key })
@@ -29,37 +39,47 @@ export default function useNotificationCenter(queryClient) {
 
   const markAllRead = useCallback(async () => {
     await api.notifications.readAll()
+    readSession()
     await Promise.all([
       notificationQueries.list.invalidate(queryClient),
       notificationQueries.unreadCount.invalidate(queryClient),
       notificationQueries.newCount.invalidate(queryClient),
     ])
-  }, [queryClient])
+  }, [queryClient, readSession])
 
   const markRead = useCallback(async (notificationId) => {
+    if (sessionNotices.some(row => row.id === notificationId)) {
+      readSession(notificationId)
+      return
+    }
     await api.notifications.read(notificationId)
     await Promise.all([
       notificationQueries.list.invalidate(queryClient),
       notificationQueries.unreadCount.invalidate(queryClient),
       notificationQueries.newCount.invalidate(queryClient),
     ])
-  }, [queryClient])
+  }, [queryClient, readSession, sessionNotices])
 
   const clearAll = useCallback(async () => {
     await api.notifications.clearAll()
+    clearSession()
     await Promise.all([
       queryClient.resetQueries({ queryKey: notificationQueries.list.key }),
       notificationQueries.unreadCount.invalidate(queryClient),
       notificationQueries.newCount.invalidate(queryClient),
     ])
-  }, [queryClient])
+  }, [clearSession, queryClient])
 
   const dismiss = useCallback(async (notificationId) => {
+    if (sessionNotices.some(row => row.id === notificationId)) {
+      dismissSession(notificationId)
+      return
+    }
     await api.notifications.dismiss(notificationId)
     await queryClient.resetQueries({ queryKey: notificationQueries.list.key })
     notificationQueries.unreadCount.invalidate(queryClient)
     notificationQueries.newCount.invalidate(queryClient)
-  }, [queryClient])
+  }, [dismissSession, queryClient, sessionNotices])
 
   useEffect(() => {
     if (!open) return undefined
@@ -97,8 +117,8 @@ export default function useNotificationCenter(queryClient) {
   }, [acknowledgeNew, queryClient])
 
   return {
-    state: { open, unreadCount, newCount },
-    actions: { toggle, close, clearAll, dismiss, markRead, markAllRead, reconcile, onCreated },
+    state: { open, unreadCount, newCount, sessionNotices, announcement: session.announcement },
+    actions: { toggle, close, clearAll, dismiss, markRead, markAllRead, reconcile, onCreated, addNotice, runNoticeAction },
     meta: { rootRef, bellRef },
   }
 }
