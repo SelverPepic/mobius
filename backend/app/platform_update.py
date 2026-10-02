@@ -1000,14 +1000,17 @@ def _checkout_transition(repo: Path, before: str, target: str, *, dry_run: bool 
   _git("read-tree", *(["-n"] if dry_run else []), "-m", "-u", before, target, repo=repo)
 
 
-def _preserve_checkout_state(repo: Path, current: str, restoring: str) -> tuple[str | None, str]:
+def _preserve_checkout_state(
+  repo: Path, current: str, restoring: str, *, force_paths: list[str] | None = None,
+) -> tuple[str | None, str]:
   """Keep worktree bytes and every staged blob in existing recovery refs.
 
   Conflict stages cannot be written as one ordinary Git tree. A recovery
   tree names their original stages and retains the raw index for exact repair;
   naming each blob also keeps it reachable through Git garbage collection.
+  Callers removing a whole worktree include every ignored path they displace.
   """
-  ignored = _ignored_checkout_obstructions(repo, restoring)
+  ignored = sorted(set(_ignored_checkout_obstructions(repo, restoring)) | set(force_paths or []))
   working = _working_tree_oid(repo, current, force_paths=ignored)
   work_ref = None
   if working != _commit_tree_oid(repo, current):
@@ -3834,22 +3837,19 @@ def _set_aside_unsaved_update_work(
   return [_keep_set_aside(repo, commit)]
 
 
-def _set_aside_resolver_work(repo: Path) -> str | None:
-  """Keep a resolver's in-progress answer to a late-edit conflict (its whole
-  working tree) under the set-aside refs before its merge is dropped."""
+def _set_aside_resolver_work(repo: Path) -> None:
+  """Preserve the complete resolver checkout before removing its worktree."""
   worktree = Path(str(
     ((_read_conflict_flag() or {}).get("overlay") or {}).get("worktree")
     or _overlay_candidate_path(repo)
   ))
   head = _rev(worktree, "HEAD") if (worktree / ".git").exists() else ""
   if not head:
-    return None
-  tree = _working_tree_oid(worktree, head)
-  commit = app_git._run(
-    repo, "commit-tree", tree, "-p", head, "-m",
-    "platform: late-edit resolution set aside when an update's image was not kept",
-  ).stdout.strip()
-  return _keep_set_aside(repo, commit)
+    return  # A resumed revert may already have removed the journaled worktree.
+  # Removal displaces all ignored files, not just target checkout obstructions.
+  ignored = _git("ls-files", "--others", "--ignored", "--exclude-standard", "-z",
+                 repo=worktree).stdout.split("\0")
+  _preserve_checkout_state(worktree, head, head, force_paths=[path for path in ignored if path])
 
 
 def _keep_set_aside(repo: Path, commit: str) -> str:

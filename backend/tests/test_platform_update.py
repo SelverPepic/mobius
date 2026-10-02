@@ -7378,3 +7378,101 @@ def test_platform_status_recovery_details_are_additive_to_existing_response_cont
   with_details = {**existing_response, "recovery_refs": ["refs/mobius/set-aside/synthetic-recovery"]}
   assert adapter.validate_python(with_details)["recovery_refs"] == with_details["recovery_refs"]
   assert "recovery_refs" not in adapter.json_schema().get("required", [])
+
+
+@pytest.mark.parametrize("index_kind", ["cached_only", "skip_worktree", "assume_unchanged", "intent_to_add"])
+@pytest.mark.parametrize("death", [None, "snapshot", "removal"])
+def test_image_revert_keeps_all_displaced_resolver_inputs_after_gc_and_death(
+  clone_env, monkeypatch, index_kind, death,
+):
+  """Removing a resolver displaces its index and ignored files, not just source."""
+  origin, platform = clone_env
+  record, resolver = _bound_late_conflict(platform, origin, uncommitted=False)
+  original = (resolver / "backend/app/foo.py").read_text()
+  staged = "VALUE = 'cached-only resolver owner input'\n"
+  if index_kind == "intent_to_add":
+    (resolver / "unfinished.txt").write_text("resolver intent to add\n")
+    _git(resolver, "add", "-N", "unfinished.txt")
+    stage_path = "unfinished.txt"
+  else:
+    (resolver / "backend/app/foo.py").write_text(staged)
+    _git(resolver, "add", "backend/app/foo.py")
+    (resolver / "backend/app/foo.py").write_text(original)
+    stage_path = "backend/app/foo.py"
+    if index_kind != "cached_only":
+      _git(resolver, "update-index", "--" + index_kind.replace("_", "-"), stage_path)
+  blob = _git(resolver, "rev-parse", ":" + stage_path).stdout.strip()
+  raw_path = _git(resolver, "rev-parse", "--git-path", "index").stdout.strip()
+  raw_index = _git(resolver, "hash-object", raw_path).stdout.strip()
+  # The original resolver conflict stages are also owner inputs to recovery.
+  stages = _git(resolver, "ls-files", "--stage", "backend/requirements.lock").stdout.splitlines()
+  assert {entry.split("\t", 1)[0].split()[2] for entry in stages} >= {"2", "3"}
+  (platform / ".git/info/exclude").write_text("resolver-only.bin\n")
+  ignored_bytes = b"resolver ignored owner bytes\x00\xff\n"
+  (resolver / "resolver-only.bin").write_bytes(ignored_bytes)
+  assert _git(resolver, "check-ignore", "resolver-only.bin").returncode == 0
+  if death == "snapshot":
+    _kill_once(monkeypatch, "_set_aside_resolver_work", after=True)
+  elif death == "removal":
+    remove = app_git.remove_overlay_worktree
+    killed = False
+
+    def killed_after_removal(*args, **kwargs):
+      nonlocal killed
+      remove(*args, **kwargs)
+      if not killed:
+        killed = True
+        raise _Killed("resolver removed")
+
+    monkeypatch.setattr(app_git, "remove_overlay_worktree", killed_after_removal)
+  _boot_image(record["snapshot"])
+  if death:
+    with pytest.raises(_Killed):
+      pu.settle_prepared_update_for_this_image(platform)
+    assert pu.RECONCILE_PRE_FLAG.exists()
+  assert pu.settle_prepared_update_for_this_image(platform) == "reverted"
+  assert not resolver.exists()
+  refs = pu.platform_status(platform)["recovery_refs"]
+  receipt = pu.platform_status(platform)["rollback_error"]
+  assert refs and all(ref in receipt for ref in refs)
+  _git(platform, "reflog", "expire", "--expire=now", "--all")
+  _git(platform, "gc", "--prune=now")
+  saved_indexes = [ref for ref in refs if _git(
+    platform, "rev-parse", ref + ":original-index", check=False,
+  ).stdout.strip() == raw_index]
+  assert saved_indexes, "resolver removal needs an exact reported, GC-reachable index copy"
+  assert _git(platform, "cat-file", "-e", blob, check=False).returncode == 0
+  for ref in saved_indexes:
+    assert _git(platform, "rev-parse", ref + ":stage-0/" + stage_path).stdout.strip() == blob
+    for entry in stages:
+      metadata, path = entry.split("\t", 1)
+      _mode, oid, stage = metadata.split()
+      assert _git(platform, "rev-parse", f"{ref}:stage-{stage}/{path}").stdout.strip() == oid
+  assert any(subprocess.run(
+    ["git", "-C", str(platform), "show", ref + ":resolver-only.bin"], capture_output=True,
+  ).stdout == ignored_bytes for ref in refs), "ignored resolver owner bytes must survive deletion"
+  assert pu.read_prepared_update()["state"] == "prepared"
+  assert not pu.RECONCILE_PRE_FLAG.exists()
+
+
+def test_failed_resolver_preservation_leaves_its_worktree_and_index_intact(clone_env, monkeypatch):
+  origin, platform = clone_env
+  record, resolver = _bound_late_conflict(platform, origin, uncommitted=False)
+  raw_index = Path(_git(resolver, "rev-parse", "--git-path", "index").stdout.strip()).read_bytes()
+  working = (resolver / "backend/requirements.lock").read_bytes()
+  preserve = pu._preserve_checkout_state
+
+  def refuse_resolver(repo, *args, **kwargs):
+    if repo == resolver:
+      raise pu.PlatformUpdateError("resolver preservation unavailable")
+    return preserve(repo, *args, **kwargs)
+
+  monkeypatch.setattr(pu, "_preserve_checkout_state", refuse_resolver)
+  _boot_image(record["snapshot"])
+  with pytest.raises(pu.PlatformUpdateError, match="resolver preservation unavailable"):
+    pu.settle_prepared_update_for_this_image(platform)
+  assert resolver.exists()
+  assert Path(_git(resolver, "rev-parse", "--git-path", "index").stdout.strip()).read_bytes() == raw_index
+  assert (resolver / "backend/requirements.lock").read_bytes() == working
+  assert pu.RECONCILE_PRE_FLAG.exists()
+  assert pu._read_conflict_flag()["overlay"]["worktree"] == str(resolver)
