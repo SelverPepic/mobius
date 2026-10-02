@@ -4022,16 +4022,22 @@ def _park_exit(
     return {"parked": False}
   if (
     (runner_result or {}).get("api_error_status") == 413
+    or (runner_result or {}).get("context_window_exceeded") is True
     or any(marker in (error_text or "").lower() for marker in (
       "request body is too large", "request body too large",
       "request entity too large", "payload too large",
     ))
   ):
+    size_message = (
+      "This conversation exceeds the model's context window."
+      if (runner_result or {}).get("context_window_exceeded") is True
+      else "This request is too large to send."
+    )
     sink.publish({
       "type": "error",
       "message": (
         f"{error_text or 'The provider rejected an oversized request.'}\n\n"
-        "This request is too large to send. Compact the conversation or "
+        f"{size_message} Compact the conversation or "
         "reduce its attachments, or continue in a new chat using your saved "
         "files. Retrying it unchanged will not help."
       ),

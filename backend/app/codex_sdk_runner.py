@@ -69,6 +69,7 @@ from app.codex_events import (
   _codex_user_error,
   _agent_message_phase,
   _codex_terminal_error,
+  _codex_size_failure,
   # Compatibility import for existing internal callers; implementation lives
   # beside the Codex event/observability code it supports.
   _skill_names_in_command,
@@ -2238,6 +2239,14 @@ async def _run_codex_sdk_turn(
               message or "Codex error",
             )
             continue
+          size_failure = _codex_size_failure(payload.error)
+          if size_failure:
+            return with_usage({
+              "session_id": current_session_id,
+              "cost_usd": None,
+              "error": str(message or "The provider rejected the request size."),
+              **size_failure,
+            })
           # When a preceding AccountRateLimitsUpdatedNotification told us a quota
           # window actually reached its cap, surface a STRUCTURED limit terminal
           # rather than raising: api_error_status=429 lets chat._is_limit_terminal
@@ -2270,6 +2279,8 @@ async def _run_codex_sdk_turn(
       })
       if terminal_status is not None:
         result["terminal_status"] = terminal_status
+      if error_text:
+        result.update(_codex_size_failure(getattr(completed_turn, "error", None)))
       if final_message_phase is not None:
         result["final_message_phase"] = final_message_phase
       # Carry any reset the SDK reported this turn, so a limit surfaced in the
