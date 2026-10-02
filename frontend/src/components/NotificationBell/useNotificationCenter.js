@@ -14,18 +14,10 @@ export default function useNotificationCenter(queryClient) {
   openRef.current = open
 
   const unreadQuery = notificationQueries.unreadCount.useQuery()
-  const serverUnreadCount = unreadQuery.data ?? 0
   const newQuery = notificationQueries.newCount.useQuery()
-  const session = useSessionNotices()
-  const {
-    rows: sessionNotices, addNotice, acknowledge: acknowledgeSession,
-    markRead: readSession, dismiss: dismissSession, clearAll: clearSession,
-    runAction: runNoticeAction,
-  } = session
-  const unreadCount = serverUnreadCount + session.unreadCount
+  const session = useSessionNotices(open)
+  const unreadCount = (unreadQuery.data ?? 0) + session.unreadCount
   const newCount = (newQuery.data ?? 0) + session.newCount
-
-  useEffect(() => { acknowledgeSession(open) }, [acknowledgeSession, open])
 
   const acknowledgeNew = useCallback(async () => {
     await queryClient.cancelQueries({ queryKey: notificationQueries.newCount.key })
@@ -39,17 +31,17 @@ export default function useNotificationCenter(queryClient) {
 
   const markAllRead = useCallback(async () => {
     await api.notifications.readAll()
-    readSession()
+    session.markRead()
     await Promise.all([
       notificationQueries.list.invalidate(queryClient),
       notificationQueries.unreadCount.invalidate(queryClient),
       notificationQueries.newCount.invalidate(queryClient),
     ])
-  }, [queryClient, readSession])
+  }, [queryClient, session.markRead])
 
   const markRead = useCallback(async (notificationId) => {
-    if (sessionNotices.some(row => row.id === notificationId)) {
-      readSession(notificationId)
+    if (session.rows.some(row => row.id === notificationId)) {
+      session.markRead(notificationId)
       return
     }
     await api.notifications.read(notificationId)
@@ -58,28 +50,28 @@ export default function useNotificationCenter(queryClient) {
       notificationQueries.unreadCount.invalidate(queryClient),
       notificationQueries.newCount.invalidate(queryClient),
     ])
-  }, [queryClient, readSession, sessionNotices])
+  }, [queryClient, session.markRead, session.rows])
 
   const clearAll = useCallback(async () => {
     await api.notifications.clearAll()
-    clearSession()
+    session.clearAll()
     await Promise.all([
       queryClient.resetQueries({ queryKey: notificationQueries.list.key }),
       notificationQueries.unreadCount.invalidate(queryClient),
       notificationQueries.newCount.invalidate(queryClient),
     ])
-  }, [clearSession, queryClient])
+  }, [session.clearAll, queryClient])
 
   const dismiss = useCallback(async (notificationId) => {
-    if (sessionNotices.some(row => row.id === notificationId)) {
-      dismissSession(notificationId)
+    if (session.rows.some(row => row.id === notificationId)) {
+      session.dismiss(notificationId)
       return
     }
     await api.notifications.dismiss(notificationId)
     await queryClient.resetQueries({ queryKey: notificationQueries.list.key })
     notificationQueries.unreadCount.invalidate(queryClient)
     notificationQueries.newCount.invalidate(queryClient)
-  }, [dismissSession, queryClient, sessionNotices])
+  }, [session.dismiss, queryClient, session.rows])
 
   useEffect(() => {
     if (!open) return undefined
@@ -117,8 +109,8 @@ export default function useNotificationCenter(queryClient) {
   }, [acknowledgeNew, queryClient])
 
   return {
-    state: { open, unreadCount, newCount, sessionNotices, announcement: session.announcement },
-    actions: { toggle, close, clearAll, dismiss, markRead, markAllRead, reconcile, onCreated, addNotice, runNoticeAction },
+    state: { open, unreadCount, newCount, sessionNotices: session.rows, announcement: session.announcement },
+    actions: { toggle, close, clearAll, dismiss, markRead, markAllRead, reconcile, onCreated, addNotice: session.addNotice, runNoticeAction: session.runAction },
     meta: { rootRef, bellRef },
   }
 }

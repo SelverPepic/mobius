@@ -1,7 +1,7 @@
 /* Session feedback joins the notification feed without timers or remote pushes. */
-import { useCallback, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
-export function addSessionNotice(rows, notice) {
+function addSessionNotice(rows, notice) {
   return [notice, ...rows.map(row => (
     notice.noticeKey && row.noticeKey === notice.noticeKey && row.sessionAction
       ? { ...row, sessionAction: null, actionStatus: 'Superseded by a newer action' }
@@ -9,18 +9,19 @@ export function addSessionNotice(rows, notice) {
   ))]
 }
 
-export function sessionNoticeCounts(rows) {
+function sessionNoticeCounts(rows) {
   return {
     unreadCount: rows.filter(row => !row.read_at).length,
     newCount: rows.filter(row => !row.seen_at).length,
   }
 }
 
-export default function useSessionNotices() {
+export default function useSessionNotices(open = false) {
   const [rows, setRows] = useState([])
   const [announcement, setAnnouncement] = useState(null)
   const sequenceRef = useRef(0)
-  const openRef = useRef(false)
+  const openRef = useRef(open)
+  openRef.current = open
   const workingRef = useRef(new Set())
   const rowsRef = useRef(rows)
   rowsRef.current = rows
@@ -43,12 +44,13 @@ export default function useSessionNotices() {
     setAnnouncement({ id: notice.id, title: message })
   }, [])
 
-  const acknowledge = useCallback((open) => {
-    openRef.current = open
-    if (open) setRows(current => current.map(row => (
-      row.seen_at ? row : { ...row, seen_at: new Date().toISOString() }
+  useEffect(() => {
+    if (!open) return
+    const timestamp = new Date().toISOString()
+    setRows(current => current.map(row => (
+      row.seen_at ? row : { ...row, seen_at: timestamp }
     )))
-  }, [])
+  }, [open])
 
   const markRead = useCallback((id) => {
     const timestamp = new Date().toISOString()
@@ -87,5 +89,5 @@ export default function useSessionNotices() {
     }
   }, [])
 
-  return { rows, announcement, ...sessionNoticeCounts(rows), addNotice, acknowledge, markRead, dismiss, clearAll, runAction }
+  return { rows, announcement, ...sessionNoticeCounts(rows), addNotice, markRead, dismiss, clearAll, runAction }
 }

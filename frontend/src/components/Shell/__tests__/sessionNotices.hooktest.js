@@ -19,15 +19,15 @@ test('repeated feedback keeps distinct rows and arrivals without replacing an ea
 })
 
 test('opening acknowledges arrivals without marking them read; open-panel arrivals are already seen', () => {
-  const { result } = renderHook(useSessionNotices)
+  const { result, rerender } = renderHook(useSessionNotices)
   result.current.addNotice('Chat archived')
-  result.current.acknowledge(true)
+  rerender(true)
   result.current.addNotice('Chat restored')
   assert.equal(result.current.newCount, 0)
   assert.equal(result.current.unreadCount, 2)
   result.current.markRead(result.current.rows[0].id)
   assert.equal(result.current.unreadCount, 1)
-  result.current.acknowledge(false)
+  rerender(false)
   result.current.addNotice('Another notice')
   assert.equal(result.current.newCount, 1)
   result.current.markRead()
@@ -99,5 +99,34 @@ test('offline feedback can be dismissed without a request; history merges chrono
   assert.deepEqual(rows.map(row => row.id), [id, 'stored'])
   assert.equal(history.length, 1)
   result.current.dismiss(id)
+  assert.equal(result.current.rows.length, 0)
+})
+
+test('notice delivery stays stable across panel changes and initially open panels acknowledge arrivals', () => {
+  const { result, rerender } = renderHook(useSessionNotices, true)
+  const deliver = result.current.addNotice
+  deliver('Chat archived')
+  assert.equal(result.current.newCount, 0)
+  assert.equal(result.current.unreadCount, 1)
+  rerender(false)
+  assert.equal(result.current.addNotice, deliver)
+  deliver('Chat restored')
+  assert.equal(result.current.newCount, 1)
+  rerender(true)
+  assert.equal(result.current.addNotice, deliver)
+  assert.equal(result.current.newCount, 0)
+  assert.equal(result.current.unreadCount, 2)
+})
+
+test('dismissing a pending Undo never resurrects its row when the action settles', async () => {
+  const { result } = renderHook(useSessionNotices)
+  let finish
+  const pending = new Promise(resolve => { finish = resolve })
+  result.current.addNotice('Chat archived', { action: { label: 'Undo', onAction: () => pending } })
+  const id = result.current.rows[0].id
+  const action = result.current.runAction(id)
+  result.current.dismiss(id)
+  finish(true)
+  await action
   assert.equal(result.current.rows.length, 0)
 })
