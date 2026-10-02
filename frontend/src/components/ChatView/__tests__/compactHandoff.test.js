@@ -58,10 +58,41 @@ test('all finished Goals are read-only records with an expandable plan', () => {
       plan: { tasks: [{ id: 'check', title: 'Check release', status: 'completed' }] } }
     const html = render(h(GoalHistoryCard, { summary }))
     assert.match(html, /Verify release/)
-    assert.match(html, /View plan/)
+    assert.match(html, /View details/)
     assert.match(html, /Check release/)
     assert.doesNotMatch(html, /<button|Clear|Abandon|Continue this work/)
   }
+})
+
+test('successful Goal evidence is available on demand, not a second completion report', () => {
+  const result = 'Verified build abc123.\n\nChecked desktop and phone layouts.'
+  const html = render(h(GoalHistoryCard, { summary: {
+    objective: 'Prepare the release', status: 'completed', result,
+  } }))
+  const [visible, details] = html.split('<details')
+  assert.match(visible, /Prepare the release/)
+  assert.doesNotMatch(visible, /abc123|Checked desktop/)
+  assert.match(details, /<summary>View details<\/summary>/)
+  assert.match(details, /Verified build abc123\.\n\nChecked desktop and phone layouts\./)
+  assert.doesNotMatch(html, /<button|<details[^>]*open/)
+})
+
+test('cancellation and unsuccessful Goal reasons remain visible without opening details', () => {
+  for (const status of ['cannot_complete', 'cancelled', 'failed']) {
+    const html = render(h(GoalHistoryCard, { summary: {
+      objective: 'Prepare the release', status, result: { reason: 'The required account is unavailable.' },
+      plan: { tasks: [{ id: 'prepare', title: 'Prepare', status: 'cancelled' }] },
+    } }))
+    const [visible, details] = html.split('<details')
+    assert.match(visible, /The required account is unavailable\./)
+    assert.doesNotMatch(details, /The required account is unavailable\./)
+  }
+})
+
+test('legacy receipt without a result or plan keeps the complete objective accessible', () => {
+  const html = render(h(GoalHistoryCard, { summary: { objective: 'Prepare the release', status: 'completed' } }))
+  assert.match(html, /Prepare the release/)
+  assert.doesNotMatch(html, /objective--preview|<details/)
 })
 
 test('collapsed cancellable Wait exposes Stop while blocked delivery reveals its existing recovery', () => {

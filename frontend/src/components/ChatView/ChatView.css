@@ -4269,7 +4269,7 @@
     align-self: flex-start;
   }
 }
-.chat__goal-result { margin: 0 10px 8px; color: var(--text); font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
+.chat__goal-result { margin: 0 10px 8px; color: var(--text); font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; white-space: pre-wrap; }
 
 .chat__goal-plan {
   flex: 1 0 100%;
@@ -4304,7 +4304,7 @@
 
 .chat__goal-history--failed { --lifecycle-tone: var(--danger); }
 .chat__goal-history--cancelled { --lifecycle-tone: var(--muted); }
-.chat__goal-history-reason { color: var(--text); font-size: 12px; line-height: 1.4; }
+.chat__goal-history-reason { color: var(--text); font-size: 12px; line-height: 1.4; white-space: pre-wrap; }
 .chat__wait-history { --lifecycle-tone: var(--accent); }
 .chat__wait-history--attention { --lifecycle-tone: var(--warning, #d8922f); }
 .chat__wait-history--stopped { --lifecycle-tone: var(--muted); }
@@ -4366,6 +4366,18 @@
 .chat__goal-history-meta {
   color: var(--muted);
   font-size: 11px;
+}
+
+/* Keep the receipt scannable without shortening or rewriting its saved Goal. */
+.chat__goal-history-objective--preview {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+}
+
+.chat__goal-history-copy:has(> .chat__goal-history-details[open]) > .chat__goal-history-objective {
+  display: block;
 }
 
 .chat__goal-history-details { margin-top: 5px; }

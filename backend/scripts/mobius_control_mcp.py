@@ -1539,7 +1539,7 @@ _TOOL_DEFINITIONS = {
       "properties": {
         "objective": {
           "type": "string",
-          "description": "Concise outcome and observable completion condition.",
+          "description": "Short, plain-language outcome shown to the owner. Put the route and verification criteria in tasks, not this heading.",
         },
         "tasks": {
           **_GOAL_TASKS_SCHEMA,
@@ -1560,7 +1560,7 @@ _TOOL_DEFINITIONS = {
         "next_action": {"type": "string", "maxLength": 2000, "description": "Next step for unfinished work. Do not combine with complete."},
         "complete": {
           "type": "string", "maxLength": 4000,
-          "description": "Verified evidence that the whole outcome holds. Do not combine with next_action; final task edits may share this call.",
+          "description": "Brief, user-readable result after verifying the whole outcome. Put technical evidence in task results or the chat checkpoint, not this message. Do not combine with next_action; final task edits may share this call.",
         },
         "cannot_complete": {
           "type": "object", "additionalProperties": False,

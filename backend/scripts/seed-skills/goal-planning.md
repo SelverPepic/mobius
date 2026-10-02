@@ -31,6 +31,22 @@ tool call returns a failure:
 python3 /data/platform/backend/scripts/mobius_control_mcp.py call promote_goal --args-json '{"objective":"Outcome and completion condition"}'
 ```
 
+### Write Goal text for the owner
+
+The objective is a visible heading, not an execution brief. Use one short,
+plain-language outcome: “Restore clear Goal handoffs”, not a list of building,
+testing, activation and contribution steps. Put those steps and their
+completion conditions in the checklist; keep the full requested outcome.
+
+Completion text is a short result the owner can understand, for example
+“The Goal panel is restored and the pull request is ready for review.”
+Verify before completing, but keep commit hashes, test logs, internal paths
+and implementation evidence in task results or the chat checkpoint, not the
+completion message. State consequential limitations or next actions in the
+normal visible reply as well; do not leave them only inside record details.
+Use normal sentences, spaces and paragraph breaks; never compress words
+around numbers to save tokens. Existing records are not silently rewritten.
+
 ## Plan and work
 
 Pass the plan to `promote_goal` as `tasks`, or send it later with
@@ -86,7 +102,7 @@ refresh context, select the next task, or ask the owner to discover Unpause.
   conceal a crash, claim completion, or decide on the owner's behalf to stop.
 - **Completed:** verify the original promised outcome. Update obsolete internal
   steps explicitly with a reason, without cancelling unmet requirements to
-  fake success. Call `update_goal` with `complete: 'Verified evidence'`, plus
+  fake success. Call `update_goal` with `complete: 'Brief user-readable result'`, plus
   final `tasks` edits and `finished_claims` for exact actions performed.
 - **Cannot complete:** when the original outcome is genuinely unreachable,
   explain the obstacle, what you tried, partial results and what is missing.

@@ -13,6 +13,17 @@ import pytest
 from app import platform_tools
 
 
+def test_goal_copy_guidance_separates_owner_text_from_verification_evidence():
+  control = _control_module()
+  objective = control._TOOL_DEFINITIONS['promote_goal']['inputSchema']['properties']['objective']
+  complete = control._TOOL_DEFINITIONS['update_goal']['inputSchema']['properties']['complete']
+  assert 'plain-language outcome shown to the owner' in objective['description']
+  assert 'verification criteria in tasks' in objective['description']
+  assert 'user-readable result after verifying the whole outcome' in complete['description']
+  assert 'technical evidence in task results or the chat checkpoint' in complete['description']
+  assert complete['maxLength'] == 4000  # Guidance, not a new truncation or validation rule.
+
+
 @pytest.mark.parametrize("top_level,coordination", [(True, True), (True, False), (False, True)])
 def test_helpers_are_builtin_without_subagents_app(monkeypatch, top_level, coordination):
   monkeypatch.delenv("MOBIUS_SUBAGENT_HELPER", raising=False)
