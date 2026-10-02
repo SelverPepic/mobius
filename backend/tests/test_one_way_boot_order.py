@@ -57,6 +57,8 @@ def test_active_step_cannot_defer_missing_new_column(tmp_path, monkeypatch):
     conn.execute("CREATE TABLE chats(id TEXT PRIMARY KEY, messages JSON NOT NULL)")
     conn.execute("CREATE TABLE platform_upgrades(level INTEGER PRIMARY KEY, state TEXT)")
     conn.execute("INSERT INTO platform_upgrades VALUES(1, 'active')")
+    conn.execute("CREATE TABLE chat_messages(chat_id TEXT, seq INTEGER)")
+    conn.execute("CREATE TABLE chat_transcript_state(chat_id TEXT, message_count INTEGER)")
   _stub_init(monkeypatch, engine, ["chats.messages_v1"])
 
   result = main_module._init_db()
@@ -95,3 +97,42 @@ def test_gate_rechecks_schema_after_activation_before_writer(monkeypatch):
   assert calls == ["gate"]
   assert exc.value.database_failure_reason == "schema_mismatch"
   assert dict(exc.value.database_failure_detail)["schema_gaps"] == ("chats.messages_v1",)
+
+
+@pytest.mark.parametrize("missing", ["chat_messages", "chat_transcript_state"])
+@pytest.mark.parametrize("ledger_present", [True, False])
+def test_active_authority_missing_refuses_before_create_all(
+  tmp_path, monkeypatch, missing, ledger_present,
+):
+  path, engine = _engine(tmp_path, "partial-restore.db")
+  with sqlite3.connect(path) as conn:
+    conn.execute("CREATE TABLE chats(id TEXT PRIMARY KEY, messages_v1 JSON NOT NULL)")
+    conn.execute("CREATE TABLE chat_messages(chat_id TEXT, seq INTEGER, body JSON)")
+    conn.execute("INSERT INTO chat_messages VALUES('chat', 0, '{\"content\":\"preserved\"}')")
+    conn.execute("CREATE TABLE chat_transcript_state(chat_id TEXT, message_count INTEGER)")
+    conn.execute("INSERT INTO chat_transcript_state VALUES('chat', 1)")
+    conn.execute("CREATE TABLE platform_compat(id INTEGER PRIMARY KEY, floor INTEGER)")
+    conn.execute("INSERT INTO platform_compat VALUES(1, 1)")
+    if ledger_present:
+      conn.execute("CREATE TABLE platform_upgrades(level INTEGER PRIMARY KEY, state TEXT)")
+      conn.execute("INSERT INTO platform_upgrades VALUES(1, 'active')")
+    conn.execute(f"DROP TABLE {missing}")
+  monkeypatch.setattr(main_module, "engine", engine)
+
+  def forbidden(*_args, **_kwargs):
+    pytest.fail("A partial restore must be refused before any schema write")
+
+  monkeypatch.setattr(main_module.Base.metadata, "create_all", forbidden)
+  monkeypatch.setattr(main_module, "run_migrations", forbidden)
+  before = path.read_bytes()
+
+  result = main_module._init_db()
+
+  assert not result.serviceable
+  assert result.failure_reason == "upgrade_authority_missing"
+  assert dict(result.failure_detail)["missing_tables"] == (missing,)
+  assert path.read_bytes() == before
+  with sqlite3.connect(path) as conn:
+    assert missing not in {row[0] for row in conn.execute(
+      "SELECT name FROM sqlite_master WHERE type='table'"
+    )}

@@ -53,6 +53,7 @@ class Preflight:
   existing_tables: frozenset[str]
   # "absent" (no floor table yet), "present", or "missing_row" (damaged).
   floor_record: str = "absent"
+  missing_authority: tuple[str, ...] = ()
 
 
 def _valid_level(value: object, name: str) -> int:
@@ -94,7 +95,14 @@ def preflight(engine) -> Preflight:
       if top is not None:
         floor = max(floor, _valid_level(top, "platform_upgrades.level"))
     conn.rollback()
-  return Preflight(floor=floor, existing_tables=tables, floor_record=record)
+  missing = tuple(sorted({
+    table for step in registered_steps() if step.level <= floor
+    for table in step.authoritative_tables if table not in tables
+  }))
+  return Preflight(
+    floor=floor, existing_tables=tables, floor_record=record,
+    missing_authority=missing,
+  )
 
 
 def boot_refusal(seen: Preflight) -> tuple[str, tuple[tuple[str, object], ...]] | None:
@@ -109,7 +117,15 @@ def boot_refusal(seen: Preflight) -> tuple[str, tuple[tuple[str, object], ...]] 
       ),
     )
   detail = floor_refusal(seen.floor)
-  return None if detail is None else ("below_compatibility_floor", detail)
+  if detail is not None:
+    return "below_compatibility_floor", detail
+  if seen.missing_authority:
+    return "upgrade_authority_missing", (
+      ("message", "This upgraded database is missing authoritative tables. "
+       "Restore a complete database through Recovery. Nothing was changed."),
+      ("missing_tables", seen.missing_authority),
+    )
+  return None
 
 
 def ensure_compat_record(database_path: str, seen: Preflight) -> None:
@@ -235,6 +251,9 @@ class OneWayStep:
   unit_key: str = "id"
   # The step's own new-form tables and the column holding the unit key.
   owned_tables: tuple[tuple[str, str], ...] = ()
+  # Once activated, these are authority, not rebuildable derived indexes.
+  # Check their original presence before create_all can hide a partial restore.
+  authoritative_tables: tuple[str, ...] = ()
 
   def legacy_present(self, conn: sqlite3.Connection) -> bool:
     raise NotImplementedError

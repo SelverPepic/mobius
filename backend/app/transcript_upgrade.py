@@ -18,6 +18,7 @@ class TranscriptStep(OneWayStep):
   name = "transcript_rows"
   unit_table = "chats"
   unit_key = "id"
+  authoritative_tables = ("chat_messages", "chat_transcript_state")
   owned_tables = (
     ("chat_messages", "chat_id"),
     ("chat_transcript_state", "chat_id"),
