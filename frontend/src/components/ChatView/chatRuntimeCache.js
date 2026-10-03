@@ -56,10 +56,6 @@ export function classifyChatHandoff({
   return 'none'
 }
 
-export function chatHasSelfResumingHandoff(state = {}) {
-  return classifyChatHandoff(state) === 'automatic'
-}
-
 function runtimeFieldMatches(current, field, value) {
   if (field === 'pending_messages') {
     return samePendingMessages(current?.pending_messages || [], value || [])

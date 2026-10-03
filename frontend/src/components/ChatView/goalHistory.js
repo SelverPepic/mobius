@@ -16,6 +16,7 @@ export function goalHistoryViewModel(summary) {
   if (!objective || !['completed', 'cannot_complete', 'cancelled', 'failed'].includes(summary?.status)) return null
   const completed = summary.status === 'completed'
   const cancelled = summary.status === 'cancelled'
+  const legacyFailure = summary.status === 'failed'
   const reason = typeof summary.result === 'string' ? summary.result.trim()
     : String(summary.result?.reason || summary.result?.summary || '').trim()
   const done = summary?.plan?.summary?.completed
@@ -30,8 +31,8 @@ export function goalHistoryViewModel(summary) {
   return {
     objective,
     completed,
-    kicker: completed ? 'Goal completed' : cancelled ? 'Goal cancelled' : 'Goal cannot complete',
-    ariaLabel: `${completed ? 'Completed goal' : cancelled ? 'Cancelled goal' : 'Goal cannot complete'}: ${objective}`,
+    kicker: completed ? 'Goal completed' : cancelled ? 'Goal cancelled' : legacyFailure ? 'Goal needs attention' : 'Goal cannot complete',
+    ariaLabel: `${completed ? 'Completed goal' : cancelled ? 'Cancelled goal' : legacyFailure ? 'Goal needing attention' : 'Goal cannot complete'}: ${objective}`,
     reason,
     metadata: [progress, duration].filter(Boolean).join(' · '),
     hasPlan: Array.isArray(summary?.plan?.tasks) && summary.plan.tasks.length > 0,

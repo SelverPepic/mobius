@@ -191,7 +191,7 @@ test('who moves next comes from the exact Goal handoff, never an obsolete wait f
     id: 'goal-1', objective: 'Finish the review', status: 'paused',
     resumable: true,
   })
-  assert.match(chatView, /const goalHandoff = actionableGoalPresentation\?\.handoff\?\.kind \|\| 'none'/)
+  assert.match(chatView, /const goalHandoff = goalPresentation\?\.handoff\?\.kind \|\| 'none'/)
   assert.doesNotMatch(chatView, /wait_kind/)
 })
 
@@ -282,7 +282,7 @@ test('Goal labels and announcements share exact pause provenance and handoff', (
     assert.equal(normalized.pause_reason, undefined)
     assert.notEqual(goalStatusLabel(normalized), 'Paused by you')
   }
-  assert.match(chatView, /goal: actionableGoalPresentation/,
+  assert.match(chatView, /goal: goalPresentation/,
     'the current announcement receives exact Goal provenance without giving history priority')
   assert.match(chatView, /hasPendingQuestion && goalHandoff === 'owner_input'/)
 })
@@ -362,7 +362,7 @@ test('a fetched plan never crosses Goal identity even when its revision is newer
   const old = { goal_id: 'a', root_run_id: 'root-a', revision: 99, tasks: [{ id: 'stale' }] }
   assert.equal(planForGoal(old, goal), null)
   assert.equal(planForGoal({ ...old, goal_id: 'b' }, goal)?.goal_id, 'b')
-  assert.match(chatView, /planForGoal\(activeGoalPlan, actionableGoalPresentation\)/)
+  assert.match(chatView, /planForGoal\(activeGoalPlan, goalPresentation\)/)
 })
 
 test('stale plan data cannot show tasks after the active goal has ended', () => {
@@ -639,7 +639,7 @@ test('the goal rail confirms and clears directly, sourced domain-neutrally', () 
     /doSend\('\/goal clear'/,
     'the Goal rail must never fabricate a /goal clear chat message',
   )
-  assert.match(chatView, /clearable:\s*!!actionableGoalPresentation\?\.id/,
+  assert.match(chatView, /clearable:\s*!!goalPresentation\?\.id/,
     'only an identified durable Goal may expose clearing')
   assert.match(chatView, /onClearItem=\{handleClearGoal\}/,
     'ChatView must wire the clear handler into the rail')
@@ -654,7 +654,7 @@ test('the goal rail confirms and clears directly, sourced domain-neutrally', () 
     'the confirmation label must be item-supplied with a neutral fallback')
   assert.match(
     chatView,
-    /resume: handleResumeGoal, state: goalResumeState[\s\S]{0,200}goalId: actionableGoalPresentation\?\.id,[\s\S]{0,100}goalRevision: actionableGoalPresentation\?\.revision/,
+    /resume: handleResumeGoal, state: goalResumeState[\s\S]{0,200}goalId: goalPresentation\?\.id,[\s\S]{0,100}goalRevision: goalPresentation\?\.revision/,
     'Goal Resume targets its exact revision through the acknowledged lifecycle action',
   )
   assert.match(chatView, /item\?\.actionKind === 'resume-goal'[\s\S]*?handleResumeGoal\(\)/,

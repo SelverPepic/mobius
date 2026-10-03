@@ -3531,10 +3531,16 @@ class ChatWriterActor:
         or target.status not in {"open", "stopped"}
         or target.revision != cmd.resume_goal_revision
         or chat.dismissed_goal_id == target.id
-        or (prior is not None and prior.status == "running")
+        or (prior is not None and (
+          prior.status == "running"
+          or (prior.goal_id != target.id
+              and prior.status in models.CONTINUATION_RUN_STATUSES)
+        ))
       ):
         db.rollback()
         return StartTurnRecoveryChanged()
+      # A targeted Resume may replace this Goal's park, never another work's
+      # pending recovery. The UI's competing-action guard is not authority.
       prior = db.query(models.ChatRun).filter(
         models.ChatRun.chat_id == cmd.chat_id, models.ChatRun.goal_id == target.id,
       ).order_by(models.ChatRun.started_at.desc(), models.ChatRun.id.desc()).first()
@@ -5194,6 +5200,30 @@ class ChatWriterActor:
       "session_id": chat.session_id,
     }
 
+  def _clean_recovery_owner(self, db, chat, cmd: PromotePending):
+    """Prove common execution authority before either clean recovery path.
+
+    The durable row alone is not authority: the ending attempt must still
+    own this writer, its browser grant, and any delegated task. Each caller
+    separately proves its reason and exact handoff/budget constraints.
+    """
+    if cmd.ending_status != "completed" or not cmd.ending_run_token:
+      return None
+    prior = self._owned_live_run(db, chat.id, cmd.ending_run_token)
+    if prior is None or prior.provider_execution_admitted is not True:
+      return None
+    from fastapi import HTTPException
+    try:
+      _require_browser_grant(db, prior.browser_grant_id, prior.browser_grant_epoch)
+    except (HTTPException, _PersistFailed):
+      return None
+    from app.delegations import delegation_recovery_allowed
+    if not delegation_recovery_allowed(
+      db, child_chat_id=chat.id, initiated_by_app_id=prior.initiated_by_app_id,
+    ):
+      return None
+    return prior
+
   def _settle_unhanded_goal(self, db, chat, cmd: PromotePending) -> dict | None:
     """Keep exact clean Goal responsibility, bounded to one settlement pass.
 
@@ -5202,22 +5232,8 @@ class ChatWriterActor:
     before this seam. Physical failure, Stop, parks and unrelated turns never
     grant it authority. The control is provider-only, not synthetic owner speech.
     """
-    if cmd.ending_status != "completed" or not cmd.ending_run_token:
-      return None
-    from app.run_state import latest_run
-    prior = db.get(models.ChatRun, cmd.ending_run_token)
-    current = latest_run(db, chat.id)
-    if (
-      prior is None or prior.chat_id != chat.id or prior.status != "running"
-      or current is None or current.id != prior.id
-      or prior.initiated_by_app_id is not None or not prior.goal_id
-      or prior.provider_execution_admitted is not True
-    ):
-      return None
-    from fastapi import HTTPException
-    try:
-      _require_browser_grant(db, prior.browser_grant_id, prior.browser_grant_epoch)
-    except (HTTPException, _PersistFailed):
+    prior = self._clean_recovery_owner(db, chat, cmd)
+    if prior is None or prior.initiated_by_app_id is not None or not prior.goal_id:
       return None
     goal = db.get(models.ChatGoal, prior.goal_id)
     if (
@@ -5226,6 +5242,8 @@ class ChatWriterActor:
     ):
       return None
     from app.chat_waits import _goal_waits, _FIRED_UNDELIVERED
+    # A handoff must own this Goal. An unrelated monitor is not permission
+    # to abandon its responsibility (quiet-write repair instead yields to any Wait).
     if _goal_waits(db, chat.id, goal.id).filter(
       (models.ChatWait.status == "armed") | _FIRED_UNDELIVERED,
     ).first() is not None:
@@ -5272,20 +5290,8 @@ class ChatWriterActor:
     resource holds, and an armed Wait never create execution permission here.
     Helpers retain the same immutable chat policy and logical root.
     """
-    if cmd.ending_status != "completed" or not cmd.ending_run_token:
-      return None
-    prior = self._owned_live_run(db, chat.id, cmd.ending_run_token)
-    if prior is None or prior.provider_execution_admitted is not True:
-      return None
-    from fastapi import HTTPException
-    try:
-      _require_browser_grant(db, prior.browser_grant_id, prior.browser_grant_epoch)
-    except (HTTPException, _PersistFailed):
-      # Keep the failure receipt, but revocation cannot earn a new run.
-      return None
-    from app.delegations import delegation_recovery_allowed
-    if not delegation_recovery_allowed(db, child_chat_id=chat.id,
-                                       initiated_by_app_id=prior.initiated_by_app_id):
+    prior = self._clean_recovery_owner(db, chat, cmd)
+    if prior is None:
       return None
     stream = db.get(models.AgentWriteStream, prior.id)
     if stream is None or not stream.sealed or db.query(models.AgentWriteIntent.operation_id).filter(

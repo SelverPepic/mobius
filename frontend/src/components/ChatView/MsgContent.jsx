@@ -533,7 +533,7 @@ function MsgContentInner({
             key={assistantBlockKey(block, i)}
             block={block}
             continuationWait={recoveryOwner ? continuationWait : null}
-            automaticHandoff={recoveryOwner && handoff?.kind === 'automatic'}
+            manualRecovery={recoveryOwner && handoff?.kind === 'recovery'}
             autoResume={automaticContinuation}
             resetElapsed={!!limitResetElapsed}
             recoveryCredit={recoveryCredit}

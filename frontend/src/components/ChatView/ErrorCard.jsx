@@ -58,7 +58,7 @@ export default function ErrorCard({
   block,
   autoResume = false,
   continuationWait = null,
-  automaticHandoff = true,
+  manualRecovery = false,
   resetElapsed = false,
   recoveryCredit = null,
   cardRef,
@@ -67,13 +67,13 @@ export default function ErrorCard({
   const vm = errorCardViewModel(block)
   // A retry deadline cannot promise progress while platform recovery holds
   // automatic admission. This live status never rewrites the original error.
-  const busyModelHold = vm.modelCapacity && (
+  const platformHold = !block.pause?.manual && (vm.modelCapacity || vm.parked || vm.resourceWait || block.pause?.kind === 'restart') && (
     continuationWait === 'restart_required' || continuationWait === 'restoring_edits'
   )
-  const recoveryTitle = busyModelHold
+  const recoveryTitle = platformHold
     ? (continuationWait === 'restart_required' ? 'Waiting for a server restart' : 'Waiting for the platform update')
     : vm.modelCapacity
-    ? automaticHandoff
+    ? !manualRecovery
       ? (vm.checkLabel ? `Trying again ${vm.checkLabel}` : 'Trying again shortly')
       : 'Model recovery needs attention'
     : vm.parked
@@ -83,12 +83,16 @@ export default function ErrorCard({
         ? 'Ready to retry'
         : 'Provider limit reached'
     : null
-  const recoveryCopy = busyModelHold
-    ? (continuationWait === 'restart_required'
+  const recoveryCopy = platformHold
+    ? block.pause?.kind === 'restart'
+      ? continuationWait === 'restart_required'
+        ? 'Waiting for a server restart to load the restored work. This chat will continue after those changes are loaded.'
+        : 'Waiting for the update to restore unfinished work. This chat will continue once that work is restored and loaded.'
+      : (continuationWait === 'restart_required'
       ? 'Your work is saved. Automatic retries are paused until a server restart loads the restored work. Möbius will retry after those changes are loaded.'
       : 'Your work is saved. Automatic retries are paused while the update restores unfinished work. Möbius will retry once that work is restored and loaded.')
     : vm.modelCapacity
-    ? automaticHandoff
+    ? !manualRecovery
       ? 'Your work is safe. Möbius will retry with increasing pauses, up to five times. If the model stays busy, you can choose another model and Resume.'
       : 'Automatic model recovery is unavailable. Choose another model and Resume your saved work.'
     : vm.parked
@@ -141,10 +145,10 @@ export default function ErrorCard({
         ) : vm.benign ? (
           <>
             <div className="chat__recovery-title chat__recovery-title--paused">
-              {vm.resourceWait && !automaticHandoff ? 'Recovery needed' : vm.label}
+              {platformHold ? recoveryTitle : vm.resourceWait && manualRecovery ? 'Recovery needed' : vm.label}
             </div>
             <div className="chat__recovery-copy">
-              {vm.modelCapacityExhausted
+              {platformHold ? recoveryCopy : vm.modelCapacityExhausted
                 ? 'Five automatic retries were used. Choose another model, then Resume to continue your saved work.'
                 : vm.goalHandoff
                 ? 'The agent stopped before arranging the next step. Your progress is saved. Resume to continue this Goal.'
@@ -152,16 +156,12 @@ export default function ErrorCard({
                 ? block.resumable
                   ? block.pause.manual
                     ? 'Your work is saved. Resume to continue.'
-                    : !automaticHandoff
+                    : manualRecovery
                       ? 'This restart needs manual recovery. Your work is saved; Resume to continue.'
-                    : continuationWait === 'restart_required'
-                      ? 'Waiting for a server restart to load the restored work. This chat will continue after those changes are loaded.'
-                      : continuationWait === 'restoring_edits'
-                        ? 'Waiting for the update to restore unfinished work. This chat will continue once that work is restored and loaded.'
-                        : 'Möbius will continue automatically when the restart is complete.'
+                    : 'Möbius will continue automatically when the restart is complete.'
                   : (block.message || 'This response is paused.')
                 : vm.resourceWait
-                  ? automaticHandoff
+                  ? !manualRecovery
                     ? (block.message || 'Möbius will continue automatically when resources free up.')
                     : 'Automatic resource recovery is unavailable. Your work is saved; Resume to continue.'
                   : (block.message || 'Möbius will continue automatically.')}

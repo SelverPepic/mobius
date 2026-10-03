@@ -1013,6 +1013,7 @@
 
 /* An execution needing recovery is not a failed Goal or a saved question. */
 .drawer__recovery-icon {
+  box-sizing: border-box;
   display: inline-flex;
   flex-shrink: 0;
   align-items: center;

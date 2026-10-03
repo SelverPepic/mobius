@@ -624,3 +624,20 @@ test('manual resource recovery retains the existing Resume action while automati
     assert.doesNotMatch(answered, /class="chat__resume chat__recovery-action"/)
   }
 })
+
+for (const kind of ['memory', 'storage', 'model_capacity', 'restart']) {
+  for (const [name, props] of [
+    ['historical', { isLastMsg: false, handoff: { kind: 'recovery' } }],
+    ['awaiting runtime', { isLastMsg: true }],
+    ['stale active snapshot', { isLastMsg: true, handoff: { kind: 'working' } }],
+  ]) {
+    test(`${name} ${kind} pause does not invent a manual recovery failure`, () => {
+      const html = renderToStaticMarkup(createElement(MsgContent, {
+        msg: { role: 'assistant', content: '', blocks: [{ type: 'error', resumable: true, pause: { kind } }] },
+        onResume() {}, ...props,
+      }))
+      assert.doesNotMatch(html, /recovery is unavailable|recovery needs attention|This restart needs manual recovery|Recovery needed/)
+      assert.match(html, /Trying again|continue automatically/)
+    })
+  }
+}

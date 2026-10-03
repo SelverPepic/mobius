@@ -2,8 +2,8 @@
 import { ChevronRight, Clock } from '@openai/apps-sdk-ui/components/Icon'
 
 export default function WaitingCard({
-  expanded, onToggle, ariaLabel, title, text, meta, description,
-  rows = [], children, action, stateLabel = 'Waiting',
+  expanded, onToggle, ariaLabel, title, text, meta,
+  rows = [], action, stateLabel = 'Waiting',
 }) {
   const label = stateLabel ? `${stateLabel}${text ? ` · ${text}` : ''}` : text
   return (
@@ -17,7 +17,6 @@ export default function WaitingCard({
         {meta && <span className="chat__wait-meta">{meta}</span>}
         <ChevronRight className="chat__wait-chevron" width={14} height={14} aria-hidden="true" />
       </button>
-      {description && <p className="chat__wait-description">{description}</p>}
       {action && <div className="chat__wait-action">
         <button type="button" className="chat__wait-cancel" onClick={action.onClick} disabled={action.disabled}>
           {action.label}
@@ -30,7 +29,6 @@ export default function WaitingCard({
             <dt>{row.label}</dt><dd>{row.value}</dd>
           </div>)}
         </dl>
-        {children}
       </div>}
     </section>
   )

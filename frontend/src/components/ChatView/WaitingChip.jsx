@@ -63,21 +63,15 @@ function HelperCard({ backgroundHelpers, expanded, onToggle }) {
   )
 }
 
-function ResourceCard({ resourcePause, autoResumeEnabled, handoff, expanded, onToggle, onRevealRecovery }) {
-  const presentation = resourcePausePresentation(resourcePause, autoResumeEnabled, handoff)
-  const kind = resourcePause?.pause?.kind
-  const manual = handoff && handoff.kind !== 'automatic'
-    ? true
-    : kind === 'model_capacity' || ['rate_limit', 'usage_limit', 'limit'].includes(kind)
-      ? !(handoff?.kind === 'automatic' && handoff.reason === kind)
-      : false
+function ResourceCard({ resourcePause, handoff, expanded, onToggle, onRevealRecovery }) {
+  const presentation = resourcePausePresentation(resourcePause, handoff)
   return (
     <WaitingCard
       expanded={expanded}
       onToggle={onToggle}
       ariaLabel="resource handoff details"
-      action={manual && onRevealRecovery ? { label: 'View recovery', onClick: onRevealRecovery } : null}
-      stateLabel={manual ? 'Needs you' : 'Waiting'}
+      action={presentation.manual && onRevealRecovery ? { label: 'View recovery', onClick: onRevealRecovery } : null}
+      stateLabel={presentation.manual ? 'Needs you' : 'Waiting'}
       title={`${presentation.summary} — ${presentation.next}`}
       text={presentation.summary}
       meta={presentation.next}
@@ -95,7 +89,6 @@ export default function WaitingChip({
   waits = [],
   backgroundHelpers,
   resourcePause,
-  autoResumeEnabled = false,
   handoff = null,
   onCancel,
   onRevealRecovery,
@@ -110,7 +103,6 @@ export default function WaitingChip({
       {resourcePause && (
         <ResourceCard
           resourcePause={resourcePause}
-          autoResumeEnabled={autoResumeEnabled}
           handoff={handoff}
           onRevealRecovery={onRevealRecovery}
           expanded={expandedKey === 'resource'}

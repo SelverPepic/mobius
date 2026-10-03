@@ -1441,7 +1441,7 @@ async def _send_message_locked(
     if manual_resume:
       raise HTTPException(409, detail={
         "code": "recovery_changed",
-        "message": "The saved restart must finish before this Goal can resume.",
+        "message": "The saved restart must finish before this chat can resume.",
       })
     new_msg = await _append_to_pending(
       chat, body, db, initiated_by_app_id=principal.app_id,

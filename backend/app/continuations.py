@@ -44,14 +44,18 @@ PEER_MESSAGE_WAKE_KIND = "peer_message"
 
 GOAL_SETTLEMENT_UNFINISHED_MESSAGE = (
   "The Goal is still unfinished: the agent ended without recording an "
-  "outcome or saving its next handoff. Automatic settlement stopped "
-  "after one recovery attempt. Resume to recover this execution; "
+  "outcome or saving its next handoff. Automatic settlement cannot safely "
+  "continue. Resume to recover this execution; "
   "the Goal has not been declared impossible."
 )
 
 
 def recovery_attempted(db, run, *, reason: str) -> bool:
-  """Exact predecessor controls bound recovery; manual owner Resume resets it."""
+  """Fail closed when recovery was used or its exact lineage cannot be proven.
+
+  Manual owner Resume resets the budget. A broken chain is not evidence that
+  an attempt happened, only that another automatic attempt is not justified.
+  """
   from app import models
   seen = set()
   while run is not None:
@@ -143,8 +147,8 @@ def continuation_reason(message: Mapping[str, Any] | None) -> str:
 def is_retired_goal_handoff(message: Mapping[str, Any] | None) -> bool:
   """A queued automatic-Goal control the pre-2026-09-27 writer left behind.
 
-  Goals no longer continue themselves. Such a row may still sit behind owner
-  input in a persisted queue; it is retired unrun, never promoted as input.
+  The former revision-budget loop is retired. Such a row may still sit behind
+  owner input; it must not become the new bounded settlement recovery.
   """
   return continuation_reason(message) == "goal_handoff"
 

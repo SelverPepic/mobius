@@ -7,7 +7,6 @@ import { goalHistoryViewModel } from './goalHistory.js'
 export default function GoalHistoryCard({ summary }) {
   const view = goalHistoryViewModel(summary)
   if (!view) return null
-  const hasDetails = view.hasPlan
 
   return (
     <aside
@@ -19,10 +18,10 @@ export default function GoalHistoryCard({ summary }) {
         <span className="chat__goal-history-kicker">
           <LifecycleOutcome tone={view.completed ? 'completed' : summary.status === 'cancelled' ? 'stopped' : 'attention'} />{view.kicker}
         </span>
-        <strong className={`chat__goal-history-objective${hasDetails ? ' chat__goal-history-objective--preview' : ''}`}>{view.objective}</strong>
+        <strong className={`chat__goal-history-objective${view.hasPlan ? ' chat__goal-history-objective--preview' : ''}`}>{view.objective}</strong>
         {!view.completed && view.reason && <span className="chat__goal-history-reason">{view.reason}</span>}
         {view.metadata && <span className="chat__goal-history-meta">{view.metadata}</span>}
-        {hasDetails && (
+        {view.hasPlan && (
           <details className="chat__goal-history-details">
             <summary>View details</summary>
             <GoalPlanDetails plan={summary.plan} />

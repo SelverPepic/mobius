@@ -69,10 +69,8 @@ function GoalPlanRow({ title, status, meta, depth, emphasized, children }) {
   )
 }
 
-export default function GoalPlanDetails({ plan, result = null, holdReason = null }) {
-  const reason = typeof holdReason === 'string' ? holdReason.trim()
-    : typeof result === 'string' ? result.trim()
-    : String(result?.reason || result?.summary || '').trim()
+export default function GoalPlanDetails({ plan, holdReason = null }) {
+  const reason = typeof holdReason === 'string' ? holdReason.trim() : ''
   const tasks = Array.isArray(plan?.tasks) ? plan.tasks : []
   if (!tasks.length && !reason) return null
   const tasksById = new Map(tasks.map(task => [task.id, task]))

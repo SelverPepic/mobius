@@ -5786,7 +5786,6 @@ export default function ChatView({
     }
     return 'Turn paused — Resume available.'
   })()
-  const actionableGoalPresentation = goalPresentation
   // Chat surfaces retain all work, but Goal labels use only its exact owners.
   const chatHandoff = classifyChatHandoff({
     turnActive,
@@ -5797,18 +5796,19 @@ export default function ChatView({
     autoResumeEnabled,
     authoritativeHandoff: serverHandoff,
   })
-  const goalHandoff = actionableGoalPresentation?.handoff?.kind || 'none'
+  const goalHandoff = goalPresentation?.handoff?.kind || 'none'
+  const goalResumeBlocked = useCallback(() => resumeBlocked() || !canResumeGoal(goalPresentation, {
+    turnActive, hasPendingQuestion, chatHandoff,
+  }), [resumeBlocked, goalPresentation, turnActive, hasPendingQuestion, chatHandoff])
   // A retained Goal may outlive the unrelated turn's recovery identity.
   const { resume: handleResumeGoal, state: goalResumeState } = useResume({
     chatId,
-    goalId: actionableGoalPresentation?.id,
-    goalRevision: actionableGoalPresentation?.revision,
+    goalId: goalPresentation?.id,
+    goalRevision: goalPresentation?.revision,
     send: sendAfterSettingsSaved,
     onAccepted: acceptResume,
     onRefresh: refreshResume,
-    blocked: () => resumeBlocked() || !canResumeGoal(actionableGoalPresentation, {
-      turnActive, hasPendingQuestion, chatHandoff,
-    }),
+    blocked: goalResumeBlocked,
   })
   const handleGoalRailAction = useCallback((item) => {
     if (item?.actionKind === 'owner-question') {
@@ -5820,11 +5820,11 @@ export default function ChatView({
 
   const ariaStatus = currentChatAnnouncement({
     turnActive, hasPendingQuestion, chatHandoff,
-    goal: actionableGoalPresentation,
+    goal: goalPresentation,
     recoveryStatus: resumeStatus,
     hasAnswer: messages.length > 0 && messages.at(-1)?.role === 'assistant',
   })
-  const continuationHandoff = goalContinuationHandoff(actionableGoalPresentation, {
+  const continuationHandoff = goalContinuationHandoff(goalPresentation, {
     turnActive, hasPendingQuestion, hasPendingResume: !!pendingResumeBlock, chatHandoff,
   })
   const buildPhaseRail = buildPhaseRailViewModel(buildPhases)
@@ -5832,17 +5832,17 @@ export default function ChatView({
   // runtime reconciliation, never a momentary browser transport signal.
   const visibleGoalObjective = activeGoalObjective
   const progressRail = progressRailViewModel(
-    currentProgressGoal(actionableGoalPresentation, { turnActive }),
+    currentProgressGoal(goalPresentation, { turnActive }),
     buildPhaseRail,
-    planForGoal(activeGoalPlan, actionableGoalPresentation),
+    planForGoal(activeGoalPlan, goalPresentation),
   ).map(item => {
     if (item.key !== 'goal') return item
     // The Goal step owns a two-tap clear affordance and the plan details.
     return {
       ...item,
-      clearable: !!actionableGoalPresentation?.id,
-      goalId: actionableGoalPresentation?.id,
-      clearConfirmationKey: actionableGoalPresentation?.id,
+      clearable: !!goalPresentation?.id,
+      goalId: goalPresentation?.id,
+      clearConfirmationKey: goalPresentation?.id,
       clearLabel: visibleGoalObjective
         ? `Clear goal: ${visibleGoalObjective}`
         : 'Clear goal',
@@ -5850,7 +5850,7 @@ export default function ChatView({
         ? `Confirm clear goal: ${visibleGoalObjective}`
         : 'Confirm clear goal',
       ...(goalClearError ? { clearError: goalClearError } : {}),
-      ...(hasPendingQuestion && goalHandoff === 'owner_input' && ['active', 'paused'].includes(actionableGoalPresentation?.status)
+      ...(hasPendingQuestion && goalHandoff === 'owner_input' && ['active', 'paused'].includes(goalPresentation?.status)
         ? {
             actionKind: 'owner-question',
             actionLabel: 'View question',
@@ -5867,13 +5867,12 @@ export default function ChatView({
         actionError: goalResumeState.error,
       } : {}),
       icon: <Flag width={14} height={14} aria-hidden="true" />,
-      ...(planForGoal(activeGoalPlan, actionableGoalPresentation) || actionableGoalPresentation?.result || actionableGoalPresentation?.hold_reason || continuationHandoff
+      ...(planForGoal(activeGoalPlan, goalPresentation) || goalPresentation?.hold_reason || continuationHandoff
         ? { details: <GoalPlanDetails
-            plan={planForGoal(activeGoalPlan, actionableGoalPresentation)}
-            result={actionableGoalPresentation?.result}
+            plan={planForGoal(activeGoalPlan, goalPresentation)}
             holdReason={continuationHandoff
               ? `${continuationHandoff.description} ${continuationHandoff.boundary}`
-              : actionableGoalPresentation?.hold_reason}
+              : goalPresentation?.hold_reason}
           /> }
         : {}),
     }
@@ -6259,7 +6258,6 @@ export default function ChatView({
               waits={armedWaits}
               backgroundHelpers={backgroundHelpers}
               resourcePause={resourcePause || (modelCapacityPause || pendingLimitPark ? pendingResumeBlock : null)}
-              autoResumeEnabled={autoResumeEnabled}
               handoff={serverHandoff}
               onCancel={handleCancelWait}
               onRevealRecovery={resumeCardEl ? () => revealPendingQuestion(resumeCardEl) : undefined}

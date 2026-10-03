@@ -108,6 +108,33 @@ def test_legacy_goal_resume_after_unrelated_turn_reuses_original_checklist(db, c
   assert goal.status == "completed"
 
 
+@pytest.mark.parametrize("status", models.NONTERMINAL_RUN_STATUSES)
+def test_exact_goal_resume_does_not_interrupt_unrelated_unfinished_work(db, chat, status):
+  goal, run = seed(db, chat, status="completed")
+  goal.status = "stopped"
+  other = models.ChatRun(
+    id="other-work", root_run_id="other-work", chat_id=chat.id, status=status,
+    park_reason="usage_limit" if status != "running" else None,
+  )
+  db.add(other)
+  db.commit()
+  assert isinstance(submit(resume(chat, goal)), StartTurnRecoveryChanged)
+  db.expire_all()
+  assert other.status == status and other.ended_at is None
+  assert goal.status == "stopped" and goal.revision == 4
+  assert db.get(models.ChatRun, "resumed") is None
+
+
+@pytest.mark.parametrize("status", models.CONTINUATION_RUN_STATUSES)
+def test_exact_goal_resume_can_continue_its_own_park(db, chat, status):
+  goal, prior = seed(db, chat, status=status)
+  assert submit(resume(chat, goal))["history"]
+  db.expire_all()
+  successor = db.get(models.ChatRun, "resumed")
+  assert successor.goal_id == goal.id
+  assert successor.continuation_json["supersedes_run_token"] == prior.id
+
+
 def test_goal_resume_is_exact_revision_fenced_and_leaves_question_intact(db, chat):
   goal, run = seed(db, chat, status="completed")
   old_revision = goal.revision

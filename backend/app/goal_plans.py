@@ -698,6 +698,7 @@ def _goal_completion_anchor(messages, run_ids, result, status="completed"):
   summaries clip arguments, so their successful receipt supplies the verdict.
   Goal state still owns completion; this only locates its transcript position.
   """
+  from app.goals import cannot_complete_result
   if status != "completed" and (not isinstance(result, str) or not result):
     return None
   for index in range(len(messages) - 1, -1, -1):
@@ -735,10 +736,7 @@ def _goal_completion_anchor(messages, run_ids, result, status="completed"):
             or (status == "cannot_complete" and isinstance(terminal_value, dict)
                 and all(isinstance(terminal_value.get(key), str) for key in
                         ("reason", "efforts", "unmet_outcome"))
-                and result == "Reason: {reason}\nEfforts and partial results: {efforts}\nUnmet outcome: {unmet_outcome}".format(
-                  **{key: terminal_value[key].strip() for key in
-                     ("reason", "efforts", "unmet_outcome")}
-                ))):
+                and result == cannot_complete_result(terminal_value))):
           return index, block["tool_use_id"]
   return None
 
@@ -845,7 +843,7 @@ def terminal_goal_summaries_by_message_index(
       continue
     plan = serialize_plan(db, physical, root)
     presentation = _goal_presentation(db, physical, root, plan)
-    if presentation["status"] not in {"completed", "cannot_complete", "cancelled", "failed"}:
+    if presentation["status"] not in {"completed", "cannot_complete", "cancelled"}:
       continue
     projected.setdefault(candidate_index, []).append({
       **presentation,

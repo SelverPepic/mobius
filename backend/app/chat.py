@@ -428,31 +428,6 @@ def continuation_handoff_for_chat(db: Session, chat_id: str) -> dict:
   return {"kind": "automatic", "reason": reason}
 
 
-def _latest_run_is_waiting_park(db: Session, chat_id: str) -> bool:
-  return continuation_handoff_for_chat(db, chat_id)["kind"] == "automatic"
-
-
-def parked_waiting_chat_ids(
-  db: Session,
-  chat_ids: Iterable[str],
-) -> set[str]:
-  """Chats whose latest resource/provider/restart park owns an eligible wake."""
-  bounded = tuple(dict.fromkeys(chat_ids))
-  if not bounded:
-    return set()
-  try:
-    rows = db.query(models.ChatRun.chat_id).filter(
-      models.ChatRun.chat_id.in_(bounded),
-      models.ChatRun.status.in_(("parked", "resume_pending")),
-    ).distinct().all()
-  except Exception:
-    return set()
-  return {
-    str(row[0]) for row in rows
-    if _latest_run_is_waiting_park(db, str(row[0]))
-  }
-
-
 def continuation_wait_for_chat(db: Session, chat_id: str) -> str | None:
   """Project restart and busy-model holds without changing recovery admission.
 

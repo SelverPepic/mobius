@@ -162,6 +162,13 @@ async def settle_after_goal_completion(chat_id: str) -> None:
   await settle_claims_with_owner(chat_id)
 
 
+def cannot_complete_result(details: dict[str, str]) -> str:
+  """Stable outcome text shared by persistence and historical tool matching."""
+  return "Reason: {reason}\nEfforts and partial results: {efforts}\nUnmet outcome: {unmet_outcome}".format(
+    **{key: details[key].strip() for key in ("reason", "efforts", "unmet_outcome")}
+  )
+
+
 def update_goal_record(db, run, goal, expected_revision, *, checkpoint=None,
                        next_action=None, complete=None, cannot_complete=None,
                        cancel=None, defer=None, tasks=None, finished_claims=()):
@@ -189,9 +196,7 @@ def update_goal_record(db, run, goal, expected_revision, *, checkpoint=None,
       for key in ("reason", "efforts", "unmet_outcome")
     ):
       raise GoalPlanError("cannot_complete needs reason, efforts, and unmet_outcome text")
-    outcome_text = "Reason: {reason}\nEfforts and partial results: {efforts}\nUnmet outcome: {unmet_outcome}".format(
-      **{key: cannot_complete[key].strip() for key in ("reason", "efforts", "unmet_outcome")}
-    )
+    outcome_text = cannot_complete_result(cannot_complete)
   else:
     outcome_text = complete.strip() if isinstance(complete, str) else cancel.strip() if isinstance(cancel, str) else None
   if status in {"cannot_complete", "cancelled"} and not outcome_text:

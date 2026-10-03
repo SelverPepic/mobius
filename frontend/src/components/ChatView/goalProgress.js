@@ -308,15 +308,14 @@ export function progressRailViewModel(
   const presentation = typeof goal === 'string'
     ? normalizeGoalPresentation({ objective: goal, status: 'active' })
     : normalizeGoalPresentation(goal)
-  const actionable = presentation
-  const goalObjective = actionable?.objective || ''
+  const goalObjective = presentation?.objective || ''
   if (goalObjective) {
     const completed = goalPlan?.summary?.completed
     const total = goalPlan?.summary?.total
     const planned = Number.isInteger(completed) && Number.isInteger(total)
     const activeTasks = visibleGoalTasks(goalPlan)
     const activeLabels = activeTasks.map(progressLabel).filter(Boolean)
-    const statusLabel = goalStatusLabel(actionable)
+    const statusLabel = goalStatusLabel(presentation)
     const progressSummary = planned ? `${completed}/${total}` : goalObjective
     items.push({
       key: 'goal',
@@ -326,7 +325,7 @@ export function progressRailViewModel(
           : ''
       }`,
       expandable: true,
-      tone: actionable.status,
+      tone: presentation.status,
       ...(goalPlan ? {
         title: `Goal: ${goalObjective}`,
         ariaLabel: `Goal: ${goalObjective}. ${statusLabel || 'Working'}; ${completed} of ${total} complete`,

@@ -28,15 +28,15 @@ test('Goal history summarizes a terminal outcome and its plan', () => {
   })
 })
 
-test('Goal history rejects active snapshots and labels failed outcomes', () => {
+test('Goal history preserves neutral labels for legacy failed snapshots', () => {
   assert.equal(goalHistoryViewModel({ objective: 'Still working', status: 'active' }), null)
   assert.deepEqual(goalHistoryViewModel({
     objective: 'Needs repair', status: 'failed', duration_seconds: null,
   }), {
     objective: 'Needs repair',
     completed: false,
-    kicker: 'Goal cannot complete',
-    ariaLabel: 'Goal cannot complete: Needs repair',
+    kicker: 'Goal needs attention',
+    ariaLabel: 'Goal needing attention: Needs repair',
     reason: '',
     metadata: '',
     hasPlan: false,

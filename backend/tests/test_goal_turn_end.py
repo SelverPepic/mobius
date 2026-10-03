@@ -9,7 +9,7 @@ from tests.goal_fixtures import goal_run as make_goal_run
 import pytest
 
 from app import models
-from app.chat_writer import PromotePending, get_writer
+from app.chat_writer import PromotePending, StartTurn, get_writer
 
 
 UNFINISHED = {"version": 1, "tasks": [{
@@ -23,22 +23,21 @@ SETTLED = {"version": 1, "tasks": [{
 
 
 def _add_goal_run(db, chat, run_id="goal-run", *, goal_id="goal-run", plan=UNFINISHED):
-  if not chat.messages:
-    chat.messages = [{
-      "role": "user", "content": "Finish the work", "cid": "owner-request",
-      "ts": 1,
-    }]
-  db.add(make_goal_run(db,
-    id=run_id,
-    root_run_id=run_id,
-    chat_id=chat.id,
-    status="running",
-    provider="codex",
-    goal_objective="Finish the work",
-    goal_id=goal_id,
-    goal_plan_json=plan,
-    goal_plan_revision=1,
-    provider_execution_admitted=True,
+  # Admission owns both the durable run and the writer's current token.
+  # A row inserted directly cannot authorize another provider execution.
+  get_writer().submit(StartTurn(
+    chat_id=chat.id, run_token=run_id,
+    user_msg={"role": "user", "content": "Finish the work", "cid": "owner-request", "ts": 1},
+    title_source="Finish the work", default_provider="codex",
+  )).result(timeout=5)
+  db.refresh(chat)
+  run = db.get(models.ChatRun, run_id)
+  run.goal_id = goal_id
+  run.goal_objective = "Finish the work"
+  run.provider_execution_admitted = True
+  db.add(models.ChatGoal(
+    id=goal_id, chat_id=chat.id, objective="Finish the work",
+    status="open", plan_json=plan, revision=1,
   ))
   db.commit()
 
@@ -227,6 +226,58 @@ def test_stale_ending_identity_does_not_take_newer_goal_execution(db, chat):
   assert response["promoted"] is None
 
 
+@pytest.mark.parametrize("owner", [None, "another-owner"])
+def test_goal_settlement_requires_the_current_writer_token(db, chat, owner):
+  _add_goal_run(db, chat)
+  writer = get_writer()
+  if owner is None:
+    writer._run_token_owner.pop(chat.id)
+  else:
+    writer._run_token_owner[chat.id] = owner
+  response = writer.submit(PromotePending(
+    chat_id=chat.id, run_token="not-authorized", ending_run_token="goal-run",
+  )).result(timeout=5)
+  assert response["promoted"] is None
+  db.expire_all()
+  assert db.query(models.ChatRun).filter_by(chat_id=chat.id).count() == 1
+  assert db.get(models.ChatGoal, "goal-run").status == "open"
+
+
+@pytest.mark.parametrize("state", ["active", "cancelled", "interrupted", "read-only", "wrong-app"])
+def test_goal_settlement_preserves_delegation_authority(db, chat, state):
+  from datetime import UTC, datetime
+  _add_goal_run(db, chat)
+  db.add(models.Chat(id="parent", title="Parent", messages=[]))
+  delegation = models.Delegation(
+    id="helper", parent_chat_id="parent", parent_root_run_id="parent-root",
+    task_key="bounded-task", child_chat_id=chat.id, provider="codex",
+    scope="read" if state == "read-only" else "write", cwd="/data/bounded",
+    prompt_sha256="a" * 64,
+  )
+  if state == "cancelled":
+    delegation.cancelled_at = datetime.now(UTC)
+  if state == "interrupted":
+    delegation.interrupted_at = datetime.now(UTC)
+  if state == "wrong-app":
+    app = models.App(name="Test app", slug="fixture", source_dir="/tmp/fixture", jsx_source="")
+    db.add(app)
+    db.flush()
+    delegation.app_id = app.id
+  db.add(delegation)
+  db.commit()
+  response = get_writer().submit(PromotePending(
+    chat_id=chat.id, run_token="provisional", ending_run_token="goal-run",
+  )).result(timeout=5)
+  assert bool(response["promoted"]) is (state == "active")
+  db.expire_all()
+  assert db.get(models.ChatGoal, "goal-run").status == "open"
+  if state == "active":
+    successor = db.get(models.ChatRun, response["promoted"]["_run_token"])
+    assert successor.goal_id == "goal-run" and successor.root_run_id == "goal-run"
+  else:
+    assert db.query(models.ChatRun).filter_by(chat_id=chat.id).count() == 1
+
+
 @pytest.mark.asyncio
 async def test_second_unhanded_ending_preserves_goal_and_records_durable_recovery(db, chat, monkeypatch):
   from app import chat as chat_mod, chat_queue
@@ -280,6 +331,17 @@ def test_resource_and_restart_recovery_cannot_reset_the_settlement_budget(db, ch
   recovered.continuation_json = {"reason": "manual", "supersedes_run_token": token}
   db.commit()
   assert recovery_attempted(db, recovered, reason="goal_settlement") is False
+
+
+def test_unknown_recovery_history_stays_closed_without_claiming_an_attempt(db, chat):
+  from app.continuations import recovery_attempted, GOAL_SETTLEMENT_UNFINISHED_MESSAGE
+  _add_goal_run(db, chat)
+  run = db.get(models.ChatRun, "goal-run")
+  run.continuation_json = {"reason": "restart", "supersedes_run_token": "missing"}
+  db.commit()
+  assert recovery_attempted(db, run, reason="goal_settlement") is True
+  assert "after one recovery attempt" not in GOAL_SETTLEMENT_UNFINISHED_MESSAGE
+  assert "cannot safely continue" in GOAL_SETTLEMENT_UNFINISHED_MESSAGE
 
 
 @pytest.mark.asyncio

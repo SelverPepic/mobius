@@ -28,6 +28,22 @@ from app.routes import chats_stream
 from app.timeutil import now_naive_utc
 
 
+@pytest.fixture(autouse=True)
+def isolated_restart_source(monkeypatch, tmp_path):
+  # Card tests exercise the real preflight boundary without importing the live
+  # editable platform. Broken-source rejection is covered explicitly below;
+  # the router-verdict contract lives in test_restart_util.
+  root = tmp_path / "platform"
+  app = root / "backend" / "app"
+  app.mkdir(parents=True)
+  (app / "__init__.py").write_text("", encoding="utf-8")
+  (app / "main.py").write_text("from app import routes\n", encoding="utf-8")
+  (app / "routes.py").write_text(
+    "def require_all_routers_loaded():\n  return None\n", encoding="utf-8",
+  )
+  monkeypatch.setenv("MOBIUS_PLATFORM_DIR", str(root))
+
+
 def _requirement(action_id="platform-restart:test"):
   return {
     "version": 1,
