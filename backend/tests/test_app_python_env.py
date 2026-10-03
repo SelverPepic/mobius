@@ -979,7 +979,7 @@ def test_store_update_smokes_the_merged_tree_and_publishes_exactly_it(
   client, auth, db, monkeypatch, store,
 ):
   builds = _fake_builds(monkeypatch)
-  app_id, source, _ = _locally_edited_store_app(client, auth, db, store)
+  app_id, _, _ = _locally_edited_store_app(client, auth, db, store)
   actual_smoke = app_python_env._smoke
   smoked = []
 
@@ -1072,8 +1072,9 @@ def test_store_update_refuses_a_tree_that_changed_while_it_was_checked(
   _assert_no_unlinked_env_or_runtime(app_id)
 
 
+@pytest.mark.usefixtures("store")
 def test_git_origin_install_smokes_modules_its_manifest_does_not_list(
-  client, auth, db, monkeypatch, store, tmp_path,
+  client, auth, db, monkeypatch, tmp_path,
 ):
   import subprocess
   from tests.test_apps_install import _fake_async_client, _fixture_commit

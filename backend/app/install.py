@@ -3813,6 +3813,14 @@ async def _activate_install_source(
         job_name=plan.job_name,
       )
 
+  _write_static_assets(
+    source_dir,
+    plan.static_assets,
+    journal.created_paths,
+    journal.rollback_actions,
+    journal.commit_actions,
+  )
+  # The source dir now holds exactly what the commit below records.
   runtime_manifest = json.dumps(manifest, sort_keys=True).encode()
   if python_declared and plan.python_check is None:
     snapshot = await asyncio.to_thread(app_git.snapshot_worktree, source_dir)
@@ -3829,13 +3837,6 @@ async def _activate_install_source(
       raise
     raise _UncheckedPythonTree(runtime, inputs, app.id if plan.updating else None)
 
-  _write_static_assets(
-    source_dir,
-    plan.static_assets,
-    journal.created_paths,
-    journal.rollback_actions,
-    journal.commit_actions,
-  )
   await compile_jsx(
     entry_source,
     out_path=staged_bundle,
