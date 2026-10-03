@@ -34,6 +34,13 @@ class BrowserAccessGrant(Base):
   epoch = Column(Integer, nullable=False, default=0)
   created_at = Column(DateTime, nullable=False, default=now_naive_utc)
   revoked_at = Column(DateTime, nullable=True, default=None)
+  kind = Column(String(16), nullable=False, default="invitation")
+  issuer = Column(String(255), nullable=True)
+  subject = Column(String(128), nullable=True)
+  recipient_handle = Column(String(128), nullable=True)
+  origin = Column(String(255), nullable=True)
+  remote_status = Column(String(24), nullable=True)
+  grantor_binding = Column(String(128), nullable=True)
 
 
 class BrowserAccessInvite(Base):
@@ -64,6 +71,24 @@ class BrowserAccessSession(Base):
   revoked_at = Column(DateTime, nullable=True, default=None)
 
 
+class BrowserAccountPending(Base):
+  __tablename__ = "browser_account_pending"
+  id = Column(String(64), primary_key=True)
+  grant_id = Column(String(64), ForeignKey("browser_access_grants.id"), nullable=False, index=True)
+  state_hash = Column(String(64), nullable=False, unique=True)
+  cookie_hash = Column(String(64), nullable=False, unique=True, index=True)
+  verifier = Column(String(128), nullable=False)
+  nonce = Column(String(64), nullable=False)
+  grant_epoch = Column(Integer, nullable=False)
+  owner_token_epoch = Column(Integer, nullable=False)
+  issuer = Column(String(255), nullable=False)
+  subject = Column(String(128), nullable=False)
+  expires_at = Column(DateTime, nullable=False, index=True)
+  consumed_at = Column(DateTime, nullable=True)
+  verified_at = Column(DateTime, nullable=True)
+  verified_expires_at = Column(DateTime, nullable=True)
+
+
 def _unauthorized() -> HTTPException:
   return HTTPException(status_code=401, detail="Browser access unavailable.")
 
@@ -83,9 +108,11 @@ def _lock_active_grant(db: Session, grant_id: str) -> BrowserAccessGrant:
   ).values(epoch=BrowserAccessGrant.epoch)).rowcount
   if changed != 1:
     raise _unauthorized()
-  return db.query(BrowserAccessGrant).execution_options(
+  grant = db.query(BrowserAccessGrant).execution_options(
     populate_existing=True,
   ).filter_by(id=grant_id).one()
+  _check_account_binding(db, grant)
+  return grant
 
 
 def _owner(db: Session, owner_id: int):
@@ -97,6 +124,51 @@ def _owner(db: Session, owner_id: int):
   if owner is None:
     raise _unauthorized()
   return owner
+
+
+def account_binding(db: Session, owner_id: int) -> str | None:
+  """Current local credential generation, never a reusable bearer."""
+  from app.config import get_settings
+  from app.models import IdentityAccountLink
+  settings = get_settings()
+  if settings.mobius_sso_enabled:
+    owner = _owner(db, owner_id)
+    if not owner.sso_subject:
+      return None
+    material = "\0".join((
+      settings.mobius_sso_instance_id, settings.mobius_sso_issuer,
+      owner.sso_subject,
+    ))
+    return "managed:" + hashlib.sha256(material.encode()).hexdigest()
+  link = db.query(IdentityAccountLink).execution_options(
+    populate_existing=True,
+  ).filter_by(owner_id=owner_id).one_or_none()
+  if link is None:
+    return None
+  return "linked:" + hashlib.sha256(link.access_token_encrypted.encode()).hexdigest()
+
+
+def _check_account_binding(db: Session, grant: BrowserAccessGrant) -> None:
+  if grant.kind != "account":
+    return
+  from app.config import get_settings
+  settings = get_settings()
+  current_issuer = (
+    settings.mobius_sso_issuer if settings.mobius_sso_enabled
+    else settings.mobius_account_origin
+  ).rstrip("/")
+  from app.routes.browser_access import _origin
+  try:
+    current_origin = _origin()
+  except HTTPException as exc:
+    raise _unauthorized() from exc
+  if (
+    not grant.grantor_binding
+    or grant.grantor_binding != account_binding(db, grant.owner_id)
+    or grant.issuer != current_issuer
+    or grant.origin != current_origin
+  ):
+    raise _unauthorized()
 
 
 def create_invitation(db: Session, owner, label: str) -> tuple[BrowserAccessGrant, str]:
@@ -137,7 +209,7 @@ def reissue_invitation(db: Session, owner, grant_id: str) -> str:
   try:
     now = now_naive_utc()
     grant = db.query(BrowserAccessGrant).filter_by(id=grant_id).first()
-    if grant is None or grant.owner_id != owner.id or grant.revoked_at is not None:
+    if grant is None or grant.owner_id != owner.id or grant.revoked_at is not None or grant.kind != "invitation":
       raise _unauthorized()
     # Match redemption's lock order: unused invite rows before the grant.
     # If revocation wins meanwhile, rollback restores all old invitations.
@@ -178,6 +250,8 @@ def redeem_invitation(db: Session, secret: str, *, previous_session_secret: str 
     if consumed != 1:
       raise _unauthorized()
     grant = _lock_active_grant(db, invite.grant_id)
+    if grant.kind != "invitation":
+      raise _unauthorized()
     owner = _owner(db, grant.owner_id)
     if owner.token_epoch != invite.owner_token_epoch:
       raise _unauthorized()
@@ -254,6 +328,7 @@ def validate_session(
   ).filter_by(id=grant_id).first()
   if grant is None or grant.owner_id != owner_id or grant.revoked_at is not None:
     raise _unauthorized()
+  _check_account_binding(db, grant)
   if _owner(db, grant.owner_id).token_epoch != session.owner_token_epoch:
     raise _unauthorized()
   return session
@@ -319,4 +394,5 @@ def validate_grant(db: Session, grant_id: str, epoch: int, owner_id: int) -> Bro
     or grant.revoked_at is not None or grant.epoch != epoch
   ):
     raise _unauthorized()
+  _check_account_binding(db, grant)
   return grant

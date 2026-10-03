@@ -21,6 +21,9 @@ class RunnerResult(TypedDict):
   # Only unexpected main-process death correlated with an OOM increase during
   # this attempt, observed before runner teardown. Never a provider API error.
   oom_killed: NotRequired[bool]
+  api_error_status: NotRequired[int]
+  # A token-context rejection is distinct from an HTTP request-byte limit.
+  context_window_exceeded: NotRequired[bool]
 
 
 class ChatEvent(TypedDict):

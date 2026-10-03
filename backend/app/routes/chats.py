@@ -2950,12 +2950,14 @@ async def compact_chat(
   provider switches use the atomic ``/provider-switch`` route.
   """
   from app.chat_queue import get_transition_lock
+  from app.chat_continuity import note_path, recovery_source
+  from app.chat_notes import extract_cumulative_summary
   from app.chat_writer import (
     PersistCompaction, alloc_run_token, await_ack, get_writer,
     messages_fingerprint,
   )
   from app.compaction import (
-    CompactionError, load_cumulative_summary, summarize_chat,
+    CompactionError, summarize_chat,
   )
 
   async with get_transition_lock(chat_id):
@@ -2981,16 +2983,25 @@ async def compact_chat(
     messages = list(chat.messages or [])
     data_dir = get_settings().data_dir
     try:
-      source_summary = load_cumulative_summary(data_dir, chat_id)
+      try:
+        note = note_path(data_dir, chat_id).read_text(encoding="utf-8")
+      except OSError:
+        note = ""
+      source_summary = extract_cumulative_summary(note)
+      source_messages = messages
+      source_note_hash = None
+      try:
+        source_summary, source_messages = recovery_source(note, messages)
+      except ValueError:
+        # Legacy or changed notes cannot replace history. Preserve the old
+        # full-transcript backstop, including its existing work limits.
+        pass
+      else:
+        source_note_hash = hashlib.sha256(note.encode("utf-8")).hexdigest()
       instructions = body.instructions if body is not None else None
-      # The agent-saved cumulative summary is best-effort and can lag the
-      # latest turn. Manual compaction retires the provider session, so always
-      # synthesize from the current transcript and use that summary only as an
-      # additional seed; copying it verbatim could drop the newest decisions
-      # from the fresh session that follows.
       settings_obj = chat.agent_settings_json or {}
       summary = await summarize_chat(
-        messages,
+        source_messages,
         data_dir=data_dir,
         provider_id=source_provider,
         source_summary=source_summary,
@@ -3012,6 +3023,7 @@ async def compact_chat(
         summary=summary,
         expected_provider=source_provider,
         source_messages_hash=messages_fingerprint(messages),
+        source_note_hash=source_note_hash,
       )))
     except Exception:
       raise HTTPException(

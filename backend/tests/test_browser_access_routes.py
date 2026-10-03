@@ -60,6 +60,10 @@ def test_guest_cannot_create_grants_or_launder_install_or_job_credentials(https,
   _, token, _ = invite(https, auth)
   guest = {"Authorization": "Bearer " + token}
   assert https.post(ROOT, json={"label": "Another"}, headers=guest).status_code == 403
+  assert https.get(ROOT + "/shared", headers=guest).status_code == 403
+  assert https.post(ROOT + "/shared/respond", headers=guest, json={
+    "origin": "https://other.example", "grant_id": "g" * 32, "action": "accept",
+  }).status_code == 403
   assert https.post("/api/auth/install-pass", json={"slug": "example"}, headers=guest).status_code == 403
   assert https.post("/api/auth/app-job-token", json={"app_id": 1}, headers=guest).status_code == 403
   assert https.post("/api/admin/sign-out-everywhere", headers=guest).status_code == 403

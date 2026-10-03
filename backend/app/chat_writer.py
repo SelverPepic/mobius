@@ -1079,6 +1079,9 @@ class PersistCompaction(_Command):
   summary: str = ""
   expected_provider: str = ""
   source_messages_hash: str = ""
+  # Required when a verified note replaces a transcript prefix. The route
+  # holds the checkpoint transition lock through this actor's commit.
+  source_note_hash: str | None = None
 
 
 
@@ -4912,6 +4915,15 @@ class ChatWriterActor:
       return {"status": "conflict", "reason": "provider_changed"}
     if messages_fingerprint(messages) != cmd.source_messages_hash:
       return {"status": "conflict", "reason": "chat_changed"}
+    if cmd.source_note_hash is not None:
+      from app.chat_continuity import note_path
+      from app.config import get_settings
+      try:
+        note = note_path(get_settings().data_dir, chat.id).read_text(encoding="utf-8")
+      except OSError:
+        return {"status": "conflict", "reason": "summary_changed"}
+      if hashlib.sha256(note.encode("utf-8")).hexdigest() != cmd.source_note_hash:
+        return {"status": "conflict", "reason": "summary_changed"}
     new_msg = {
       "role": "assistant",
       "kind": "compaction",

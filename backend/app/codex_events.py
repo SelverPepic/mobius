@@ -968,6 +968,24 @@ def _turn_items(turn: Any) -> list[Any]:
   ]
 
 
+def _codex_size_failure(error: Any) -> dict:
+  """Preserve confirmed size failures independently of provider prose.
+
+  The SDK owns this union: only its context-window code and HTTP 413 may
+  request changed-context recovery. Other statuses retain existing handling.
+  """
+  info = getattr(getattr(error, "codex_error_info", None), "root", None)
+  if _enum_wire_value(info) == "contextWindowExceeded":
+    return {"context_window_exceeded": True}
+  for variant in (
+    "http_connection_failed", "response_stream_connection_failed",
+    "response_stream_disconnected", "response_too_many_failed_attempts",
+  ):
+    if getattr(getattr(info, variant, None), "http_status_code", None) == 413:
+      return {"api_error_status": 413}
+  return {}
+
+
 def _codex_terminal_error(
   completed_turn: Any | None,
   sdk: dict[str, Any],

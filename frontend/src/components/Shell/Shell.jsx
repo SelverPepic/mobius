@@ -11,7 +11,6 @@ import {
   SettingsNavIcon,
 } from '../navigationIcons.js'
 import Drawer from '../Drawer/Drawer.jsx'
-import Toast from '../ui/Toast.jsx'
 import AppCanvas from '../AppCanvas/AppCanvas.jsx'
 import WalkthroughOverlay from '../Walkthrough/WalkthroughOverlay.jsx'
 import NotificationCenter from '../NotificationBell/NotificationCenter.jsx'
@@ -753,10 +752,6 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
   modelQueries.prefs.useQuery({ enabled: !!activeChatId })
 
   const [appIntents, setAppIntents] = useState({})
-  // toast state: null | { message, variant, duration, action }
-  // variant: 'info' | 'error'  (see components/ui/Toast.jsx)
-  const toastSequenceRef = useRef(0)
-  const [toast, setToast] = useState(null)
   const [settingsFocusTarget, setSettingsFocusTarget] = useState(() =>
     initialNav.section
       ? { section: initialNav.section, nonce: Date.now() }
@@ -766,19 +761,9 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
   // Settings; this token lets that live instance re-read authoritative status
   // even when a multi-pane workspace deliberately defers the full-page reload.
   const [settingsRefreshToken, setSettingsRefreshToken] = useState(0)
-  const showToast = useCallback((
-    message,
-    { variant = 'info', duration = 4000, action } = {},
-  ) => {
-    toastSequenceRef.current += 1
-    setToast({
-      message, variant, duration, action, sequence: toastSequenceRef.current,
-    })
+  const notifyShell = useCallback((message, options) => {
+    notificationCenterActionsRef.current?.addNotice(message, options)
   }, [])
-  // Stable identity is part of Toast's timer contract. Recreating this callback
-  // on every Shell render resets the effect timer while chats stream, making a
-  // nominal five-second notice linger indefinitely.
-  const dismissToast = useCallback(() => { setToast(null) }, [])
   const handleAppIntentDelivered = useCallback((appId, delivered) => {
     setAppIntents((prev) => {
       const key = String(appId)
@@ -1535,7 +1520,6 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
     navTo('project', { projectId: project.id })
     dispatchWorkspace({
       type: 'APPLY_PLACEMENT',
-      toast: null,
       resolve: (current) => {
         let next = paneModel.setViewMode(current, 'panes')
         const projectKey = tabModel.tabKey(tabModel.projectTab(project.id))
@@ -1569,7 +1553,6 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
     const artifactRef = tabModel.artifactTabId(projectId, artifactId)
     dispatchWorkspace({
       type: 'APPLY_PLACEMENT',
-      toast: null,
       resolve: (current) => {
         let next = paneModel.setViewMode(current, 'panes')
         const artifactKey = tabModel.tabKey(tabModel.makeTab('artifact', artifactRef))
@@ -1600,7 +1583,6 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
     navTo('chat', { chatId })
     dispatchWorkspace({
       type: 'APPLY_PLACEMENT',
-      toast: null,
       resolve: (current) => {
         let next = paneModel.setViewMode(current, 'panes')
         const chatTab = tabModel.makeTab('chat', chatId)
@@ -1755,7 +1737,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
     try {
       await importProjectSource(source)
     } catch (error) {
-      showToast(error?.message || 'Could not add this work to Projects.', { variant: 'error' })
+      notifyShell(error?.message || 'Could not add this work to Projects.', { variant: 'error' })
     }
   }
 
@@ -2013,10 +1995,8 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
   })
 
   // ── Workspace undo chord (design §3.5) ────────────────────────────────────
-  // Workspace mutations update the reducer's single undo slot SILENTLY; the
-  // owner found the "Moved X · Undo" / "Agent arranged your workspace" toasts
-  // noise, so there is no per-mutation toast (owner call, live testing). Undo
-  // remains available through Cmd/Ctrl+Z while focus is outside an editor.
+  // Workspace changes are silent. Undo remains available through Cmd/Ctrl+Z
+  // while focus is outside an editor.
   // Cmd/Ctrl+Z restores the single-slot pre-mutation snapshot while no input is
   // focused (design §3.5). Flag-gated; a text field's own undo always wins.
   // Documented limitation (PR3): key events do not cross the iframe boundary, so
@@ -2141,11 +2121,6 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
     runAction: runShellShortcut,
   } = useShellShortcuts(shortcutActions)
 
-  // No per-mutation undo toast: the reducer still mints a fresh undo slot on
-  // every workspace mutation (its `toast` label included, for the reducer's own
-  // tests), but the shell deliberately does NOT surface it — the owner found the
-  // "Moved X · Undo" and "Agent arranged your workspace" toasts noisy. Recovery
-  // stays on the Cmd/Ctrl+Z chord above.
   // Ids of apps that appeared in the fetched list AFTER this session's
   // baseline — the drawer renders a subtle accent dot until each is opened.
   const [newAppIds, setNewAppIds] = useState(() => new Set())
@@ -2550,7 +2525,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
   const setChatArchived = useCallback(async (chatId, archived, { undoable = true } = {}) => {
     const sid = String(chatId)
     const previous = chatsRef.current.find(row => String(row?.id) === sid)
-    if (!previous) return
+    if (!previous) return false
     const token = Symbol(sid)
     archiveActionsRef.current.set(sid, {
       token,
@@ -2571,25 +2546,31 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
       const response = await request
       committed = response.ok
     } catch {}
-    if (archiveActionsRef.current.get(sid)?.token !== token) return
+    if (archiveActionsRef.current.get(sid)?.token !== token) return false
     archiveActionsRef.current.delete(sid)
     archiveRequestsRef.current.delete(sid)
     refreshChatRows(sid)
     if (!committed) {
-      showToast(`Couldn’t ${archived ? 'archive' : 'restore'} that chat.`, { variant: 'error' })
-      return
+      notifyShell(`Couldn’t ${archived ? 'archive' : 'restore'} that chat.`, { variant: 'error' })
+      return false
     }
-    if (!undoable) return
-    // Undo needs time to read and reach, matching the shell's other
-    // actionable notices rather than the 4 s informational default.
-    showToast(archived ? 'Chat archived' : 'Chat restored', {
-      duration: 6000,
+    if (!undoable) return true
+    // Keep only the latest action for this chat available in Notifications.
+    notifyShell(archived ? 'Chat archived' : 'Chat restored', {
+      noticeKey: `chat-archive:${sid}`,
       action: {
         label: 'Undo',
-        onAction: () => { void setChatArchived(sid, !archived, { undoable: false }) },
+        onAction: () => {
+          const current = chatsRef.current.find(row => String(row?.id) === sid)
+          if (!current || Boolean(current.archived_at) !== archived || archiveActionsRef.current.has(sid)) {
+            throw new Error('This chat has changed since that action. Use its current archive or restore control.')
+          }
+          return setChatArchived(sid, !archived, { undoable: false })
+        },
       },
     })
-  }, [projectChatList, refreshChatRows, showToast])
+    return true
+  }, [projectChatList, refreshChatRows, notifyShell])
   const archivedChatIds = useMemo(() => new Set(
     chats.filter(row => row?.archived_at).map(row => String(row.id)),
   ), [chats])
@@ -2648,7 +2629,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
   const { openAppWithIntent, handleChatInternalNav } = useAppIntentNavigation({
     appsRef,
     refreshApps,
-    showToast,
+    notifyShell,
     setAppIntents,
     navToRef,
   })
@@ -4036,9 +4017,9 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
     const { chatId, reason } = resolution
     if (chatId == null) {
       // Don't leave a dead, drawer-still-open tap. Offline / failed create surface a
-      // toast; an in-flight second tap just closes the drawer (the first create lands).
-      if (reason === 'offline') showToast("You're offline.")
-      else if (reason === 'error') showToast("Couldn't start a new chat — please try again.", { variant: 'error' })
+      // notice; an in-flight second tap just closes the drawer (the first create lands).
+      if (reason === 'offline') notifyShell("You're offline.")
+      else if (reason === 'error') notifyShell("Couldn't start a new chat — please try again.", { variant: 'error' })
       closeDrawer()
       return
     }
@@ -4086,9 +4067,9 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
     }
     const { chatId, reason } = resolution
     if (chatId == null) {
-      if (reason === 'offline') showToast("You're offline.")
+      if (reason === 'offline') notifyShell("You're offline.")
       else if (reason === 'error') {
-        showToast("Couldn't open a new chat pane — please try again.", { variant: 'error' })
+        notifyShell("Couldn't open a new chat pane — please try again.", { variant: 'error' })
       }
       return false
     }
@@ -4109,7 +4090,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
       applyModeDestination({
         view: 'chat', chatId, appId: null, paneId: ws.focusedPaneId,
       })
-      showToast('No room for another pane — opened the chat in the focused pane.')
+      notifyShell('No room for another pane — opened the chat in the focused pane.')
     } else {
       dispatchWorkspace(action)
     }
@@ -4207,16 +4188,16 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
       res = await api.chats.remove(id)
     } catch {
       // Network error — treat as inconclusive, don't touch local state.
-      showToast("Couldn't delete — check your connection.", { variant: 'error' })
+      notifyShell("Couldn't delete — check your connection.", { variant: 'error' })
       return
     }
     if (!res.ok) {
       if (res.status === 409) {
-        showToast('Agent is still working in this chat — stop it first.', { duration: 6000 })
+        notifyShell('Agent is still working in this chat — stop it first.')
         return
       }
       if (res.status !== 404) {
-        showToast("Couldn't delete this chat — please try again.", { variant: 'error' })
+        notifyShell("Couldn't delete this chat — please try again.", { variant: 'error' })
         return
       }
       // A 404 means the server row is already gone; remove the local phantom.
@@ -4278,14 +4259,14 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
     try {
       res = await api.projects.remove(projectId)
     } catch {
-      showToast("Couldn't delete — check your connection.", { variant: 'error' })
+      notifyShell("Couldn't delete — check your connection.", { variant: 'error' })
       return false
     }
     if (!res.ok && res.status !== 404) {
       if (res.status === 409) {
-        showToast('The project agent is still working — stop it and retry.', { duration: 6000 })
+        notifyShell('The project agent is still working — stop it and retry.')
       } else {
-        showToast("Couldn't delete this project — please try again.", { variant: 'error' })
+        notifyShell("Couldn't delete this project — please try again.", { variant: 'error' })
       }
       return false
     }
@@ -4327,7 +4308,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
     return true
   }
 
-  // App delete lives here (not in Drawer) so we have access to showToast.
+  // App delete lives here (not in Drawer) so we have access to notifyShell.
   // The Drawer's local deleteApp swallowed all errors silently — 409 means
   // the agent is still working and the app cannot be safely removed yet;
   // network errors must not leave the UI in an ambiguous state.
@@ -4336,23 +4317,22 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
     try {
       res = await api.apps.remove(id)
     } catch {
-      showToast("Couldn't delete — check your connection.", { variant: 'error' })
+      notifyShell("Couldn't delete — check your connection.", { variant: 'error' })
       return
     }
     if (!res.ok) {
       if (res.status === 409) {
         let detail = null
         try { detail = (await res.json())?.detail } catch { /* use fallback */ }
-        showToast(
+        notifyShell(
           detail?.code === 'app_has_imported_project'
             ? detail.message
             : 'Agent is still working in this app — stop it first.',
-          { duration: 6000 },
         )
         return
       }
       if (res.status !== 404) {
-        showToast("Couldn't delete this app — please try again.", { variant: 'error' })
+        notifyShell("Couldn't delete this app — please try again.", { variant: 'error' })
         return
       }
       // A 404 means the server row is already gone; remove the local phantom.
@@ -4384,7 +4364,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
 
   // Wipes an app's stored data back to empty while KEEPING it installed —
   // a separate, additive action from deleteApp (which tombstones the whole
-  // app). Lives here, like deleteApp, so it has access to showToast and
+  // app). Lives here, like deleteApp, so it has access to notifyShell and
   // refreshApps. The app STAYS in the list; refreshApps picks up the bumped
   // updated_at, which rotates versionForApp's cache-buster so an open iframe
   // remounts against its now-empty storage — no manual cache eviction.
@@ -4393,15 +4373,15 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
     try {
       res = await api.apps.deleteData(id)
     } catch {
-      showToast("Couldn't delete app data — check your connection.", { variant: 'error' })
+      notifyShell("Couldn't delete app data — check your connection.", { variant: 'error' })
       return
     }
     if (!res.ok) {
       if (res.status === 409) {
-        showToast('Agent is still working in this app — stop it first.', { duration: 6000 })
+        notifyShell('Agent is still working in this app — stop it first.')
         return
       }
-      showToast("Couldn't delete app data.", { variant: 'error' })
+      notifyShell("Couldn't delete app data.", { variant: 'error' })
       return
     }
     // The server rotated this app's immutable storage generation under the write
@@ -4416,7 +4396,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
     await clearAppRuntimeData(id)
     await appQueries.token.invalidate(queryClient, id)
     await refreshApps()
-    showToast('App data deleted')
+    notifyShell('App data deleted')
   }
 
   // Bootstrap: create an initial chat once the server confirms zero
@@ -4594,7 +4574,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
           </button>
         </nav>
         <div className="shell__bar-actions">
-          <ScreenControlButton chatId={activeChatId} onNotice={showToast} />
+          <ScreenControlButton chatId={activeChatId} onNotice={notifyShell} />
           {connectionStatusLabel && (
             <span
               className="shell__connection-status"
@@ -4678,7 +4658,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
         onSetChatArchived={setChatArchived}
         onDeleteApp={deleteApp}
         onDeleteAppData={deleteAppData}
-        onNotice={showToast}
+        onNotice={notifyShell}
         onSettings={() => {
           setSettingsFocusTarget(null)
           navTo('settings')
@@ -5356,14 +5336,6 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
           <CollapseSm width={18} height={18} aria-hidden="true" />
         </button>
       )}
-      <Toast
-        key={toast?.sequence || 'toast-empty'}
-        message={toast?.message}
-        variant={toast?.variant}
-        duration={toast?.duration}
-        action={toast?.action}
-        onDismiss={dismissToast}
-      />
       {tabMenu && (() => {
         const menuPane = workspace.panes[tabMenu.paneId]
         const menuTabIndex = menuPane?.tabs.findIndex(

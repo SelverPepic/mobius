@@ -5777,6 +5777,27 @@ def _add_embed_browser_lineage(eng) -> None:
         conn.execute(text(f"ALTER TABLE chat_embed_grants ADD COLUMN {name} {sqltype}"))
 
 
+def _add_browser_account_grants(eng) -> None:
+  from sqlalchemy import inspect as sa_inspect, text
+  if not sa_inspect(eng).has_table("browser_access_grants"):
+    return
+  columns = {c["name"] for c in sa_inspect(eng).get_columns("browser_access_grants")}
+  with eng.begin() as conn:
+    for name, sqltype in (
+      ("kind", "VARCHAR(16) NOT NULL DEFAULT 'invitation'"),
+      ("issuer", "VARCHAR(255)"), ("subject", "VARCHAR(128)"),
+      ("recipient_handle", "VARCHAR(128)"), ("origin", "VARCHAR(255)"),
+      ("remote_status", "VARCHAR(24)"),
+      ("grantor_binding", "VARCHAR(128)"),
+    ):
+      if name not in columns:
+        conn.execute(text(f"ALTER TABLE browser_access_grants ADD COLUMN {name} {sqltype}"))
+    conn.execute(text("CREATE TABLE IF NOT EXISTS browser_account_pending (id VARCHAR(64) NOT NULL PRIMARY KEY, grant_id VARCHAR(64) NOT NULL REFERENCES browser_access_grants(id), state_hash VARCHAR(64) NOT NULL UNIQUE, cookie_hash VARCHAR(64) NOT NULL, verifier VARCHAR(128) NOT NULL, nonce VARCHAR(64) NOT NULL, grant_epoch INTEGER NOT NULL, owner_token_epoch INTEGER NOT NULL, issuer VARCHAR(255) NOT NULL, subject VARCHAR(128) NOT NULL, expires_at TIMESTAMP NOT NULL, consumed_at TIMESTAMP, verified_at TIMESTAMP, verified_expires_at TIMESTAMP)"))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_browser_account_pending_grant_id ON browser_account_pending(grant_id)"))
+    conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_browser_account_pending_cookie_hash ON browser_account_pending(cookie_hash)"))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_browser_account_pending_expires_at ON browser_account_pending(expires_at)"))
+
+
 def _add_goal_hold(eng) -> None:
   """Add explicit pause attribution without inventing intent for old stops."""
   from sqlalchemy import inspect as sa_inspect, text
@@ -5893,6 +5914,7 @@ _SCHEMA_MIGRATIONS = (
   ("0079_chat_run_browser_lineage", _add_chat_run_browser_lineage),
   ("0080_embed_browser_lineage", _add_embed_browser_lineage),
   ("0078_agent_write_journal", _add_agent_write_journal),
+  ("0081_browser_account_grants", _add_browser_account_grants),
   ("0081_goal_hold", _add_goal_hold),
   ("0082_run_owner_input_at", _add_run_owner_input_at),
 )

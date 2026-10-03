@@ -63,6 +63,7 @@ function withSharedBrowserCookieOwner(operation) {
   }
 }
 let sharedBrowserRenewal = null
+let sharedBrowserAccountFinalization = null
 let pendingSharedBrowserLogoutGrantId = null
 let sharedBrowserClosed = false
 
@@ -138,6 +139,25 @@ function sharedBrowserSessionRequest(path, body, redeemIntent) {
 export function redeemSharedBrowserInvite(invite) {
   if (!sharedBrowserEnabled || !invite) throw new Error('SHARED_ACCESS_INVALID_INVITE')
   return sharedBrowserSessionRequest('session/redeem', { invite }, ++sharedBrowserRedeemIntent)
+}
+
+export function finalizeSharedBrowserAccount(pendingId) {
+  if (!sharedBrowserEnabled || !pendingId) throw new Error('SHARED_ACCESS_INVALID_ACCOUNT_FLOW')
+  if (sharedBrowserAccountFinalization?.id === pendingId
+      && sharedBrowserAccountFinalization.intent === sharedBrowserRedeemIntent) {
+    return sharedBrowserAccountFinalization.promise
+  }
+  // Unlike the cross-site callback, this same-origin request receives the
+  // previous Strict cookie and participates in the existing browser-wide lock.
+  // React's repeated effect setup observes the same one-use operation.
+  const intent = ++sharedBrowserRedeemIntent
+  const operation = { id: pendingId, intent }
+  operation.promise = sharedBrowserSessionRequest('session/account/finalize', { pending_id: pendingId }, intent)
+    .finally(() => {
+      if (sharedBrowserAccountFinalization === operation) sharedBrowserAccountFinalization = null
+    })
+  sharedBrowserAccountFinalization = operation
+  return operation.promise
 }
 
 export function renewSharedBrowserSession() {

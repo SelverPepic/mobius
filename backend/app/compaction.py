@@ -7,9 +7,10 @@ Only that provider-neutral result is stored and replayed into the selected
 provider's first real turn; the disposable synthesis session is never attached
 to the chat.
 
-The visible transcript is always included as a freshness backstop; legacy chats
-without a running note use it as their sole source. The route and writer actor own
-the atomic switch; this module only reads the source and produces compacted text.
+Callers include the visible transcript as a freshness backstop, or its uncovered
+tail when a verified note replaces the prefix. Legacy chats without a note use
+the transcript alone. The route and writer actor own the atomic switch; this
+module only reads the selected source and produces compacted text.
 """
 
 from __future__ import annotations
@@ -202,8 +203,8 @@ async def summarize_chat(
   """Let the incoming provider synthesize its portable starting context.
 
   ``source_summary`` is the preferred, complete ``## Summary`` from the
-  per-chat note. The complete visible transcript is also included to close the
-  window where that note is stale. The selected provider/model performs the
+  per-chat note. The caller supplies the complete visible transcript unless it
+  has verified coverage allowing only the uncovered tail. The provider performs the
   synthesis in one or more disposable sessions; very large sources are folded
   progressively so no source interval is silently dropped or placed into an
   over-context prompt.
@@ -221,11 +222,10 @@ async def summarize_chat(
   if source:
     source_material = f"--- DETAILED RUNNING SUMMARY ---\n{source}"
     if transcript:
-      # The turn-end note backstop runs after the reply settles. Including the
-      # complete transcript closes that freshness window without assuming the
-      # missing material is necessarily at the tail.
+      # Include every supplied interval; coverage selection belongs to the
+      # caller, never to this bounded synthesis engine.
       source_material += (
-        "\n\n--- COMPLETE CURRENT CHAT TRANSCRIPT ---\n" + transcript
+        "\n\n--- CURRENT CHAT TRANSCRIPT ---\n" + transcript
       )
   else:
     source_material = f"--- LEGACY CHAT TRANSCRIPT ---\n{transcript}"
