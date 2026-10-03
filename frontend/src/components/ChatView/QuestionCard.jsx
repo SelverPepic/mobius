@@ -338,7 +338,7 @@ export default function QuestionCard({
     <div
       className={`qcard${grouped ? ' qcard--grouped' : ''}${answered ? ' qcard--answered' : ''}`}
       onDrop={event => {
-        if (selectionLocked || disabled || platformAction) return
+        if (selectionLocked || disabled || submitting || platformAction) return
         const dropped = Array.from(event.dataTransfer?.files || [])
         if (!dropped.length) return
         event.preventDefault()
@@ -503,7 +503,7 @@ export default function QuestionCard({
                       aria-label="Attach files to your answer"
                       onChange={e => { const selected = Array.from(e.target.files || []); e.target.value = ''; addFiles(selected) }} />
                     <button type="button" className="qcard__attach" aria-label="Attach a photo or file"
-                      title="Attach a photo or file" onClick={() => fileInputRef.current?.click()}>
+                      title="Attach a photo or file" disabled={submitting} onClick={() => fileInputRef.current?.click()}>
                       <Paperclip width={18} height={18} aria-hidden="true" />
                     </button>
                   </div>
