@@ -29,6 +29,20 @@ def _grant(db, monkeypatch):
   return owner, grant
 
 
+def _owner_account_grant(db):
+  owner = db.query(models.Owner).one()
+  db.add(models.IdentityAccountLink(owner_id=owner.id,
+    access_token_encrypted="fixture-token-ciphertext", scopes_json=[]))
+  db.commit()
+  grant = access.BrowserAccessGrant(
+    id="g" * 32, owner_id=owner.id, label="Shared", kind="account",
+    remote_status="active", epoch=0,
+  )
+  db.add(grant)
+  db.commit()
+  return owner, grant
+
+
 def _denied(fn):
   with pytest.raises(HTTPException) as error:
     fn()
@@ -302,6 +316,65 @@ def test_unlink_failure_still_closes_every_local_account_grant(client, auth, db,
   assert all(g.remote_status == "cleanup_pending" for g in grants)
   assert len(attempted) == 2
   assert db.get(models.IdentityAccountLink, owner.id) is not None
+
+
+def test_unlink_retry_skips_confirmed_directory_revocations(client, auth, db, monkeypatch):
+  from app.routes import browser_access as routes, identity
+  owner, confirmed = _owner_account_grant(db)
+  confirmed.remote_status = "revoked"
+  confirmed.revoked_at = access.now_naive_utc()
+  pending = access.BrowserAccessGrant(
+    id="p" * 32, owner_id=owner.id, label="Pending", kind="account",
+    remote_status="cleanup_pending", epoch=1,
+  )
+  db.add(pending)
+  db.commit()
+  calls = []
+  async def remote(db, owner_id, method, suffix, payload=None):
+    calls.append(suffix)
+    return httpx.Response(204)
+  monkeypatch.setattr(routes, "_issuer_request", remote)
+  monkeypatch.setattr(identity, "_open", lambda value: "fixture-token")
+  original = httpx.AsyncClient
+  monkeypatch.setattr(identity.httpx, "AsyncClient", lambda **kwargs: original(
+    transport=httpx.MockTransport(lambda request: httpx.Response(204)), **kwargs))
+  response = client.delete("/api/identity/link", headers=auth)
+  assert response.status_code == 204, response.text
+  assert calls == ["/grants/" + pending.id]
+  db.refresh(confirmed)
+  db.refresh(pending)
+  assert confirmed.remote_status == pending.remote_status == "revoked"
+  assert pending.revoked_at is not None
+  assert db.get(models.IdentityAccountLink, owner.id) is None
+
+
+@pytest.mark.parametrize("lost_credential", ["issuer_401", "unreadable"])
+def test_unlink_lost_credential_closes_local_grants_without_directory_claim(
+  client, auth, db, monkeypatch, lost_credential,
+):
+  from app.routes import browser_access as routes, identity
+  owner, first = _owner_account_grant(db)
+  second = access.BrowserAccessGrant(
+    id="q" * 32, owner_id=owner.id, label="Second", kind="account",
+    remote_status="active", epoch=0,
+  )
+  db.add(second)
+  db.commit()
+  calls = []
+  async def remote(db, owner_id, method, suffix, payload=None):
+    calls.append(suffix)
+    if lost_credential == "unreadable":
+      raise HTTPException(409, "Sign in again to reconnect your account.")
+    return httpx.Response(401)
+  monkeypatch.setattr(routes, "_issuer_request", remote)
+  response = client.delete("/api/identity/link", headers=auth)
+  assert response.status_code == 204, response.text
+  assert calls == ["/grants/" + first.id]
+  db.refresh(first)
+  db.refresh(second)
+  assert all(grant.revoked_at is not None for grant in (first, second))
+  assert all(grant.remote_status == "cleanup_pending" for grant in (first, second))
+  assert db.get(models.IdentityAccountLink, owner.id) is None
 
 
 def test_registration_response_cannot_reactivate_locally_revoked_grant(client, auth, db, monkeypatch):

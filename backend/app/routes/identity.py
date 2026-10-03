@@ -1608,7 +1608,7 @@ async def delete_link(
   from app.routes.connect import cancel_browser_grant_commands
   from app.app_services import cancel_browser_grant_calls
   from app.chat import stop_browser_grant_runs
-  from sqlalchemy import update
+  from sqlalchemy import or_, update
   grants = db.query(shared_access.BrowserAccessGrant).filter_by(
     owner_id=owner.id, kind="account",
   ).all()
@@ -1625,10 +1625,15 @@ async def delete_link(
   db.execute(update(shared_access.BrowserAccessGrant).where(
     shared_access.BrowserAccessGrant.owner_id == owner.id,
     shared_access.BrowserAccessGrant.kind == "account",
+    or_(
+      shared_access.BrowserAccessGrant.remote_status != "revoked",
+      shared_access.BrowserAccessGrant.remote_status.is_(None),
+    ),
   ).values(remote_status="cleanup_pending"))
   db.commit()
   cleanup_pending = False
   stop_pending = False
+  credential_lost = False
   for grant in grants:
     try:
       if cancel_browser_grant_commands(grant.id):
@@ -1637,18 +1642,29 @@ async def delete_link(
       await stop_browser_grant_runs(grant.id, db)
     except Exception:
       stop_pending = True
-    try:
-      cleanup = await _issuer_request(db, owner.id, "DELETE", "/grants/" + grant.id)
-    except HTTPException:
-      cleanup = None
-    if cleanup is None or cleanup.status_code not in (200, 204):
-      grant.remote_status = "cleanup_pending"
-      cleanup_pending = True
-    else:
-      grant.remote_status = "revoked"
+    # A confirmed directory revocation must survive retry. A rejected or
+    # unreadable link credential cannot perform further directory cleanup;
+    # keep unconfirmed rows pending, but do not strand local unlink forever.
+    if grant.remote_status != "revoked" and not credential_lost:
+      try:
+        cleanup = await _issuer_request(db, owner.id, "DELETE", "/grants/" + grant.id)
+      except HTTPException as exc:
+        cleanup = None
+        credential_lost = exc.status_code == 409
+      if cleanup is not None and cleanup.status_code in (200, 204):
+        grant.remote_status = "revoked"
+      else:
+        credential_lost = credential_lost or (
+          cleanup is not None and cleanup.status_code == 401
+        )
+        cleanup_pending = True
     db.commit()
-  if cleanup_pending or stop_pending:
+  if (cleanup_pending and not credential_lost) or stop_pending:
     raise HTTPException(502, "Shared access ended locally, but cleanup is pending. Retry unlink.")
+  if credential_lost:
+    db.delete(link)
+    db.commit()
+    return Response(status_code=204)
   try:
     token = _open(link.access_token_encrypted)
   except HTTPException:

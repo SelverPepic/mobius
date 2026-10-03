@@ -174,7 +174,8 @@ def test_verified_flow_cannot_finalize_after_local_grant_revocation(account_flow
     assert db.query(access.BrowserAccessSession).count() == 0
 
 
-def test_unlink_retains_retry_until_remote_command_stop_is_confirmed(client, auth, db, monkeypatch):
+@pytest.mark.parametrize("directory_status", [204, 401])
+def test_unlink_retains_retry_until_remote_command_stop_is_confirmed(client, auth, db, monkeypatch, directory_status):
     from app import models, browser_access as access
     from app.config import get_settings
     from app.routes import browser_access as routes, connect
@@ -190,7 +191,7 @@ def test_unlink_retains_retry_until_remote_command_stop_is_confirmed(client, aut
     db.add(grant)
     db.commit()
     async def cleanup(*args, **kwargs):
-        return httpx.Response(204)
+        return httpx.Response(directory_status)
     monkeypatch.setattr(routes, "_issuer_request", cleanup)
     monkeypatch.setattr(connect, "cancel_browser_grant_commands",
         lambda grant_id: [{"request_id": "pending-test-command", "remote_confirmed": False}])
@@ -199,6 +200,7 @@ def test_unlink_retains_retry_until_remote_command_stop_is_confirmed(client, aut
     assert "cleanup is pending" in response.json()["detail"]
     db.refresh(grant)
     assert grant.revoked_at is not None
+    assert grant.remote_status == ("revoked" if directory_status == 204 else "cleanup_pending")
     assert db.get(models.IdentityAccountLink, owner.id) is not None
 
 
