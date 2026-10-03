@@ -466,7 +466,15 @@ def prepare_env(
 
 
 def rebuild_accepted_env(data_dir: Path | str, app_id: int, root: Path) -> Path | None:
-  """Restore the pinned accepted tree with the ordinary build/publication path."""
+  """Restore the pinned accepted tree with the ordinary build/publication path.
+
+  An env that is still usable was validated when its tree was accepted, so
+  restoring after every start does not run the app's code again.
+  """
+  try:
+    return resolve_env(data_dir, app_id, root)
+  except PythonEnvUnavailable:
+    pass
   staged = prepare_env(data_dir, app_id, root)
   if staged is None:
     return None

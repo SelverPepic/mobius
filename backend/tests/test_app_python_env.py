@@ -774,6 +774,24 @@ def test_rebuild_accepted_env_uses_frozen_lock_after_image_change(
   assert len(builds) == 2
 
 
+def test_rebuild_accepted_env_does_not_rerun_code_for_a_usable_env(
+  client, auth, db, monkeypatch,
+):
+  _fake_builds(monkeypatch)
+  source = _source(lock="accepted==1\n", service=b"import json\n")
+  created = _apply(client, auth, source)
+  assert created.status_code == 200, created.text
+  row = db.get(models.App, created.json()["app"]["id"])
+  root = applied_app_runtime.runtime_root(row)
+  existing = app_python_env.resolve_env(_data_dir(), row.id, root)
+
+  def no_smoke(*_args, **_kwargs):
+    raise AssertionError("restoring a usable env must not run app code")
+
+  monkeypatch.setattr(app_python_env, "_smoke", no_smoke)
+  assert app_python_env.rebuild_accepted_env(_data_dir(), row.id, root) == existing
+
+
 def test_apply_failure_after_env_publication_removes_the_new_env(
   client, auth, db, monkeypatch,
 ):
