@@ -1201,27 +1201,39 @@ column remains only as an internal latch: it defaults on and is cleared solely
 by `delegations.mark_cancelled`, so a cancelled delegated child cannot
 resurrect itself when the boot sweep claims restart parks.
 
-### A Goal is a note, a checklist, and Done
+### A Goal owns an outcome; attempts own execution
 
-`ChatGoal` owns the stable objective, revision-checked plan, checkpoint, next
-step, and explicit outcome. `ChatRun.goal_id` attaches each execution attempt
-to that record. A failed, interrupted, or cleanly ended attempt cannot complete
-or fail the obligation. Stop and dismissal are explicit; a deliberate Resume
-can reopen stopped work but stale deliveries cannot. Migration 0063 copies
-historical plans without deleting run snapshots and leaves uncertain work open.
+`ChatGoal` owns the original objective, revision-checked checklist, checkpoint,
+next step, and explicit Completed / Cannot complete / Cancelled outcome.
+`ChatRun.goal_id` attaches an execution attempt without replacing that obligation.
+Task edits and terminal settlement share one transaction: a refusal saves neither.
+A green checklist alone is not completion, and an interruption is not capitulation.
 
-The writer admits Goal identity and the attempt in the same transaction.
-Execution turns are not a budget, and an unfinished Goal never schedules its
-own next turn. Goal work moves only through what already wakes a chat: owner
-input, a Wait result, a helper result, peer or activation delivery, and
-restart or usage-limit recovery. A turn that ends cleanly needs no Goal
-handoff: nothing checks it, and an idle unfinished Goal is simply the owner's
-turn. The Goal record reports only its own lifecycle (`active` while a turn
-runs, `paused` while idle or stopped, `completed`); who moves next is derived
-from chat state the client already holds — an open card, armed Waits, running
-helpers — never from a per-Goal ownership query. Retired automatic-continuation
-bookkeeping (`goal_plan_revision_at_admission`, the `automatic_remaining`
-column) is inert historical schema.
+The writer records a deliberate Stop or quiet card answer as a Goal hold before
+interrupting execution. `hold_json` identifies the actor, exact action/card and
+attempt, and time. Generic `FinishRun` never manufactures Goal intent. Absent or
+invalid historical attribution remains held but neutral: **Interrupted**, never
+**Paused by you**. Dismissal and verified terminal outcomes remain distinct.
+Migrations 0081/0082 add nullable provenance without rewriting historical intent.
+
+Resume uses the existing acknowledged continuation path. A Goal action carries
+its exact ID and revision; a reply action carries its physical run ID. Neither is
+queued behind activation or allowed to bypass a saved question. Receipt retries
+acknowledge only the original target. Named `update_goal` can attach later owner
+work to a retained Goal, preserving its objective and checklist. Reopening a hold
+requires durable owner-admission evidence, not a different run ID or guessed text.
+`owner_input_at` records direct/queued acceptance; physical recovery inherits that
+time rather than renewing authority. Unknown holds accept new owner input, not
+inherited recovery. Automatic results and parks cannot override held/settled work.
+
+An unfinished Goal retains responsibility until a truthful outcome, answerable
+saved card, or genuine automatic wake. The existing writer/continuation runner
+admits one bounded settlement pass after a clean unhanded ending; another such
+ending records a visible technical recovery failure, not a fabricated outcome.
+No separate Goal worker, unlimited retry, or automatic crash/Stop recovery exists.
+Goal labels derive only from that Goal's cards, Waits, helpers and eligible parks;
+chat-wide handoff guards conflicting actions without borrowing another task's
+question. Retired revision-budget columns remain inert historical schema.
 
 Persisted plans use the same task validation as plan writes. An unreadable
 plan keeps its Goal open, cannot authorize completion, and can be repaired

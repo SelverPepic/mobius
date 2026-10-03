@@ -286,3 +286,75 @@ async def test_guest_followup_routes_reject_foreign_lineage_before_start(monkeyp
       await routes.retry_delegation("child", routes.DelegationRetry(run_token="parked"),
                                     principal=principal, db=None)
   assert denied.value.status_code == 403
+
+
+@pytest.mark.parametrize('revoked', [False, True])
+def test_exact_goal_resume_inherits_target_grant_not_intervening_owner_run(tmp_path, revoked):
+  from datetime import UTC, datetime, timedelta
+  from app.chat_writer import ChatWriterActor, StartTurn
+
+  eng = create_engine(f"sqlite:///{tmp_path / 'goal-resume.db'}")
+  models.Base.metadata.create_all(eng)
+  with Session(eng) as db:
+    owner = models.Owner(username='owner', hashed_password='unused')
+    db.add(owner)
+    db.commit()
+    grant, _ = create_invitation(db, owner, 'guest')
+    base = datetime.now(UTC)
+    db.add(create_chat(id='chat', messages=[{'role': 'user', 'content': 'Work', 'ts': 1}]))
+    db.add(models.ChatGoal(id='goal', chat_id='chat', objective='Finish work', status='stopped', revision=3))
+    db.add(models.ChatRun(
+      id='target', chat_id='chat', root_run_id='target', status='completed',
+      goal_id='goal', goal_objective='Finish work', started_at=base,
+      browser_grant_id=grant.id, browser_grant_epoch=grant.epoch,
+    ))
+    db.add(models.ChatRun(
+      id='intervening', chat_id='chat', root_run_id='intervening', status='completed',
+      started_at=base + timedelta(seconds=1),
+    ))
+    db.commit()
+    if revoked:
+      revoke_grant(db, grant.id, owner.id)
+    actor = ChatWriterActor(session_factory=lambda: db)
+    command = StartTurn(chat_id='chat', run_token='resumed',
+      user_msg={'kind': 'continuation', 'continuation_reason': 'manual', 'cid': 'resume'},
+      resume_goal_id='goal', resume_goal_revision=3)
+    if revoked:
+      with pytest.raises(HTTPException):
+        actor._start_turn(db, command)
+      assert db.get(models.ChatRun, 'resumed') is None
+      assert db.get(models.ChatGoal, 'goal').status == 'stopped'
+    else:
+      actor._start_turn(db, command)
+      run = db.get(models.ChatRun, 'resumed')
+      assert (run.browser_grant_id, run.browser_grant_epoch) == (grant.id, grant.epoch)
+      assert run.root_run_id == 'target' and run.goal_id == 'goal'
+
+
+def test_guest_cannot_resume_retained_owner_goal_through_its_intervening_run(tmp_path):
+  from datetime import UTC, datetime, timedelta
+  from app.chat_writer import ChatWriterActor, StartTurn
+
+  eng = create_engine(f"sqlite:///{tmp_path / 'foreign-goal.db'}")
+  models.Base.metadata.create_all(eng)
+  with Session(eng) as db:
+    owner = models.Owner(username='owner', hashed_password='unused')
+    db.add(owner)
+    db.commit()
+    grant, _ = create_invitation(db, owner, 'guest')
+    base = datetime.now(UTC)
+    db.add(models.Chat(id='chat'))
+    db.add(models.ChatGoal(id='goal', chat_id='chat', objective='Owner work', status='stopped', revision=3))
+    db.add(models.ChatRun(id='target', chat_id='chat', root_run_id='target', status='completed',
+      goal_id='goal', goal_objective='Owner work', started_at=base))
+    db.add(models.ChatRun(id='intervening', chat_id='chat', status='completed',
+      started_at=base + timedelta(seconds=1), browser_grant_id=grant.id, browser_grant_epoch=grant.epoch))
+    db.commit()
+    actor = ChatWriterActor(session_factory=lambda: db)
+    with pytest.raises(_PersistFailed, match='Browser grant cannot resume a foreign run'):
+      actor._start_turn(db, StartTurn(chat_id='chat', run_token='resumed',
+        user_msg={'kind': 'continuation', 'continuation_reason': 'manual', 'cid': 'resume'},
+        browser_grant_id=grant.id, browser_grant_epoch=grant.epoch,
+        resume_goal_id='goal', resume_goal_revision=3))
+    assert db.get(models.ChatRun, 'resumed') is None
+    assert db.get(models.ChatGoal, 'goal').status == 'stopped'

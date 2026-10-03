@@ -350,6 +350,7 @@ class ChatGoal(Base):
   objective = Column(Text, nullable=False)
   status = Column(String(16), nullable=False, default="open", server_default="open")
   plan_json = Column(JSON, nullable=True)
+  hold_json = Column(JSON, nullable=True)
   revision = Column(Integer, nullable=False, default=0, server_default="0")
   checkpoint = Column(Text, nullable=True)
   next_action = Column(Text, nullable=True)
@@ -391,8 +392,8 @@ class ChatRun(Base):
     String(64), ForeignKey("chats.id"), nullable=False, index=True
   )
   # "running" while in flight; terminal outcomes are "completed" for a clean
-  # turn, "failed" for a provider/setup error, "stopped" for an explicit user
-  # Stop, and "interrupted" for crash/supersession/watchdog recovery. Provider
+  # turn, "failed" for a provider/setup error, "stopped" for process Stop
+  # (not proof of Goal intent), and "interrupted" for crash/supersession recovery. Provider
   # limits additionally use the parked/resume_pending/parked_notified states.
   # A successfully drained planned restart reuses that retry path with
   # park_reason="restart"; an unplanned crash remains "interrupted".
@@ -430,6 +431,9 @@ class ChatRun(Base):
   # Claimed before note-based size recovery makes any model call. This is
   # independent of continuation provenance: a direct owner run remains direct.
   note_recovery_attempted = Column(Boolean, nullable=False, default=False, server_default="0")
+  # When direct owner input was accepted. Exact physical recovery inherits it;
+  # automatic work and legacy runs have no evidence to override a later hold.
+  owner_input_at = Column(DateTime, nullable=True, default=None)
   provider = Column(String(32), nullable=True, default=None)
   # Objective shown by the shell while this exact run is attached to a Goal.
   # This belongs to the run rather than the transcript tail: mid-turn owner
