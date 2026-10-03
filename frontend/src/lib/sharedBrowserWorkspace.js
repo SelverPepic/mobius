@@ -60,16 +60,14 @@ export function sharedBrowserWorkspaceStorage(grantId, storage) {
   }
 }
 
-let activeGrantId = null
+// The active grant's storage is one stable object, so a module that asks for
+// both durable and tab storage sees a single guest store rather than two views
+// of the same keys.
+let activeGrantStorage = null
 export function setActiveSharedBrowserGrantId(grantId) {
-  activeGrantId = grantId == null ? null : String(grantId)
-}
-
-export function currentSharedBrowserGrantId() {
-  return isSharedBrowserRoute() ? activeGrantId : null
+  activeGrantStorage = grantId == null ? null : sharedBrowserStorageForGrant(String(grantId))
 }
 
 export function currentSharedBrowserStorage() {
-  if (!isSharedBrowserRoute() || !activeGrantId) return null
-  return sharedBrowserStorageForGrant(activeGrantId)
+  return isSharedBrowserRoute() ? activeGrantStorage : null
 }
