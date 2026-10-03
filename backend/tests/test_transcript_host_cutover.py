@@ -108,8 +108,13 @@ def test_exact_transcript_archive_survives_and_old_host_rollback_is_refused(
   assert events[-1]["code"] == "newer_version_required"
 
 
+class UnsafeFirstUpgradeRollback(AssertionError):
+  """Only the observed old-image start is this rehearsal's known failure."""
+
+
 @pytest.mark.xfail(
   strict=True,
+  raises=UnsafeFirstUpgradeRollback,
   reason="Known first-upgrade defect: installed 36c0ce1016 worker REV2 has no rollback floor preflight",
 )
 def test_installed_prior_worker_must_not_start_level_zero_after_activation(
@@ -134,6 +139,7 @@ def test_installed_prior_worker_must_not_start_level_zero_after_activation(
   monkeypatch.setattr(prior, "wait_healthy", lambda *a, **kw: False)
   prior.rollback({"data_dir": str(tmp_path)}, "operation", "a" * 40,
                  "health_check_failed", "candidate failed", "sha256:previous")
-  assert not any("up" in args and "--force-recreate" in args for args in calls), (
-    "installed REV2 worker attempted to start its level-0 rollback image after floor 1"
-  )
+  if any("up" in args and "--force-recreate" in args for args in calls):
+    raise UnsafeFirstUpgradeRollback(
+      "installed REV2 worker attempted to start its level-0 rollback image after floor 1"
+    )
