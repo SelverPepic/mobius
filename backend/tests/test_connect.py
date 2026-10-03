@@ -2156,7 +2156,7 @@ def test_runner_refuses_expired_command_without_spawning(
   })
   assert reported.wait(2)
 
-  messages = list(runner.outbox)
+  messages = runner.pending_messages()
   assert messages[-1]["outcome"] == "expired"
   assert messages[-1]["exit_code"] == 124
   assert runner.active == {}
@@ -2178,7 +2178,9 @@ def test_runner_retries_a_result_until_ordinary_https_succeeds(monkeypatch):
   monkeypatch.setattr(connect_runner, "_post", post)
   runner = connect_runner._CommandRunner("https://mobius.test", "token")
   request_id = "4" * 16
-  runner._post_result(request_id, "ready", "", 0, "completed")
+  runner._post_result(
+    connect_runner._Command(request_id, 30), "ready", "", 0, "completed",
+  )
   assert first_attempt.wait(2)
   with runner.flush_lock:
     pass
@@ -2198,22 +2200,15 @@ def test_runner_retries_a_result_until_ordinary_https_succeeds(monkeypatch):
 
 def test_runner_finishes_into_pending_result_atomically(monkeypatch):
   runner = connect_runner._CommandRunner("https://example.test", "token")
-  record = {
-    "request_id": "a" * 16,
-    "proc": None,
-    "reason": None,
-    "timeout": 30,
-  }
-  runner.active[record["request_id"]] = record
+  command = connect_runner._Command("a" * 16, 30)
+  runner.active[command.request_id] = command
   monkeypatch.setattr(runner, "_wake_result_worker", lambda: None)
 
-  runner._post_result(
-    record["request_id"], "done", "", 0, "completed", record=record,
-  )
+  runner._post_result(command, "done", "", 0, "completed")
 
   active_ids, pending_ids = runner.snapshot()
   assert active_ids == []
-  assert pending_ids == [record["request_id"]]
+  assert pending_ids == [command.request_id]
 
 
 def test_runner_ignores_duplicate_delivery_of_an_accepted_request(monkeypatch):
@@ -2226,7 +2221,7 @@ def test_runner_ignores_duplicate_delivery_of_an_accepted_request(monkeypatch):
     before_spawn()
     spawned.append((cmd, cwd))
     spawned_event.set()
-    return object()
+    return object(), None
   monkeypatch.setattr(
     connect_runner,
     "_spawn_command",
@@ -2254,7 +2249,7 @@ def test_runner_ignores_duplicate_delivery_of_an_accepted_request(monkeypatch):
   assert spawned == [("do it once", None)]
   assert list(runner.active) == [event["request_id"]]
   assert runner.pending_messages() == []
-  runner.active[event["request_id"]]["output"].close()
+  runner.active[event["request_id"]].output.close()
 
 
 def test_runner_runs_commands_in_parallel_without_queueing(monkeypatch):
@@ -2266,7 +2261,7 @@ def test_runner_runs_commands_in_parallel_without_queueing(monkeypatch):
     spawned.append((cmd, cwd))
     if len(spawned) == 2:
       both_spawned.set()
-    return object()
+    return object(), None
   monkeypatch.setattr(
     connect_runner,
     "_spawn_command",
@@ -2295,10 +2290,10 @@ def test_runner_runs_commands_in_parallel_without_queueing(monkeypatch):
     connect_runner, "_terminate_process_tree", lambda _proc: None,
   )
   assert runner.cancel("1" * 16) is True
-  assert first["reason"] == "canceled"
-  assert runner.active["2" * 16]["reason"] is None
-  for record in runner.active.values():
-    record["output"].close()
+  assert first.stop_reason == "canceled"
+  assert runner.active["2" * 16].stop_reason is None
+  for command in runner.active.values():
+    command.output.close()
 
 
 def test_runner_keeps_literal_script_off_the_process_command_line(monkeypatch):
@@ -2311,7 +2306,7 @@ def test_runner_keeps_literal_script_off_the_process_command_line(monkeypatch):
     before_spawn()
     spawned.append((cmd, cwd, script, shell))
     spawned_event.set()
-    return object()
+    return object(), None
 
   monkeypatch.setattr(connect_runner, "_spawn_command", spawn)
   monkeypatch.setattr(runner, "_post_started", lambda _request_id: None)
@@ -2328,14 +2323,14 @@ def test_runner_keeps_literal_script_off_the_process_command_line(monkeypatch):
   assert spawned_event.wait(2)
 
   assert spawned == [(None, "/srv/app", script, "bash")]
-  assert runner.active["e" * 16]["input"] == script
-  runner.active["e" * 16]["output"].close()
+  assert runner.active["e" * 16].stdin_text == script
+  runner.active["e" * 16].output.close()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell contract")
 def test_runner_executes_literal_posix_script_through_stdin():
   script = "name='$literal'\nfor value in \"$name\" two; do printf '<%s>\\n' \"$value\"; done\n"
-  proc = connect_runner._spawn_command(
+  proc, _command_file = connect_runner._spawn_command(
     None, None, script=script, shell="sh",
   )
 
@@ -2397,7 +2392,7 @@ def test_runner_rechecks_expiry_after_start_ack_before_spawning(monkeypatch):
   })
   assert reported.wait(2)
 
-  messages = list(runner.outbox)
+  messages = runner.pending_messages()
   assert [message["type"] for message in messages] == ["result"]
   assert messages[-1]["outcome"] == "expired"
   assert runner.active == {}

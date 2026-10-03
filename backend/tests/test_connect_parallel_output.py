@@ -413,8 +413,9 @@ def test_heavy_output_cannot_starve_the_time_limit(monkeypatch):
   assert result["exit_code"] == 124
   assert runner.active == {}
   # This test deliberately disables delivery; it owns the retained scratch.
-  for record in runner.pending_outputs.values():
-    record["output"].close()
+  for command in runner.outbox:
+    if command.output is not None:
+      command.output.close()
 
 
 def test_hello_enables_live_output_and_survives_reconnects(monkeypatch):
