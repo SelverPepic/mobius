@@ -1892,9 +1892,11 @@ cover it deterministically.
 Connect manages per-recipient access to this instance, not screen mirroring or
 isolated accounts. `browser_access.py` owns grants (until explicitly revoked),
 hashed one-use invitations (one day), and hashed renewal sessions (30-day idle
-window). Recipient labels are owner-assigned attribution, not verified account
-identities. The invitation is a possession credential and must be delivered
-privately. The feature requires the configured HTTPS origin.
+window). Legacy invitation labels are owner-assigned attribution, not verified
+account identities; invitations are possession credentials delivered privately.
+Account grants instead pin a verified mobius.you issuer and subject. Both use the
+same local revocation and descendant-work lineage. The feature requires the
+configured HTTPS origin.
 
 `routes/browser_access.py` owns invitation management and the same-origin
 cookie exchange. A 15-minute bearer stays in memory; the renewal credential is
@@ -1929,5 +1931,36 @@ keeps its content and identity. A remote stop is not claimed until confirmed:
 survives Connect reconnection. This is trusted full workspace access, not a
 hostile-tenant sandbox: it cannot undo copied data, completed writes, publication,
 external actions or deliberate persistent machine changes. No screen relay,
-private-network tunnel, verified mobius.you guest identity, or automatic grant
-expiry is included in this version.
+private-network tunnel or automatic grant expiry is included in this version.
+
+#### Account-linked shared access
+
+`account_browser_access.py` owns a separate guest PKCE flow, never the owner's
+runtime-enrollment receipt. Connect registers a local account grant with the
+configured issuer using the existing managed broker or linked-account bearer.
+The issuer derives the owner and origin from that credential, lists active
+registrations in Shared with me, and issues one-use, identity-only proofs after
+recipient sign-in and explicit consent. Directory entries are discovery, not
+authorization. A lost registration response retries the reserved grant ID;
+revocation or account replacement racing registration cannot activate it.
+
+The callback verifies issuer, audience, subject, origin, grant, nonce and proof
+expiry, then redirects with a non-secret pending ID. It never writes the refresh
+cookie: a cross-site callback cannot receive the old SameSite=Strict cookie.
+The shared shell removes the marker and finalizes with a same-origin POST under
+the existing cookie Web Lock. That transaction consumes the browser-bound proof,
+rechecks local permission, and retires the previous browser session. Failed proof
+validation leaves that prior session unchanged. Verified proof admission expires
+within 60 seconds; old pending rows are pruned on subsequent starts.
+
+Local validation pins the issuer, runtime origin and grantor credential generation
+(or managed instance ID and owner subject). Changing those bindings invalidates
+existing account-derived sessions and credentials. Unlink commits revocation of
+all account grants before attempting descendant stops and issuer cleanup; partial
+cleanup retains the link for an explicit retry. Legacy invitation grants are not
+revoked by account unlink. Issuer-side link loss blocks discovery and new proofs;
+it does not independently push revocation into an otherwise valid local session.
+
+This protocol adds no new owner account and does not distribute owner passwords.
+Deploy both issuer and runtime implementations before offering account sharing;
+source-only tests do not activate the feature on a running installation.

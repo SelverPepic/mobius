@@ -1601,6 +1601,54 @@ async def delete_link(
   link = _linked_row(db, owner.id)
   if link is None:
     return Response(status_code=204)
+  # Unlink is a local sharing-policy event. Revoke account-kind grants before
+  # the remote token is destroyed; legacy invitations remain untouched.
+  from app import browser_access as shared_access
+  from app.routes.browser_access import _issuer_request
+  from app.routes.connect import cancel_browser_grant_commands
+  from app.app_services import cancel_browser_grant_calls
+  from app.chat import stop_browser_grant_runs
+  from sqlalchemy import update
+  grants = db.query(shared_access.BrowserAccessGrant).filter_by(
+    owner_id=owner.id, kind="account",
+  ).all()
+  # One local transaction closes every account grant before any slower network
+  # or descendant cancellation can fail. None may remain live on partial work.
+  db.execute(update(shared_access.BrowserAccessGrant).where(
+    shared_access.BrowserAccessGrant.owner_id == owner.id,
+    shared_access.BrowserAccessGrant.kind == "account",
+    shared_access.BrowserAccessGrant.revoked_at.is_(None),
+  ).values(
+    revoked_at=now_naive_utc(),
+    epoch=shared_access.BrowserAccessGrant.epoch + 1,
+  ))
+  db.execute(update(shared_access.BrowserAccessGrant).where(
+    shared_access.BrowserAccessGrant.owner_id == owner.id,
+    shared_access.BrowserAccessGrant.kind == "account",
+  ).values(remote_status="cleanup_pending"))
+  db.commit()
+  cleanup_pending = False
+  stop_pending = False
+  for grant in grants:
+    try:
+      if cancel_browser_grant_commands(grant.id):
+        stop_pending = True
+      await cancel_browser_grant_calls(grant.id)
+      await stop_browser_grant_runs(grant.id, db)
+    except Exception:
+      stop_pending = True
+    try:
+      cleanup = await _issuer_request(db, owner.id, "DELETE", "/grants/" + grant.id)
+    except HTTPException:
+      cleanup = None
+    if cleanup is None or cleanup.status_code not in (200, 204):
+      grant.remote_status = "cleanup_pending"
+      cleanup_pending = True
+    else:
+      grant.remote_status = "revoked"
+    db.commit()
+  if cleanup_pending or stop_pending:
+    raise HTTPException(502, "Shared access ended locally, but cleanup is pending. Retry unlink.")
   try:
     token = _open(link.access_token_encrypted)
   except HTTPException:

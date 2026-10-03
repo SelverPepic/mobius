@@ -367,3 +367,37 @@ test('hash clear invalidates pending redeem even without a newer acceptance', as
   assert.deepEqual(calls, ['redeem:A', 'logout:A'])
   assert.equal(client.getToken(), null)
 })
+
+test('account finalization uses the same cookie lock and never accepts a superseded account', async () => {
+  const client = await import('../../api/client.js')
+  client.beginSharedBrowserAuth()
+  const locks = lockManager()
+  let lockEntries = 0
+  navigatorForTests.locks = { request(...args) { lockEntries++; return locks.request(...args) } }
+  const calls = []
+  let finishAccount
+  let started
+  const ready = new Promise(resolve => { started = resolve })
+  globalThis.fetch = async (url, options) => {
+    calls.push(url)
+    if (url.endsWith('/session/account/finalize')) {
+      assert.equal(options.credentials, 'same-origin')
+      assert.deepEqual(JSON.parse(options.body), { pending_id: 'specific-account-flow' })
+      assert.equal(options.headers.Authorization, undefined)
+      started()
+      return new Promise(resolve => { finishAccount = resolve })
+    }
+    assert.ok(url.endsWith('/session/logout'))
+    assert.deepEqual(JSON.parse(options.body), { grant_id: 'account-A' })
+    return new Response(null, { status: 204 })
+  }
+  const pending = client.finalizeSharedBrowserAccount('specific-account-flow')
+  assert.equal(client.finalizeSharedBrowserAccount('specific-account-flow'), pending)
+  await ready
+  client.clearSharedBrowserSession()
+  finishAccount(new Response(JSON.stringify({ access_token: 'must-not-install', token_type: 'bearer', grant: { id: 'account-A' }, expires_in: 900 }), { status: 200 }))
+  await assert.rejects(pending, /SHARED_ACCESS_SUPERSEDED/)
+  assert.equal(lockEntries, 1)
+  assert.equal(calls.length, 2)
+  assert.equal(client.getToken(), null)
+})
