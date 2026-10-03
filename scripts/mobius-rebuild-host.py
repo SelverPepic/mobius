@@ -807,6 +807,14 @@ def settle_forward(config_value: dict, operation: str, expected: str,
     return 1
 
 
+def still_settling() -> bool:
+    """Whether the last outcome left the new release's container starting."""
+    try:
+        return read_json(STATUS).get("code") == "new_version_not_ready"
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+
+
 def worker_revision(source: bytes) -> int | None:
     """A worker's declared revision, read as text and never by running it:
     0 for a worker from before revisions, None when the declaration is
@@ -1236,7 +1244,7 @@ def run() -> int:
                     "health_check_failed", "the new container was unhealthy",
                     previous,
                 )
-                if result == 0:  # settled forward on this release's image
+                if result == 0 or still_settling():  # this release's image runs
                     retain_images(image_ref)
                 else:
                     discard_pulled_image(image_ref)
@@ -1272,7 +1280,7 @@ def run() -> int:
                 try:
                     result = rollback(config_value, operation, expected,
                                       "replacement_failed", detail, previous)
-                    if result == 0:  # settled forward on this release's image
+                    if result == 0 or still_settling():  # this release's image runs
                         retain_images(image_ref)
                     elif image_ref and pulled_recorded:
                         discard_pulled_image(image_ref)

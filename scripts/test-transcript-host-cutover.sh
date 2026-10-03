@@ -310,6 +310,10 @@ interrupt_scenario() {  # <when: before|after> <how: container|worker>
       || fail "the previous release was not restored on the legacy data"
     assert_fixture_exact
     started=$SECONDS
+    # The restored release settles its bound prepared update on its own poll;
+    # a new attempt may start only after it has.
+    wait_for "the restored release to settle its update" \
+      '! docker exec mobius test -e /data/.platform-prepared-update.json'
     nonce=$(queue_target)
     outcome=$(wait_outcome "$nonce")
     echo "timing before/resume: second attempt settled ($outcome) in $((SECONDS - started))s"

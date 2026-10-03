@@ -766,6 +766,10 @@ def reported_floor() -> int | None:
   global _REPORTED_FLOOR
   if _REPORTED_FLOOR is not None:
     return _REPORTED_FLOOR
+  if registered_steps() and not _GATE_PASSED:
+    # A conversion may still raise the floor in this very process: the value
+    # read now could be stale a moment later, so it is unknown until the gate.
+    return None
   try:
     from app.database import engine
     seen = preflight(engine)
