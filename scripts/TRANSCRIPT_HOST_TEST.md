@@ -1,133 +1,78 @@
-# Private transcript Host cutover readiness
+# Transcript-row Host cutover tests
 
-This is a **constrained preparation**, not a passed disposable-host cutover.
-Do not run it on `/data/platform`, a production host, or any host with existing
-Möbius data. No image is published by this procedure.
+The transcript-row release raises the database compatibility floor to 1 on
+its first boot. From then on no earlier image may run on that database. These
+tests prove that a self-hosted owner reaches it safely. Never run them on
+`/data/platform`, a production host, or any host with existing Möbius data.
 
-## What can run now
+## Prerequisite
 
-On an isolated test checkout, run
-`scripts/wt-pytest.sh backend/tests/test_transcript_host_cutover.py -q`.
-It constructs a disposable legacy SQLite database, runs the actual level-1
-transcript gate, compares both normalized messages and the byte-exact preserved
-legacy archive, executes the Host's exact floor probe, and checks that its
-rollback policy refuses a level-0 image after activation without Compose `up`.
-The Docker image probes and app fencing are simulated; this is **not** evidence
-that a real worker, mounted volume, or systemd unit works. A second test loads
-the **exact committed previous worker** (`36c0ce1016`, revision 2) through
-`git show`, activates a real disposable level-1 database, and checks that the
-worker must not Compose-up its level-0 rollback image. It is a **strict
-expected failure**: that historical worker has no floor-aware rollback.
-One pass plus one xfail is *not* a deployment pass.
+The Host worker installed before this release (revision 2) restores the
+previous image unconditionally when a replacement fails or is interrupted.
+It must not perform the first level-0 to level-1 replacement, and a newer
+worker offered by an image becomes ACTIVE only after a later successful
+replacement. So the release advances `deployment/self-hosted-helper.required`
+to 2:
 
-On a **fresh disposable systemd/Docker host**, the read-only preflight is
-`scripts/test-transcript-host-cutover.sh <candidate-full-sha> <local-image>`.
-It requires a local image with matching revision/source labels and refuses the
-production container, volume, and helper paths if already present. It performs
-no install, replacement, rollback, or cleanup. A pass is not deployment proof.
+- Older releases refuse it in Settings (`external_activation_required`).
+- The owner updates the trusted host checkout and runs
+  `sudo scripts/install-rebuild-helper.sh`. It seeds and verifies the
+  checkout's floor-aware worker as ACTIVE (a pending or dropped candidate is
+  never promoted; the high-water and candidate-fallback guards are unchanged),
+  freezes `MOBIUS_HOST_RECOVERY_REQUIRED=1` and a read-only mount of
+  `/var/lib/mobius-rebuild` at `/run/mobius-rebuild-host`, and then starts the
+  waiting update through the running app's own reviewed updater
+  (`scripts/finish-helper-update.py`).
+- On every container boot the root entrypoint verifies the mounted ACTIVE
+  worker's index and bytes and publishes a proof bound to `MOBIUS_BOOT_ID`.
+  The storage gate converts only with that proof; otherwise legacy data stays
+  authoritative and untouched.
+- If the floor has risen when a replacement fails, the worker refuses to
+  start the previous image and settles forward on the new one.
 
-## ARM64 private-image validation recipe (no publish)
+`deploy-prod.sh` does not carry the Host mount, so on a helper-installed host
+the gate refuses its conversion (with a message naming the installer) and its
+own floor-aware rollback restores the previous image. Managed deployments with
+no Host controller use their own deployment and rollback contract.
 
-Use a disposable ARM64 machine with an empty Docker data root, private clone,
-and an isolated, throwaway disk/volume. From the **candidate commit**:
+## What runs where
 
-```sh
-SHA=$(git rev-parse HEAD)
-DATE=$(git show -s --format=%cs HEAD)
-BASE=36c0ce1016df68a379bbebaed91993606298d33c
-# Use the existing local-source provenance path for an unpushed candidate.
-# Default Docker builds fetch BUILD_SHA from GitHub and cannot see private Git.
-CONTEXT=$(mktemp -d)
-trap 'rm -rf "$CONTEXT"' EXIT
-git diff --quiet HEAD && test -z "$(git ls-files --others --exclude-standard)"
-git bundle create "$CONTEXT/platform.bundle" HEAD "^$BASE"
-docker buildx build --platform linux/arm64 --load \
-  --build-arg BUILD_SHA="$SHA" --build-arg BUILD_DATE="$DATE" \
-  --build-arg MOBIUS_USE_LOCAL_PLATFORM_SOURCE=1 \
-  --build-arg MOBIUS_LOCAL_PLATFORM_SHA="$SHA" \
-  --build-arg MOBIUS_LOCAL_PLATFORM_BASE_SHA="$BASE" \
-  --build-arg MOBIUS_LOCAL_PLATFORM_DATE="$DATE" \
-  --build-context "mobius-local-platform-source=$CONTEXT" \
-  -t "mobius-transcript-private:sha-$SHA" .
-scripts/test-transcript-host-cutover.sh "$SHA" "mobius-transcript-private:sha-$SHA"
-scripts/wt-pytest.sh backend/tests/test_transcript_host_cutover.py -q
-```
+- Any checkout: `scripts/wt-pytest.sh backend/tests/test_transcript_host_cutover.py
+  backend/tests/test_transcript_host_prerequisite.py
+  backend/tests/test_mobius_rebuild_launcher.py -q` runs the real gate and
+  SQLite floor probe with Docker seams simulated. One test loads the exact
+  historical revision-2 worker and is a **strict expected failure**: it
+  documents the unsafe old behavior the prerequisite avoids, not a pass.
+- Hosted pull-request checks: `scripts/test-upgrade-path.sh` boots the
+  previous official image, requires Settings to refuse this release, seeds
+  and verifies the real worker into a Host-state volume, runs the installer's
+  bridge inside the old app, and boots the candidate with the read-only mount.
+  A typed fixture chat must convert exactly. The worker's replacement loop and
+  systemd are stood in for.
+- Disposable systemd host:
+  `sudo scripts/test-transcript-host-cutover.sh <previous-sha> <target-sha>`
+  runs the real installers, units, worker and images. Each scenario deploys
+  `<previous>` like an owner (typed fixture chat, bulk history, helper from
+  that checkout), then:
+  - `upgrade`: `<target>`'s installer finishes the waiting update; a later
+    request for `<previous>` must roll back onto `<target>`.
+  - `before`: the new container stops while converting; `<previous>` returns
+    on exact legacy data, and a second attempt resumes and completes.
+  - `after` / `interrupted`: the container stops, or the worker is killed,
+    once the floor rose; the worker must settle forward without ever starting
+    `<previous>`.
+  Both images must be pullable under their official names. The manual
+  `transcript_host_proof` input of `.github/workflows/test.yml` builds the
+  commit on a hosted runner and serves both images from a registry on that
+  runner, so the unmodified worker still pulls and checks their labels.
 
-The bundle stays private and goes only to this local build. The image build
-uses the existing exact-SHA/base proof; no image or Git branch is pushed.
-These commands validate the **local ARM64 image identity and isolated policy
-test only**. They do not invoke a public workflow or push. A local `docker
-compose up` of the candidate on a disposable database can additionally probe
-its real entrypoint/readiness, but it cannot by itself prove Host replacement,
-pre-activation rollback, or exact active-chat handoff. Save before/after SQL
-evidence for `chat_messages` in `seq` order, `upgrade_archive` verified by
-`one_way_upgrades.verified_legacy_copy`, `platform_compat.floor`, and the
-running container image ID; never score only JSON-normalized content as exact
-archive survival.
+Record elapsed times. The worker waits 180 s for Docker health and 120 s for a
+rollback or settle-forward to become ready; `deploy-prod.sh` allows 120 s;
+Railway's health check allows 300 s. Do not enlarge them to hide a failure.
 
-## Missing end-to-end proof / go-no-go
+## Architecture
 
-`test-host-helper.sh` cannot be reused unchanged: it pulls **both** public
-SHA images and expects the reverse replacement to succeed. The installed
-worker in `mobius-rebuild-host.py` hardcodes `ghcr.io/mobius-os/mobius`, calls
-`docker pull`, requires the official source/revision labels **and amd64**, and
-the installer rejects ARM64. Merely retagging a local candidate does not make
-the real worker accept it. Do not patch or bypass those checks to call it an
-end-to-end pass. A private, reviewed test-only image-routing mechanism (or
-approved private registry with equivalent identity checks) and an amd64
-disposable systemd host are prerequisites for the real worker test. ARM64
-Host-worker proof additionally needs explicit architecture support in the
-production installer/worker; this task does not change them.
-
-**First-upgrade blocker:** `36c0ce1016` installs worker revision 2. It runs
-the first level-0→1 replacement and, on failure or interrupted recovery,
-unconditionally tries to recreate the old image; the candidate worker is
-offered only after the replacement is healthy. Candidate adoption therefore
-cannot protect the first activation. A floor-aware worker must be active
-**before** the gate can raise the floor. Verify the installed active worker's
-revision **and byte hash** against reviewed source, not just the candidate
-image's worker. Do not mark readiness green while the strict xfail persists.
-
-When that prerequisite is addressed, the host test must: start a level-0
-image on fresh data; create an owner/service token and noncanonical duplicate-ID
-chat fixture; install the floor-aware helper before activation; request the
-level-1 image through the app inbox; verify the **container ID changed**,
-served SHA, exact `chat_messages` order and archive bytes, and floor 1;
-then, in a **separate fresh fixture**, inject a candidate failure *after its
-gate activates but before the worker declares health* and prove the actual
-worker reports `needs_recovery/newer_version_required` without starting the
-old image. Another fresh fixture must fail **before activation** and show
-the old image restored, floor 0, and exact transcript retained. Do not use the
-old harness's unconditional return-to-previous assertion.
-
-Record elapsed times against the deployment's **120-second preflight and
-120-second cutover defaults** (`deploy-prod.sh`); do not enlarge them silently.
-The worker's health wait is 180 seconds and rollback readiness wait is 120
-seconds, which are distinct bounds, not permission to relax deploy deadlines.
-
-
-## Private first-upgrade repair candidate (not deployment clearance)
-
-The repair uses the existing host-helper installation prerequisite, not a
-skippable intermediate application release. Helper protocol 2 requires the
-reviewed installer to seed and verify revision 4 or newer as **ACTIVE** before
-replacement. A pending or burned revision is not reused: the existing
-high-water and candidate-fallback guards remain unchanged. If seeding keeps an
-unsafe older active worker, installation refuses rather than reporting success.
-
-The frozen Compose override pins `MOBIUS_HOST_RECOVERY_REQUIRED=1` and mounts
-`/var/lib/mobius-rebuild` read-only at `/run/mobius-rebuild-host`. On every
-container boot the baked root entrypoint clears the old proof, verifies the
-actual root-owned private index and ACTIVE bytes (version, hash, revision and
-floor capability), and publishes a root-owned proof bound to `MOBIUS_BOOT_ID`.
-The one-way gate requires that proof before preparing or raising the floor.
-App-writable `/data` directory disappearance and cached `status.json` cannot
-provide or remove this explicit prerequisite. Managed/direct deployments with
-no installed Host controller use their own deployment/rollback contract.
-
-The historical revision-2 strict xfail remains deliberately negative: history
-is not repaired by changing its expectation. Positive private tests cover the
-new prerequisite and real SQLite gate/floor-aware rollback with Docker seams
-simulated. The read-only bind mount, root entrypoint, frozen Compose merge,
-systemd interruption and real image cutover still need disposable-host proof.
-Do not install or publish this private candidate without separate owner approval.
+Official images are published for amd64 only and the installer refuses other
+architectures, so there is no ARM64 Host path to prove. Supporting ARM64
+needs multi-architecture publication and explicit installer and worker
+support first.

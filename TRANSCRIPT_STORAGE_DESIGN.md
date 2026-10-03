@@ -88,15 +88,15 @@ frozen-schema boot test separately covers ledger/gate ordering. Neither
 substitutes for a full previous-image-to-candidate cutover.
 
 
-## Private first-upgrade prerequisite refinement
+## First-upgrade Host prerequisite
 
 The initial upgrade must install a floor-aware Host worker as ACTIVE before
 activation, using the existing explicit helper-install marker. A trial cannot
-protect interruption recovery by the older active worker. The private repair
-pins this prerequisite in the installer's frozen Compose override and verifies
-mounted private Host state in the baked root entrypoint on each boot; the app
-gate consumes only that boot's root-owned proof. See
-`scripts/TRANSCRIPT_HOST_TEST.md` for tests and unproven deployment boundaries.
+protect interruption recovery by the older active worker. The installer pins
+this prerequisite in its frozen Compose override, then finishes the update
+the older release's Settings refuses; the baked root entrypoint verifies the
+mounted private Host state on each boot, and the gate consumes only that
+boot's root-owned proof. See `scripts/TRANSCRIPT_HOST_TEST.md`.
 
 Archive compression uses zlib level 1 to reduce the measured conversion CPU
 cost, retaining exact decoded originals and all verification passes. This

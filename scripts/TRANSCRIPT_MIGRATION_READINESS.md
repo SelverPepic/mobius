@@ -40,5 +40,4 @@ and WAL headroom. The gate's own free-space refusal remains enabled. A failure
 leaves its new proof directory intact for inspection; never automatically remove
 an existing proof or source copy to get a pass.
 
-See `TRANSCRIPT_HOST_TEST.md` for the separate disposable-host/ARM64 recipe and
-its still-unverified real replacement prerequisites.
+See `TRANSCRIPT_HOST_TEST.md` for the real disposable-host cutover test.

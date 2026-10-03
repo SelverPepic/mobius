@@ -58,7 +58,11 @@ failed task keeps its error and resumable cursor rather than claiming success.
 
 Host replacement checks the database floor against the exact candidate or
 rollback image before boot. Healthy-but-wrong-image probes do not establish a
-successful rollback. Source swap rollback uses compare-and-swap ownership:
+successful rollback. When the floor refuses the previous image, the worker
+settles forward instead: it restarts the new container unchanged and reports
+success only if that container serves exactly the requested release. Either
+way it retires the replacement journal, which exists only to restore the
+previous image; keeping it would re-fence the serving app on every later run. Source swap rollback uses compare-and-swap ownership:
 unexpected HEAD or working-tree changes are preserved, not blindly reset.
 
 After a one-way activation, use a capable image to repair forward. Restoring
@@ -67,6 +71,10 @@ automatic per-table reversal. Archive retirement and rebuilding a legacy form
 are not implemented by this release.
 
 ## Deployment envelope
+
+Within one gate run, the confirming fingerprint pass trusts units this run
+just committed on its own connection; units prepared by an earlier boot, and
+every unit after another connection commits, are verified in full.
 
 Readiness remains false until the gate has established the new authority.
 Conversion must fit the actual deployment allowance, not just a synthetic hash
