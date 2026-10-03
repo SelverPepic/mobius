@@ -449,15 +449,17 @@ class _Docker:
     self.calls.append(" ".join(args))
     if args[:2] == ["docker", "stop"]:
       self.running = False
+    if args[:2] == ["docker", "start"]:
+      self.running = True
     return done()
 
 
-def _rebuild_rollback(tmp_path: Path, monkeypatch, docker: _Docker):
+def _rebuild_rollback(tmp_path: Path, monkeypatch, docker: _Docker, image: str = "new"):
   data = docker.data
   config = {"project": "mobius", "control_dir": tmp_path / "control", "data_dir": data}
   monkeypatch.setattr(host.subprocess, "run", docker)
   monkeypatch.setattr(host.time, "sleep", lambda _seconds: None)
-  monkeypatch.setattr(host, "app_container", lambda _config: ("cid", "new"))
+  monkeypatch.setattr(host, "app_container", lambda _config: ("cid", image))
   monkeypatch.setattr(host, "clear_transaction", lambda: None)
   ledger = []
   monkeypatch.setattr(
@@ -499,16 +501,37 @@ def test_rebuild_rollback_happy_path_is_fenced_then_validated_by_readiness(
 
 
 def test_rebuild_rollback_refuses_an_image_below_the_floor(tmp_path, monkeypatch):
+  """The previous image is never started; the new release is settled forward."""
   docker = _Docker(tmp_path / "data", compat="COMPAT_LEVEL = 1\n")
   _database(docker.data, floor=2)
+  target = "sha256:" + "9" * 64
+  monkeypatch.setattr(host, "read_transaction", lambda: {"target_image": target})
+  monkeypatch.setattr(host, "inspect_container_image", lambda cid: target)
+  monkeypatch.setattr(host, "verify_served_generation", lambda cid, sha: None)
+  monkeypatch.setattr(host, "adopt_from_image", lambda image: "kept")
+  code, statuses = _rebuild_rollback(tmp_path, monkeypatch, docker, image=target)
+
+  assert code == 0
+  assert statuses[-1]["state"] == "succeeded"
+  assert not any(call.startswith("compose up") for call in docker.calls)
+  start = docker.calls.index("docker start cid")
+  assert docker.calls.index("ledger rearm-cutover") < start
+  assert docker.calls.index("ledger finalize-cutover") > start
+
+
+def test_rebuild_rollback_below_the_floor_starts_nothing_it_cannot_identify(
+  tmp_path, monkeypatch,
+):
+  docker = _Docker(tmp_path / "data", compat="COMPAT_LEVEL = 1\n")
+  _database(docker.data, floor=2)
+  monkeypatch.setattr(host, "read_transaction", lambda: None)
   code, statuses = _rebuild_rollback(tmp_path, monkeypatch, docker)
 
   assert code == 1
   assert statuses[-1]["state"] == "needs_recovery"
   assert statuses[-1]["code"] == "newer_version_required"
-  assert "a newer version is required" in statuses[-1]["message"]
-  assert not any(call.startswith(("compose up", "ledger")) for call in docker.calls)
-  assert docker.calls[-1] == "docker start cid"
+  assert "cannot run on this database" in statuses[-1]["message"]
+  assert not any(call.startswith(("compose up", "ledger", "docker start")) for call in docker.calls)
 
 
 def test_rebuild_rollback_missing_table_is_zero_only_with_the_ledger(
