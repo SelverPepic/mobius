@@ -95,13 +95,18 @@ it. It has three parts:
   abstract older detail without erasing its meaning or unresolved threads.
   Rewrite the pair coherently; new sessions receive bounded excerpts of recent
   chats' names and chat summaries, not their full digests.
-- **Full digest** (`summary`) — append only new continuation-critical facts since
-  the last save: decisions, verified results, failed approaches, corrections
-  (say what they supersede), and open work or approval boundaries. Keep enough
-  detail for safe continuation, not an execution diary: omit routine steps,
-  raw output, and test counts, paths, or hashes unless needed to continue or
-  verify the work. Do not repeat earlier entries or the chat summary. Keep
-  proposed vs. accepted and reported vs. verified distinct.
+- **Full digest** (`summary`) — append what changed since the last save, for a
+  future agent who must pick the work up without the transcript: decisions and
+  their reasons, verified outcomes, failed approaches, corrections (say what
+  they supersede), and open work or approval boundaries. Keep proposed vs.
+  accepted and reported vs. verified distinct. Write it as a brief handoff in
+  plain, complete sentences, not an execution diary or a telegraphic log: a
+  typical entry is a few sentences, and a busy turn still compresses to what a
+  successor needs. State results, not how you got them — leave out commands,
+  tool names, test counts, log locations, commit hashes, file paths, and run or
+  helper ids unless a later step needs that exact identifier to act, and record
+  such an identifier once rather than in every entry. Do not repeat earlier
+  entries or the chat summary.
 
 The existing tool keys and note headings remain unchanged: `digest` / `## Digest`
 hold the replaceable chat summary; `summary` / `## Summary` hold the append-only

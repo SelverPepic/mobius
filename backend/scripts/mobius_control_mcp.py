@@ -1135,7 +1135,10 @@ _TOOL_DEFINITIONS = {
       "connected paragraphs: whole-chat purpose and important earlier outcomes, "
       "then the recent phase and open work in that context, not just the last turn. "
       "Abstract older detail without losing unresolved threads. Full-digest entries "
-      "keep new facts needed for safe continuation, not an execution diary. "
+      "are a brief handoff in plain, complete sentences: decisions, verified "
+      "outcomes, corrections and open work a successor needs, not an execution "
+      "diary. Leave out commands, test counts, log locations, hashes, paths and "
+      "run or helper ids unless a later step needs that exact identifier. "
       "Default to one concise changes-only full-digest save per substantive "
       "turn; save earlier before handoffs, owner-input cards, restarts, or "
       "risky/long work that needs a recovery checkpoint. Omit unchanged title "
@@ -1151,7 +1154,7 @@ _TOOL_DEFINITIONS = {
         "digest": {"type": "string", "maxLength": 1000,
                    "description": "Chat summary. Replace both short paragraphs coherently: whole-chat context, then connected recent phase."},
         "summary": {"type": "string", "maxLength": 8000,
-                    "description": "Full digest. Append only new continuation-critical facts; omit routine steps and unnecessary implementation detail."},
+                    "description": "Full digest. Append what changed as a brief plain-prose handoff; omit routine steps, counts, logs and identifiers a later step does not need."},
       },
     },
   },
