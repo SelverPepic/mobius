@@ -100,6 +100,11 @@ def test_exact_transcript_archive_survives_and_old_host_rollback_is_refused(
   monkeypatch.setattr(host, "write_status", lambda *a, **kw: events.append(kw))
   monkeypatch.setattr(host, "compose", lambda *a, **kw: events.append(("compose", a)))
   monkeypatch.setattr(host.subprocess, "run", lambda *a, **kw: events.append("start"))
+  # The refused rollback settles forward; here the new container never
+  # becomes ready again, so the outcome stays needs_recovery.
+  monkeypatch.setattr(host, "TRANSACTION", tmp_path / "transaction.json")
+  monkeypatch.setattr(host, "restart_ledger", lambda *a, **kw: True)
+  monkeypatch.setattr(host, "wait_ready", lambda *a, **kw: ("timeout", None))
   outcome = host.rollback({"data_dir": str(tmp_path)}, "op", "a" * 40,
                           "health_check_failed", "candidate unhealthy")
   assert outcome == 1

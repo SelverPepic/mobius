@@ -605,3 +605,58 @@ def test_boot_proof_and_frozen_launcher_reject_unknown_worker_index_version(root
   index["version"] = version
   host._atomic_json(host.WORKER_INDEX, index)
   assert host.active_worker_receipt(state) is None
+
+
+# --- A refused rollback settles forward --------------------------------------
+
+
+@pytest.fixture
+def refused(tmp_path, monkeypatch):
+  """The database floor refuses the previous image; Docker seams recorded."""
+  monkeypatch.setattr(host, "TRANSACTION", tmp_path / "transaction.json")
+  host.write_transaction(TXN)
+  calls = {"status": [], "ledger": [], "compose": [], "docker": []}
+  monkeypatch.setattr(host, "write_status", lambda _c, **f: calls["status"].append(f))
+  monkeypatch.setattr(host, "restart_ledger",
+                      lambda _c, cid, cmd, op, image=None: calls["ledger"].append((cmd, image)) or True)
+  monkeypatch.setattr(host, "compose", lambda *a, **k: calls["compose"].append(a))
+  monkeypatch.setattr(host.subprocess, "run", lambda args, **k: calls["docker"].append(args))
+  monkeypatch.setattr(host, "fence_app", lambda *a: True)
+  monkeypatch.setattr(host, "rollback_image_level", lambda *a: 0)
+  monkeypatch.setattr(host, "read_database_floor", lambda *a: 1)
+  monkeypatch.setattr(host, "verify_served_generation", lambda cid, sha: None)
+  monkeypatch.setattr(host, "adopt_from_image", lambda image: "offered")
+  return calls
+
+
+def _rollback():
+  return host.rollback({}, TXN["operation_id"], TXN["expected_sha"],
+                       "health_check_failed", "slow", TXN["previous_image"])
+
+
+def test_refused_rollback_finishes_on_the_new_release_when_it_serves(refused, monkeypatch):
+  monkeypatch.setattr(host, "wait_ready", lambda *a: ("ready", {"ready": True}))
+  monkeypatch.setattr(host, "app_container", lambda _c: ("new-cid", TXN["target_image"]))
+  assert _rollback() == 0
+  assert refused["status"][-1]["state"] == "succeeded"
+  assert ("rearm-cutover", TXN["target_image"]) in refused["ledger"]
+  assert ("finalize-cutover", TXN["target_image"]) in refused["ledger"]
+  assert not any("up" in args for args in refused["compose"])
+  assert host.read_transaction() is None
+
+
+@pytest.mark.parametrize("ready,image", [
+  ("timeout", TXN["target_image"]),
+  ("ready", "sha256:" + "e" * 64),
+])
+def test_refused_rollback_never_leaves_a_journal_that_refences_the_app(
+    refused, monkeypatch, ready, image):
+  """No earlier image may ever run again: the journal has nothing left to
+  restore, and keeping it would fence the serving app on every later run."""
+  monkeypatch.setattr(host, "wait_ready", lambda *a: (ready, None))
+  monkeypatch.setattr(host, "app_container", lambda _c: ("new-cid", image))
+  assert _rollback() == 1
+  assert refused["status"][-1]["state"] == "needs_recovery"
+  assert refused["status"][-1]["code"] == "newer_version_required"
+  assert not any("up" in args for args in refused["compose"])
+  assert host.read_transaction() is None

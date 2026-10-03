@@ -854,6 +854,11 @@ report_readiness_failure() {
     *'"reason":"below_compatibility_floor"'*)
       fail "this release is below the database's compatibility floor; a newer version is required."
       ;;
+    *'"reason":"host_helper_outdated"'*)
+      fail "this host has the Settings update helper, which must own this storage conversion."
+      fail "Run sudo scripts/install-rebuild-helper.sh from this checkout instead; it installs"
+      fail "the floor-aware helper and then performs this update. Legacy data is unchanged."
+      ;;
     *'"reason":"image_below_source"'*)
       fail "the served source needs a newer image than this one; finish the image update."
       ;;

@@ -138,6 +138,9 @@ def test_actual_active_worker_proof_precedes_gate_and_floor_aware_recovery(tmp_p
   monkeypatch.setattr(host, "read_database_floor", lambda *_: _floor(host, path))
   monkeypatch.setattr(host, "write_status", lambda *a, **kw: calls.append(kw))
   monkeypatch.setattr(host, "compose", lambda *a, **kw: calls.append(a))
+  monkeypatch.setattr(host, "TRANSACTION", tmp_path / "transaction.json")
+  monkeypatch.setattr(host, "restart_ledger", lambda *a, **kw: True)
+  monkeypatch.setattr(host, "wait_ready", lambda *a, **kw: ("timeout", None))
   assert host.rollback({"data_dir": str(tmp_path)}, "op", "a" * 40,
     "health_check_failed", "candidate unhealthy") == 1
   assert calls[-1]["code"] == "newer_version_required"

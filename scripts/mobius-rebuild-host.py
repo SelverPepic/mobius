@@ -635,6 +635,8 @@ def rollback(config_value: dict, operation: str, expected: str,
     try:
         rollback_preflight(config_value, cid)
     except RollbackRefused as exc:
+        if exc.code == "newer_version_required":
+            return settle_forward(config_value, operation, expected, cid, detail)
         # Nothing is replaced: start the fenced container again unchanged.
         if cid:
             subprocess.run(["docker", "start", cid], text=True, capture_output=True)
@@ -700,6 +702,62 @@ def rollback(config_value: dict, operation: str, expected: str,
     write_status(config_value, operation_id=operation, state="needs_recovery",
                  expected_sha=expected, code="rollback_failed",
                  message=f"Replacement and rollback failed: {detail}"[:300])
+    return 1
+
+
+def settle_forward(config_value: dict, operation: str, expected: str,
+                   cid: str, detail: str) -> int:
+    """Finish a replacement whose previous image the database now refuses.
+
+    Once the new release raised the compatibility floor, no earlier image may
+    ever run again, so the replacement can only end on the new image. Start
+    the fenced container again unchanged (re-armed so its boot continues the
+    drained chats) and give it the rollback readiness window. If it serves
+    exactly the requested release, the replacement succeeded, only late.
+    Either way the journal is retired: its sole purpose was restoring the
+    previous image, and keeping it would make every later run and boot fence
+    the serving app again and block the newer release a failure needs.
+    """
+    target = (read_transaction() or {}).get("target_image")
+    target = target if isinstance(target, str) and target.startswith("sha256:") else None
+    rearmed = bool(cid) and restart_ledger(
+        config_value, cid, "rearm-cutover", operation, image=target,
+    )
+    if cid:
+        subprocess.run(["docker", "start", cid], text=True, capture_output=True)
+    verdict, _payload = wait_ready(config_value, 120)
+    if verdict == "ready":
+        try:
+            ready_cid, current = app_container(config_value)
+            if target is None or current != target:
+                raise RuntimeError("the serving container is not the requested image")
+            verify_served_generation(ready_cid, expected)
+        except Exception as exc:  # anything but the exact release is unsettled
+            failure = str(exc)
+        else:
+            finalized = restart_ledger(
+                config_value, ready_cid, "finalize-cutover", operation, image=current,
+            )
+            clear_transaction()
+            message = (
+                "Container rebuilt successfully after a slow first start."
+                if finalized and rearmed else
+                "Container rebuilt after a slow first start, but the Host could "
+                "not verify the exact chat handoff. Check the affected chats."
+            )
+            write_status(config_value, operation_id=operation, state="succeeded",
+                         expected_sha=expected,
+                         code=None if finalized and rearmed else "handoff_finalize_failed",
+                         message=message, worker_adoption=adopt_from_image(current))
+            return 0
+    else:
+        failure = f"the new container was not ready ({verdict})"
+    clear_transaction()
+    write_status(config_value, operation_id=operation, state="needs_recovery",
+                 expected_sha=expected, code="newer_version_required",
+                 message=(f"The previous version cannot run on this database, and "
+                          f"{failure}. Install a newer release. Original failure: "
+                          f"{detail}")[:300])
     return 1
 
 
@@ -1118,7 +1176,10 @@ def run() -> int:
                     "health_check_failed", "the new container was unhealthy",
                     previous,
                 )
-                discard_pulled_image(image_ref)
+                if result == 0:  # settled forward on this release's image
+                    retain_images(image_ref)
+                else:
+                    discard_pulled_image(image_ref)
                 return result
             cid, current = app_container(config_value)
             if current != digest:
@@ -1151,7 +1212,9 @@ def run() -> int:
                 try:
                     result = rollback(config_value, operation, expected,
                                       "replacement_failed", detail, previous)
-                    if image_ref and pulled_recorded:
+                    if result == 0:  # settled forward on this release's image
+                        retain_images(image_ref)
+                    elif image_ref and pulled_recorded:
                         discard_pulled_image(image_ref)
                     return result
                 except Exception as rollback_exc:
