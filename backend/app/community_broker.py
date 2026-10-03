@@ -18,6 +18,8 @@ from urllib.parse import urlencode
 
 import httpx
 
+from app.runtime_identity import private_socket_tls_context
+
 
 DEFAULT_SOCKET = "/run/mobius-identity-broker.sock"
 COMMUNITY_PREFIX = "/v1/community"
@@ -149,7 +151,7 @@ class CommunityBrokerClient:
     if idempotency_key:
       headers["Idempotency-Key"] = idempotency_key
     broker_transport = self.transport or httpx.AsyncHTTPTransport(
-      uds=self.socket_path,
+      uds=self.socket_path, verify=private_socket_tls_context(),
     )
     try:
       async with _client(broker_transport, "http://mobius-identity-broker") as client:

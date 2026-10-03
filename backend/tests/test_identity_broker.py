@@ -70,12 +70,16 @@ def test_broker_and_app_consumers_share_the_root_owned_socket():
     "app/runtime_identity.py",
     "app/contribution_broker.py",
     "app/community_broker.py",
-    "app/providers.py",
     "scripts/entrypoint.sh",
   ):
     source = (backend / relative).read_text(encoding="utf-8")
     assert socket in source
     assert "/data/run/mobius-identity-broker.sock" not in source
+  # The model provider reaches the broker only through runtime_identity.
+  providers = (backend / "app/providers.py").read_text(encoding="utf-8")
+  assert "from app.runtime_identity import broker_client" in providers
+  assert "MOBIUS_IDENTITY_BROKER_SOCKET" not in providers
+  assert "mobius-identity-broker.sock" not in providers
 
 
 @pytest.fixture()

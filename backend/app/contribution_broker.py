@@ -11,6 +11,8 @@ from typing import Any
 
 import httpx
 
+from app.runtime_identity import private_socket_tls_context
+
 
 DEFAULT_SOCKET = "/run/mobius-identity-broker.sock"
 CONTRIBUTION_PREFIX = "/v1/contributions"
@@ -107,7 +109,9 @@ class ContributionBrokerClient:
       headers["Content-Type"] = "application/json"
     if idempotency_key:
       headers["Idempotency-Key"] = idempotency_key
-    transport = self.transport or httpx.AsyncHTTPTransport(uds=self.socket_path)
+    transport = self.transport or httpx.AsyncHTTPTransport(
+      uds=self.socket_path, verify=private_socket_tls_context(),
+    )
     try:
       async with httpx.AsyncClient(
         transport=transport,
