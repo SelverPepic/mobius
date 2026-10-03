@@ -1831,7 +1831,7 @@ def test_runner_uses_standard_urllib_for_protocol_four_stream(monkeypatch):
   )
   monkeypatch.setattr(
     connect_runner, "_post",
-    lambda url, payload, token=None: posted.append((url, payload, token)),
+    lambda url, payload, token=None, context=None: posted.append((url, payload, token)),
   )
 
   connect_runner._serve_connection(
@@ -1995,7 +1995,7 @@ def test_runner_disconnect_scopes_to_one_of_several_connections(monkeypatch):
   )
   monkeypatch.setattr(
     connect_runner, "_post",
-    lambda url, payload, token=None: posted.append(payload),
+    lambda url, payload, token=None, context=None: posted.append(payload),
   )
 
   connect_runner._serve_connection(
@@ -2047,7 +2047,7 @@ def test_runner_retries_a_result_until_ordinary_https_succeeds(monkeypatch):
   first_attempt = threading.Event()
   second_attempt = threading.Event()
 
-  def post(_url, payload, token=None):
+  def post(_url, payload, token=None, context=None):
     attempts.append((payload, token))
     if len(attempts) == 1:
       first_attempt.set()
@@ -2533,7 +2533,7 @@ def test_serve_connection_retries_after_auth_rejection(monkeypatch):
   )
   monkeypatch.setattr(
     connect_runner, "_post",
-    lambda url, payload, token=None: posted.append(payload),
+    lambda url, payload, token=None, context=None: posted.append(payload),
   )
 
   connect_runner._serve_connection(
@@ -2587,7 +2587,7 @@ def test_serve_connection_retries_when_proxy_stops_forwarding_heartbeats(
   )
   monkeypatch.setattr(
     connect_runner, "_post",
-    lambda url, payload, token=None: posted.append(payload),
+    lambda url, payload, token=None, context=None: posted.append(payload),
   )
 
   connect_runner._serve_connection(
@@ -2691,7 +2691,7 @@ def test_serve_connection_reconnects_immediately_after_healthy_rotation(
   )
   monkeypatch.setattr(
     connect_runner, "_post",
-    lambda url, payload, token=None: posted.append(payload),
+    lambda url, payload, token=None, context=None: posted.append(payload),
   )
 
   connect_runner._serve_connection({

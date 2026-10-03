@@ -407,7 +407,7 @@ def test_runner_sends_no_live_output_to_a_server_that_did_not_offer_it(
 def test_heavy_output_cannot_starve_the_time_limit(monkeypatch):
   queued = threading.Event()
 
-  def slow_post(url, payload, token=None, timeout=30):
+  def slow_post(url, payload, token=None, timeout=30, context=None):
     if url.endswith("/output"):
       time.sleep(0.05)
     if url.endswith("/output"):
