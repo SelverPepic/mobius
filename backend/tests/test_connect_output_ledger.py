@@ -213,3 +213,16 @@ def test_reading_history_creates_no_empty_ledger(client, auth):
   listed = client.get(f'/api/connect/hosts/{host_id}/commands', headers=auth)
   assert listed.json() == {'running': [], 'recent': []}
   assert not connect_output._path(host_id).exists()
+
+
+def test_reader_treats_a_not_yet_initialized_ledger_as_empty(tmp_path, monkeypatch):
+  # A writer creates the private file before its schema commits; a concurrent
+  # history read in that window must not fail the whole host listing.
+  class Settings:
+    data_dir = str(tmp_path)
+  monkeypatch.setattr(connect_output, 'get_settings', lambda: Settings())
+  host_id = 'h_' + 'c' * 16
+  connect_output._create_private(connect_output._path(host_id))
+  assert connect_output.recent(host_id) == []
+  assert connect_output.finished(host_id, 'e' * 16) is None
+  assert connect_output.view(host_id, 'e' * 16, 0)[0] is None

@@ -51,7 +51,8 @@ def _ledger(host_id: str, *, write: bool = False) -> Iterator[sqlite3.Connection
   path = _path(host_id)
   if write:
     _create_private(path)
-  elif not path.exists():
+  elif not path.exists() or path.stat().st_size == 0:
+    # Missing, or created by a writer that has not committed its schema yet.
     yield None
     return
   with closing(sqlite3.connect(path, timeout=10)) as db:
