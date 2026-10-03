@@ -56,6 +56,7 @@ from app.chat import (
   continuation_wait_for_chat,
 )
 from app.broadcast import get_system_broadcast
+from app.chat_compaction_state import compaction_kind
 from app.recovery_notifications import (
   complete_recovery_action,
   publish_recovery_notification,
@@ -773,6 +774,7 @@ def _chat_detail_response(
     "total": total,
     "offset": start,
     "running": running,
+    "compacting": compaction_kind(chat.id),
     "run_id": run_id,
     "run_status": "running" if running and run_id else run_status,
     "runtime_revision": runtime_revision,
@@ -1840,6 +1842,7 @@ def get_chat_runtime(
   run_id, run_status, runtime_revision = _latest_run_snapshot(db, chat.id)
   response = {
     "running": running,
+    "compacting": compaction_kind(chat.id),
     "restart_observation_key": restart_observation_key(db, chat.id),
     "run_id": run_id,
     "run_status": "running" if running and run_id else run_status,
@@ -2717,10 +2720,12 @@ async def switch_chat_provider(
   provider/settings, and clears the outgoing session in one transaction. Any
   synthesis or contention failure leaves every durable field unchanged.
   """
+  from app.chat_compaction_state import compacting
   from app.chat_queue import get_transition_lock
 
   async with get_transition_lock(chat_id):
-    return await _compact_chat_locked(body, chat_id, db)
+    with compacting(chat_id, "provider_switch"):
+      return await _compact_chat_locked(body, chat_id, db)
 
 
 async def _compact_chat_locked(
@@ -2956,6 +2961,7 @@ async def compact_chat(
     PersistCompaction, alloc_run_token, await_ack, get_writer,
     messages_fingerprint,
   )
+  from app.chat_compaction_state import compacting
   from app.compaction import (
     CompactionError, summarize_chat,
   )
@@ -2979,67 +2985,70 @@ async def compact_chat(
         status_code=409,
         detail="Chat is busy — finish or stop the current turn before compacting.",
       )
-    source_provider = chat.provider or "claude"
-    messages = list(chat.messages or [])
-    data_dir = get_settings().data_dir
-    try:
+    # Other tabs, panes and devices learn the chat is busy from this state;
+    # a send made meanwhile waits on the transition lock above.
+    with compacting(chat_id, "compact"):
+      source_provider = chat.provider or "claude"
+      messages = list(chat.messages or [])
+      data_dir = get_settings().data_dir
       try:
-        note = note_path(data_dir, chat_id).read_text(encoding="utf-8")
-      except OSError:
-        note = ""
-      source_summary = extract_cumulative_summary(note)
-      source_messages = messages
-      source_note_hash = None
+        try:
+          note = note_path(data_dir, chat_id).read_text(encoding="utf-8")
+        except OSError:
+          note = ""
+        source_summary = extract_cumulative_summary(note)
+        source_messages = messages
+        source_note_hash = None
+        try:
+          source_summary, source_messages = recovery_source(note, messages)
+        except ValueError:
+          # Legacy or changed notes cannot replace history. Preserve the old
+          # full-transcript backstop, including its existing work limits.
+          pass
+        else:
+          source_note_hash = hashlib.sha256(note.encode("utf-8")).hexdigest()
+        instructions = body.instructions if body is not None else None
+        settings_obj = chat.agent_settings_json or {}
+        summary = await summarize_chat(
+          source_messages,
+          data_dir=data_dir,
+          provider_id=source_provider,
+          source_summary=source_summary,
+          model=settings_obj.get("model"),
+          effort=settings_obj.get("effort"),
+          custom_instructions=instructions,
+        )
+      except CompactionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+      except Exception as exc:
+        log.warning("legacy compaction failed for chat %s: %s", chat_id, exc)
+        raise HTTPException(
+          status_code=502, detail="The summarize turn failed; not compacting."
+        )
       try:
-        source_summary, source_messages = recovery_source(note, messages)
-      except ValueError:
-        # Legacy or changed notes cannot replace history. Preserve the old
-        # full-transcript backstop, including its existing work limits.
-        pass
-      else:
-        source_note_hash = hashlib.sha256(note.encode("utf-8")).hexdigest()
-      instructions = body.instructions if body is not None else None
-      settings_obj = chat.agent_settings_json or {}
-      summary = await summarize_chat(
-        source_messages,
-        data_dir=data_dir,
-        provider_id=source_provider,
-        source_summary=source_summary,
-        model=settings_obj.get("model"),
-        effort=settings_obj.get("effort"),
-        custom_instructions=instructions,
-      )
-    except CompactionError as exc:
-      raise HTTPException(status_code=422, detail=str(exc))
-    except Exception as exc:
-      log.warning("legacy compaction failed for chat %s: %s", chat_id, exc)
-      raise HTTPException(
-        status_code=502, detail="The summarize turn failed; not compacting."
-      )
-    try:
-      result = await await_ack(get_writer().submit(PersistCompaction(
-        chat_id=chat_id,
-        run_token=alloc_run_token(),
-        summary=summary,
-        expected_provider=source_provider,
-        source_messages_hash=messages_fingerprint(messages),
-        source_note_hash=source_note_hash,
-      )))
-    except Exception:
-      raise HTTPException(
-        status_code=503, detail="Could not store the compaction; try again."
-      )
-    if result.get("status") == "conflict":
-      raise HTTPException(
-        status_code=409,
-        detail="The chat changed while compacting. Try again.",
-      )
-    return {
-      "ok": True,
-      "summary": summary,
-      "command": f"POST /api/chats/{chat_id}/compact",
-      "stored": result.get("stored"),
-    }
+        result = await await_ack(get_writer().submit(PersistCompaction(
+          chat_id=chat_id,
+          run_token=alloc_run_token(),
+          summary=summary,
+          expected_provider=source_provider,
+          source_messages_hash=messages_fingerprint(messages),
+          source_note_hash=source_note_hash,
+        )))
+      except Exception:
+        raise HTTPException(
+          status_code=503, detail="Could not store the compaction; try again."
+        )
+      if result.get("status") == "conflict":
+        raise HTTPException(
+          status_code=409,
+          detail="The chat changed while compacting. Try again.",
+        )
+      return {
+        "ok": True,
+        "summary": summary,
+        "command": f"POST /api/chats/{chat_id}/compact",
+        "stored": result.get("stored"),
+      }
 
 
 # An app that opens a chat ABOUT one of its dated reports passes the report's

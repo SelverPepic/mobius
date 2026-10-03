@@ -1452,3 +1452,67 @@ def test_manual_note_compaction_retains_existing_work_limits(
     assert calls == []
     assert row.session_id == "previous-session"
     assert row.messages == messages
+
+
+def test_manual_compaction_is_visible_to_every_viewer_while_it_runs(
+  client, auth, db, monkeypatch,
+):
+  """Other panes, reloads and devices must see the rebuild window.
+
+  Sends wait behind the transition lock during compaction, so a view that
+  cannot see the window shows an idle chat whose message silently waits.
+  """
+  from app import chat_compaction_state
+
+  published = []
+  monkeypatch.setattr(
+    chat_compaction_state,
+    "get_system_broadcast",
+    lambda: SimpleNamespace(publish=published.append),
+  )
+  chat_id = _make_chat_with_messages(client, auth, [
+    {"role": "user", "content": "keep this context"},
+    {"role": "assistant", "content": "I will."},
+  ])
+  during = {}
+
+  async def _stub(_messages, **_kwargs):
+    during["kind"] = chat_compaction_state.compaction_kind(chat_id)
+    return "briefing"
+
+  monkeypatch.setattr(compaction, "summarize_chat", _stub)
+  assert client.get(
+    f"/api/chats/{chat_id}", headers=auth,
+  ).json()["compacting"] is None
+
+  response = client.post(f"/api/chats/{chat_id}/compact", headers=auth)
+
+  assert response.status_code == 200, response.text
+  assert during["kind"] == "compact"
+  assert published == [
+    {"type": "chat_compaction_changed", "chatId": chat_id, "compacting": "compact"},
+    {"type": "chat_compaction_changed", "chatId": chat_id, "compacting": None},
+  ]
+  assert chat_compaction_state.compaction_kind(chat_id) is None
+  assert client.get(
+    f"/api/chats/{chat_id}", headers=auth,
+  ).json()["compacting"] is None
+
+
+def test_failed_compaction_clears_the_visible_window(
+  client, auth, db, monkeypatch,
+):
+  from app import chat_compaction_state
+
+  chat_id = _make_chat_with_messages(client, auth, [
+    {"role": "user", "content": "keep this context"},
+  ])
+
+  async def _boom(_messages, **_kwargs):
+    raise RuntimeError("provider down")
+
+  monkeypatch.setattr(compaction, "summarize_chat", _boom)
+  response = client.post(f"/api/chats/{chat_id}/compact", headers=auth)
+
+  assert response.status_code == 502
+  assert chat_compaction_state.compaction_kind(chat_id) is None

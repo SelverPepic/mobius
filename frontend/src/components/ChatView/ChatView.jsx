@@ -1,4 +1,10 @@
 import { LocalAnswersContext } from './localAnswersContext.js'
+import {
+  chatCompactingKind,
+  compactionNotice,
+  setChatCompacting,
+  subscribeChatCompaction,
+} from './chatCompactionStore.js'
 import { questionAnswerPatch } from './questionSubmission.js'
 import { usePeerTimeline, PeerTimelineRows } from './PeerTimeline.jsx'
 import { PeerTimelineContext } from './peerTimelineContext.js'
@@ -12,6 +18,7 @@ import {
   useCallback,
   useMemo,
   useReducer,
+  useSyncExternalStore,
 } from 'react'
 import { flushSync } from 'react-dom'
 import { useQueryClient } from '@tanstack/react-query'
@@ -699,6 +706,11 @@ export default function ChatView({
   // context instead of asking the model anything.
   const [compactingChat, setCompactingChat] = useState(false)
   const compactingChatRef = useRef(false)
+  // The server's view of the same window, shared by every pane and device.
+  const serverCompactingKind = useSyncExternalStore(
+    subscribeChatCompaction,
+    () => chatCompactingKind(chatId),
+  )
   const [embeddedRunActive, setEmbeddedRunActive] = useState(false)
   // A counter is only a render wake-up; deadline elapsed is derived directly
   // from the current card's reset timestamp below, so a newly loaded card can
@@ -1519,6 +1531,7 @@ export default function ChatView({
       setLiveQuestionId(data.pending_question_id || null)
       if (Array.isArray(data.waits)) setArmedWaits(data.waits)
       setServerHandoff(data.handoff || null)
+      if (!staleSnapshot) setChatCompacting(chatId, data.compacting || null)
       setBackgroundHelpers(normalizeBackgroundHelpers(data.background_helpers))
       updateChatRuntimeCache(queryClient, chatMessagesQueryKey(chatId), {
         running: !!data.running,
@@ -1725,6 +1738,7 @@ export default function ChatView({
       setLiveQuestionId(pendingQuestionId)
       if (Array.isArray(data.waits)) setArmedWaits(data.waits)
       setServerHandoff(data.handoff || null)
+      setChatCompacting(chatId, data.compacting || null)
       setBackgroundHelpers(normalizeBackgroundHelpers(data.background_helpers))
       updateChatRuntimeCache(queryClient, chatMessagesQueryKey(chatId), {
         running: !!data.running,
@@ -6397,7 +6411,7 @@ export default function ChatView({
           canRequestSteer={canRequestSteer}
           canSubmitSteer={canSubmitSteer}
           sendFailure={sendFailure}
-          notice={compactingChat ? 'Compacting this chat’s context…' : null}
+          notice={compactionNotice(serverCompactingKind || (compactingChat ? 'compact' : null))}
           submissionBlocked={
             (!activationSettled && !activationFailed)
             || providerSwitching

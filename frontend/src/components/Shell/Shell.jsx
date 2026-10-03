@@ -28,6 +28,7 @@ import { handleAppProjectsRequest } from '../../lib/appProjectControl.js'
 import { parseNotificationTarget } from '../../lib/notificationTarget.js'
 import { requestChatQuestionReveal } from '../../lib/chatQuestionReveal.js'
 import { recordClientError } from '../../lib/errorLog.js'
+import { setChatCompacting } from '../ChatView/chatCompactionStore.js'
 import useSystemEventStream from '../../hooks/useSystemEventStream.js'
 import useTheme from '../../hooks/useTheme.js'
 import useProviderAuthStatus from '../../hooks/useProviderAuthStatus.js'
@@ -3172,6 +3173,14 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
         // refill the PWA's list cache. Input transitions are rare, and always
         // refreshing avoids stale offline markers and missing background rows.
         void invalidateShellListCache('chats').then(refreshChats)
+      }
+    } else if (ev.type === 'chat_compaction_changed') {
+      if (ev.chatId) {
+        // Every mounted view shows the server's rebuild window; when it ends,
+        // reconcile so the stored compaction card and any send that waited
+        // behind it appear without a reload.
+        setChatCompacting(ev.chatId, ev.compacting || null)
+        if (!ev.compacting) markChatRunReconcile(ev.chatId)
       }
     } else if (ev.type === 'chat_wait_changed') {
       if (ev.chatId) {
