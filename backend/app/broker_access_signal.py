@@ -110,6 +110,10 @@ def _mark_statement_access_change(state) -> None:
 
 @event.listens_for(Session, "after_commit")
 def _publish_committed_access_change(session) -> None:
+  # SQLAlchemy also fires this when a savepoint is released; the change is not
+  # visible to other sessions until the outermost transaction commits.
+  if session.in_nested_transaction():
+    return
   if session.info.pop(_PENDING_KEY, False):
     notify_access_changed()
 

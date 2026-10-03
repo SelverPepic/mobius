@@ -247,6 +247,23 @@ def test_only_committed_access_changes_wake_open_broker_streams(tmp_path):
     db.commit()
     assert bumps(lambda: (db.delete(link), db.commit()))
 
+    # A savepoint released inside the revoking transaction must not publish
+    # early; the outer commit is what makes the change visible.
+    other = models.Connector(
+      slug='later', name='Later', url='https://later.example/mcp',
+      enabled=True, status='ok', tools_json=[], est_tokens=0,
+    )
+    db.add(other)
+    db.commit()
+    before = broker_access_signal.current_revision()
+    other.enabled = False
+    db.flush()
+    with db.begin_nested():
+      db.add(models.Chat(id='c2', title='y'))
+    assert broker_access_signal.current_revision() == before
+    db.commit()
+    assert broker_access_signal.current_revision() != before
+
 
 class _LineageProbe:
   """Stands in for the database lineage check and records where it ran."""
