@@ -35,7 +35,6 @@ def _host():
     "id": host_id,
     "name": "Box",
     "runner_protocol": connect_runner.RUNNER_PROTOCOL_VERSION,
-    "runner_transport": "sse",
     "runner_capabilities": ["parallel"],
     "token_sha256": "paired",
     "active_commands": [],

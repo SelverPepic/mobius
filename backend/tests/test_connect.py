@@ -995,6 +995,18 @@ def test_host_rename_rejects_empty_or_unknown_hosts(client, auth):
   assert missing.status_code == 404, missing.text
 
 
+def test_pairing_accepts_the_code_without_its_hyphen(client, auth):
+  pairing = client.post("/api/connect/hosts", headers=auth, json={}).json()
+
+  paired = client.post(
+    "/api/connect/pair",
+    json={"code": pairing["pairing_code"].replace("-", "").lower()},
+  )
+
+  assert paired.status_code == 200, paired.text
+  assert paired.json()["host_id"] == pairing["id"]
+
+
 def test_pairing_is_one_time_and_delete_revokes_runner(client, auth):
   runner = client.get("/api/connect/runner")
   assert runner.status_code == 200
@@ -1172,7 +1184,6 @@ def test_stale_runner_record_offers_an_offline_update(client, auth):
   pairing, _ = _paired_host(client, auth)
   host = connect_routes._load_host(pairing["id"])
   host["runner_protocol"] = 3
-  host.pop("runner_transport", None)
   connect_routes._save_host(host)
 
   public = client.get("/api/connect/hosts", headers=auth).json()["hosts"][0]
@@ -1196,7 +1207,6 @@ def test_compatible_runner_release_controls_update_offer(
   pairing, _ = _paired_host(client, auth)
   host = connect_routes._load_host(pairing["id"])
   host["runner_protocol"] = connect_runner.RUNNER_PROTOCOL_VERSION
-  host["runner_transport"] = "sse"
   host["runner_release"] = runner_release
   host["runner_capabilities"] = list(connect_runner.RUNNER_CAPABILITIES)
   connect_routes._save_host(host)
@@ -1312,15 +1322,15 @@ async def test_current_stream_rotates_without_losing_running_command(
   assert host["platform"] == "TestOS 1"
   assert connect_routes._public_host(host)["runner_update_available"] is False
 
-  assert await response.body_iterator.__anext__() == ": connected\n\n"
-  with pytest.raises(StopAsyncIteration):
-    await response.body_iterator.__anext__()
+  # The rotated stream ends on its own; only heartbeats precede the end.
+  sent = [item async for item in response.body_iterator]
+  assert sent[0] == ": connected\n\n"
+  assert set(sent[1:]) <= {": ping\n\n"}
 
   assert pairing["id"] not in connect_routes._channels
   assert connect_routes._find_command(pairing["id"], request_id) is not None
   assert not caller.done()
   host = connect_routes._load_host(pairing["id"])
-  assert host["runner_transport"] == "sse"
   assert connect_routes._public_host(host)["runner_update_available"] is False
   connect_routes._runner_result(pairing["id"], connect_routes.ResultBody(
     request_id=request_id,
@@ -1531,7 +1541,6 @@ async def test_offline_cancel_is_delivered_when_current_runner_reconnects(
   pairing, _ = _paired_host(client, auth)
   host = connect_routes._load_host(pairing["id"])
   host["runner_protocol"] = 4
-  host["runner_transport"] = "sse"
   connect_routes._save_host(host)
   request_id = "6" * 16
   command = connect_routes._ActiveCommand(
@@ -1573,7 +1582,6 @@ async def test_exec_caps_large_output_and_reports_runner_timeout(client, auth):
     "stdout": oversized,
     "stderr": "runner timed out",
     "exit_code": 124,
-    "timed_out": True,
     "outcome": "timed_out",
   })
 
@@ -1703,7 +1711,6 @@ async def test_current_runner_keeps_retryable_result_after_server_timeout(
     request_id=request_id,
     stdout="reported after reconnect",
     exit_code=124,
-    timed_out=True,
     outcome="timed_out",
   ))
   assert connect_routes._host_commands(pairing["id"]) == {}

@@ -44,7 +44,6 @@ def _paired_host(
   host["runner_protocol"] = connect_runner.RUNNER_PROTOCOL_VERSION
   host["runner_release"] = connect_runner.RUNNER_RELEASE
   host["runner_capabilities"] = list(capabilities)
-  host["runner_transport"] = "sse"
   connect_routes._save_host(host)
   channel = connect_routes._Channel()
   connect_routes._channels[pairing["id"]] = channel

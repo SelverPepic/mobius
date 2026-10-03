@@ -659,7 +659,6 @@ class ResultBody(BaseModel):
   stdout: str = Field(default="", max_length=8 * 1024 * 1024)
   stderr: str = Field(default="", max_length=8 * 1024 * 1024)
   exit_code: int = 0
-  timed_out: bool = False
   outcome: str | None = Field(default=None, max_length=16)
   truncated: bool = False
   output_seq: int | None = Field(default=None, ge=0)
@@ -835,20 +834,13 @@ def _public_host(host: dict) -> dict:
   ch = _channels.get(host["id"])
   _prune_recent_commands(host)
   active = _active_public(host["id"])
-  runner_protocol = (
-    _RUNNER_PROTOCOL_VERSION if ch is not None
-    else host.get("runner_protocol")
-  )
-  runner_transport = (
-    "sse" if ch is not None else host.get("runner_transport")
-  )
+  runner_protocol = host.get("runner_protocol")
   runner_release = _reported_runner_release(host.get("runner_release"))
   paired = bool(host.get("token_sha256"))
   managed_by_mobius = host.get("runner_managed") == "mobius"
   runner_update_available = bool(
     paired and (
       int(runner_protocol or 0) != _RUNNER_PROTOCOL_VERSION
-      or runner_transport != "sse"
       or runner_release is None
       or runner_release < _RUNNER_RELEASE
       or not _RUNNER_CAPABILITIES <= _runner_capabilities(host)
@@ -996,6 +988,21 @@ async def _await_command_result(
   return command.result
 
 
+def _issue_pairing(host: dict) -> dict:
+  """Give an unpaired host a fresh one-time code and its install command."""
+  code = _new_code()
+  host["pairing_code"] = code
+  host["pairing_expires_at"] = _now() + _PAIRING_TTL_SECONDS
+  _save_host(host)
+  return {
+    "id": host["id"],
+    "name": host["name"],
+    "pairing_code": code,
+    "install_command": _install_command(_base_url(), code),
+    "expires_at": host["pairing_expires_at"],
+  }
+
+
 @router.post(
   "/hosts",
   dependencies=[Depends(require_nondelegated_owner_or_app_control)],
@@ -1004,33 +1011,20 @@ async def create_host(
   body: CreateHostBody,
   _owner: models.Owner = Depends(get_owner_or_app_with_connect_manage),
 ) -> dict:
-  host_id = _new_id()
-  code = _new_code()
   host = {
-    "id": host_id,
+    "id": _new_id(),
     "name": body.name,
     "created_at": _now(),
-    "pairing_code": code,
-    "pairing_expires_at": _now() + _PAIRING_TTL_SECONDS,
     "token_sha256": None,
     "paired_at": None,
     "last_seen": None,
     "platform": None,
     "runner_protocol": None,
     "runner_release": None,
-    "runner_transport": None,
     "active_commands": [],
     "recent_commands": {},
   }
-  _save_host(host)
-  base = _base_url()
-  return {
-    "id": host_id,
-    "name": host["name"],
-    "pairing_code": code,
-    "install_command": _install_command(base, code),
-    "expires_at": host["pairing_expires_at"],
-  }
+  return _issue_pairing(host)
 
 
 @router.get("/hosts")
@@ -1073,18 +1067,7 @@ async def host_pairing(
     raise HTTPException(status_code=404, detail="No such host.")
   if host.get("token_sha256"):
     raise HTTPException(status_code=409, detail="This machine is already paired.")
-  code = _new_code()
-  host["pairing_code"] = code
-  host["pairing_expires_at"] = _now() + _PAIRING_TTL_SECONDS
-  _save_host(host)
-  base = _base_url()
-  return {
-    "id": host_id,
-    "name": host["name"],
-    "pairing_code": code,
-    "install_command": _install_command(base, code),
-    "expires_at": host["pairing_expires_at"],
-  }
+  return _issue_pairing(host)
 
 
 @router.delete(
@@ -1374,9 +1357,7 @@ def _format_result(request_id: str, result: dict) -> dict:
   stdout, stdout_truncated = _cap_stream(str(result.get("stdout") or ""))
   stderr, stderr_truncated = _cap_stream(str(result.get("stderr") or ""))
   exit_code = int(result.get("exit_code", 0))
-  outcome = result.get("outcome") or (
-    "timed_out" if result.get("timed_out") else "completed"
-  )
+  outcome = result.get("outcome") or "completed"
   return {
     "request_id": request_id,
     "stdout": stdout,
@@ -1417,7 +1398,6 @@ def _runner_result(host_id: str, body: ResultBody) -> None:
     "stdout": body.stdout,
     "stderr": body.stderr,
     "exit_code": body.exit_code,
-    "timed_out": body.timed_out,
     "outcome": outcome,
     "truncated": body.truncated,
     "output_seq": body.output_seq,
@@ -1469,14 +1449,12 @@ def _reconcile_runner(host_id: str, hello: dict) -> None:
 @router.post("/pair")
 @_pair_limiter.limit("10/minute")
 async def pair(request: Request, body: PairBody) -> dict:
-  code = (body.code or "").strip().upper()
-  if not code:
-    raise HTTPException(status_code=400, detail="Missing pairing code.")
+  code = _normalize_code(body.code)
+  if code is None:
+    raise HTTPException(status_code=400, detail="Invalid pairing code.")
   for host in _list_hosts():
     stored = host.get("pairing_code")
-    if not stored:
-      continue
-    if not secrets.compare_digest(stored.upper(), code):
+    if not stored or not secrets.compare_digest(stored, code):
       continue
     if _now() > float(host.get("pairing_expires_at") or 0):
       raise HTTPException(status_code=400, detail="That pairing code has expired.")
@@ -1523,7 +1501,6 @@ async def stream(request: Request, inventory: StreamInventory | None = None) -> 
   host["runner_capabilities"] = sorted(
     set(request.query_params.getlist("capability")) & _RUNNER_CAPABILITIES
   )
-  host["runner_transport"] = "sse"
   # A runner supervised by another Möbius is updated by that Möbius when it
   # relaunches the runner, never by the service install command.
   host["runner_managed"] = (
@@ -1532,6 +1509,7 @@ async def stream(request: Request, inventory: StreamInventory | None = None) -> 
   plat = request.query_params.get("platform")
   if plat:
     host["platform"] = plat[:80]
+  host["last_seen"] = _now()
   _save_host(host)
   if protocol_version != _RUNNER_PROTOCOL_VERSION:
     # This runner replaced the one that ran any active command, and it cannot
@@ -1548,7 +1526,6 @@ async def stream(request: Request, inventory: StreamInventory | None = None) -> 
   ch = _Channel()
   # A reconnecting runner replaces any stale channel.
   _replace_channel(host_id, ch)
-  _touch(host_id)
   # Runners that stream output wait for this before sending any; older runners
   # ignore event types they do not know.
   ch.queue.put_nowait({"type": "hello", "live_output": True})
@@ -1565,30 +1542,25 @@ async def stream(request: Request, inventory: StreamInventory | None = None) -> 
     try:
       yield ": connected\n\n"
       while True:
-        if ch.closed.is_set() or await request.is_disconnected():
+        remaining = rotation_at - loop.time()
+        if ch.closed.is_set() or remaining <= 0 or await request.is_disconnected():
           break
-        if loop.time() >= rotation_at:
-          break
-        wait_seconds = min(
-          _HEARTBEAT_SECONDS, max(0.01, rotation_at - loop.time()),
-        )
         try:
-          evt = await asyncio.wait_for(ch.queue.get(), timeout=wait_seconds)
-          if evt.get("type") == "exec":
-            command = _find_command(host_id, evt.get("request_id"))
-            if command is None or command.state != "dispatching":
-              continue
-            if not _command_grant_active(command):
-              # Its grant was revoked before delivery: never send it.
-              _finish_unstarted(host_id, command)
-              continue
-          yield f"data: {json.dumps(evt)}\n\n"
+          evt = await asyncio.wait_for(
+            ch.queue.get(), timeout=min(_HEARTBEAT_SECONDS, remaining),
+          )
         except asyncio.TimeoutError:
-          if ch.closed.is_set() or (
-            loop.time() >= rotation_at
-          ):
-            break
           yield ": ping\n\n"
+          continue
+        if evt.get("type") == "exec":
+          command = _find_command(host_id, evt.get("request_id"))
+          if command is None or command.state != "dispatching":
+            continue
+          if not _command_grant_active(command):
+            # Its grant was revoked before delivery: never send it.
+            _finish_unstarted(host_id, command)
+            continue
+        yield f"data: {json.dumps(evt)}\n\n"
     finally:
       if _channels.get(host_id) is ch:
         del _channels[host_id]
