@@ -417,13 +417,19 @@ COPY protected-files.txt ./protected-files.txt
 # build context while the baked fallback is the checkout at BUILD_SHA. A step
 # release advances both together; refuse a build whose context claims a
 # different level than the baked fallback actually understands.
-RUN python3 -P -c 'import importlib.util, json; \
+# The image label below declares the same level to deployment controllers
+# that inspect the image without running it (the account service's rollback).
+ARG MOBIUS_COMPAT_LEVEL=1
+RUN python3 -P -c 'import importlib.util, json, os; \
 spec = importlib.util.spec_from_file_location("compat", "/app/app/compat.py"); \
 compat = importlib.util.module_from_spec(spec); spec.loader.exec_module(compat); \
 claimed = json.load(open("/app/runtime/one_way_capability.json"))["level"]; \
 baked = compat.baked_image_level(); \
 assert type(claimed) is int and claimed == baked, \
-  f"runtime/one_way_capability.json level {claimed!r} != baked COMPAT_LEVEL {baked}"'
+  f"runtime/one_way_capability.json level {claimed!r} != baked COMPAT_LEVEL {baked}"; \
+labelled = os.environ["MOBIUS_COMPAT_LEVEL"]; \
+assert labelled == str(baked), \
+  f"MOBIUS_COMPAT_LEVEL label {labelled!r} != baked COMPAT_LEVEL {baked}"'
 
 # The restart supervisor imports no mutable platform code.
 RUN chmod -R a-w /app/runtime
@@ -440,7 +446,8 @@ ENV BUILD_SHA=${BUILD_SHA}
 # /app/build-info.json, written above, so Settings can still show a date.
 ENV BUILD_DATE=${BUILD_DATE}
 LABEL org.opencontainers.image.source="https://github.com/mobius-os/mobius" \
-      org.opencontainers.image.revision="${BUILD_SHA}"
+      org.opencontainers.image.revision="${BUILD_SHA}" \
+      you.mobius.compat-level="${MOBIUS_COMPAT_LEVEL}"
 
 EXPOSE 8000
 

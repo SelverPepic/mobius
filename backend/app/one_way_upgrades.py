@@ -751,6 +751,33 @@ def run_gate(
   _GATE_PASSED = True
 
 
+_REPORTED_FLOOR: int | None = None
+
+
+def reported_floor() -> int | None:
+  """The database's effective compatibility floor for deployment controllers.
+
+  The account service reads it from /api/health to decide whether rolling a
+  failed replacement back to an older image is safe. Only the startup gate
+  raises the floor, so once it has passed the value is fixed for this process
+  and cached. None means unknown (unreadable, or a damaged floor record):
+  callers must then treat an older image as unsafe.
+  """
+  global _REPORTED_FLOOR
+  if _REPORTED_FLOOR is not None:
+    return _REPORTED_FLOOR
+  try:
+    from app.database import engine
+    seen = preflight(engine)
+  except Exception:
+    return None
+  if seen.floor_record == "missing_row":
+    return None
+  if _GATE_PASSED:
+    _REPORTED_FLOOR = seen.floor
+  return seen.floor
+
+
 def readiness_verdict() -> dict | None:
   """Not ready while registered steps exist and the gate has not passed."""
   if registered_steps() and not _GATE_PASSED:

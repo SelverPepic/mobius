@@ -6,6 +6,7 @@ refuse to serve without changing anything.
 """
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -357,3 +358,12 @@ def test_the_floor_record_is_created_atomically(tmp_path, monkeypatch):
     assert conn.execute("SELECT id, floor FROM platform_compat").fetchall() == [(1, 0)]
   finally:
     conn.close()
+
+
+def test_image_label_declares_the_baked_level_and_the_build_enforces_it():
+  """Controllers that inspect an image without running it read this label."""
+  dockerfile = (Path(compat.__file__).resolve().parents[2] / "Dockerfile").read_text()
+  default = re.search(r"^ARG MOBIUS_COMPAT_LEVEL=(\d+)$", dockerfile, re.M)
+  assert default and int(default[1]) == compat.COMPAT_LEVEL
+  assert 'you.mobius.compat-level="${MOBIUS_COMPAT_LEVEL}"' in dockerfile
+  assert 'assert labelled == str(baked)' in dockerfile

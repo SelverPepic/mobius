@@ -370,3 +370,39 @@ def test_health_reports_the_boot_protocol_only_when_this_boot_ran_it(
 
   marker.write_text(f"{platform_update.BOOT_PROTOCOL}\n")
   assert client.get("/api/health").json()["boot_protocol"] == platform_update.BOOT_PROTOCOL
+
+
+def test_health_reports_the_database_compatibility_floor(client, monkeypatch):
+  """Deployment controllers never roll back below this floor; unknown is None."""
+  from app import one_way_upgrades
+
+  monkeypatch.setattr(one_way_upgrades, "_REPORTED_FLOOR", None)
+  monkeypatch.setattr(one_way_upgrades, "_GATE_PASSED", False)
+  monkeypatch.setattr(one_way_upgrades, "preflight", lambda _engine: one_way_upgrades.Preflight(
+    floor=1, existing_tables=frozenset(), floor_record="present", missing_authority=()))
+  assert client.get("/api/health").json()["compat_floor"] == 1
+  monkeypatch.setattr(one_way_upgrades, "preflight", lambda _engine: one_way_upgrades.Preflight(
+    floor=0, existing_tables=frozenset(), floor_record="missing_row", missing_authority=()))
+  assert client.get("/api/health").json()["compat_floor"] is None
+
+  def unreadable(_engine):
+    raise RuntimeError("locked")
+
+  monkeypatch.setattr(one_way_upgrades, "preflight", unreadable)
+  assert client.get("/api/health").json()["compat_floor"] is None
+
+
+def test_the_floor_is_cached_only_after_the_gate_passed(monkeypatch):
+  from app import one_way_upgrades
+
+  reads = []
+  monkeypatch.setattr(one_way_upgrades, "_REPORTED_FLOOR", None)
+  monkeypatch.setattr(one_way_upgrades, "preflight", lambda _engine: reads.append(1) or
+    one_way_upgrades.Preflight(floor=1, existing_tables=frozenset(),
+                               floor_record="present", missing_authority=()))
+  monkeypatch.setattr(one_way_upgrades, "_GATE_PASSED", False)
+  assert one_way_upgrades.reported_floor() == 1 and one_way_upgrades.reported_floor() == 1
+  assert len(reads) == 2
+  monkeypatch.setattr(one_way_upgrades, "_GATE_PASSED", True)
+  assert one_way_upgrades.reported_floor() == 1 and one_way_upgrades.reported_floor() == 1
+  assert len(reads) == 3

@@ -1131,6 +1131,10 @@ def health(response: Response):
   # offers a container-only upgrade to a runtime that reports none: its image
   # predates the boot transaction and cannot take a package-changing release.
   payload["boot_protocol"] = BOOT_PROTOCOL if image_activates_updates() else None
+  # The database's compatibility floor (None when unknown). A deployment
+  # controller must never roll back to an image whose level is below it.
+  from app.one_way_upgrades import reported_floor
+  payload["compat_floor"] = reported_floor()
   if degraded:
     # Still HTTP 200: database failure must never masquerade as device offline.
     # The strict and readiness variants below carry the 5xx service verdict.
