@@ -1,7 +1,7 @@
-/* WaitingChip renders compact in-conversation waits with their existing condition and recovery owners. */
+/* WaitingChip renders bordered waits with their existing condition and recovery owners. */
 
 import { useState } from 'react'
-import CompactHandoff from './CompactHandoff.jsx'
+import WaitingCard from './WaitingCard.jsx'
 import {
   helperPresentation,
   resourcePausePresentation,
@@ -13,10 +13,10 @@ export function WaitCard({ wait, expanded, onToggle, onCancel, onRevealRecovery 
   const needsRecovery = wait.delivery_pending && ['manual_resume', 'resume_failed', 'restart'].includes(wait.resume_blocker)
   const cancellable = wait.kind !== 'platform_activation' && !wait.delivery_pending
   return (
-    <CompactHandoff
+    <WaitingCard
       expanded={expanded}
       onToggle={onToggle}
-      ariaLabel={`handoff details: ${presentation.condition}`}
+      ariaLabel="waiting details"
       title={`${presentation.condition} — ${presentation.summary}`}
       text={presentation.condition}
       meta={presentation.summary}
@@ -40,12 +40,13 @@ export function WaitCard({ wait, expanded, onToggle, onCancel, onRevealRecovery 
 function HelperCard({ backgroundHelpers, expanded, onToggle }) {
   const presentation = helperPresentation(backgroundHelpers)
   return (
-    <CompactHandoff
+    <WaitingCard
       expanded={expanded}
       onToggle={onToggle}
       ariaLabel="helper waiting details"
       title={presentation.tasks.length ? presentation.tasks.join(', ') : undefined}
       text={presentation.summary}
+      stateLabel={null}
       meta="resumes automatically"
       rows={[
         {
@@ -71,7 +72,7 @@ function ResourceCard({ resourcePause, autoResumeEnabled, handoff, expanded, onT
       ? !(handoff?.kind === 'automatic' && handoff.reason === kind)
       : false
   return (
-    <CompactHandoff
+    <WaitingCard
       expanded={expanded}
       onToggle={onToggle}
       ariaLabel="resource handoff details"

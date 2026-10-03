@@ -7,7 +7,7 @@ import { goalContinuationHandoff } from '../chatHandoffPresentation.js'
 
 const vite = await createServer({ appType: 'custom', logLevel: 'error', server: { middlewareMode: true, hmr: false, ws: false }, ssr: { noExternal: ['@openai/apps-sdk-ui'] } })
 after(() => vite.close())
-const { default: CompactHandoff } = await vite.ssrLoadModule('/src/components/ChatView/CompactHandoff.jsx')
+const { default: WaitingCard } = await vite.ssrLoadModule('/src/components/ChatView/WaitingCard.jsx')
 const { default: ProgressRail } = await vite.ssrLoadModule('/src/components/ChatView/ProgressRail.jsx')
 const { default: GoalHistoryCard } = await vite.ssrLoadModule('/src/components/ChatView/GoalHistoryCard.jsx')
 const { WaitCard } = await vite.ssrLoadModule('/src/components/ChatView/WaitingChip.jsx')
@@ -26,7 +26,7 @@ test('a held Goal uses the existing expandable panel with one continuation actio
 })
 
 test('details explain action scope without changing the action', () => {
-  const html = render(h(CompactHandoff, { stateLabel: 'On hold', ariaLabel: 'Goal hold', expanded: true,
+  const html = render(h(WaitingCard, { ariaLabel: 'Waiting details', expanded: true,
     rows: [{ label: 'Scope', value: 'Continuing does not approve a declined action.' }],
     action: { label: 'Continue this work', onClick: () => {} },
   }))
@@ -120,4 +120,38 @@ test('collapsed cancellable Wait exposes Stop while blocked delivery reveals its
   }
   const activation = render(h(WaitCard, { ...props, wait: { ...wait, kind: 'platform_activation' } }))
   assert.doesNotMatch(activation, /Stop waiting/)
+})
+
+test('helper, condition and resource handoffs all use the established bordered Waiting card', async () => {
+  const { default: WaitingChip } = await vite.ssrLoadModule('/src/components/ChatView/WaitingChip.jsx')
+  for (const props of [
+    { backgroundHelpers: { count: 1, items: [{ task_key: 'review' }] } },
+    { waits: [{ id: 'timer', kind: 'timer', description: 'Deployment ready' }] },
+    { resourcePause: { pause: { kind: 'memory' } }, handoff: { kind: 'automatic', reason: 'memory' } },
+    { resourcePause: { pause: { kind: 'model_capacity' } }, handoff: { kind: 'recovery' }, onRevealRecovery: () => {} },
+  ]) {
+    const html = render(h(WaitingChip, props))
+    assert.match(html, /class="chat__wait-card"/)
+    assert.match(html, /class="chat__wait-summary"/)
+    assert.match(html, /aria-expanded="false"/)
+    assert.doesNotMatch(html, /class="chat__handoff|Next move and details/)
+  }
+  const helper = render(h(WaitingChip, { backgroundHelpers: { count: 1, items: [] } }))
+  assert.match(helper, /Waiting on 1 helper/)
+  assert.doesNotMatch(helper, /Waiting · Waiting/)
+  assert.match(helper, /aria-label="Expand helper waiting details: Waiting on 1 helper — resumes automatically"/)
+})
+
+test('Waiting panel preserves expanded evidence, action errors and disabled state', () => {
+  const html = render(h(WaitingCard, { expanded: true, text: 'Deployment ready', meta: 'checks every minute',
+    ariaLabel: 'handoff details', onToggle: () => {}, rows: [{ label: 'Handled by', value: 'Deployment service' }],
+    action: { label: 'Stop waiting', onClick: () => {}, disabled: true, error: 'Please try again.' },
+  }))
+  assert.match(html, /chat__wait-card--expanded/)
+  assert.match(html, /aria-expanded="true"/)
+  assert.match(html, /Deployment service/)
+  assert.match(html, /disabled=""/)
+  assert.match(html, /role="alert"/)
+  assert.match(html, /Please try again/)
+  assert.match(html, /<\/button>[\s\S]*<button[^>]+class="chat__wait-cancel"/)
 })
