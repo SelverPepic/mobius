@@ -634,6 +634,32 @@ def _route_diagnostics_to_chat_log(_context: StartupContext) -> None:
     if handler not in logger.handlers:
       logger.addHandler(handler)
     logger.setLevel(level)
+  # Unhandled route exceptions ("Exception in ASGI application") are logged
+  # by uvicorn's error logger, which otherwise reaches only the container's
+  # stdout — invisible from inside Möbius, so a one-off 500 left no trace to
+  # diagnose. Copy its errors into the same file without raising that
+  # logger's own level, which would silence uvicorn's console lifecycle lines.
+  uvicorn_errors = logging.getLogger("uvicorn.error")
+  if not any(
+    isinstance(h, _ErrorsToChatLog) for h in uvicorn_errors.handlers
+  ):
+    uvicorn_errors.addHandler(_ErrorsToChatLog(handler))
+
+
+class _ErrorsToChatLog(logging.Handler):
+  """Forward ERROR+ records to the one shared chat-log handler.
+
+  A separate handler object carries the level gate because the shared
+  rotating handler must stay single (two handlers rotating one file race)
+  and unfiltered for its other loggers.
+  """
+
+  def __init__(self, target: logging.Handler):
+    super().__init__(level=logging.ERROR)
+    self._target = target
+
+  def emit(self, record: logging.LogRecord) -> None:
+    self._target.handle(record)
 
 
 def _capture_platform_activation_snapshot(context: StartupContext) -> None:
