@@ -15,7 +15,7 @@ export default function WaitingCard({
         <span className="chat__progress-identity" aria-hidden="true"><Clock width={14} height={14} /></span>
         <span className="chat__wait-text">{label}</span>
         {meta && <span className="chat__wait-meta">{meta}</span>}
-        <ChevronRight className="chat__wait-chevron" width={14} height={14} aria-hidden="true" />
+        <ChevronRight className="chat__panel-chevron" width={14} height={14} aria-hidden="true" />
       </button>
       {action && <div className="chat__wait-action">
         <button type="button" className="chat__wait-cancel" onClick={action.onClick} disabled={action.disabled}>

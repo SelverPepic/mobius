@@ -4135,8 +4135,9 @@
   overflow-wrap: anywhere;
 }
 
-.chat__wait-chevron { flex: 0 0 auto; }
-.chat__wait-summary[aria-expanded="true"] .chat__wait-chevron { transform: rotate(90deg); }
+.chat__panel-chevron { flex: 0 0 auto; }
+button[aria-expanded="true"] > .chat__panel-chevron,
+details[open] > summary > .chat__panel-chevron { transform: rotate(90deg); }
 
 .chat__wait-description {
   margin: 0;
@@ -4402,21 +4403,21 @@
   overflow: hidden;
 }
 
-.chat__goal-history-copy:has(> .chat__goal-history-details[open]) > .chat__goal-history-objective {
-  display: block;
-}
-
-.chat__goal-history-details { margin-top: 5px; }
-
-.chat__goal-history-details > summary {
-  width: fit-content;
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 600;
+/* The whole receipt header discloses its plan, like the active Waiting header. */
+.chat__goal-history-details { grid-column: 1 / -1; width: 100%; min-width: 0; }
+.chat__goal-history-summary {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  list-style: none;
   cursor: pointer;
+  border-radius: 7px;
 }
-
-.chat__goal-history-details[open] > summary { color: var(--text); }
+.chat__goal-history-summary::-webkit-details-marker { display: none; }
+.chat__goal-history-summary > .chat__goal-history-copy { flex: 1; }
+.chat__goal-history-summary > .chat__panel-chevron { margin-top: 7px; color: var(--muted); }
+.chat__goal-history-summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+.chat__goal-history-details[open] .chat__goal-history-objective { display: block; }
 
 .chat__goal-task {
   display: grid;

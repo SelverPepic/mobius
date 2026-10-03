@@ -22,6 +22,7 @@ test('a held Goal uses the existing expandable panel with one continuation actio
   assert.match(html, /Goal · On hold/)
   assert.match(html, /Continue this work/)
   assert.match(html, /aria-expanded="false"/)
+  assert.match(html, /chat__panel-chevron/)
   assert.doesNotMatch(html, /chat__handoff|role="alert"/)
 })
 
@@ -58,7 +59,9 @@ test('all finished Goals are read-only records with an expandable plan', () => {
       plan: { tasks: [{ id: 'check', title: 'Check release', status: 'completed' }] } }
     const html = render(h(GoalHistoryCard, { summary }))
     assert.match(html, /Verify release/)
-    assert.match(html, /View details/)
+    assert.match(html, /chat__goal-history-summary/)
+    assert.match(html, /chat__panel-chevron/)
+    assert.doesNotMatch(html, /View details/)
     assert.match(html, /Check release/)
     assert.doesNotMatch(html, /<button|Clear|Abandon|Continue this work/)
   }
@@ -73,7 +76,8 @@ test('completed Goals show the checklist without repeating the final reply', () 
     const original = structuredClone(summary)
     const html = render(h(GoalHistoryCard, { summary }))
     assert.match(html, /Prepare the release/)
-    assert.match(html, /<summary>View details<\/summary>/)
+    assert.match(html, /<summary class="chat__goal-history-summary"/)
+    assert.doesNotMatch(html, /View details/)
     assert.match(html, /Check the release/)
     assert.doesNotMatch(html, /The release is ready|chat__goal-result|<button/)
     assert.deepEqual(summary, original)
@@ -95,7 +99,7 @@ test('cancellation and unsuccessful Goal reasons remain visible without opening 
       objective: 'Prepare the release', status, result: { reason: 'The required account is unavailable.' },
       plan: { tasks: [{ id: 'prepare', title: 'Prepare', status: 'cancelled' }] },
     } }))
-    const [visible, details] = html.split('<details')
+    const [visible, details] = html.split('</summary>')
     assert.match(visible, /The required account is unavailable\./)
     assert.doesNotMatch(details, /The required account is unavailable\./)
   }
@@ -154,4 +158,16 @@ test('Waiting panel preserves expanded evidence, action errors and disabled stat
   assert.match(html, /role="alert"/)
   assert.match(html, /Please try again/)
   assert.match(html, /<\/button>[\s\S]*<button[^>]+class="chat__wait-cancel"/)
+})
+
+test('settled waits remain read-only transcript records after the active Waiting block is gone', async () => {
+  const { default: WaitHistoryCard } = await vite.ssrLoadModule('/src/components/ChatView/WaitHistoryCard.jsx')
+  for (const [status, label] of [['met', 'Wait completed'], ['expired', 'Wait reached its deadline'], ['failed', 'Wait check failed'], ['cancelled', 'Wait stopped']]) {
+    const html = render(h(WaitHistoryCard, { summary: { id: 'wait-a', description: 'Release checks finish', status, duration_seconds: 125, checks_count: 3 } }))
+    assert.match(html, /chat__wait-history/)
+    assert.ok(html.includes(label))
+    assert.match(html, /Release checks finish/)
+    assert.match(html, /3 checks · 2m 5s/)
+    assert.doesNotMatch(html, /<button|Stop waiting|View recovery/)
+  }
 })
