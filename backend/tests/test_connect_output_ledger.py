@@ -58,7 +58,7 @@ async def test_full_output_survives_memory_reset_and_pages(client, auth):
 
 
 @pytest.mark.asyncio
-async def test_late_upload_and_archived_retry(client, auth, monkeypatch):
+async def test_late_upload_and_archived_retry(client, auth):
   host_id, token, ch = host(client, auth)
   rid = 'b' * 16
   task = asyncio.create_task(connect.exec_on_host(
@@ -77,8 +77,6 @@ async def test_late_upload_and_archived_retry(client, auth, monkeypatch):
       {'seq': 1, 'stream': 'stdout', 'text': 'b'}]})
   assert r.status_code == 200 and r.json()['next'] == 2
   assert client.get(endpoint, headers=auth).json()['output_complete'] is True
-  monkeypatch.setattr(connect, '_now', lambda: time.time() + 3600)
-  connect._prune_recent_commands(connect._load_host(host_id))
   connect._channels.clear()
   retry = await connect.exec_on_host(
     host_id, connect.ExecBody(cmd='true', request_id=rid, stream=True),
@@ -136,9 +134,7 @@ async def test_unknown_cross_host_and_disk_failure_do_not_ack(client, auth, monk
 
 
 @pytest.mark.asyncio
-async def test_recent_history_survives_cache_expiry_without_storing_command_text(
-  client, auth, monkeypatch,
-):
+async def test_recent_history_survives_without_storing_command_text(client, auth):
   host_id, _token, ch = host(client, auth)
   rid = 'f' * 16
   task = asyncio.create_task(connect.exec_on_host(
@@ -148,10 +144,6 @@ async def test_recent_history_survives_cache_expiry_without_storing_command_text
   connect._mark_command_started(host_id, rid)
   await task
   connect._runner_result(host_id, connect.ResultBody(request_id=rid))
-  assert connect._load_host(host_id).get('recent_commands', {}) == {}
-  monkeypatch.setattr(connect, '_now', lambda: time.time() + 3600)
-  connect._prune_recent_commands(connect._load_host(host_id))
-  assert connect._load_host(host_id)['recent_commands'] == {}
   host_view = connect._public_host(connect._load_host(host_id))
   listed = await connect.list_host_commands(host_id, _owner=object())
   assert [item['id'] for item in host_view['recent_commands']] == [rid]
@@ -159,26 +151,7 @@ async def test_recent_history_survives_cache_expiry_without_storing_command_text
   assert host_view['recent_commands'][0]['label'] is None
   db_bytes = connect_output._path(host_id).read_bytes()
   assert b'private-token' not in db_bytes
-  assert connect._load_host(host_id).get('recent_commands', {}) == {}
-
-
-def test_legacy_registry_history_migrates_once_without_expiring_ledger(client, auth):
-  host_id, _token, _ch = host(client, auth)
-  saved = connect._load_host(host_id)
-  rid = '2' * 16
-  saved['recent_commands'] = {rid: {
-    'fingerprint': 'legacy-identity', 'finished_at': time.time() - 3600,
-    'result': {'request_id': rid, 'stdout': 'legacy preview', 'outcome': 'completed'},
-  }}
-  saved.pop('recent_ledger_migrated', None)
-  connect._save_host(saved)
-  connect._prune_recent_commands(connect._load_host(host_id))
-  migrated = connect_output.finished(host_id, rid)
-  assert migrated['fingerprint'] == 'legacy-identity'
-  assert migrated['result']['stdout'] == 'legacy preview'
-  assert connect._load_host(host_id)['recent_commands'] == {}
-  connect._prune_recent_commands(connect._load_host(host_id))
-  assert connect_output.finished(host_id, rid) == migrated
+  assert b'private-token' not in connect._host_path(host_id).read_bytes()
 
 
 def test_conflicting_seq_replay_is_rejected_without_partial_append(tmp_path, monkeypatch):

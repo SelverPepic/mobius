@@ -1487,7 +1487,7 @@ def test_exec_body_requires_exactly_one_work_form():
 
 @pytest.mark.asyncio
 async def test_persisted_running_command_accepts_result_after_runtime_restart(
-  client, auth, monkeypatch,
+  client, auth,
 ):
   pairing, _ = _paired_host(client, auth)
   request_id = "8" * 16
@@ -1524,14 +1524,6 @@ async def test_persisted_running_command_accepts_result_after_runtime_restart(
   assert connect_routes._host_commands(pairing["id"]) == {}
   last = connect_routes.connect_output.finished(pairing["id"], request_id)
   assert last["result"]["stdout"] == "finished after restart"
-  monkeypatch.setattr(
-    connect_routes,
-    "_now",
-    lambda: last["finished_at"] + connect_routes._RESULT_RETENTION_SECONDS + 1,
-  )
-  connect_routes._prune_recent_commands(connect_routes._load_host(pairing["id"]))
-  assert connect_routes._load_host(pairing["id"])["recent_commands"] == {}
-  assert connect_routes.connect_output.finished(pairing["id"], request_id) == last
 
 
 @pytest.mark.asyncio

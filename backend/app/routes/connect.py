@@ -40,8 +40,8 @@ Owner/app surface:
 Live sockets and waiting callers are in-process — safe because the backend runs
 a single uvicorn worker, the same assumption broadcast.py already relies on.
 Active commands are written into the host registry. Full numbered output and
-terminal identity have one private per-host ledger; legacy recent results are
-migrated on read. Reconnects and backend restarts preserve replay and output.
+terminal identity have one private per-host ledger. Reconnects and backend
+restarts preserve replay and output.
 
 Runners that announce the "parallel" capability run any number of commands at
 once, each with its own id, time limit, output, and cancellation. Other
@@ -114,7 +114,6 @@ _RUNNER_RELEASE = connect_runner.RUNNER_RELEASE
 _STREAM_ROTATION_SECONDS = 10 * 60
 _START_ACK_TIMEOUT = 10
 _RESULT_GRACE_SECONDS = 15
-_RESULT_RETENTION_SECONDS = 15 * 60
 _RUNNER_CAPABILITIES = frozenset(connect_runner.RUNNER_CAPABILITIES)
 # Longest single output long-poll. Stays well inside proxy idle-request cuts.
 _MAX_OUTPUT_WAIT_SECONDS = 25
@@ -432,12 +431,7 @@ def _host_commands(host_id: str) -> dict[str, _ActiveCommand]:
   commands = {}
   host = _load_host(host_id)
   if host is not None:
-    records = list(host.get("active_commands") or [])
-    # Records written before parallel commands held a single active command.
-    legacy = host.get("active_command")
-    if isinstance(legacy, dict):
-      records.append(legacy)
-    for record in records:
+    for record in host.get("active_commands") or []:
       if (isinstance(record, dict) and record.get("id")
           and _ledger_read(connect_output.finished, host_id, str(record["id"])) is None):
         command = _ActiveCommand.from_record(record)
@@ -457,7 +451,6 @@ def _persist_commands(host_id: str) -> None:
   host["active_commands"] = [
     command.record() for command in _host_commands(host_id).values()
   ]
-  host.pop("active_command", None)
   _save_host(host)
 
 
@@ -485,17 +478,7 @@ def _finish_command(host_id: str, request_id: str, result: dict) -> bool:
   connect_output.finish(host_id, request_id, command.fingerprint,
                         finished_at, output_seq, public_result)
   _host_commands(host_id).pop(request_id, None)
-  host = _load_host(host_id)
-  if host is not None:
-    host["active_commands"] = [
-      active.record() for active in _host_commands(host_id).values()
-    ]
-    host.pop("active_command", None)
-    # The ledger is the single owner of finished identities and previews.
-    # Legacy registry history is migrated on read; never duplicate new output
-    # into a growing JSON file that every state transition must rewrite.
-    host.pop("last_command", None)
-    _save_host(host)
+  _persist_commands(host_id)
   command.finish(public_result)
   return True
 
@@ -607,7 +590,6 @@ def _runs_in_parallel(host: dict | None) -> bool:
 def _touch(host_id: str) -> None:
   host = _load_host(host_id)
   if host is not None:
-    _prune_recent_commands(host)
     host["last_seen"] = _now()
     _save_host(host)
 
@@ -832,7 +814,6 @@ def _reported_runner_release(value: object) -> int | None:
 def _public_host(host: dict) -> dict:
   """Registry view safe to hand to the owner/app (no token hash)."""
   ch = _channels.get(host["id"])
-  _prune_recent_commands(host)
   active = _active_public(host["id"])
   runner_protocol = host.get("runner_protocol")
   runner_release = _reported_runner_release(host.get("runner_release"))
@@ -870,60 +851,6 @@ def _public_host(host: dict) -> dict:
     "platform": host.get("platform"),
     "disconnect_command": _DISCONNECT_COMMAND,
   }
-
-
-def _prune_recent_commands(host: dict) -> None:
-  """Migrate legacy recent metadata once, then bound only the registry cache.
-
-  The ledger has no automatic history expiry. A failed migration leaves the
-  original record in place so a later request can retry it.
-  """
-  recent = host.get("recent_commands")
-  recent = dict(recent) if isinstance(recent, dict) else {}
-  changed = False
-  legacy = host.get("last_command")
-  if isinstance(legacy, dict) and legacy.get("id"):
-    recent.setdefault(str(legacy["id"]), {
-      key: legacy.get(key) for key in ("fingerprint", "finished_at", "result")
-    })
-  if not host.get("recent_ledger_migrated"):
-    all_migrated = True
-    for request_id, entry in recent.items():
-      if not isinstance(entry, dict) or not isinstance(entry.get("result"), dict):
-        all_migrated = False
-        continue
-      fingerprint = entry.get("fingerprint")
-      if not isinstance(fingerprint, str) or not fingerprint:
-        all_migrated = False
-        continue
-      _ledger_read(
-        connect_output.finish, host["id"], request_id, fingerprint,
-        float(entry.get("finished_at") or _now()),
-        entry.get("output_seq"), entry["result"],
-      )
-    if all_migrated:
-      host["recent_ledger_migrated"] = True
-      host.pop("last_command", None)
-      changed = True
-  cutoff = _now() - _RESULT_RETENTION_SECONDS
-  kept = {
-    request_id: entry for request_id, entry in recent.items()
-    if isinstance(entry, dict) and (
-      not host.get("recent_ledger_migrated")
-      or float(entry.get("finished_at") or 0) >= cutoff
-    )
-  }
-  if kept != host.get("recent_commands"):
-    host["recent_commands"] = kept
-    changed = True
-  if changed:
-    _save_host(host)
-
-
-def _recent_command(host: dict, request_id: str) -> dict | None:
-  recent = host.get("recent_commands")
-  entry = recent.get(request_id) if isinstance(recent, dict) else None
-  return entry if isinstance(entry, dict) else None
 
 
 def _forget_host(host_id: str) -> None:
@@ -1022,7 +949,6 @@ async def create_host(
     "runner_protocol": None,
     "runner_release": None,
     "active_commands": [],
-    "recent_commands": {},
   }
   return _issue_pairing(host)
 
@@ -1169,19 +1095,16 @@ async def exec_on_host(
     script=body.script,
     shell=body.shell,
   )
-  _prune_recent_commands(host)
-  recent = _ledger_read(connect_output.finished, host_id, request_id) or _recent_command(host, request_id)
-  if recent is not None:
-    if recent.get("fingerprint") != fingerprint:
+  finished = _ledger_read(connect_output.finished, host_id, request_id)
+  if finished is not None:
+    if finished["fingerprint"] != fingerprint:
       raise HTTPException(
         status_code=409,
         detail="That request id already belongs to a different command.",
       )
-    result = recent.get("result")
-    if isinstance(result, dict):
-      if body.stream:
-        return {"request_id": request_id, "state": "finished"}
-      return result
+    if body.stream:
+      return {"request_id": request_id, "state": "finished"}
+    return finished["result"]
 
   commands = _host_commands(host_id)
   command = commands.get(request_id)
@@ -1274,7 +1197,6 @@ async def list_host_commands(
   host = _load_host(host_id)
   if host is None:
     raise HTTPException(status_code=404, detail="No such host.")
-  _prune_recent_commands(host)
   return {
     "running": _active_public(host_id),
     "recent": _ledger_read(connect_output.recent, host_id),
@@ -1304,13 +1226,6 @@ async def read_command_output(
     entry, page, complete = _ledger_read(
       connect_output.view, host_id, request_id, after,
     )
-    if command is None and entry is None:
-      # Move still-retained legacy terminal metadata before its short cache
-      # expires. The ledger then owns it indefinitely.
-      _prune_recent_commands(host)
-      entry, page, complete = _ledger_read(
-        connect_output.view, host_id, request_id, after,
-      )
     if command is None and entry is None:
       raise HTTPException(status_code=404, detail="Connect has no command with that id.")
     if command is None or page["chunks"] or _now() >= deadline:

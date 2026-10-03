@@ -258,24 +258,6 @@ async def test_reconnect_reconciles_every_command_the_runner_reports(
   assert await replacement.queue.get() == {"type": "cancel", "request_id": "8" * 16}
 
 
-@pytest.mark.asyncio
-async def test_single_legacy_active_command_record_is_restored(client, auth):
-  host_id, _channel = _paired_host(client, auth)
-  host = connect_routes._load_host(host_id)
-  host.pop("active_commands", None)
-  host["active_command"] = {
-    "id": "9" * 16, "timeout": 60, "created_at": time.time(),
-    "started_at": time.time(), "state": "running", "fingerprint": "x",
-  }
-  connect_routes._save_host(host)
-
-  assert list(connect_routes._host_commands(host_id)) == ["9" * 16]
-  connect_routes._persist_commands(host_id)
-  saved = connect_routes._load_host(host_id)
-  assert "active_command" not in saved
-  assert [record["id"] for record in saved["active_commands"]] == ["9" * 16]
-
-
 def test_command_label_is_the_first_line_and_never_persists():
   script = "\nset -euo pipefail\ncd /srv/app\ndocker compose up -d\n"
   assert connect_routes._command_label(None, script) == "set -euo pipefail …"
@@ -493,23 +475,6 @@ async def test_older_app_clients_still_see_and_stop_one_command(client, auth):
   public = connect_routes._public_host(connect_routes._load_host(host_id))
   assert public["active_command"]["id"] == "d" * 16
   assert len(public["active_commands"]) == 2
-
-
-def test_result_finished_before_upgrade_still_answers_a_retry(client, auth):
-  host_id, _channel = _paired_host(client, auth)
-  host = connect_routes._load_host(host_id)
-  host.pop("recent_commands", None)
-  host["last_command"] = {
-    "id": "f" * 16, "fingerprint": "abc", "finished_at": time.time(),
-    "result": {"request_id": "f" * 16, "exit_code": 0},
-  }
-  connect_routes._save_host(host)
-
-  connect_routes._prune_recent_commands(connect_routes._load_host(host_id))
-
-  saved = connect_routes._load_host(host_id)
-  assert "last_command" not in saved
-  assert saved["recent_commands"]["f" * 16]["fingerprint"] == "abc"
 
 
 def test_cached_runner_identity_still_honours_revocation(client, auth):
