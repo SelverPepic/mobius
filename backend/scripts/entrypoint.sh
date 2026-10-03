@@ -40,6 +40,23 @@ if ! DATA_DIR=/data python3 -P /app/runtime/restart_ledger.py \
   echo "WARNING: planned-restart ledger could not begin this boot; automatic restart continuation is disabled." >&2
 fi
 
+# The host's ACTIVE worker, not a stale status mirror or trial, owns recovery.
+# Its private state is mounted read-only outside writable /data. Verify as root
+# on every container boot, before imports or database changes; publish only the
+# capability proof for the unprivileged gate. No installed Host means no proof.
+rm -f /run/mobius-rebuild-active.json
+case "${MOBIUS_HOST_RECOVERY_REQUIRED:-0}" in
+  1|true|True)
+    if ! python3 -I -S /app/platform-baked/scripts/mobius-rebuild-host.py \
+      verify-mounted-active > /run/mobius-rebuild-active.json; then
+      rm -f /run/mobius-rebuild-active.json
+      echo "Host recovery worker is missing or outdated; refusing boot before storage conversion." >&2
+      exit 1
+    fi
+    chmod 0644 /run/mobius-rebuild-active.json
+    ;;
+esac
+
 # /data/agent-browser-profiles holds PER-CHAT Chrome user-data dirs
 # (chat-<chat_id>/...) for agent-browser. The path is set per-chat by
 # `app.chat._build_subprocess_env` so the agent's repeated screenshots

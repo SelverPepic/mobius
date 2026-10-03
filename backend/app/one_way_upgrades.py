@@ -18,7 +18,11 @@ message rows; later steps share the same activation and recovery contract.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+import os
+import re
+import stat
 import shutil
 import sqlite3
 import threading
@@ -539,7 +543,7 @@ def _commit_batch(
           " VALUES (?, ?, ?, ?, ?)"
           " ON CONFLICT(level, unit_id) DO UPDATE SET zlib_raw = excluded.zlib_raw,"
           " raw_length = excluded.raw_length, sha256 = excluded.sha256",
-          (step.level, unit_id, zlib.compress(raw, 6), len(raw), sha),
+          (step.level, unit_id, zlib.compress(raw, 1), len(raw), sha),
         )
       conn.execute(
         "INSERT INTO upgrade_units (level, unit_id, sha256, raw_length, damaged, converted_at)"
@@ -654,6 +658,54 @@ def _prepare_and_activate(
   )
 
 
+HOST_RECOVERY_PROOF = Path("/run/mobius-rebuild-active.json")
+
+
+def assert_host_recovery_supports(level: int) -> None:
+  """Require this boot's root proof of the installed recovery owner.
+
+  The installer pins deployment intent and a read-only Host-state mount in
+  Compose, independent of app-writable /data. Root entrypoint verifies actual
+  workers.json and ACTIVE bytes before importing application code. An old
+  controller without this setup may not activate new authority either.
+  """
+  from app.config import get_settings
+  settings = get_settings()
+  control = Path(settings.data_dir) / "mobius-rebuild"
+  required = settings.mobius_host_recovery_required
+  # lexists also catches broken symlinks; directory loss cannot exempt an
+  # explicitly configured Host, and old installations require installer setup.
+  if not required and not os.path.lexists(control):
+    return
+  try:
+    if not required:
+      raise ValueError("Old Host installation lacks the recovery prerequisite")
+    path = HOST_RECOVERY_PROOF
+    info = path.lstat()
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0
+        or info.st_mode & 0o022):
+      raise ValueError("Host proof is not root-owned")
+    proof = json.loads(path.read_text(encoding="utf-8"))
+    boot_id = os.environ.get("MOBIUS_BOOT_ID")
+    if not isinstance(proof, dict) or not boot_id or proof.get("boot_id") != boot_id:
+      raise ValueError("Host proof belongs to another boot")
+    active = proof["active_worker"]
+    if (not isinstance(active, dict) or type(active.get("revision")) is not int
+        or active["revision"] < 4 or type(active.get("rollback_floor_level")) is not int
+        or active["rollback_floor_level"] < level
+        or not isinstance(active.get("sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", active["sha256"]) is None):
+      raise ValueError("No verified active recovery capability")
+  except (OSError, ValueError, TypeError, KeyError):
+    raise StepRefusal(
+      "host_helper_outdated",
+      "Update the Host replacement helper from this reviewed checkout before "
+      "converting storage. Its ACTIVE recovery worker must understand the "
+      "database floor; a trial candidate is not enough. Legacy data is unchanged.",
+      required_rollback_floor_level=level,
+    ) from None
+
+
 def run_gate(
   database_path: str,
   existing_tables: frozenset[str] | None,
@@ -680,6 +732,7 @@ def run_gate(
       state = _state(conn, step.level)
       if state == "active":
         continue
+      assert_host_recovery_supports(step.level)
       if state is None and fresh:
         _begin_step(conn, step, activate=True)
         continue

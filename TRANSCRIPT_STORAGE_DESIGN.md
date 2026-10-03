@@ -83,3 +83,23 @@ maintenance-mode lifecycle.
 Before release, validate a matching image, supported architectures, real
 container cutover and floor-aware rollback. Host-only pytest proves application
 contracts, not the completed image or production deployment envelope.
+
+
+## Private first-upgrade prerequisite refinement
+
+The initial upgrade must install a floor-aware Host worker as ACTIVE before
+activation, using the existing explicit helper-install marker. A trial cannot
+protect interruption recovery by the older active worker. The private repair
+pins this prerequisite in the installer's frozen Compose override and verifies
+mounted private Host state in the baked root entrypoint on each boot; the app
+gate consumes only that boot's root-owned proof. See
+`scripts/TRANSCRIPT_HOST_TEST.md` for tests and unproven deployment boundaries.
+
+Archive compression uses zlib level 1 to reduce the measured conversion CPU
+cost, retaining exact decoded originals and all verification passes. This
+trades a modest archive-size increase for time; it does not enlarge deployment
+deadlines. Normalized bodies and projections use matching escaped JSON, even
+for valid legacy escaped surrogates. Indexed identity hints are bounded hashes;
+original `id`/`cid` values and post-lookup comparison remain authoritative.
+JSON comparison preserves bool, integer, float and signed-zero changes on
+single-row updates rather than conflating them through Python equality.

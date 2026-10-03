@@ -200,3 +200,35 @@ def test_generic_reads_do_not_trust_cached_rows_after_external_writer_ack(db):
   db.expire(chat)
   assert rows.count(db, chat) == 2
   assert rows.at(db, chat, 0)["content"] == "after"
+
+
+@pytest.mark.parametrize("before,after", [(True, 1), (1, 1.0), (-0.0, 0.0)])
+def test_single_row_update_preserves_json_type_change_and_projection(db, before, after):
+  import json
+  chat = seed(db, messages=[{"role": "assistant", "id": before, "ts": before}])
+  rows.update_at(db, chat, 0, {"role": "assistant", "id": after, "ts": after})
+  db.commit()
+  db.expire_all()
+  actual = rows.at(db, chat, 0)
+  projected = rows.metadata(db, chat)[0]
+  for result in (actual, projected):
+    assert json.dumps(result["id"]) == json.dumps(after)
+    assert json.dumps(result["ts"]) == json.dumps(after)
+
+
+def test_surrogate_identity_lookup_preserves_first_matching_message(db):
+  key = "\ud83d"
+  chat = seed(db, messages=[{"role": "assistant", "id": key, "content": "original"}])
+  assert rows.assistant_index(db, chat, {"id": key}) == 0
+  assert rows.metadata(db, chat)[0]["id"] == key
+
+
+@pytest.mark.parametrize("key", ["a" * 256, "long" * 1000, "\ud800" * 256])
+def test_arbitrary_legacy_ids_have_bounded_lookup_hints_without_changing_identity(db, key):
+  chat = create_chat(id="bounded-id", title="test", messages=[
+    {"role": "assistant", "id": key, "content": "original"}], agent_settings_json={"model": "test"})
+  db.add(chat)
+  db.commit()
+  assert len(rows.identity_key(key)) == 64
+  assert rows.assistant_index(db, chat, {"id": key}) == 0
+  assert rows.at(db, chat, 0)["id"] == key

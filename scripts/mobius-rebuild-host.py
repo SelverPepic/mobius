@@ -49,11 +49,12 @@ REQUEST_VERSIONS = [1, 2]
 # each requested official image only when this number is higher than every
 # worker it has run. Increase it with every change to this file; never lower
 # it. The launcher reads it as text, so keep it a plain literal on one line.
-WORKER_REVISION = 3
+WORKER_REVISION = 4
 # The frozen launcher runs the worker selected here; see offer_worker().
 WORKERS = STATE_DIR / "workers"
 WORKER_INDEX = STATE_DIR / "workers.json"
 WORKER_IN_IMAGE = "/app/platform-baked/scripts/mobius-rebuild-host.py"
+ROLLBACK_FLOOR_LEVEL = 1
 MAX_WORKER_BYTES = 1024 * 1024
 MAX_REQUEST_BYTES = 4096
 _REVISION_LINE = re.compile(rb"^WORKER_REVISION\s*=.*$", re.MULTILINE)
@@ -228,6 +229,47 @@ def config() -> dict:
 
 
 
+
+
+def active_worker_receipt(state_dir: Path | None = None) -> dict | None:
+    """Report the launcher's verified ACTIVE bytes, never the running trial.
+
+    The frozen launcher may run a candidate while recovery still belongs to
+    its active worker. Only the root-owned selection and unchanged private
+    file establish which recovery policy survives a failed trial.
+    """
+    index_path = WORKER_INDEX if state_dir is None else state_dir / "workers.json"
+    workers = WORKERS if state_dir is None else state_dir / "workers"
+    try:
+        root = STATE_DIR if state_dir is None else state_dir
+        for path, directory in ((root, True), (index_path, False), (workers, True)):
+            info = path.lstat()
+            kind = stat.S_ISDIR if directory else stat.S_ISREG
+            if not kind(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o077:
+                return None
+        index = read_json(index_path)
+        if type(index.get("version")) is not int or index["version"] != 1:
+            return None
+        entry = index["active"]
+        path = workers / entry["file"]
+        if path.parent != workers:
+            return None
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o077:
+            return None
+        if path.stat().st_size > MAX_WORKER_BYTES:
+            return None
+        source = path.read_bytes()
+        if len(source) > MAX_WORKER_BYTES:
+            return None
+        digest = hashlib.sha256(source).hexdigest()
+        revision = worker_revision(source)
+        if digest != entry["sha256"] or revision != entry["revision"]:
+            return None
+        level = compat_level(source.decode("utf-8"), "ROLLBACK_FLOOR_LEVEL")
+        return {"revision": revision, "sha256": digest, "rollback_floor_level": level}
+    except (OSError, ValueError, TypeError, KeyError, UnicodeError):
+        return None
 
 
 def write_status(config_value: dict, **fields) -> dict:
@@ -1247,6 +1289,15 @@ if __name__ == "__main__":
         raise SystemExit(run())
     if len(sys.argv) == 2 and sys.argv[1] == "reconcile" and os.geteuid() == 0:
         raise SystemExit(reconcile())
+    if len(sys.argv) == 2 and sys.argv[1] in {"verify-active", "verify-mounted-active"} and os.geteuid() == 0:
+        mounted = Path("/run/mobius-rebuild-host") if sys.argv[1] == "verify-mounted-active" else None
+        receipt = active_worker_receipt(mounted)
+        safe = bool(receipt and receipt["revision"] >= 4
+                    and receipt["rollback_floor_level"] >= ROLLBACK_FLOOR_LEVEL)
+        proof = {"boot_id": os.environ.get("MOBIUS_BOOT_ID"), "active_worker": receipt} if mounted else receipt
+        safe = safe and (mounted is None or bool(proof["boot_id"]))
+        print(json.dumps(proof) if safe else "No verified floor-aware ACTIVE worker is installed.")
+        raise SystemExit(0 if safe else 1)
     if len(sys.argv) == 2 and sys.argv[1] == "adopt-self" and os.geteuid() == 0:
         # The installer seeds the launcher with this trusted checkout's worker.
         STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)

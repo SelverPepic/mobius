@@ -6,7 +6,7 @@ set -euo pipefail
 # This installs the frozen launcher and seeds it with this checkout's worker;
 # later worker changes arrive with verified official images, so this runs once.
 #
-# Helper protocol revision: 1 (request version 2 echoes the app's nonce).
+# Helper protocol revision: 2 (request version 2 echoes the app's nonce).
 # Keep in step with deployment/self-hosted-helper.required; never decrement.
 
 if [[ $EUID -ne 0 ]]; then
@@ -143,6 +143,9 @@ flock 9
 # already adopted from a newer official image.
 MOBIUS_REBUILD_LOCK_HELD=1 \
   /usr/bin/python3 -I -S "$ROOT/scripts/mobius-rebuild-host.py" adopt-self
+# A queued or previously rejected candidate is not installed recovery authority.
+# Refuse rather than silently weaken the launcher's revision high-water guard.
+/usr/bin/python3 -I -S "$ROOT/scripts/mobius-rebuild-host.py" verify-active
 install -D -m 0755 "$ROOT/scripts/mobius-rebuild-launcher.py" \
   /usr/local/libexec/.mobius-rebuild-host.new
 mv -f /usr/local/libexec/.mobius-rebuild-host.new \
@@ -161,6 +164,15 @@ cat >"$OVERRIDE_NEW" <<'EOF'
 services:
   app:
     image: ${MOBIUS_IMAGE:?MOBIUS_IMAGE is required}
+    environment:
+      MOBIUS_HOST_RECOVERY_REQUIRED: "1"
+    volumes:
+      - type: bind
+        source: /var/lib/mobius-rebuild
+        target: /run/mobius-rebuild-host
+        read_only: true
+        bind:
+          create_host_path: false
 EOF
 chmod 0600 "$OVERRIDE_NEW"
 mv -f "$OVERRIDE_NEW" /etc/mobius-rebuild/image.override.yml

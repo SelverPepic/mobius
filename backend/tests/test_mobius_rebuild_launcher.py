@@ -499,3 +499,109 @@ def test_a_revision_one_worker_can_still_recover_this_journal(tmp_path, monkeypa
   ))
   assert revision1.read_transaction() is not None
   assert host.read_transaction() is not None
+
+
+@pytest.fixture
+def root_owned_test_state(state, monkeypatch):
+  """Only test-owned temporary paths simulate root uid; bytes/modes stay real."""
+  from types import SimpleNamespace
+  original = Path.lstat
+  def owned(path):
+    info = original(path)
+    if path == state or state in path.parents:
+      return SimpleNamespace(st_mode=info.st_mode, st_uid=0)
+    return info
+  monkeypatch.setattr(Path, "lstat", owned)
+  return state
+
+
+def test_active_receipt_does_not_confuse_trial_writer_with_recovery_owner(root_owned_test_state):
+  host.seed_worker(worker(2))
+  host.offer_worker(worker(4, "ROLLBACK_FLOOR_LEVEL = 1"), IMAGE_ID)
+  receipt = host.active_worker_receipt()
+  assert receipt["revision"] == 2
+  assert receipt["rollback_floor_level"] == 0
+  assert receipt["sha256"] == _index(root_owned_test_state)["active"]["sha256"]
+
+
+def test_installing_new_reviewed_revision_seeds_active_without_relaxing_high_water(root_owned_test_state):
+  state = root_owned_test_state
+  host.seed_worker(worker(2))
+  host.offer_worker(worker(3), IMAGE_ID)
+  assert host.seed_worker(worker(3)).startswith("kept")
+  assert host.active_worker_receipt()["revision"] == 2
+  safe = worker(4, "ROLLBACK_FLOOR_LEVEL = 1")
+  assert host.seed_worker(safe) == "installed: revision 4"
+  assert host.active_worker_receipt() == {
+    "revision": 4, "sha256": hashlib.sha256(safe).hexdigest(), "rollback_floor_level": 1,
+  }
+  assert _index(state)["candidate"] is None
+
+
+def test_active_receipt_refuses_modified_or_public_worker(root_owned_test_state):
+  state = root_owned_test_state
+  host.seed_worker(worker(4, "ROLLBACK_FLOOR_LEVEL = 1"))
+  path = host.WORKERS / _index(state)["active"]["file"]
+  path.chmod(0o755)
+  assert host.active_worker_receipt() is None
+  path.chmod(0o700)
+  path.write_bytes(worker(4, "ROLLBACK_FLOOR_LEVEL = 9"))
+  assert host.active_worker_receipt() is None
+
+
+def test_active_receipt_refuses_symlink_worker(root_owned_test_state):
+  state = root_owned_test_state
+  host.seed_worker(worker(4, "ROLLBACK_FLOOR_LEVEL = 1"))
+  path = host.WORKERS / _index(state)["active"]["file"]
+  target = state / "elsewhere.py"
+  target.write_bytes(path.read_bytes())
+  target.chmod(0o700)
+  path.unlink()
+  path.symlink_to(target)
+  assert host.active_worker_receipt() is None
+
+
+def test_helper_install_prerequisite_is_explicit_and_verifies_active_before_services():
+  marker = (ROOT / "deployment/self-hosted-helper.required").read_text().strip()
+  installer = (ROOT / "scripts/install-rebuild-helper.sh").read_text()
+  assert marker == "2"
+  assert "Helper protocol revision: 2" in installer
+  assert installer.index("adopt-self") < installer.index("verify-active")
+  assert installer.index("verify-active") < installer.index("ExecStart=")
+
+
+def test_mounted_active_proof_rechecks_selection_and_actual_worker_bytes(root_owned_test_state):
+  state = root_owned_test_state
+  host.seed_worker(worker(4, "ROLLBACK_FLOOR_LEVEL = 1"))
+  proof = host.active_worker_receipt(state)
+  assert proof == host.active_worker_receipt()
+  active = host.WORKERS / _index(state)["active"]["file"]
+  active.unlink()
+  assert host.active_worker_receipt(state) is None
+  assert proof["rollback_floor_level"] == 1  # Old proof cannot validate new boot.
+  host.WORKER_INDEX.unlink()
+  assert host.active_worker_receipt(state) is None
+
+
+def test_installer_pins_host_intent_and_readonly_state_outside_writable_data():
+  installer = (ROOT / "scripts/install-rebuild-helper.sh").read_text()
+  assert 'MOBIUS_HOST_RECOVERY_REQUIRED: "1"' in installer
+  assert "source: /var/lib/mobius-rebuild" in installer
+  assert "target: /run/mobius-rebuild-host" in installer
+  assert "read_only: true" in installer
+  assert "create_host_path: false" in installer
+  entrypoint = (ROOT / "backend/scripts/entrypoint.sh").read_text()
+  assert entrypoint.index("export MOBIUS_BOOT_ID") < entrypoint.index("verify-mounted-active")
+  assert entrypoint.index("verify-mounted-active") < entrypoint.index("PHASE 1:")
+  assert "rm -f /run/mobius-rebuild-active.json" in entrypoint
+  assert "chmod 0644 /run/mobius-rebuild-active.json" in entrypoint
+
+
+@pytest.mark.parametrize("version", [2, True, "1", None])
+def test_boot_proof_and_frozen_launcher_reject_unknown_worker_index_version(root_owned_test_state, version):
+  state = root_owned_test_state
+  host.seed_worker(worker(4, "ROLLBACK_FLOOR_LEVEL = 1"))
+  index = _index(state)
+  index["version"] = version
+  host._atomic_json(host.WORKER_INDEX, index)
+  assert host.active_worker_receipt(state) is None

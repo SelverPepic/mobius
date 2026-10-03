@@ -60,8 +60,8 @@ class TranscriptStep(OneWayStep):
     conn.executemany(
       "INSERT INTO chat_messages(chat_id,seq,message_key,message_id,client_id,role,ts,flags,body) VALUES(?,?,?,?,?,?,?,?,?)",
       [(unit_id, i, attrs["message_key"], json.dumps(attrs["message_id"]), json.dumps(attrs["client_id"]),
-        attrs["role"], json.dumps(attrs["ts"]),
-        attrs["flags"], json.dumps(body, ensure_ascii=False))
+        json.dumps(attrs["role"]), json.dumps(attrs["ts"]),
+        attrs["flags"], json.dumps(body))
        for i, body in enumerate(messages) for attrs in [attributes(body)]],
     )
     conn.execute(
@@ -112,9 +112,9 @@ class TranscriptStep(OneWayStep):
     for index, expected in enumerate(messages):
       row = cursor.fetchone()
       attrs = attributes(expected)
-      expected_row = (index, json.dumps(expected, ensure_ascii=False), attrs["message_key"],
+      expected_row = (index, json.dumps(expected), attrs["message_key"],
                       json.dumps(attrs["message_id"]), json.dumps(attrs["client_id"]),
-                      attrs["role"], json.dumps(attrs["ts"]), attrs["flags"])
+                      json.dumps(attrs["role"]), json.dumps(attrs["ts"]), attrs["flags"])
       if row is None or tuple(row) != expected_row:
         cursor.close()
         return False

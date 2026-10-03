@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
 from copy import deepcopy
+import hashlib
+import json
 
 from sqlalchemy.orm import object_session
 
@@ -19,6 +21,12 @@ QUESTION = 2
 LEGACY_MEDIA = 4
 HIDDEN = 8
 GOAL_COMPLETION = 16
+
+
+def identity_key(value):
+  # A bounded lookup hint, never identity authority. Escaped encoding handles
+  # arbitrary legacy ids; callers compare original values after the lookup.
+  return None if value is None else hashlib.sha256(json.dumps(str(value)).encode("ascii")).hexdigest()
 
 
 def attributes(body):
@@ -37,7 +45,6 @@ def attributes(body):
       flags |= GOAL_COMPLETION
   # Legacy repair and contribution discovery deliberately keep their former
   # serialized predicates; flags avoid hydrating every large body at lookup.
-  import json
   serialized = json.dumps(body)
   if '"edit_preview"' in serialized:
     flags |= EDIT_PREVIEW
@@ -46,7 +53,7 @@ def attributes(body):
   key = body.get("id")
   if key is None:
     key = body.get("cid")
-  return {"message_key": None if key is None else str(key),
+  return {"message_key": identity_key(key),
           "message_id": body.get("id"), "client_id": body.get("cid"),
           "role": body.get("role") if isinstance(body.get("role"), str) else None,
           "ts": body.get("ts"), "flags": flags}
@@ -160,7 +167,7 @@ def assistant_index(db, chat, message):
   if key is not None:
     matches = db.query(models.ChatMessage.seq, models.ChatMessage.message_id).filter(
       models.ChatMessage.chat_id == _id(chat), models.ChatMessage.role == "assistant",
-      models.ChatMessage.message_key == str(key),
+      models.ChatMessage.message_key == identity_key(key),
     ).order_by(models.ChatMessage.seq).all()
     for index, candidate_id in matches:
       if candidate_id is not None and str(candidate_id) == str(key):
@@ -200,7 +207,7 @@ def update_at(db, chat, index, body):
   row = db.get(models.ChatMessage, (_id(chat), index))
   if row is None:
     raise IndexError(index)
-  if row.body == body:
+  if models.transcript_values_equal(row.body, body):
     return
   row.body = deepcopy(body)
   for key, value in attributes(body).items():

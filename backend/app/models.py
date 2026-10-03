@@ -2136,6 +2136,19 @@ class ChatActivityPosition(Base):
   position = Column(JSON, nullable=True)
 
 
+def transcript_values_equal(left, right):
+  """JSON equality retains bool/int/float and signed-zero distinctions."""
+  from sqlalchemy.orm.attributes import NO_VALUE
+  if left is NO_VALUE or right is NO_VALUE:
+    return left is right
+  return json.dumps(left, sort_keys=True) == json.dumps(right, sort_keys=True)
+
+
+class TranscriptJSON(JSON):
+  def compare_values(self, left, right):
+    return transcript_values_equal(left, right)
+
+
 class TranscriptJSONText(TypeDecorator):
   """Preserve JSON scalar types in transcripts and their projections.
 
@@ -2145,6 +2158,9 @@ class TranscriptJSONText(TypeDecorator):
   """
   impl = Text
   cache_ok = True
+
+  def compare_values(self, left, right):
+    return transcript_values_equal(left, right)
 
   def process_bind_param(self, value, _dialect):
     return json.dumps(value)
@@ -2162,10 +2178,10 @@ class ChatMessage(Base):
   message_key = Column(String(256), nullable=True)
   message_id = Column(TranscriptJSONText, nullable=True)
   client_id = Column(TranscriptJSONText, nullable=True)
-  role = Column(String(32), nullable=True)
+  role = Column(TranscriptJSONText, nullable=True)
   ts = Column(TranscriptJSONText, nullable=True)
   flags = Column(Integer, nullable=False, default=0)
-  body = Column(JSON().with_variant(TranscriptJSONText(), "sqlite"), nullable=False)
+  body = Column(TranscriptJSON().with_variant(TranscriptJSONText(), "sqlite"), nullable=False)
 
 
 class ChatTranscriptState(Base):

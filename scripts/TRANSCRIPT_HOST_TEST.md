@@ -104,3 +104,30 @@ Record elapsed times against the deployment's **120-second preflight and
 120-second cutover defaults** (`deploy-prod.sh`); do not enlarge them silently.
 The worker's health wait is 180 seconds and rollback readiness wait is 120
 seconds, which are distinct bounds, not permission to relax deploy deadlines.
+
+
+## Private first-upgrade repair candidate (not deployment clearance)
+
+The repair uses the existing host-helper installation prerequisite, not a
+skippable intermediate application release. Helper protocol 2 requires the
+reviewed installer to seed and verify revision 4 or newer as **ACTIVE** before
+replacement. A pending or burned revision is not reused: the existing
+high-water and candidate-fallback guards remain unchanged. If seeding keeps an
+unsafe older active worker, installation refuses rather than reporting success.
+
+The frozen Compose override pins `MOBIUS_HOST_RECOVERY_REQUIRED=1` and mounts
+`/var/lib/mobius-rebuild` read-only at `/run/mobius-rebuild-host`. On every
+container boot the baked root entrypoint clears the old proof, verifies the
+actual root-owned private index and ACTIVE bytes (version, hash, revision and
+floor capability), and publishes a root-owned proof bound to `MOBIUS_BOOT_ID`.
+The one-way gate requires that proof before preparing or raising the floor.
+App-writable `/data` directory disappearance and cached `status.json` cannot
+provide or remove this explicit prerequisite. Managed/direct deployments with
+no installed Host controller use their own deployment/rollback contract.
+
+The historical revision-2 strict xfail remains deliberately negative: history
+is not repaired by changing its expectation. Positive private tests cover the
+new prerequisite and real SQLite gate/floor-aware rollback with Docker seams
+simulated. The read-only bind mount, root entrypoint, frozen Compose merge,
+systemd interruption and real image cutover still need disposable-host proof.
+Do not install or publish this private candidate without separate owner approval.

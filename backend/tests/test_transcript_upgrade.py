@@ -193,3 +193,15 @@ def test_resume_reconstructs_damaged_prepared_artifacts_before_activation(tmp_pa
   with sqlite3.connect(path) as conn:
     assert items(conn, "one") == json.loads(raw)
     assert upgrades.verified_legacy_copy(conn, 1, "one") == raw.encode()
+
+
+@pytest.mark.parametrize("field", ["content", "id", "cid", "role"])
+def test_valid_escaped_surrogate_is_preserved_not_mistaken_for_damaged_json(tmp_path, field):
+  message = {"role": "assistant", field: "\ud83d"}
+  raw = json.dumps([message])
+  path, seen = legacy(tmp_path, {"surrogate": raw})
+  upgrades.run_gate(str(path), seen.existing_tables)
+  with sqlite3.connect(path) as conn:
+    assert items(conn, "surrogate") == [message]
+    assert upgrades.verified_legacy_copy(conn, 1, "surrogate") == raw.encode()
+    assert conn.execute("SELECT COUNT(*) FROM upgrade_quarantine").fetchone()[0] == 0
