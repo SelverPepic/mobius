@@ -13,6 +13,7 @@ import {
   toolCallLabel,
   effectiveToolName,
   isQuietBookkeepingTool,
+  quietBookkeepingLabel,
 } from './toolActivityLabel.js'
 import { preserveTogglePosition } from './preserveTogglePosition.js'
 import { elapsedLabel, runningBackgroundTask } from './toolTasks.js'
@@ -139,11 +140,12 @@ function GenericToolBlock({
   // Use that raw identity for command/result formatting even though
   // effectiveToolName intentionally classifies the collapsed row as Skill.
   const isShell = t?.tool === 'Bash' || t?.tool === 'shell'
-  const label = compact && isQuietBookkeepingTool(t) ? 'Activity details' : toolCallLabel(t)
   // A command sent (or auto-moved) to the background is still running after
   // its tool call returned: the row says so and times it until it finishes.
   const backgroundTask = runningBackgroundTask(t)
   const running = t.status === 'running' || !!backgroundTask
+  const label = compact && isQuietBookkeepingTool(t)
+    ? quietBookkeepingLabel({ live: running }) : toolCallLabel(t)
   const iconKind = toolActivityIcon(effectiveName)
   const isImageTool = effectiveName === 'ViewImage'
   const hasEditPreview = typeof t.edit_preview?.diff === 'string'

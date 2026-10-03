@@ -29,11 +29,11 @@ test('real expanded quiet tool rows render historical argument objects safely', 
       for (const value of Object.values(row.input)) assert.ok(html.includes(value))
       assert.equal(typeof row.input, 'object', 'rendering does not rewrite historical input')
     }
-    // Even a lone save must use the generic disclosure, not a success headline.
+    // A lone save reads as plain note-keeping; its content stays behind expansion.
     const lone = renderToStaticMarkup(React.createElement(ActivityStretch, {
       entries: [{ item: rows[0], idx: 0 }], chatId: 'quiet-lone-test', surfaceKey: 'test',
     }))
-    assert.ok(lone.includes('Activity details'))
+    assert.ok(lone.includes('Saved notes'))
     assert.ok(!lone.includes('Saved chat notes'))
     assert.ok(!lone.includes('Continue safely'), 'receipt is available only after expansion')
     const capture = { ...rows[2], app_activity: {
@@ -43,7 +43,7 @@ test('real expanded quiet tool rows render historical argument objects safely', 
     const captureLone = renderToStaticMarkup(React.createElement(ActivityStretch, {
       entries: [{ item: capture, idx: 0 }], chatId: 'quiet-capture-test', surfaceKey: 'test',
     }))
-    assert.ok(captureLone.includes('Activity details'))
+    assert.ok(captureLone.includes('Saved notes'))
     assert.ok(!captureLone.includes('Saved to Memory'))
     assert.ok(!captureLone.includes('A synthetic fact'))
     persistDisclosureOpen('quiet-capture-expanded', 'capture', true)

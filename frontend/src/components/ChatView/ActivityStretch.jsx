@@ -289,7 +289,9 @@ function GroupedActivityStretch({
       toolCount: Number.isInteger(summaryToolCount)
         ? summaryToolCount
         : tools.length,
-      thinkingOnly: tools.length === 0,
+      // A reasoning pass that routine saves joined keeps its reasoning glyph.
+      thinkingOnly: tools.length === 0 || (tools.every(isQuietBookkeepingTool)
+        && entries.some(entry => entry?.item?.type === 'thinking')),
     }
   }, [sig, summaryToolCount]) // eslint-disable-line react-hooks/exhaustive-deps
 

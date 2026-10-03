@@ -260,7 +260,12 @@ function controlInputValue(input, key) {
 }
 
 // These writes have no decision-bearing result. Keep their full receipts in
-// the activity disclosure, but don't promote routine saving into a chat beat.
+// the activity disclosure, but don't promote routine saving into a chat beat:
+// a row made only of them reads as plain note-keeping, never a headline.
+export function quietBookkeepingLabel({ live = false } = {}) {
+  return live ? 'Saving notes' : 'Saved notes'
+}
+
 export function isQuietBookkeepingTool(tool) {
   const bare = bareControlName(tool?.tool)
   const capture = tool?.app_activity?.app_slug === 'memory'

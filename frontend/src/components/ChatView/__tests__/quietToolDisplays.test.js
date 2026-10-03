@@ -1,7 +1,7 @@
 // Routine receipts stay inspectable without duplicating meaningful chat cards.
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { groupActivityRuns } from '../activityGrouping.js'
+import { groupActivityRuns, joinQuietSavesToActivity } from '../activityGrouping.js'
 import { activityCollapsedLabel, activityMemoSig } from '../groupBlocks.js'
 import { isQuietBookkeepingTool, isDistinctiveActivityTool } from '../toolActivityLabel.js'
 import { suppressedQuestionToolIndices } from '../streamReducers.js'
@@ -13,11 +13,11 @@ const notification = extra => tool('notify_owner', {
   input: JSON.stringify({ title: 'Möbius needs your answer', body: 'Continue?' }), ...extra,
 })
 
-test('routine saves share one disclosure and do not advertise their success', () => {
+test('routine saves share one plain note-keeping disclosure', () => {
   const saves = ['checkpoint_chat', 'memory_remember', 'reflection_log_friction'].map(name => entry(tool(name)))
   assert.deepEqual(groupActivityRuns(saves), [{ group: saves }])
-  assert.equal(activityCollapsedLabel(saves), 'Activity details')
-  assert.equal(activityCollapsedLabel(saves, { live: true }), 'Activity details')
+  assert.equal(activityCollapsedLabel(saves), 'Saved notes')
+  assert.equal(activityCollapsedLabel(saves, { live: true }), 'Saving notes')
   assert.deepEqual(saves.map(e => e.item.tool), [
     'mobius_control:checkpoint_chat', 'mobius_control:memory_remember', 'mobius_control:reflection_log_friction',
   ])
@@ -52,7 +52,7 @@ test('failed saves, warnings and useful resources never become quiet receipts', 
   ]) assert.equal(isQuietBookkeepingTool(tool('memory_remember', extra)), false, JSON.stringify(extra))
   assert.equal(isQuietBookkeepingTool(tool('another_app_write')), false)
   const failed = tool('checkpoint_chat', { output_exit_code: 1 })
-  assert.notEqual(activityCollapsedLabel([entry(failed)]), 'Activity details')
+  assert.equal(isQuietBookkeepingTool(failed), false)
   assert.notEqual(activityMemoSig([entry(tool('checkpoint_chat'))]), activityMemoSig([entry(failed)]))
 })
 
@@ -108,4 +108,38 @@ test('a missing Memory receipt remains distinctive rather than routine', () => {
   assert.equal(isQuietBookkeepingTool(capture), false)
   assert.equal(isDistinctiveActivityTool(capture), true)
   assert.equal(groupActivityRuns([entry(capture), entry(tool('checkpoint_chat'))]).length, 2)
+})
+
+test('trailing saves join the reply\'s earlier activity line instead of adding a row', () => {
+  const read = { item: { type: 'tool', tool: 'Read', status: 'done' }, idx: 0 }
+  const prose = { item: { type: 'text', content: 'Done.' }, idx: 1 }
+  const save = { item: tool('checkpoint_chat'), idx: 2 }
+  const nodes = groupActivityRuns(joinQuietSavesToActivity([read, prose, save]))
+  assert.deepEqual(nodes, [{ group: [read, save] }, { single: prose }])
+  assert.equal(activityCollapsedLabel(nodes[0].group), 'Read a file')
+  // With no earlier activity the save keeps its own plainly named row.
+  assert.deepEqual(joinQuietSavesToActivity([prose, save]), [prose, save])
+  // A failed save is real activity and stays where it happened.
+  const failed = { item: tool('checkpoint_chat', { status: 'failed' }), idx: 2 }
+  assert.deepEqual(joinQuietSavesToActivity([read, prose, failed]), [read, prose, failed])
+})
+
+test('a saved reply\'s compact save block joins its compact activity line', () => {
+  const compact = (entries, extra = {}) => ({ type: 'activity', entries, tool_count: entries.length, ...extra })
+  const line = { item: compact([entry({ type: 'tool', tool: 'Bash', status: 'done' })], { start: 0, end: 1 }), idx: 0 }
+  const prose = { item: { type: 'text', content: 'Done.' }, idx: 1 }
+  const saves = { item: compact([entry(tool('checkpoint_chat'))], { start: 2, end: 3 }), idx: 2 }
+  assert.deepEqual(joinQuietSavesToActivity([line, prose, saves]), [line, saves, prose])
+  // A block whose sampled summary may hide other steps is never treated as quiet.
+  const sampled = { item: compact([entry(tool('checkpoint_chat'))], { tool_count: 4 }), idx: 2 }
+  assert.deepEqual(joinQuietSavesToActivity([line, prose, sampled]), [line, prose, sampled])
+})
+
+test('a reasoning pass joined by a save still reads as that reasoning pass', () => {
+  const thought = { item: { type: 'thinking', content: 'x', duration_ms: 3000 }, idx: 0 }
+  const nodes = groupActivityRuns(joinQuietSavesToActivity([
+    thought, { item: { type: 'text', content: 'Answer.' }, idx: 1 }, { item: tool('checkpoint_chat'), idx: 2 },
+  ]))
+  assert.equal(nodes[0].group.length, 2)
+  assert.equal(activityCollapsedLabel(nodes[0].group), activityCollapsedLabel([thought]))
 })
