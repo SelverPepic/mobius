@@ -105,15 +105,35 @@ jobs:
           certs=$(mktemp -d)
           openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=ghcr.io" \
             -addext "subjectAltName=DNS:ghcr.io" -keyout "$certs/ghcr.key" -out "$certs/ghcr.crt" 2>/dev/null
-          docker run -d --name disposable-registry -p 127.0.0.1:443:443 -v "$certs:/certs:ro" \
+          # Serve on the Docker bridge address, not loopback: the daemon treats
+          # 127.0.0.0/8 as an insecure registry and may silently fall back to
+          # plain HTTP on port 80. Off loopback it verifies TLS against the CA
+          # below exactly as it does for the real registry.
+          address=$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}')
+          [[ $address =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "no IPv4 bridge address: '$address'"; exit 1; }
+          docker run -d --name disposable-registry -p "$address:443:443" -v "$certs:/certs:ro" \
             -e REGISTRY_HTTP_ADDR=0.0.0.0:443 -e REGISTRY_HTTP_TLS_CERTIFICATE=/certs/ghcr.crt \
             -e REGISTRY_HTTP_TLS_KEY=/certs/ghcr.key registry:2 >/dev/null
-          echo "127.0.0.1 ghcr.io" | sudo tee -a /etc/hosts >/dev/null
+          echo "$address ghcr.io" | sudo tee -a /etc/hosts >/dev/null
           sudo install -D -m 0644 "$certs/ghcr.crt" /etc/docker/certs.d/ghcr.io/ca.crt
-          for _ in $(seq 1 30); do curl -fsS --cacert "$certs/ghcr.crt" https://ghcr.io/v2/ >/dev/null && break; sleep 1; done
-          docker push -q "$image:sha-$previous"
-          docker push -q "$image:sha-${{ github.sha }}"
+          ready=""
+          for _ in $(seq 1 30); do
+            if curl -fsS --cacert "$certs/ghcr.crt" https://ghcr.io/v2/ >/dev/null; then ready=1; break; fi
+            sleep 1
+          done
+          [ -n "$ready" ] || { echo "the disposable registry never answered"; exit 1; }
+          docker push "$image:sha-$previous"
+          docker push "$image:sha-${{ github.sha }}"
+          curl -fsS --cacert "$certs/ghcr.crt" https://ghcr.io/v2/mobius-os/mobius/tags/list
+          echo
           echo "PREVIOUS=$previous" >> "$GITHUB_ENV"
+      - name: Disposable registry diagnostics
+        if: failure()
+        run: |
+          getent hosts ghcr.io || true
+          sudo ss -ltnp | grep -E ':(80|443) ' || true
+          docker logs --tail 200 disposable-registry 2>&1 || true
+          sudo journalctl --no-pager -u docker --since '-2h' | tail -n 120 || true
       - name: First upgrade, interruptions and floor-aware recovery on a real Host
         run: |
           # The installer runs as root over this runner-owned checkout.
