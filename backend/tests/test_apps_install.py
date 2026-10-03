@@ -6258,10 +6258,10 @@ def _update_check(
   job=b"#!/bin/sh\n",
   candidate_manifest_url=None,
 ):
+  candidate = _git_candidate(manifest, jsx, sources=sources, job=job)
   with patch(
-    "app.routes.apps._fetch_update_candidate",
-    return_value=_git_candidate(manifest, jsx, sources=sources, job=job),
-  ):
+    "app.routes.apps._fetch_update_candidate", return_value=candidate,
+  ), patch("app.install.read_git_install_candidate", return_value=candidate):
     return client.get(
       f"/api/apps/{app_id}/update-check",
       headers=headers,
@@ -6486,8 +6486,9 @@ def test_update_check_degrades_cross_owner_predecessor_to_unknown(
   assert response.json()["upstream_version"] is None
 
 
+@pytest.mark.parametrize("recorded_manifest", [None, b"invalid recorded JSON"])
 def test_update_check_final_fence_preserves_concurrent_pending_conflict(
-  client, auth, bypass_url_validation, monkeypatch,
+  client, auth, bypass_url_validation, monkeypatch, recorded_manifest,
 ):
   """A conflict receipt created during fetch wins over the stale comparison.
 
@@ -6511,10 +6512,15 @@ def test_update_check_final_fence_preserves_concurrent_pending_conflict(
   upstream_v2 = JSX_MULTI.replace("ORIGINAL TITLE", "UPSTREAM TITLE")
   manifest_v2 = {**manifest_v1, "version": "2.0.0"}
 
-  async def advance_during_fetch(_repo, _manifest_url, *, strict=True):
+  async def advance_during_fetch(
+    _repo, _manifest_url, *, strict=True, fetch_package=None,
+  ):
+    recorded_tree = {"index.jsx": upstream_v2.encode()}
+    if recorded_manifest is not None:
+      recorded_tree["mobius.json"] = recorded_manifest
     current_upstream = app_git.record_upstream(
       repo,
-      {"index.jsx": upstream_v2.encode()},
+      recorded_tree,
       base + "mobius.json",
       "2.0.0",
     )
@@ -6854,7 +6860,12 @@ def test_update_check_releases_db_connection_before_remote_fetch(
 
   baseline = checked_out_connections()
 
-  async def _slow_remote_fetch(_repo, _url, *, strict=True):
+  entered = []
+
+  async def _slow_remote_fetch(
+    _repo, _url, *, strict=True, fetch_package=None,
+  ):
+    entered.append(True)
     assert checked_out_connections() <= baseline, (
       "update-check kept its request DB connection checked out while "
       "starting remote work"
@@ -6868,6 +6879,7 @@ def test_update_check_releases_db_connection_before_remote_fetch(
 
   assert res.status_code == 200, res.text
   assert res.json()["update_available"] is None
+  assert entered == [True], "The DB-release assertion must actually run"
 
 
 def test_update_check_unknown_app_id_is_404(client, auth):
@@ -7151,6 +7163,41 @@ def test_store_merge_replay_then_code_only_apply_does_not_warn(
 
   assert applied.status_code == 200, applied.text
   assert applied.json()["warnings"] == []
+
+
+@pytest.mark.parametrize("state", ["unchanged", "changed", "missing-entry"])
+def test_update_check_modern_package_never_materializes_recorded_tree(
+  client, auth, bypass_url_validation, monkeypatch, state,
+):
+  """The real route streams modern baselines and fails closed on missing input."""
+  base = "https://uc-streamed.test/repo/"
+  manifest = {
+    "id": "uc-streamed", "name": "Streamed", "version": "1.0.0",
+    "description": "Complete recorded package", "entry": "index.jsx",
+  }
+  installed = _install_v1(client, auth, base, manifest, JSX)
+  assert installed.status_code == 201, installed.text
+  repo = Path(get_settings().data_dir) / "apps" / manifest["id"]
+  recorded_tree = {
+    "mobius.json": json.dumps(manifest).encode(),
+    "index.jsx": JSX.encode(),
+    "undeclared.bin": b"\x00\xff" * 100000,
+  }
+  if state == "missing-entry":
+    recorded_tree.pop("index.jsx")
+  app_git.record_upstream(repo, recorded_tree, base + "mobius.json", "1.0.0")
+
+  def forbidden(*args, **kwargs):
+    pytest.fail("A modern recorded package must not materialize its full tree")
+
+  monkeypatch.setattr(app_git, "read_ref_tree", forbidden)
+  incoming = JSX.replace("ok", "changed") if state == "changed" else JSX
+  response = _update_check(
+    client, auth, base, installed.json()["id"], manifest, incoming,
+  )
+  assert response.status_code == 200, response.text
+  expected = None if state == "missing-entry" else state == "changed"
+  assert response.json()["update_available"] is expected
 
 
 @pytest.mark.parametrize("git_path", [".git/config", "lib/.GIT/hooks/post-checkout"])

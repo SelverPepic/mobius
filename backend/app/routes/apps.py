@@ -13,7 +13,7 @@ import tempfile
 import uuid
 from datetime import datetime, UTC
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
@@ -1282,14 +1282,17 @@ async def _fetch_update_candidate(
   manifest_url: str,
   *,
   strict: bool,
+  fetch_package: Callable[..., object] | None = None,
 ):
   """Fetch one Git candidate; Store updates have no parallel HTTP transport."""
   from app import install
 
   if install._derive_repo_ref(manifest_url) is None or not app_git.has_origin(repo):
     raise ValueError("app has no root Git update source")
+  # Preview/install retain payloads; update discovery needs only a complete
+  # identity. Both use this same origin/lock seam.
   return await asyncio.to_thread(
-    install.fetch_git_install_candidate,
+    fetch_package or install.fetch_git_install_candidate,
     repo,
     manifest_url,
     strict=strict,
@@ -1493,6 +1496,7 @@ async def update_check(
         repo,
         fetch_manifest_url,
         strict=False,
+        fetch_package=install.fetch_git_package_summary,
       )
       pending, pending_state = await asyncio.to_thread(
         _current_pending_update,
@@ -1501,28 +1505,38 @@ async def update_check(
         installed_manifest_url, manifest_url, candidate.manifest,
       ):
         return _unknown()
-      recorded_tree = await asyncio.to_thread(
-        app_git.read_ref_tree, repo, app_git.UPSTREAM_BRANCH,
+      # The durable pending receipt wins before parsing/comparing a baseline.
+      # This fence stays inside the source lock after the fetch/identity check.
+      if pending is not None:
+        return _pending_result(pending, pending_state)
+      recorded_package = await asyncio.to_thread(
+        install.package_content_digest_from_git, repo, app_git.UPSTREAM_BRANCH,
       )
+      # Real legacy owner data has no package manifest. Preserve its bridge /
+      # executable-source comparison, while ordinary packages stream bytes.
+      recorded_tree = None
+      if recorded_package is None:
+        recorded_tree = await asyncio.to_thread(
+          app_git.read_ref_tree, repo, app_git.UPSTREAM_BRANCH,
+        )
+        # Only real pre-manifest owner data needs source bytes. Re-read the
+        # immutable candidate already fetched above, never another network ref.
+        legacy_candidate = await asyncio.to_thread(
+          install.read_git_install_candidate,
+          repo, candidate.commit, fetch_manifest_url, strict=False,
+        )
     except (
       HTTPException, OSError, subprocess.SubprocessError, RuntimeError,
       TypeError, ValueError,
     ):
       return _unknown()
-    if pending is not None:
-      return _pending_result(pending, pending_state)
     # One digest owns the complete declared package: manifest/capabilities,
     # executable source, icon, static assets, and seeds. A trusted catalog
     # app's migration bridge has no manifest to compare, so its first real
     # release is offered once: install replaces the bridge on exactly this
     # predicate, and later checks compare exact packages.
-    if "mobius.json" in recorded_tree:
-      try:
-        _, recorded_digest = install.package_content_digest_from_tree(
-          recorded_tree,
-        )
-      except install.PackageContentError:
-        return _unknown()
+    if recorded_package is not None:
+      _, recorded_digest = recorded_package
       update_available = recorded_digest != candidate.source_digest
     elif install.replaces_migration_bridge(
       recorded_tree,
@@ -1541,8 +1555,8 @@ async def update_check(
       except (AttributeError, KeyError, TypeError, ValueError, HTTPException):
         return _unknown()
       update_available = (
-        _recorded_update_source(recorded_tree, candidate.runtime_tree)
-        != candidate.runtime_tree
+        _recorded_update_source(recorded_tree, legacy_candidate.runtime_tree)
+        != legacy_candidate.runtime_tree
         or any(
           capability_changes[key]
           for key in ("added", "removed", "changed")
