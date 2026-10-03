@@ -29,11 +29,10 @@ Lifecycle:
   a descendant that calls ``setsid`` leaves the group, but waiting for a step
   is always bounded. A matching env is reused; a failure fails the Apply or
   install, so the previous revision stays live. A Store install or update
-  validates the fetched package before its database transaction. When local
-  edits are merged into the update, the reconciled service/job is not what
-  was smoke-tested; only a changed lock is detected (and refused). Closing
-  that gap needs separate bounded pre-publication validation of the reconciled
-  tree, outside SQLite/source locks.
+  checks the exact runtime tree it reconciles (local edits merged in, or every
+  module of a Git origin) between two passes of its transaction, holding no
+  lock, and publishes it only if the second pass reconciles the same tree from
+  the same inputs. A local edit to the lock itself is refused.
 - Restore (``rebuild_accepted_env``): after an image replacement, rebuild a
   missing env from the frozen accepted runtime tree, never editable source.
   Restoration uses the same validation and atomic publication as Apply. A

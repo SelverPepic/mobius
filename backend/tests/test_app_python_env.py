@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 import pytest
 from fastapi import HTTPException
 
-from app import app_python_env, app_services, applied_app_runtime, models
+from app import app_git, app_python_env, app_services, applied_app_runtime, models
 from app.config import get_settings
 from app.manifest_contract import (
   ManifestContractError,
@@ -824,17 +824,20 @@ def store(monkeypatch):
   base = "https://deps.test/repo/"
 
   def install(client, auth, *, lock: str, version: str,
-              service: bytes = b"import json, sys\n"):
+              service: bytes = b"import json, sys\n",
+              files: dict[str, bytes] | None = None):
+    files = files or {}
     manifest = _manifest(
       version=version, python={"lock": "requirements.lock"},
       service={"entry": "service.py"},
-      source_files=["service.py", "requirements.lock"],
+      source_files=["service.py", "requirements.lock", *files],
     )
     responses = {
       base + "mobius.json": (200, json.dumps(manifest).encode()),
       base + "index.jsx": (200, b"export default function App() { return <div>x</div> }"),
       base + "service.py": (200, service),
       base + "requirements.lock": (200, lock.encode()),
+      **{base + name: (200, content) for name, content in files.items()},
     }
     with patch("app.install.httpx.AsyncClient", side_effect=_fake_async_client(responses)):
       return client.post("/api/apps/install", headers=auth, json={
@@ -934,18 +937,181 @@ def test_store_update_whose_merged_lock_diverges_is_refused_and_leaves_no_build(
   assert applied.status_code == 200, applied.text
   db.expire_all()
   live = db.get(models.App, app_id).runtime_revision
+  built = list(builds)
 
   diverged = store(client, auth, lock=f"a==1\n{padding}b==2\n", version="1.1.0")
 
   assert diverged.status_code == 409, diverged.text
   assert diverged.json()["detail"]["code"] == "python_lock_diverged"
-  assert builds[-1] == f"a==1\n{padding}b==2\n"
+  assert builds == built
   db.expire_all()
   assert db.get(models.App, app_id).runtime_revision == live
   linked = {
     link.resolve() for link in app_python_env.envs_parent(_data_dir(), app_id).iterdir()
   }
   assert {path.resolve() for path in (_data_dir() / "app-envs" / "builds").iterdir()} == linked
+
+
+def _assert_no_unlinked_env_or_runtime(app_id: int) -> None:
+  linked = {
+    link.resolve() for link in app_python_env.envs_parent(_data_dir(), app_id).iterdir()
+  }
+  assert {path.resolve() for path in (_data_dir() / "app-envs" / "builds").iterdir()} <= linked
+  assert not list((_data_dir() / "app-runtime").glob(".staged-*"))
+
+
+def _locally_edited_store_app(client, auth, db, store) -> tuple[int, Path, str]:
+  """A Store app whose applied local service uses a helper the package ships."""
+  first = store(
+    client, auth, lock="a==1\n", version="1.0.0", files={"lib.py": b"VALUE = 1\n"},
+  )
+  assert first.status_code == 201, first.text
+  app_id = first.json()["id"]
+  source = Path(db.get(models.App, app_id).source_dir)
+  (source / "service.py").write_bytes(b"import json, sys\nfrom lib import VALUE\n")
+  applied = _apply(client, auth, source)
+  assert applied.status_code == 200, applied.text
+  db.expire_all()
+  return app_id, source, db.get(models.App, app_id).runtime_revision
+
+
+def test_store_update_smokes_the_merged_tree_and_publishes_exactly_it(
+  client, auth, db, monkeypatch, store,
+):
+  builds = _fake_builds(monkeypatch)
+  app_id, source, _ = _locally_edited_store_app(client, auth, db, store)
+  actual_smoke = app_python_env._smoke
+  smoked = []
+
+  def observe(env, runtime_root, manifest, relative):
+    smoked.append((
+      (runtime_root / "service.py").read_bytes(),
+      (runtime_root / "lib.py").read_bytes(),
+      applied_app_runtime._prepared(runtime_root).revision,
+    ))
+    actual_smoke(env, runtime_root, manifest, relative)
+
+  monkeypatch.setattr(app_python_env, "_smoke", observe)
+  updated = store(
+    client, auth, lock="a==1\n", version="1.1.0",
+    files={"lib.py": b"VALUE = 2\n"},
+  )
+
+  assert updated.status_code == 201, updated.text
+  db.expire_all()
+  row = db.get(models.App, app_id)
+  assert smoked == [(
+    b"import json, sys\nfrom lib import VALUE\n", b"VALUE = 2\n", row.runtime_revision,
+  )]
+  assert builds == ["a==1\n"]
+  _assert_no_unlinked_env_or_runtime(app_id)
+
+
+def test_store_update_whose_merged_service_fails_keeps_the_old_revision_live(
+  client, auth, db, monkeypatch, store,
+):
+  builds = _fake_builds(monkeypatch)
+  app_id, source, live = _locally_edited_store_app(client, auth, db, store)
+
+  # The package alone passes: its own service never imports VALUE. Only the
+  # merged tree, which keeps the local service, cannot start.
+  failed = store(
+    client, auth, lock="a==1\n", version="1.1.0",
+    files={"lib.py": b"RENAMED = 1\n"},
+  )
+
+  assert failed.status_code == 422, failed.text
+  assert failed.json()["detail"]["code"] == "python_env_failed"
+  assert "VALUE" in failed.json()["detail"]["message"]
+  db.expire_all()
+  row = db.get(models.App, app_id)
+  assert row.runtime_revision == live
+  root = applied_app_runtime.runtime_root(row)
+  assert (root / "lib.py").read_bytes() == b"VALUE = 1\n"
+  assert app_python_env.resolve_env(_data_dir(), app_id, root) == _keyed(_data_dir(), app_id, "a==1\n")
+  assert (source / "lib.py").read_bytes() == b"VALUE = 1\n"
+  assert app_git.head_sha(source, app_git.UPSTREAM_BRANCH) == row.upstream_commit
+  assert builds == ["a==1\n"]
+  _assert_no_unlinked_env_or_runtime(app_id)
+
+
+def test_store_update_refuses_a_tree_that_changed_while_it_was_checked(
+  client, auth, db, monkeypatch, store,
+):
+  from sqlalchemy import text
+  from app import fs_locks
+  from app.database import SessionLocal
+  _fake_builds(monkeypatch)
+  app_id, source, live = _locally_edited_store_app(client, auth, db, store)
+  draft = b"import json, sys\nfrom lib import VALUE\nDRAFT = True\n"
+  actual_smoke = app_python_env._smoke
+
+  def edit_while_checking(env, runtime_root, manifest, relative):
+    # The check holds neither the source lock nor a write transaction, so an
+    # agent edit can land here.
+    assert not fs_locks.source_dir_lock(str(source)).locked()
+    with SessionLocal() as other:
+      other.execute(text("UPDATE apps SET description = description WHERE id = :id"), {"id": app_id})
+      other.commit()
+    actual_smoke(env, runtime_root, manifest, relative)
+    (source / "service.py").write_bytes(draft)
+
+  monkeypatch.setattr(app_python_env, "_smoke", edit_while_checking)
+  stale = store(
+    client, auth, lock="a==1\n", version="1.1.0", files={"lib.py": b"VALUE = 2\n"},
+  )
+
+  assert stale.status_code == 409, stale.text
+  assert stale.json()["detail"]["code"] == "python_check_stale"
+  db.expire_all()
+  row = db.get(models.App, app_id)
+  assert row.runtime_revision == live
+  assert (applied_app_runtime.runtime_root(row) / "lib.py").read_bytes() == b"VALUE = 1\n"
+  assert (source / "service.py").read_bytes() == draft
+  assert (source / "lib.py").read_bytes() == b"VALUE = 1\n"
+  _assert_no_unlinked_env_or_runtime(app_id)
+
+
+def test_git_origin_install_smokes_modules_its_manifest_does_not_list(
+  client, auth, db, monkeypatch, store, tmp_path,
+):
+  import subprocess
+  from tests.test_apps_install import _fake_async_client, _fixture_commit
+  _fake_builds(monkeypatch)
+  base = "https://deps.test/origin/"
+  manifest = _manifest(
+    python={"lock": "requirements.lock"}, service={"entry": "service.py"},
+    source_files=["service.py", "requirements.lock"],
+  )
+  files = {
+    "mobius.json": json.dumps(manifest).encode(),
+    "index.jsx": b"export default function App() { return <div>x</div> }",
+    "service.py": b"import json, sys\nimport helper\n",
+    "requirements.lock": b"a==1\n",
+  }
+  work = tmp_path / "origin-work"
+  bare = tmp_path / "origin.git"
+  subprocess.run(["git", "init", "-q", "-b", "main", str(work)], check=True)
+  for name, content in {**files, "helper.py": b"READY = True\n"}.items():
+    (work / name).write_bytes(content)
+  commit = _fixture_commit(work, "v1")
+  subprocess.run(["git", "clone", "-q", "--bare", str(work), str(bare)], check=True)
+
+  with patch(
+    "app.install._derive_repo_ref", return_value=(bare.as_uri(), commit),
+  ), patch(
+    "app.install.httpx.AsyncClient",
+    side_effect=_fake_async_client({base + name: (200, content) for name, content in files.items()}),
+  ):
+    response = client.post("/api/apps/install", headers=auth, json={
+      "manifest_url": base + "mobius.json",
+    })
+
+  assert response.status_code == 201, response.text
+  row = db.get(models.App, response.json()["id"])
+  root = applied_app_runtime.runtime_root(row)
+  assert (root / "helper.py").read_bytes() == b"READY = True\n"
+  assert app_python_env.resolve_env(_data_dir(), row.id, root) == _keyed(_data_dir(), row.id, "a==1\n")
 
 
 # --- GC --------------------------------------------------------------------------
