@@ -542,7 +542,7 @@ def _goal_report(payload: dict[str, Any], *, full: bool) -> str:
   elif isinstance(goal.get("hold"), dict) and goal["hold"].get("cause") == "deferred":
     lines.append("On hold: " + goal["hold"]["reason"])
     lines.append("End normally. Resume only when the owner asks to continue; no automatic retry.")
-  elif goal.get("result"):
+  elif goal.get("result") and (full or goal.get("status") != "completed"):
     lines.append("Outcome: " + goal["result"] + ".")
   if full:
     lines.insert(0, f"Objective: {goal.get('objective')}")
@@ -1559,8 +1559,8 @@ _TOOL_DEFINITIONS = {
         "tasks": _GOAL_TASKS_SCHEMA,
         "next_action": {"type": "string", "maxLength": 2000, "description": "Next step for unfinished work. Do not combine with complete."},
         "complete": {
-          "type": "string", "maxLength": 4000,
-          "description": "Brief, user-readable result after verifying the whole outcome. Put technical evidence in task results or the chat checkpoint, not this message. Do not combine with next_action; final task edits may share this call.",
+          "type": "boolean", "enum": [True],
+          "description": "Set true after verifying the whole outcome. No separate success summary. Keep useful verification evidence in task results or the chat checkpoint; communicate the outcome and any consequential caveats in your normal final reply. Do not combine with next_action; final task edits may share this call.",
         },
         "cannot_complete": {
           "type": "object", "additionalProperties": False,

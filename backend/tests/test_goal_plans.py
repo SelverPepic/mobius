@@ -116,12 +116,12 @@ def test_terminal_goal_history_projects_onto_final_assistant_message(
 
 @pytest.mark.parametrize("compact", [False, True])
 @pytest.mark.parametrize("summarized", [False, True])
+@pytest.mark.parametrize("complete", [True, "Verified exact result"])
 def test_completed_card_stays_at_successful_completion_not_later_segment(
-  client, owner_token, db, compact, summarized,
+  client, owner_token, db, compact, summarized, complete,
 ):
   auth = {"Authorization": f"Bearer {owner_token}"}
   base = datetime(2026, 8, 23, 12, 0, tzinfo=UTC)
-  complete = "Verified exact result"
   completion = {
     "type": "tool", "tool": "mobius_control:update_goal",
     "input": f"complete={complete}" if summarized else json.dumps({"complete": complete}),
@@ -151,7 +151,7 @@ def test_completed_card_stays_at_successful_completion_not_later_segment(
   db.flush()
   goal = db.get(models.ChatGoal, "anchor-goal")
   goal.status = "completed"
-  goal.result = complete
+  goal.result = complete if isinstance(complete, str) else None
   db.commit()
 
   payload = client.get(f"/api/chats/{chat_id}?limit=20&compact={str(compact).lower()}", headers=auth).json()

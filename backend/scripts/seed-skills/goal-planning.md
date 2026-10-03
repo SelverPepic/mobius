@@ -38,12 +38,12 @@ plain-language outcome: “Restore clear Goal handoffs”, not a list of buildin
 testing, activation and contribution steps. Put those steps and their
 completion conditions in the checklist; keep the full requested outcome.
 
-Completion text is a short result the owner can understand, for example
-“The Goal panel is restored and the pull request is ready for review.”
-Verify before completing, but keep commit hashes, test logs, internal paths
-and implementation evidence in task results or the chat checkpoint, not the
-completion message. State consequential limitations or next actions in the
-normal visible reply as well; do not leave them only inside record details.
+Successful completion is a signal, `complete: true`, not another summary to
+write. Verify first; keep useful evidence in task results or the chat
+checkpoint rather than repeating it at completion. Communicate the outcome
+once in your normal visible reply, including consequential limitations or
+next actions; do not leave them only inside record details. Non-success
+outcomes and deferrals still need their specific explanations.
 Use normal sentences, spaces and paragraph breaks; never compress words
 around numbers to save tokens. Existing records are not silently rewritten.
 
@@ -102,7 +102,7 @@ refresh context, select the next task, or ask the owner to discover Unpause.
   conceal a crash, claim completion, or decide on the owner's behalf to stop.
 - **Completed:** verify the original promised outcome. Update obsolete internal
   steps explicitly with a reason, without cancelling unmet requirements to
-  fake success. Call `update_goal` with `complete: 'Brief user-readable result'`, plus
+  fake success. Call `update_goal` with `complete: true`, plus
   final `tasks` edits and `finished_claims` for exact actions performed.
 - **Cannot complete:** when the original outcome is genuinely unreachable,
   explain the obstacle, what you tried, partial results and what is missing.

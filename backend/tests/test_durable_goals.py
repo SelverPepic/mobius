@@ -50,7 +50,7 @@ def test_completed_tasks_are_not_implicit_goal_completion(db, chat):
   goal, run = work(db, chat, task_status="completed")
   assert goal.status == "open"
   assert presented_goal(db, chat.id)["status"] == "active"
-  update_goal_record(db, run, goal, 1, result="Verified deployment and collaboration")
+  update_goal_record(db, run, goal, 1, complete="Verified deployment and collaboration")
   assert goal.status == "completed"
   assert presented_goal(db, chat.id)["status"] == "completed"
 
@@ -62,7 +62,7 @@ def test_completion_cannot_race_scope_change(db, chat):
     {"id":"collab","title":"Collaboration","status":"pending","depends_on":[]},
   ])
   with pytest.raises(GoalPlanError):
-    update_goal_record(db, run, goal, 1, result="Stale verification")
+    update_goal_record(db, run, goal, 1, complete="Stale verification")
   assert goal.status == "open"
 
 
@@ -159,10 +159,11 @@ def test_writer_duplicate_attempt_does_not_create_twice(db, chat):
   assert db.query(models.ChatRun).filter_by(id="exact-next").count() == 1
 
 
-def test_exact_completion_retry_is_idempotent(db, chat):
+@pytest.mark.parametrize("complete", [True, "Verified result"])
+def test_exact_completion_retry_is_idempotent(db, chat, complete):
   goal, run = work(db, chat, task_status="completed")
-  first = update_goal_record(db, run, goal, 1, result="Verified result")
-  second = update_goal_record(db, run, goal, 1, result="Verified result")
+  first = update_goal_record(db, run, goal, 1, complete=complete)
+  second = update_goal_record(db, run, goal, 1, complete=complete)
   assert second == first
   assert goal.revision == 2
 
@@ -175,7 +176,7 @@ def test_stop_racing_stale_completion_keeps_obligation_stopped(db, chat):
                               terminal_status="stopped")).result(timeout=5)
   # Deliberately retain the stale ORM snapshot from before Stop.
   with pytest.raises(GoalPlanConflict):
-    update_goal_record(db, run, goal, 1, result="Late completion")
+    update_goal_record(db, run, goal, 1, complete="Late completion")
   db.expire_all()
   assert db.get(models.ChatGoal, goal.id).status == "stopped"
 
@@ -237,7 +238,7 @@ def test_api_branch_add_and_completion_fence(client, db, chat):
 def test_dismissing_completed_goal_keeps_verified_outcome(db, chat):
   from app.chat_writer import ClearPresentedGoal, get_writer
   goal, run = work(db, chat, task_status="completed")
-  update_goal_record(db, run, goal, 1, result="Verified entire outcome")
+  update_goal_record(db, run, goal, 1, complete="Verified entire outcome")
   receipt = get_writer().submit(ClearPresentedGoal(
     chat_id=chat.id, expected_goal_id=goal.id, preserve_execution=True,
   )).result(timeout=5)
@@ -255,7 +256,7 @@ def test_corrupt_plan_cannot_complete_and_full_replace_repairs_it(db, chat):
   db.commit()
 
   with pytest.raises(GoalPlanError, match="unreadable"):
-    update_goal_record(db, run, goal, 1, result="Must not silently complete")
+    update_goal_record(db, run, goal, 1, complete="Must not silently complete")
   assert goal.status == "open"
 
   repaired = replace_plan(
@@ -266,7 +267,7 @@ def test_corrupt_plan_cannot_complete_and_full_replace_repairs_it(db, chat):
     }],
   )
   assert repaired["summary"]["can_complete"] is True
-  update_goal_record(db, run, goal, 2, result="Verified repaired plan")
+  update_goal_record(db, run, goal, 2, complete="Verified repaired plan")
   assert goal.status == "completed"
 
 
@@ -279,7 +280,7 @@ def test_malformed_task_status_remains_repairable(db, chat, status):
   assert serialize_plan(db, run, goal) is None
   assert presented_goal(db, chat.id)["status"] == "active"
   with pytest.raises(GoalPlanError, match="unreadable"):
-    update_goal_record(db, run, goal, 2, result="Cannot complete malformed work")
+    update_goal_record(db, run, goal, 2, complete="Cannot complete malformed work")
   assert goal.status == "open"
 
   with pytest.raises(GoalPlanError, match="invalid status"):
@@ -292,5 +293,5 @@ def test_malformed_task_status_remains_repairable(db, chat, status):
   with pytest.raises(GoalPlanConflict, match="changed"):
     replace_plan(db, physical=run, root=goal, expected_revision=1, tasks=repaired_tasks)
   replace_plan(db, physical=run, root=goal, expected_revision=2, tasks=repaired_tasks)
-  update_goal_record(db, run, goal, 3, result="Verified repaired work")
+  update_goal_record(db, run, goal, 3, complete="Verified repaired work")
   assert goal.status == "completed"

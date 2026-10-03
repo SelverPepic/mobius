@@ -314,7 +314,7 @@ def _complete(db, result="Verified: checks green"):
 
   goal = db.get(models.ChatGoal, "goal-run")
   return update_goal_record(
-    db, db.get(models.ChatRun, "goal-run"), goal, goal.revision, result=result,
+    db, db.get(models.ChatRun, "goal-run"), goal, goal.revision, complete=result,
   )
 
 

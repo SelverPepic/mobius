@@ -150,7 +150,7 @@ def test_deferral_does_not_drop_an_owed_helper_result_from_an_earlier_attempt(db
   assert goal.status == "open" and goal.hold_json is None
 
 
-@pytest.mark.parametrize("operation", ["defer", "result"])
+@pytest.mark.parametrize("operation", ["defer", "complete"])
 def test_settlement_cannot_hide_an_older_live_helper_behind_a_newer_finished_attempt(db, chat, operation):
   from datetime import UTC, datetime, timedelta
   from app.goal_plans import GoalPlanError, serialize_plan
@@ -171,7 +171,7 @@ def test_settlement_cannot_hide_an_older_live_helper_behind_a_newer_finished_att
   db.commit()
   assert [h["id"] for h in serialize_plan(db, run, goal)["delegations"]] == ["helper-new"]
   with pytest.raises(GoalPlanError, match="verify"):
-    update_goal_record(db, run, goal, goal.revision, **{operation: "Reviewed"})
+    update_goal_record(db, run, goal, goal.revision, **{operation: True if operation == "complete" else "Reviewed"})
   assert goal.status == "open" and goal.hold_json is None
 
 

@@ -698,7 +698,7 @@ def _goal_completion_anchor(messages, run_ids, result, status="completed"):
   summaries clip arguments, so their successful receipt supplies the verdict.
   Goal state still owns completion; this only locates its transcript position.
   """
-  if not isinstance(result, str) or not result:
+  if status != "completed" and (not isinstance(result, str) or not result):
     return None
   for index in range(len(messages) - 1, -1, -1):
     message = messages[index]
@@ -730,7 +730,8 @@ def _goal_completion_anchor(messages, run_ids, result, status="completed"):
         terminal_value = (args.get("complete") if status == "completed" else
                           args.get("cancel") if status == "cancelled" else
                           args.get("cannot_complete")) if isinstance(args, dict) else None
-        if ((isinstance(terminal_value, str) and terminal_value == result)
+        if ((status == "completed" and terminal_value is True and result is None)
+            or (isinstance(terminal_value, str) and terminal_value == result)
             or (status == "cannot_complete" and isinstance(terminal_value, dict)
                 and all(isinstance(terminal_value.get(key), str) for key in
                         ("reason", "efforts", "unmet_outcome"))

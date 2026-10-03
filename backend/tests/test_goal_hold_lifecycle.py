@@ -104,7 +104,7 @@ def test_legacy_goal_resume_after_unrelated_turn_reuses_original_checklist(db, c
   assert goal.status == "open" and goal.hold_json is None and goal.revision == 5
   assert goal.plan_json["tasks"][0]["id"] == "verify"
   assert db.query(models.ChatGoal).count() == 1
-  update_goal_record(db, successor, goal, goal.revision, result="Original outcome verified")
+  update_goal_record(db, successor, goal, goal.revision, complete="Original outcome verified")
   assert goal.status == "completed"
 
 

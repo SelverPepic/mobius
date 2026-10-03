@@ -163,18 +163,24 @@ async def settle_after_goal_completion(chat_id: str) -> None:
 
 
 def update_goal_record(db, run, goal, expected_revision, *, checkpoint=None,
-                       next_action=None, result=None, cannot_complete=None,
+                       next_action=None, complete=None, cannot_complete=None,
                        cancel=None, defer=None, tasks=None, finished_claims=()):
   from app.goal_plans import (
     GoalPlanConflict, GoalPlanError, active_goal_helpers, normalize_tasks,
     staged_task_edits,
   )
-  outcomes = [result is not None, cannot_complete is not None, cancel is not None]
+  # New callers signal success without prose. Keep string completion for
+  # running agents whose tool schema was loaded before the update.
+  if complete is not None and complete is not True and not (
+    isinstance(complete, str) and complete.strip()
+  ):
+    raise GoalPlanError("complete must be true")
+  outcomes = [complete is not None, cannot_complete is not None, cancel is not None]
   if sum(outcomes + [defer is not None, next_action is not None]) > 1:
     raise GoalPlanError("Choose one Goal outcome, deferral, or next action")
-  if finished_claims and result is None:
+  if finished_claims and complete is None:
     raise GoalPlanError("Only verified completion may name finished claims")
-  status = ("completed" if result is not None else
+  status = ("completed" if complete is not None else
             "cannot_complete" if cannot_complete is not None else
             "cancelled" if cancel is not None else None)
   if cannot_complete is not None:
@@ -187,8 +193,8 @@ def update_goal_record(db, run, goal, expected_revision, *, checkpoint=None,
       **{key: cannot_complete[key].strip() for key in ("reason", "efforts", "unmet_outcome")}
     )
   else:
-    outcome_text = result.strip() if isinstance(result, str) else cancel.strip() if isinstance(cancel, str) else None
-  if status and not outcome_text:
+    outcome_text = complete.strip() if isinstance(complete, str) else cancel.strip() if isinstance(cancel, str) else None
+  if status in {"cannot_complete", "cancelled"} and not outcome_text:
     raise GoalPlanError("A Goal outcome needs a specific explanation")
   if defer is not None and (not isinstance(defer, str) or not defer.strip()):
     raise GoalPlanError("A Goal deferral needs a specific explanation")

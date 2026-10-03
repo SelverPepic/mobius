@@ -2,6 +2,8 @@
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from app import models
 from tests.goal_fixtures import goal_run as make_goal_run
 from tests.test_goal_plans import _active_goal, _agent_run_auth
@@ -85,7 +87,7 @@ def test_completion_refusal_rolls_back_task_edits_in_the_same_call(
 
   refused = _update(client, db, chat_id, {
     "tasks": [{"id": "inspect", "status": "completed", "result": "Done"}],
-    "complete": "Everything verified",
+    "complete": True,
   })
 
   assert refused.status_code == 422
@@ -187,7 +189,7 @@ def test_outcome_tool_receipt_retry_is_idempotent_but_cannot_edit_settled_work(
       {"id": "inspect", "status": "completed", "result": "Checked"},
       {"id": "build", "status": "completed", "result": "Verified"},
     ],
-    "complete": "Original outcome verified",
+    "complete": True,
   }
   first = _update(client, db, chat_id, body)
   assert first.status_code == 200, first.text
@@ -223,11 +225,11 @@ def test_goal_returns_exact_held_work_keys_and_completion_settles_only_named_wor
   assert read.json()["goal"]["held_work_keys"] == ["test:performed", "test:unneeded"]
 
   refused = _update(client, db, chat_id, {
-    "complete": "Verified", "finished_claims": ["test:guessed"],
+    "complete": True, "finished_claims": ["test:guessed"],
   })
   assert refused.status_code == 422
   finished = _update(client, db, chat_id, {
-    "complete": "Verified", "finished_claims": ["test:performed"],
+    "complete": True, "finished_claims": ["test:performed"],
   })
   assert finished.status_code == 200, finished.text
   assert finished.json()["goal"]["held_work_keys"] == []
@@ -247,13 +249,37 @@ def test_the_final_task_edit_and_completion_can_share_one_call(
 
   completed = _update(client, db, chat_id, {
     "tasks": [{"id": "only", "status": "completed", "result": "Shipped"}],
-    "complete": "Release verified live",
+    "complete": True,
   })
 
   assert completed.status_code == 200, completed.text
   assert completed.json()["goal"]["status"] == "completed"
   db.expire_all()
-  assert db.get(models.ChatGoal, "goal-1").result == "Release verified live"
+  assert db.get(models.ChatGoal, "goal-1").result is None
+  assert completed.json()["plan"]["tasks"][0]["result"] == "Shipped"
+
+
+@pytest.mark.parametrize("value", [False, 0, 1, "", " ", [], {}, "x" * 4001])
+def test_completion_flag_rejects_accidental_coercion(client, owner_token, db, value):
+  _, chat_id = _active_goal(client, owner_token, db)
+  response = _update(client, db, chat_id, {"complete": value})
+  assert response.status_code == 422
+  db.expire_all()
+  assert db.get(models.ChatGoal, "goal-1").status == "open"
+
+
+def test_loaded_legacy_agent_can_complete_and_replay_without_rewriting_history(
+  client, owner_token, db,
+):
+  _, chat_id = _active_goal(client, owner_token, db)
+  body = {"complete": "Original verified result"}
+  first = _update(client, db, chat_id, body)
+  assert first.status_code == 200, first.text
+  assert first.json()["goal"]["result"] == body["complete"]
+  assert _update(client, db, chat_id, body).json() == first.json()
+  # A different signal is not an exact replay of a historical receipt.
+  assert _update(client, db, chat_id, {"complete": True}).status_code == 409
+  assert _update(client, db, chat_id, {}).json()["goal"] == first.json()["goal"]
 
 
 def test_completing_through_the_route_withdraws_its_fired_waits_resume(
@@ -282,7 +308,7 @@ def test_completing_through_the_route_withdraws_its_fired_waits_resume(
 
   completed = _update(client, db, chat_id, {
     "tasks": [{"id": "only", "status": "completed", "result": "Shipped"}],
-    "complete": "Release verified live",
+    "complete": True,
   })
 
   assert completed.status_code == 200, completed.text
@@ -302,7 +328,7 @@ def test_next_action_leaves_a_handoff_checkpoint(client, owner_token, db):
 
   assert saved.status_code == 200, saved.text
   assert saved.json()["goal"]["next_action"] == "Run the live check"
-  both = _update(client, db, chat_id, {"next_action": "x", "complete": "y"})
+  both = _update(client, db, chat_id, {"next_action": "x", "complete": True})
   assert both.status_code == 422
 
 

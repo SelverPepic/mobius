@@ -233,11 +233,22 @@ class GoalUpdateRequest(BaseModel):
   goal_id: str | None = Field(default=None, min_length=1, max_length=64)
   tasks: list[dict[str, Any]] | None = Field(default=None, min_length=1)
   next_action: str | None = Field(default=None, min_length=1, max_length=2000)
-  complete: str | None = Field(default=None, min_length=1, max_length=4000)
+  complete: bool | str | None = None
   cannot_complete: CannotCompleteOutcome | None = None
   cancel: str | None = Field(default=None, min_length=1, max_length=4000)
   defer: str | None = Field(default=None, min_length=1, max_length=2000)
   finished_claims: list[str] = Field(default_factory=list, max_length=50)
+
+  @field_validator("complete", mode="before")
+  @classmethod
+  def completion_signal(cls, value):
+    # Preserve already-running clients with the old string tool schema.
+    # Advertise only true to new agents; never coerce 1 or "true" into it.
+    if value is None or value is True:
+      return value
+    if isinstance(value, str) and value.strip() and len(value) <= 4000:
+      return value
+    raise ValueError("complete must be true")
 
   @model_validator(mode="after")
   def one_record_operation(self) -> "GoalUpdateRequest":
@@ -354,7 +365,7 @@ async def update_goal(
           db, run, goal, goal.revision,
           tasks=body.tasks,
           checkpoint="Plan saved." if body.next_action is not None else None,
-          next_action=body.next_action, result=body.complete,
+          next_action=body.next_action, complete=body.complete,
           cannot_complete=(body.cannot_complete.model_dump() if body.cannot_complete else None),
           cancel=body.cancel, defer=body.defer,
           finished_claims=body.finished_claims,

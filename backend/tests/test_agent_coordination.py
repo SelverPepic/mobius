@@ -1761,7 +1761,7 @@ def test_settlement_notice_lost_to_a_crash_is_delivered_by_the_next_seam(
   # Completion commits, then the process "dies" before any notice is sent.
   update_goal_record(
     db, db.get(models.ChatRun, "claim-owner-run"),
-    db.get(models.ChatGoal, "claim-owner-goal"), 0, result="Merged",
+    db.get(models.ChatGoal, "claim-owner-goal"), 0, complete="Merged",
   )
   claim, notices = _claim_and_notices(db)
   assert claim.notification_revision < claim.revision and notices == []
