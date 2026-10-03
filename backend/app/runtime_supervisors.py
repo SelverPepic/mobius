@@ -92,13 +92,20 @@ class RuntimeSupervisors:
       coroutine, name=f"mobius:{name}",
     )
 
-  def reclaim_boot_file_cache(self) -> None:
+  def reclaim_boot_file_cache(self, *, startup_succeeded: bool) -> None:
     """Release file pages boot left cached, once the server is ready.
 
     Boot reconciles the platform checkout, may finish an update swap, and
     bootstraps apps before any turn exists, so no settled-turn cleanup follows
-    that git and tool I/O. One pass at readiness, off the event loop.
+    that git and tool I/O. Startup maintenance also reads much of the main
+    database file; only after every startup task succeeded and the database
+    supervisors are running is that one file advised too. One pass per
+    process at readiness, off the event loop.
     """
+    if "boot-file-cache-reclaim" in self._tasks:
+      return
+    advise_database = startup_succeeded and self.database_service_readiness()[0]
+
     async def reclaim():
       from app.file_cache import reclaim_background_work_cache
       try:
@@ -107,6 +114,23 @@ class RuntimeSupervisors:
         )
       except Exception:
         self.log.debug("boot file cache advice failed", exc_info=True)
+      if not advise_database:
+        return
+      from app.database import reclaim_startup_database_file_cache
+      try:
+        result = await asyncio.to_thread(reclaim_startup_database_file_cache)
+      except Exception:
+        self.log.debug("startup database file cache advice failed", exc_info=True)
+        return
+      if result and result["files"]:
+        # Advised, not reclaimed: concurrent activity moves the cgroup figures.
+        self.log.info(
+          "startup database file cache advice: advised_bytes=%s "
+          "cgroup_file_before=%s cgroup_file_after=%s",
+          result["advised_file_bytes"],
+          result["file_cache_before_bytes"],
+          result["file_cache_after_bytes"],
+        )
 
     self._spawn("boot-file-cache-reclaim", reclaim())
 

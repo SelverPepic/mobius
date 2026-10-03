@@ -420,7 +420,7 @@ async def test_boot_file_cache_reclaim_runs_off_the_event_loop_and_failure_stays
     raise OSError("advice unavailable")
 
   monkeypatch.setattr(file_cache, "reclaim_background_work_cache", reclaim)
-  supervisors.reclaim_boot_file_cache()
+  supervisors.reclaim_boot_file_cache(startup_succeeded=False)
   await supervisors._tasks["boot-file-cache-reclaim"]
 
   assert [data_dir for data_dir, _thread in calls] == ["/tmp"]
