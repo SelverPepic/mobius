@@ -926,9 +926,12 @@ def _checkout_matches_transition_target(repo: Path, target: str, other: str) -> 
   if paths & (changed_paths(target, index.stdout.strip()) | changed_paths(target, working)):
     return False
   present = set(_git("ls-tree", "-r", "--name-only", "-z", target, repo=repo).stdout.split("\0"))
-  # Git diff ignores ignored additions. They cannot survive from a partial
-  # candidate as an untracked source file on a path absent from target.
-  return all(path in present or not os.path.lexists(repo / path) for path in paths)
+  # Git diff ignores ignored additions. A retired source file must be absent,
+  # but its path may now be a real directory (a file/directory replacement or
+  # independent owner files). A symlink is still a leftover source entry.
+  return all(path in present or not os.path.lexists(repo / path) or (
+    (repo / path).is_dir() and not (repo / path).is_symlink()
+  ) for path in paths)
 
 
 def _forced_checkout_matches_target(repo: Path, target: str, displaced: str) -> bool:
@@ -1007,7 +1010,8 @@ def _preserve_checkout_state(
 
   Conflict stages cannot be written as one ordinary Git tree. A recovery
   tree names their original stages and retains the raw index for exact repair;
-  naming each blob also keeps it reachable through Git garbage collection.
+  a split index's companion is part of that same saved index, not optional.
+  Naming each blob also keeps it reachable through Git garbage collection.
   Callers removing a whole worktree include every ignored path they displace.
   """
   ignored = sorted(set(_ignored_checkout_obstructions(repo, restoring)) | set(force_paths or []))
@@ -1030,6 +1034,10 @@ def _preserve_checkout_state(
   raw_index = _git("rev-parse", "--git-path", "index", repo=repo).stdout.strip()
   index_blob = _git("hash-object", "-w", raw_index, repo=repo).stdout.strip()
   entries.append(f"100644 {index_blob}\toriginal-index\0")
+  shared_index = _git("rev-parse", "--shared-index-path", repo=repo).stdout.strip()
+  if shared_index:
+    shared_blob = _git("hash-object", "-w", shared_index, repo=repo).stdout.strip()
+    entries.append(f"100644 {shared_blob}\t{Path(shared_index).name}\0")
   with tempfile.TemporaryDirectory(prefix="mobius-recovery-index-") as tmp:
     index = Path(tmp) / "index"
     app_git._run_with_index(repo, index, "read-tree", "--empty")

@@ -7476,3 +7476,151 @@ def test_failed_resolver_preservation_leaves_its_worktree_and_index_intact(clone
   assert (resolver / "backend/requirements.lock").read_bytes() == working
   assert pu.RECONCILE_PRE_FLAG.exists()
   assert pu._read_conflict_flag()["overlay"]["worktree"] == str(resolver)
+
+
+@pytest.mark.parametrize("direction", ["file_to_directory", "directory_to_file"])
+@pytest.mark.parametrize("gate", ["pass", "frontend_failure"])
+def test_native_directory_replacement_keeps_final_gate_and_recovery_contract(
+  clone_env, monkeypatch, direction, gate,
+):
+  origin, platform = clone_env
+  old_path = "layout" if direction == "file_to_directory" else "layout/module.py"
+  new_path = "layout/module.py" if direction == "file_to_directory" else "layout"
+  _advance_origin(origin, edits={old_path: "previous layout source\n"})
+  assert pu.reconcile_clone(platform).status == "updated"
+  before = _served_sha(platform)
+  source = origin.parent / "origin-work"
+  (source / old_path).unlink()
+  if direction == "directory_to_file":
+    (source / "layout").rmdir()
+  target = _advance_origin(origin, edits={
+    new_path: "candidate layout source\n", "frontend/src/App.jsx": "export default 'candidate';\n",
+    "backend/app/foo.py": "VALUE = 'candidate directory update'\n",
+  })
+  observed = {}
+  staged = "VALUE = 'late staging at directory final gate'\n"
+  working = "VALUE = 'late working at directory final gate'\n"
+
+  def final_gate(repo, result):
+    observed["called"] = True
+    assert pu.RECONCILE_PRE_FLAG.exists()
+    if gate == "frontend_failure":
+      (platform / "backend/app/foo.py").write_text(staged)
+      _git(platform, "add", "backend/app/foo.py")
+      (platform / "backend/app/foo.py").write_text(working)
+      raise RuntimeError("directory update frontend rejected")
+
+  monkeypatch.setattr(pu, "_rebuild_frontend", final_gate)
+  result = pu.reconcile_clone(platform)
+  assert observed.get("called"), "a valid D/F checkout must reach its final gate"
+  if gate == "pass":
+    assert result.status == "updated", result.error
+    assert _served_sha(platform) == target
+    assert (platform / new_path).read_text() == "candidate layout source\n"
+  else:
+    assert result.status == "error"
+    assert _served_sha(platform) == before
+    assert pu.RECONCILE_PRE_FLAG.exists()
+    pu.boot_guard_clean_served_tree(platform)
+    assert (platform / old_path).read_text() == "previous layout source\n"
+    refs = pu.platform_status(platform)["recovery_refs"]
+    _git(platform, "reflog", "expire", "--expire=now", "--all")
+    _git(platform, "gc", "--prune=now")
+    assert any(_git(platform, "show", ref + ":stage-0/backend/app/foo.py", check=False).stdout == staged
+               for ref in refs)
+    assert any(_git(platform, "show", ref + ":backend/app/foo.py", check=False).stdout == working
+               for ref in refs)
+  assert not pu.RECONCILE_PRE_FLAG.exists()
+
+
+@pytest.mark.parametrize("leftover", ["ignored_file", "directory_symlink"])
+def test_native_directory_coherence_still_rejects_retired_files_and_symlinks(clone_env, leftover):
+  _origin, platform = clone_env
+  before = _local_commit(platform, edits={"layout": "old leaf\n"})
+  _git(platform, "rm", "-q", "layout")
+  target = _local_commit(platform, edits={"readme.txt": "release without layout\n"})
+  (platform / ".git/info/exclude").write_text("layout\n")
+  if leftover == "ignored_file":
+    (platform / "layout").write_text("retired candidate bytes\n")
+  else:
+    (platform / "layout").symlink_to(platform / "backend", target_is_directory=True)
+  assert not pu._checkout_matches_transition_target(platform, target, before)
+
+
+@pytest.mark.parametrize("checkout", ["served", "resolver"])
+@pytest.mark.parametrize("index_flag", ["--assume-unchanged", "--skip-worktree"])
+def test_saved_split_index_closure_is_portable_after_image_revert_and_gc(
+  clone_env, tmp_path, checkout, index_flag,
+):
+  origin, platform = clone_env
+  if checkout == "resolver":
+    record, source = _bound_late_conflict(platform, origin, uncommitted=False)
+  else:
+    record = _prepare_package_update(platform, origin)
+    _boot_image(record["target"])
+    assert pu.settle_prepared_update_for_this_image(platform) == "replayed"
+    source = platform
+  path = "backend/app/foo.py"
+  _git(source, "update-index", index_flag, path)
+  _git(source, "update-index", "--split-index")
+  shared = Path(_git(source, "rev-parse", "--shared-index-path").stdout.strip())
+  if not shared.is_absolute():
+    shared = source / shared
+  assert shared.is_file()
+  companion = shared.read_bytes()
+  raw_path = Path(_git(source, "rev-parse", "--git-path", "index").stdout.strip())
+  if not raw_path.is_absolute():
+    raw_path = source / raw_path
+  raw_oid = _git(source, "hash-object", str(raw_path)).stdout.strip()
+  flags = _git(source, "ls-files", "-v", path).stdout
+  _boot_image(record["snapshot"])
+  assert pu.settle_prepared_update_for_this_image(platform) == "reverted"
+  if checkout == "resolver":
+    assert not source.exists() and not shared.exists()
+  refs = pu.platform_status(platform)["recovery_refs"]
+  _git(platform, "reflog", "expire", "--expire=now", "--all")
+  _git(platform, "gc", "--prune=now")
+  saved = next(ref for ref in refs if _git(
+    platform, "rev-parse", ref + ":original-index", check=False,
+  ).stdout.strip() == raw_oid)
+  # Loading while the original companion still exists is not recovery.
+  # A fresh repo proves the reported copy carries its own index dependencies.
+  recovered = tmp_path / "recovered-index"
+  recovered.mkdir()
+  _git(recovered, "init", "-q")
+  def saved_bytes(name):
+    return subprocess.run(
+      ["git", "-C", str(platform), "show", saved + ":" + name],
+      capture_output=True, check=True,
+    ).stdout
+  (recovered / ".git/index").write_bytes(saved_bytes("original-index"))
+  assert _git(recovered, "ls-files", "-v", path, check=False).returncode == 128
+  assert _git(platform, "cat-file", "-e", saved + ":" + shared.name, check=False).returncode == 0, (
+    "exact index recovery requires its GC-durable shared-index companion"
+  )
+  assert saved_bytes(shared.name) == companion
+  (recovered / ".git" / shared.name).write_bytes(saved_bytes(shared.name))
+  assert _git(recovered, "ls-files", "-v", path).stdout == flags
+
+
+def test_failed_split_index_companion_capture_refuses_resolver_removal(clone_env, monkeypatch):
+  origin, platform = clone_env
+  record, resolver = _bound_late_conflict(platform, origin, uncommitted=False)
+  _git(resolver, "update-index", "--assume-unchanged", "backend/app/foo.py")
+  _git(resolver, "update-index", "--split-index")
+  raw_path = Path(_git(resolver, "rev-parse", "--git-path", "index").stdout.strip())
+  raw = raw_path.read_bytes()
+  git = pu._git
+
+  def cannot_save_companion(*args, **kwargs):
+    if args[0] == "hash-object" and Path(args[-1]).name.startswith("sharedindex."):
+      raise pu.PlatformUpdateError("shared index snapshot unavailable")
+    return git(*args, **kwargs)
+
+  monkeypatch.setattr(pu, "_git", cannot_save_companion)
+  _boot_image(record["snapshot"])
+  with pytest.raises(pu.PlatformUpdateError, match="shared index snapshot unavailable"):
+    pu.settle_prepared_update_for_this_image(platform)
+  assert resolver.exists()
+  assert raw_path.read_bytes() == raw
+  assert pu.RECONCILE_PRE_FLAG.exists()
