@@ -555,3 +555,28 @@ def test_pipe_reader_closes_its_own_pipe_after_eof():
         runner._pump_stream(pipe, 'stdout', output)
         assert pipe.closed
         assert output.final_streams() == ('last bytes', '', False)
+
+
+@pytest.mark.parametrize('base', ['https://controller.example', 'https://192.0.2.42:8443'])
+def test_pair_success_names_granted_instance_not_machine_alias(monkeypatch, capsys, base):
+    saved = []
+    monkeypatch.setattr(runner, '_post', lambda *_args, **_kwargs: {
+        'host_id': 'test-host', 'token': 'private-host-token', 'name': 'Mac',
+    })
+    monkeypatch.setattr(runner, '_add_connection', saved.append)
+    connection = runner._pair(base + '/', 'private-pair-code')
+    assert capsys.readouterr().out == 'Granted command access to %s.\n' % base
+    assert connection['name'] == 'Mac'
+    assert saved == [connection]
+
+
+def test_pair_does_not_announce_access_when_saving_fails(monkeypatch, capsys):
+    monkeypatch.setattr(runner, '_post', lambda *_args, **_kwargs: {
+        'host_id': 'test-host', 'token': 'private-host-token', 'name': 'Mac',
+    })
+    def failed_save(_connection):
+        raise OSError('Disk full')
+    monkeypatch.setattr(runner, '_add_connection', failed_save)
+    with pytest.raises(OSError, match='Disk full'):
+        runner._pair('https://controller.example', 'private-pair-code')
+    assert capsys.readouterr().out == ''
