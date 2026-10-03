@@ -1608,3 +1608,12 @@ def test_inference_final_byte_limit_runs_after_real_web_rewrite(monkeypatch, cap
     server.shutdown()
     server.server_close()
     thread.join(timeout=2)
+
+
+def test_shared_inbox_broker_exposes_only_exact_response_route():
+  path = "/api/instance/v1/browser-access/shared/respond"
+  assert broker_module._managed_upstream_path("POST", "/managed" + path) == path
+  assert broker_module.BROKER_ROUTE_EPOCH >= 7
+  for method, suffix in (("GET", ""), ("DELETE", ""), ("POST", "/other"),
+                         ("POST", "?subject=other"), ("POST", "/../grants")):
+    assert broker_module._managed_upstream_path(method, "/managed" + path + suffix) is None
