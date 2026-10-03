@@ -401,6 +401,39 @@ def test_cas_guard_nonterminal_run_and_updated_at(db):
 
 
 # -- round-trip verification + rollback-on-failure ------------------------
+@pytest.mark.parametrize("race", ["updated_at", "nonterminal_run"])
+def test_actor_losing_cas_never_writes_transcript_and_rolls_back_stashes(db, monkeypatch, race):
+    from datetime import timedelta
+
+    original_messages = [{"role": "user", "ts": 1}, _fat_tool_msg(ts=2)]
+    _make_chat(db, "cas-race", original_messages)
+    actor = get_writer()
+    verify = actor._verify_round_trip
+
+    def changed_before_cas(session, chat_id, stashes):
+        verify(session, chat_id, stashes)
+        if race == "updated_at":
+            stamp = session.execute(
+                select(models.Chat.updated_at).where(models.Chat.id == chat_id)
+            ).scalar_one()
+            session.execute(update(models.Chat).where(models.Chat.id == chat_id)
+                            .values(updated_at=stamp + timedelta(seconds=1))
+                            .execution_options(synchronize_session=False))
+        else:
+            session.add(models.ChatRun(id="cas-race-run", chat_id=chat_id,
+                                       status="running", provider="claude"))
+            session.flush()
+
+    def forbidden_row_write(*args, **kwargs):
+        pytest.fail("A failed CAS must not reach normalized transcript writes")
+
+    monkeypatch.setattr(actor, "_verify_round_trip", changed_before_cas)
+    monkeypatch.setattr(transcript_rows, "replace_all", forbidden_row_write)
+    assert _migrate("cas-race")["status"] == "skipped_active"
+    assert list(transcript_rows.history(_reread(db, "cas-race"))) == original_messages
+    assert db.query(models.ToolOutput).filter_by(chat_id="cas-race").count() == 0
+
+
 def test_verify_round_trip_detects_mismatch(db):
     actor = get_writer()
     db.add(models.ToolOutput(chat_id="cv", tool_use_id="t", output="stored"))

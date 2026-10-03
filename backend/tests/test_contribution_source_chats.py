@@ -139,10 +139,20 @@ def test_discovery_does_not_hydrate_unrelated_chat_payloads(client, db, setup):
   chat(db, "plain")
   selected = []
   def capture(conn, cursor, statement, parameters, context, executemany):
-    if statement.lstrip().startswith("SELECT") and "chats.messages" in statement:
+    projection = statement.split("FROM", 1)[0]
+    if statement.lstrip().startswith("SELECT") and any(
+      payload in projection for payload in (
+        "chat_messages.body", "chat_live_assistants.snapshot",
+      )
+    ):
       selected.append(statement)
   event.listen(engine, "before_cursor_execute", capture)
   try:
+    # A real normalized body read must trip the guard; a retired-column
+    # predicate would silently accept every request after the storage change.
+    db.query(models.ChatMessage.body).filter_by(chat_id="plain").all()
+    assert selected
+    selected.clear()
     assert read(client, setup()).json() == {"chats": []}
   finally:
     event.remove(engine, "before_cursor_execute", capture)

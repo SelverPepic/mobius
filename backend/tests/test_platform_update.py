@@ -6297,7 +6297,7 @@ def test_rollback_preserves_uncommitted_edits_arriving_after_activation(
   _advance_origin(origin, edits={'backend/app/foo.py': "VALUE = 'update'\n"})
   path = platform / 'backend/app/foo.py'
 
-  def changed_then_fail(repo=platform, timeout=pu._PROBE_TIMEOUT):
+  def changed_then_fail(repo=platform, timeout=pu._PROBE_TIMEOUT, *, candidate_target=None):
     path.write_text("VALUE = 'arrived after activation'\n")
     return False, 'candidate rejected'
 
@@ -7626,3 +7626,41 @@ def test_failed_split_index_companion_capture_refuses_resolver_removal(clone_env
   assert resolver.exists()
   assert raw_path.read_bytes() == raw
   assert pu.RECONCILE_PRE_FLAG.exists()
+
+
+def test_forced_revert_refuses_detached_owner_history_before_journal_admission(clone_env):
+  origin, platform = clone_env
+  record = _prepare_package_update(platform, origin)
+  _boot_image(record["target"])
+  assert pu.settle_prepared_update_for_this_image(platform) == "replayed"
+  _git(platform, "checkout", "--detach", "HEAD")
+  _local_commit(platform, edits={"detached-owner.txt": "owner work\n"})
+  detached = _served_sha(platform)
+  index = (platform / ".git/index").read_bytes()
+  with pytest.raises(pu.BootTransactionError, match="HEAD changed"):
+    pu.revert_failed_update(platform)
+  assert _git(platform, "rev-parse", "HEAD").stdout.strip() == detached
+  assert pu._head_detached(platform)
+  assert (platform / ".git/index").read_bytes() == index
+  assert not pu.RECONCILE_PRE_FLAG.exists()
+  assert pu.read_prepared_update()["state"] == "swapped"
+
+
+@pytest.mark.parametrize("marker", ["journal", "{}", "[]"])
+def test_forced_revert_refuses_another_checkout_journal_without_overwriting_it(clone_env, marker):
+  origin, platform = clone_env
+  record = _prepare_package_update(platform, origin)
+  _boot_image(record["target"])
+  assert pu.settle_prepared_update_for_this_image(platform) == "replayed"
+  head = _served_sha(platform)
+  pu._write_reconcile_pre(head, head, saved_refs=["refs/mobius/other-owner"])
+  if marker != "journal":
+    pu.RECONCILE_PRE_FLAG.write_text(marker)
+  journal = pu.RECONCILE_PRE_FLAG.read_bytes()
+  index = (platform / ".git/index").read_bytes()
+  with pytest.raises(pu.BootTransactionError, match="Another checkout transaction"):
+    pu.revert_failed_update(platform)
+  assert pu.RECONCILE_PRE_FLAG.read_bytes() == journal
+  assert _served_sha(platform) == head
+  assert (platform / ".git/index").read_bytes() == index
+  assert pu.read_prepared_update()["state"] == "swapped"

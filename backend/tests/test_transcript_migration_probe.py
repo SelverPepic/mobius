@@ -23,6 +23,7 @@ def probe_module():
 
 
 def legacy_copy(tmp_path, values):
+  # Step-level hybrid fixture, not a complete previous-release image database.
     path = tmp_path / "source.db"
     engine = create_engine(f"sqlite:///{path}")
     Base.metadata.create_all(engine)

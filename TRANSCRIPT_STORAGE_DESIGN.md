@@ -82,7 +82,10 @@ maintenance-mode lifecycle.
 
 Before release, validate a matching image, supported architectures, real
 container cutover and floor-aware rollback. Host-only pytest proves application
-contracts, not the completed image or production deployment envelope.
+contracts, not the completed image or production deployment envelope. Concrete
+step tests use hybrid legacy-column/current-auxiliary-schema fixtures; the
+frozen-schema boot test separately covers ledger/gate ordering. Neither
+substitutes for a full previous-image-to-candidate cutover.
 
 
 ## Private first-upgrade prerequisite refinement

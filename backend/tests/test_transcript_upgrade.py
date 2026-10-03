@@ -13,6 +13,7 @@ from app.transcript_upgrade import TranscriptStep
 
 
 def legacy(tmp_path, values):
+  # Step-level hybrid fixture, not a complete previous-release image database.
   path = tmp_path / "legacy.db"
   eng = create_engine(f"sqlite:///{path}")
   Base.metadata.create_all(eng)

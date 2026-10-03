@@ -45,6 +45,7 @@ def _historical_host(tmp_path):
 
 
 def _legacy(tmp_path):
+  # Step-level hybrid fixture, not a complete previous-release image database.
   path = tmp_path / "ultimate.db"
   engine = create_engine(f"sqlite:///{path}")
   Base.metadata.create_all(engine)
@@ -121,7 +122,7 @@ def test_installed_prior_worker_must_not_start_level_zero_after_activation(
     tmp_path, monkeypatch):
   """Red until a floor-aware worker is active *before* the first level-1 gate.
 
-  The previous release's real worker (not the candidate REV3 worker) performs
+  The previous release's real worker (not the candidate REV4 worker) performs
   the first replacement. Its Docker boundary is mocked, but the gate and
   SQLite floor probe are real. No host/container side effects occur.
   """

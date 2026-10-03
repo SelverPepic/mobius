@@ -3839,16 +3839,7 @@ _REPLACEMENT_NOT_KEPT = (
 
 def revert_failed_update(repo: Path = PLATFORM_REPO) -> bool:
   """Boot, after the swapped-in update failed its import probe: return to the
-  swap's own saved previous state. Returns whether anything was reverted.
-
-  Compare-and-swap, never a blind reset: under the reconcile lock the
-  checkout must stand exactly where this boot's transaction left the update
-  (``_revert_refusal``). Anything else raises ``BootTransactionError`` with
-  the checkout and record untouched; the entrypoint then serves the baked
-  platform and the work stays in place. The record leaves ``swapped`` in one
-  atomic write only after the checkout provably reached the saved state, so a
-  crash in between leaves a swapped record the next boot settles again.
-  """
+  swap's own saved previous state. Returns whether anything was reverted."""
   with _reconcile_flock():
     journal = _read_reconcile_journal()
     if journal.get("revert"):
@@ -3858,38 +3849,8 @@ def revert_failed_update(repo: Path = PLATFORM_REPO) -> bool:
     record = read_prepared_update()
     if record is None or record["state"] != "swapped" or not record["late"]:
       return False
-    refusal = _revert_refusal(repo, record)
-    if refusal:
-      raise BootTransactionError(
-        f"not reverting the failed update: {refusal}; the checkout is left as it is",
-      )
     _revert_swap(repo, record, reason=_FAILED_STARTUP_CHECK)
     return True
-
-
-def _revert_refusal(repo: Path, record: PreparedUpdate) -> str | None:
-  """Why the checkout is not the swapped update this revert may discard.
-
-  HEAD, attached to the working branch, must be the tip the swap recorded:
-  its merge-back when one ran, otherwise the prepared update itself. The
-  working tree must be clean at that tip or exactly the tree the merge-back
-  restored (the carried in-progress edits the updater owns). No merge or
-  branch transition may be in flight.
-  """
-  local = _local_branch(repo)
-  expected = record["replayed"] or record["prepared"]
-  head, branch = _rev(repo, "HEAD"), _rev(repo, local)
-  if not expected or head != expected or branch != expected:
-    return (
-      f"HEAD {_short(head)} (branch {_short(branch)}) is not the swapped "
-      f"update {_short(expected)}"
-    )
-  if _reconcile_in_progress(repo) or RECONCILE_PRE_FLAG.exists():
-    return "another checkout transition is in progress"
-  tree = _working_tree_oid(repo, head)
-  if tree not in {_commit_tree_oid(repo, head), record["booted_tree"]}:
-    return "the working tree holds changes the update did not make"
-  return None
 
 
 def _revert_swap(repo: Path, record: PreparedUpdate, *, reason: str) -> None:
@@ -3901,12 +3862,16 @@ def _revert_swap(repo: Path, record: PreparedUpdate, *, reason: str) -> None:
   """
   local = _local_branch(repo)
   journal = _read_reconcile_journal()
+  if _head_detached(repo) or _rev(repo, "HEAD") != _rev(repo, local):
+    raise BootTransactionError("Image rollback HEAD changed; checkout is left as it is")
   if journal.get("revert"):
     saved = journal["revert"]
     if saved["record"]["prepared"] != record["prepared"]:
       raise BootTransactionError("Another image revert owns checkout recovery")
     record, reason = saved["record"], saved["reason"]
   else:
+    if RECONCILE_PRE_FLAG.exists():
+      raise BootTransactionError("Another checkout transaction owns recovery")
     current = _rev(repo, local)
     if _swap_position(repo, record, current) == "unknown":
       raise BootTransactionError("Image rollback does not own the served branch")
@@ -3926,6 +3891,8 @@ def _revert_swap(repo: Path, record: PreparedUpdate, *, reason: str) -> None:
     app_git.remove_overlay_worktree(repo, worktree)
     CONFLICT_FLAG.unlink(missing_ok=True)
   _set_aside_unsaved_update_work(repo, local, record)
+  if _head_detached(repo) or _local_branch(repo) != local:
+    raise BootTransactionError("Image rollback HEAD changed; recovery marker retained")
   _abort_interrupted(repo)
   if _rev(repo, local) not in {journal["pre"], journal["tip"]}:
     raise BootTransactionError("Image rollback branch changed; recovery marker retained")
