@@ -81,7 +81,7 @@ production installer/worker; this task does not change them.
 
 **First-upgrade blocker:** `36c0ce1016` installs worker revision 2. It runs
 the first level-0→1 replacement and, on failure or interrupted recovery,
-unconditionally tries to recreate the old image; candidate revision 3 is
+unconditionally tries to recreate the old image; the candidate worker is
 offered only after the replacement is healthy. Candidate adoption therefore
 cannot protect the first activation. A floor-aware worker must be active
 **before** the gate can raise the floor. Verify the installed active worker's
