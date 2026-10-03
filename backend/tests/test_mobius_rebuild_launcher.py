@@ -626,6 +626,7 @@ def refused(tmp_path, monkeypatch):
   monkeypatch.setattr(host, "read_database_floor", lambda *a: 1)
   monkeypatch.setattr(host, "verify_served_generation", lambda cid, sha: None)
   monkeypatch.setattr(host, "adopt_from_image", lambda image: "offered")
+  monkeypatch.setattr(host, "inspect_container_image", lambda cid: TXN["target_image"])
   return calls
 
 
@@ -634,10 +635,18 @@ def _rollback():
                        "health_check_failed", "slow", TXN["previous_image"])
 
 
-def test_refused_rollback_finishes_on_the_new_release_when_it_serves(refused, monkeypatch):
+@pytest.mark.parametrize("running_before_fence", [True, False])
+def test_refused_rollback_finishes_on_the_new_release_when_it_serves(
+    refused, monkeypatch, running_before_fence):
+  """Also when the new container had already stopped before the fence."""
   monkeypatch.setattr(host, "wait_ready", lambda *a: ("ready", {"ready": True}))
-  monkeypatch.setattr(host, "app_container", lambda _c: ("new-cid", TXN["target_image"]))
+  served = iter([("new-cid", TXN["target_image"])] if running_before_fence else [])
+  monkeypatch.setattr(host, "app_container", lambda _c: next(
+    served, ("new-cid", TXN["target_image"])) if running_before_fence or refused["docker"]
+    else (_ for _ in ()).throw(RuntimeError("no running app")))
+  monkeypatch.setattr(host, "app_container_any", lambda _c: "new-cid")
   assert _rollback() == 0
+  assert ["docker", "start", "new-cid"] in refused["docker"]
   assert refused["status"][-1]["state"] == "succeeded"
   assert ("rearm-cutover", TXN["target_image"]) in refused["ledger"]
   assert ("finalize-cutover", TXN["target_image"]) in refused["ledger"]
@@ -657,6 +666,26 @@ def test_refused_rollback_never_leaves_a_journal_that_refences_the_app(
   monkeypatch.setattr(host, "app_container", lambda _c: ("new-cid", image))
   assert _rollback() == 1
   assert refused["status"][-1]["state"] == "needs_recovery"
-  assert refused["status"][-1]["code"] == "newer_version_required"
+  assert refused["status"][-1]["code"] == "new_version_not_ready"
   assert not any("up" in args for args in refused["compose"])
   assert host.read_transaction() is None
+
+
+def test_a_refused_rollback_never_starts_a_container_that_is_not_the_new_release(
+    refused, monkeypatch):
+  monkeypatch.setattr(host, "app_container", lambda _c: ("cid", TXN["previous_image"]))
+  monkeypatch.setattr(host, "inspect_container_image", lambda cid: TXN["previous_image"])
+  monkeypatch.setattr(host, "wait_ready", lambda *a: (_ for _ in ()).throw(
+    AssertionError("nothing may be started")))
+  assert _rollback() == 1
+  assert not any(args[:2] == ["docker", "start"] for args in refused["docker"])
+  assert refused["status"][-1]["state"] == "needs_recovery"
+  assert host.read_transaction() is None
+
+
+def test_installed_service_allows_recovery_to_finish_after_an_interruption():
+  installer = (ROOT / "scripts/install-rebuild-helper.sh").read_text()
+  unit = installer[installer.index("mobius-rebuild.service <<'EOF'"):]
+  unit = unit[:unit.index("EOF\n")]
+  assert "ExecStopPost=/usr/local/libexec/mobius-rebuild-host reconcile" in unit
+  assert "TimeoutStopSec=15min" in unit

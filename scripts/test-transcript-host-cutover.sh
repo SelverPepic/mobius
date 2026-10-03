@@ -46,6 +46,8 @@ STATUS=/var/lib/mobius-rebuild/status.json
 WORK=$(mktemp -d /tmp/mobius-transcript-host.XXXXXX)
 ENV_FILE=$WORK/env
 export COMPOSE_PROJECT_NAME=mobius
+PREVIOUS_ID=""
+TARGET_ID=""
 HELPER_PATHS=(/etc/mobius-rebuild /var/lib/mobius-rebuild
   /usr/local/libexec/mobius-rebuild-host /etc/systemd/system/mobius-rebuild.service
   /etc/systemd/system/mobius-rebuild.path /etc/systemd/system/mobius-rebuild-reconcile.service)
@@ -98,8 +100,8 @@ reset_host() {  # remove everything a scenario created; images stay pulled
   docker rm -f mobius >/dev/null 2>&1 || true
   docker volume rm mobius_app_data >/dev/null 2>&1 || true
   # The worker re-tags images it manages; restore the official tags.
-  docker tag "$PREVIOUS_ID" "$IMAGE:sha-$PREVIOUS"
-  docker tag "$TARGET_ID" "$IMAGE:sha-$TARGET"
+  [[ -z $PREVIOUS_ID ]] || docker tag "$PREVIOUS_ID" "$IMAGE:sha-$PREVIOUS"
+  [[ -z $TARGET_ID ]] || docker tag "$TARGET_ID" "$IMAGE:sha-$TARGET"
   update_checkout "$PREVIOUS"
 }
 
@@ -171,6 +173,17 @@ for n in range(int(sys.argv[2])):
 db.commit()
 db.close()
 PY
+  # The previous release reviews <target> from its own clone. A published
+  # release is on origin/main; an unpublished candidate travels as a bundle.
+  local ref=refs/transcript-host/target-$$
+  git -C "$ROOT" update-ref "$ref" "$TARGET"
+  git -C "$ROOT" bundle create "$WORK/target.bundle" "$ref" >/dev/null 2>&1 \
+    || fail "could not bundle sha-$TARGET"
+  git -C "$ROOT" update-ref -d "$ref"
+  docker cp "$WORK/target.bundle" mobius:/tmp/target.bundle >/dev/null
+  docker exec mobius chmod 0644 /tmp/target.bundle
+  docker exec -u mobius mobius git -C /data/platform fetch -q /tmp/target.bundle \
+    "$ref:refs/remotes/origin/main" || fail "the previous release could not fetch sha-$TARGET"
   for _ in $(seq 1 30); do docker exec mobius test -s /data/service-token.txt && break; sleep 2; done
   (cd "$CHECKOUT" && scripts/install-rebuild-helper.sh >/dev/null) \
     || fail "the previous release's installer failed"
@@ -211,8 +224,11 @@ assert_target_serving() {
 
 assert_previous_never_started_after_floor() {  # <since>
   local started
+  # Only the app container counts: the worker's own read-only probes run the
+  # previous image deliberately (and never as the app).
   started=$(docker events --since "$1" --until "$(date +%s)" --filter type=container \
-    --filter event=start --format '{{.Actor.Attributes.image}}' | sort -u)
+    --filter event=start --filter label=com.docker.compose.service=app \
+    --format '{{.Actor.Attributes.image}}' | sort -u)
   while read -r image; do
     [[ -z $image ]] && continue
     [[ $(docker image inspect -f '{{.Id}}' "$image" 2>/dev/null) != "$PREVIOUS_ID" ]] \
@@ -252,8 +268,13 @@ scenario_upgrade() {
     printf '%s' '{\"version\":2,\"expected_sha\":\"$PREVIOUS\",\"nonce\":\"$nonce\"}' \
       > /data/mobius-rebuild/inbox/.request.tmp &&
     mv /data/mobius-rebuild/inbox/.request.tmp /data/mobius-rebuild/inbox/request.json"
+  local before_id; before_id=$(docker inspect -f '{{.Id}}' mobius)
   local outcome; outcome=$(wait_outcome "$nonce")
-  [[ $outcome == rolled_back ]] || fail "asking for the level-0 release ended $outcome"
+  [[ $outcome == failed && $(field "$STATUS" 'd.get("code")') == newer_version_required ]] \
+    || fail "asking for the level-0 release ended $outcome ($(field "$STATUS" 'd.get("code")'))"
+  [[ $(docker inspect -f '{{.Id}}' mobius) == "$before_id" ]] \
+    || fail "a refused downgrade still replaced the container"
+  assert_previous_never_started_after_floor "$since"
   assert_target_serving
   assert_fixture_exact
 }
@@ -273,6 +294,11 @@ interrupt_scenario() {  # <when: before|after> <how: container|worker>
   fi
   if [[ $2 == worker ]]; then
     systemctl kill --signal=SIGKILL mobius-rebuild.service
+  elif [[ $1 == before ]]; then
+    # Killed as soon as conversion starts, long before it can activate; the
+    # floor check proves this run really interrupted it before activation.
+    docker kill mobius >/dev/null
+    [[ $(floor) == 0 ]] || fail "conversion activated before the interruption; rerun with more history"
   else
     docker stop -t 1 mobius >/dev/null
   fi

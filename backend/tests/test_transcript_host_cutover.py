@@ -105,6 +105,8 @@ def test_exact_transcript_archive_survives_and_old_host_rollback_is_refused(
   monkeypatch.setattr(host, "TRANSACTION", tmp_path / "transaction.json")
   monkeypatch.setattr(host, "restart_ledger", lambda *a, **kw: True)
   monkeypatch.setattr(host, "wait_ready", lambda *a, **kw: ("timeout", None))
+  # No stopped app container is found, so nothing may be started.
+  monkeypatch.setattr(host, "app_container_any", lambda *_: "")
   outcome = host.rollback({"data_dir": str(tmp_path)}, "op", "a" * 40,
                           "health_check_failed", "candidate unhealthy")
   assert outcome == 1

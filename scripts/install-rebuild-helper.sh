@@ -218,6 +218,9 @@ Requires=docker.service
 Type=oneshot
 ExecStart=/usr/local/libexec/mobius-rebuild-host run
 ExecStopPost=/usr/local/libexec/mobius-rebuild-host reconcile
+# Recovery after an interrupted run may restore or restart a container and
+# wait for it; the default 90 s stop limit would cut it off mid-recovery.
+TimeoutStopSec=15min
 EOF
 cat >/etc/systemd/system/mobius-rebuild.path <<EOF
 [Unit]

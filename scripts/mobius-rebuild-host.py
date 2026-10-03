@@ -306,6 +306,14 @@ def compose(config_value: dict, *args: str, image: str | None = None,
     )
 
 
+def inspect_container_image(cid: str) -> str:
+    result = subprocess.run(
+        ["docker", "container", "inspect", "-f", "{{.Image}}", cid],
+        text=True, capture_output=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
 def inspect_image(image: str, template: str) -> str:
     result = subprocess.run(
         ["docker", "image", "inspect", "--format", template, image],
@@ -558,6 +566,32 @@ def read_database_floor(config_value: dict, image: str) -> int:
     raise RollbackRefused("rollback_preflight_failed", verdict or "error=read_failed")
 
 
+def live_database_floor(cid: str) -> int:
+    """The floor as the serving app's own container reads its live database.
+
+    Run as the app user so a WAL read never creates root-owned SQLite files.
+    """
+    result = subprocess.run(
+        ["docker", "exec", "-u", "mobius", cid, "python3", "-I", "-c",
+         FLOOR_PROBE, ROLLBACK_DATABASE],
+        text=True, capture_output=True, timeout=60,
+    )
+    lines = (result.stdout or "").strip().splitlines()
+    verdict = lines[-1] if lines else ""
+    if result.returncode == 0 and re.fullmatch(r"floor=[0-9]+", verdict):
+        return int(verdict[len("floor="):])
+    raise RuntimeError(
+        f"the database compatibility floor could not be read ({verdict or 'no answer'})"
+    )
+
+
+def app_container_any(config_value: dict) -> str:
+    """The app container's ID whether or not it is running ('' if not one)."""
+    result = compose(config_value, "ps", "-a", "-q", "app", check=False)
+    ids = result.stdout.split() if result.returncode == 0 else []
+    return ids[0] if len(ids) == 1 else ""
+
+
 def rollback_preflight(config_value: dict, cid: str) -> None:
     """Refuse to start the rollback image on a database above its level.
 
@@ -720,11 +754,22 @@ def settle_forward(config_value: dict, operation: str, expected: str,
     """
     target = (read_transaction() or {}).get("target_image")
     target = target if isinstance(target, str) and target.startswith("sha256:") else None
-    rearmed = bool(cid) and restart_ledger(
+    # The fenced (or already stopped) container must be exactly the new
+    # release before anything starts it: never start an image below the floor.
+    cid = cid or app_container_any(config_value)
+    image = inspect_container_image(cid) if cid else ""
+    if target is None or image != target:
+        clear_transaction()
+        write_status(config_value, operation_id=operation, state="needs_recovery",
+                     expected_sha=expected, code="newer_version_required",
+                     message=("The previous version cannot run on this database, and "
+                              "the stopped container is not the requested release, so "
+                              f"nothing was started. Original failure: {detail}")[:300])
+        return 1
+    rearmed = restart_ledger(
         config_value, cid, "rearm-cutover", operation, image=target,
     )
-    if cid:
-        subprocess.run(["docker", "start", cid], text=True, capture_output=True)
+    subprocess.run(["docker", "start", cid], text=True, capture_output=True)
     verdict, _payload = wait_ready(config_value, 120)
     if verdict == "ready":
         try:
@@ -751,13 +796,14 @@ def settle_forward(config_value: dict, operation: str, expected: str,
                          message=message, worker_adoption=adopt_from_image(current))
             return 0
     else:
-        failure = f"the new container was not ready ({verdict})"
+        failure = f"the new container did not become ready within 120 seconds ({verdict})"
     clear_transaction()
     write_status(config_value, operation_id=operation, state="needs_recovery",
-                 expected_sha=expected, code="newer_version_required",
-                 message=(f"The previous version cannot run on this database, and "
-                          f"{failure}. Install a newer release. Original failure: "
-                          f"{detail}")[:300])
+                 expected_sha=expected, code="new_version_not_ready",
+                 message=(f"The previous version cannot run on this database, so the "
+                          f"new container was started again, but {failure}. It may "
+                          f"still finish starting; otherwise a newer release is "
+                          f"needed. Original failure: {detail}")[:300])
     return 1
 
 
@@ -1152,6 +1198,20 @@ def run() -> int:
                     worker_adoption=adopt_from_image(digest),
                 )
                 return 0
+            # Never replace the app with an image below the database floor.
+            # Checked before the drain, so a refusal leaves the app untouched.
+            target_level = rollback_image_level(digest)
+            floor = live_database_floor(cid)
+            if target_level < floor:
+                discard_pulled_image(image_ref)
+                write_status(
+                    config_value, operation_id=operation, state="failed",
+                    expected_sha=expected, code="newer_version_required",
+                    message=(f"This database needs compatibility level {floor}; "
+                             f"that release understands only {target_level}. "
+                             "The running version was left unchanged."),
+                )
+                return 1
             subprocess.run(["docker", "tag", previous, ROLLBACK_TAG], check=True,
                            text=True, capture_output=True)
             transaction = transaction_record(operation, expected, nonce,

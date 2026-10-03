@@ -40,8 +40,14 @@ STAND_IN = {
     def platform_update_preview(target_sha=None):
         _record("preview", target_sha)
         return json.loads(os.environ["BRIDGE_PREVIEW"])
+    def activation_changes_python_dependencies(impact):
+        return "python_dependencies" in json.dumps(impact)
+    def image_activates_updates():
+        return os.environ.get("BRIDGE_IMAGE_ACTIVATES", "1") == "1"
     def prepare_reviewed_update(**plan):
         _record("prepare", plan)
+        if os.environ.get("BRIDGE_PREPARE_RAISES"):
+            raise RuntimeError(os.environ["BRIDGE_PREPARE_RAISES"])
         return json.loads(os.environ.get("BRIDGE_PREPARED", '{"state": "prepared", "requires_image": true}'))
   """,
   "deployment_control.py": """
@@ -110,10 +116,10 @@ HELPER = {"code": "host_helper_migration", "paths": ["deployment/self-hosted-hel
 IMAGE = {"code": "image_inputs", "paths": ["Dockerfile"]}
 
 
-def _run(old_release, preview, *, protocol="2", prepared=None):
+def _run(old_release, preview, *, protocol="2", prepared=None, **extra_env):
   backend, repo, target, calls = old_release
   env = {"BRIDGE_REPO": str(repo), "BRIDGE_CALLS": str(calls),
-         "BRIDGE_PREVIEW": json.dumps(preview), "PATH": "/usr/bin:/bin"}
+         "BRIDGE_PREVIEW": json.dumps(preview), "PATH": "/usr/bin:/bin", **extra_env}
   if prepared is not None:
     env["BRIDGE_PREPARED"] = json.dumps(prepared)
   result = subprocess.run(
@@ -186,3 +192,20 @@ def test_installer_finishes_the_update_only_after_the_active_worker_verifies():
   assert "--no-update) FINISH_UPDATE=0" in installer
   # The bridge runs as the app user inside the app, never as host root.
   assert 'docker exec -i -u mobius -w /data/platform/backend "$CID"' in installer
+
+
+def test_refuses_package_changes_an_old_image_cannot_hand_over(old_release):
+  deps = {"code": "python_dependencies", "paths": ["Dockerfile"]}
+  code, out, names, _ = _run(old_release, _preview(
+    old_release[2], ["host_maintenance", "image_rebuild"], [HELPER, deps]),
+    BRIDGE_IMAGE_ACTIVATES="0")
+  assert code == 1 and "Python packages" in out["message"]
+  assert names == ["preview"]
+
+
+def test_a_failing_prepare_is_a_refusal_not_a_traceback(old_release):
+  code, out, names, _ = _run(old_release, _preview(
+    old_release[2], ["host_maintenance", "image_rebuild"], [HELPER, IMAGE]),
+    BRIDGE_PREPARE_RAISES="finish_update_first")
+  assert code == 1 and out["state"] == "refused" and "finish_update_first" in out["message"]
+  assert names == ["preview", "prepare"]

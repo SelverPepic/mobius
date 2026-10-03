@@ -93,13 +93,30 @@ def main(argv: list[str]) -> None:
     if int(required.stdout.strip()) > protocol:
         refuse(f"The release needs helper protocol {required.stdout.strip()}; "
                f"this checkout installed {protocol}. Update the host checkout first.")
+    # The prepared-target path skips the older release's final review, so
+    # apply its Python-package guard here: source that imports packages its
+    # image lacks may run only on an image that can swap it in.
+    changes_packages = getattr(pu, "activation_changes_python_dependencies", None)
+    activates = getattr(pu, "image_activates_updates", None)
+    incoming = preview.get("incoming_activation") or activation
+    if changes_packages is None or activates is None:
+        refuse("This Möbius version is too old to finish the update from the host. "
+               "Move the container first as described in scripts/CONTAINER-REBUILD.md, "
+               "then run the installer again.")
+    if changes_packages(incoming) and not activates():
+        refuse("This update changes Python packages that this version's image cannot "
+               "hand over safely. Move the container first as described in "
+               "scripts/CONTAINER-REBUILD.md, then run the installer again.")
     if preview.get("conflict_paths") or preview.get("blocking_paths"):
         refuse("Local changes overlap this update. Open Settings, choose the update "
                "and let Möbius resolve them; the installed helper then finishes it.")
 
     plan = {key: preview.get(key) for key in
             ("plan_id", "current_sha", "target_sha", "image_digest")}
-    prepared = prepare(**plan)
+    try:
+        prepared = prepare(**plan)
+    except Exception as exc:  # e.g. another update is still unfinished
+        refuse(f"The update could not be prepared: {exc}")
     if not isinstance(prepared, dict) or prepared.get("state") != "prepared":
         refuse("Local changes overlap this update. Open Settings and let Möbius "
                "resolve them; the installed helper then finishes it.")
@@ -117,6 +134,8 @@ def main(argv: list[str]) -> None:
         status = asyncio.run(request(db=db, **plan))
     except deployment_control.DeploymentControlError as exc:
         refuse(f"The helper could not take the update: {exc.message}")
+    except Exception as exc:
+        refuse(f"The helper could not take the update: {exc}")
     finally:
         db.close()
     if not isinstance(status, dict) or status.get("state") not in {"queued", "running"}:
