@@ -466,7 +466,7 @@ async def revoke_browser_access(
       raise
     stop_error = exc
   cleanup_pending = False
-  if grant.kind == "account":
+  if grant.kind == "account" and grant.remote_status != "revoked":
     try:
       response = await _issuer_request(db, owner.id, "DELETE", "/grants/" + quote(grant.id, safe=""))
       if response.status_code not in (200, 204):

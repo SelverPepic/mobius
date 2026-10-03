@@ -157,6 +157,37 @@ def test_account_route_registration_retry_and_revocation_cleanup(client, auth, d
   assert client.get("/api/connect/browser-access", headers=auth).json()["grants"][0]["directory_cleanup_pending"] is True
 
 
+def test_revoke_retry_preserves_confirmed_directory_cleanup_while_stopping_work(client, auth, db, monkeypatch):
+  from app.routes import browser_access as routes, connect
+  owner, grant = _owner_account_grant(db)
+  cleanup_calls = []
+  stops_pending = True
+  async def remote(db, owner_id, method, suffix, payload=None):
+    cleanup_calls.append(suffix)
+    return httpx.Response(204 if len(cleanup_calls) == 1 else 401)
+  monkeypatch.setattr(routes, "_issuer_request", remote)
+  monkeypatch.setattr(connect, "cancel_browser_grant_commands", lambda grant_id:
+    [{"request_id": "fixture-command", "remote_confirmed": False}] if stops_pending else [])
+  path = "/api/connect/browser-access/" + grant.id
+  initial = client.delete(path, headers=auth)
+  assert initial.status_code == 202, initial.text
+  assert initial.json()["directory_cleanup_pending"] is False
+  db.refresh(grant)
+  assert grant.remote_status == "revoked"
+  assert grant.revoked_at is not None
+  # A retry must still report unfinished work without repeating confirmed cleanup.
+  pending = client.delete(path, headers=auth)
+  assert pending.status_code == 202, pending.text
+  assert pending.json()["directory_cleanup_pending"] is False
+  stops_pending = False
+  finished = client.delete(path, headers=auth)
+  assert finished.status_code == 204, finished.text
+  db.refresh(grant)
+  assert grant.remote_status == "revoked"
+  assert grant.revoked_at is not None
+  assert cleanup_calls == ["/grants/" + grant.id]
+
+
 @pytest.mark.parametrize("configured,canonical", [
   ("https://shared.example:443", "https://shared.example"),
   ("https://shared.example:8443", "https://shared.example:8443"),
