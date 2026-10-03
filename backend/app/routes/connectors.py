@@ -496,7 +496,11 @@ async def _open_broker_upstream(
 
 
 def _broker_lineage_active(connector_id: int, snapshot: _BrokerSnapshot) -> bool:
-  """Fresh broker-side check; a copied provider token is never grant authority."""
+  """Fresh broker-side check; a copied provider token is never grant authority.
+
+  Every table read here must be in ``broker_access_signal.ACCESS_TABLES`` so
+  that a committed change to it wakes open exchanges for a recheck.
+  """
   with SessionLocal() as db:
     row = db.get(models.Connector, connector_id)
     if (row is None or not row.enabled or row.status != "ok"
@@ -523,30 +527,37 @@ async def _until_broker_revoked(
   stream costs the event loop nothing. A chunk is forwarded only while the
   last passing check covers the latest access change.
   """
+  loop = asyncio.get_running_loop()
   checked = snapshot.access_revision
+  # The safety deadline moves only after a passing check, so a busy stream
+  # still rechecks out-of-process changes on schedule.
+  recheck_at = loop.time() + _BROKER_OUT_OF_PROCESS_RECHECK_SECONDS
   next_chunk = None
   try:
     while True:
       if next_chunk is None:
         next_chunk = asyncio.create_task(anext(iterator))
       change = asyncio.create_task(broker_access_signal.wait_for_change(
-        checked, timeout=_BROKER_OUT_OF_PROCESS_RECHECK_SECONDS,
+        checked, timeout=max(0.0, recheck_at - loop.time()),
       ))
       try:
-        done, _ = await asyncio.wait(
+        await asyncio.wait(
           {next_chunk, change}, return_when=asyncio.FIRST_COMPLETED,
         )
       finally:
         change.cancel()
         await asyncio.gather(change, return_exceptions=True)
       revision = broker_access_signal.current_revision()
-      if change in done or revision != checked:
+      if revision != checked or loop.time() >= recheck_at:
         if not await asyncio.to_thread(
           _broker_lineage_active, connector_id, snapshot,
         ):
           raise _BrokerRevoked
         checked = revision
+        recheck_at = loop.time() + _BROKER_OUT_OF_PROCESS_RECHECK_SECONDS
         continue
+      if not next_chunk.done():
+        continue  # The wait ended a hair before the deadline; wait again.
       try:
         chunk = next_chunk.result()
       except StopAsyncIteration:

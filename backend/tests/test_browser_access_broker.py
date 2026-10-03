@@ -238,6 +238,15 @@ def test_only_committed_access_changes_wake_open_broker_streams(tmp_path):
     assert bumps(lambda: revoke_grant(db, grant.id, owner.id))
     assert bumps(lambda: (db.delete(connector), db.commit()))
 
+    # Account grants are bound to the owner's mobius.you link, which identity
+    # routes can delete on its own (for example after a remote 401).
+    link = models.IdentityAccountLink(
+      owner_id=owner.id, access_token_encrypted='unused', scopes_json=[],
+    )
+    db.add(link)
+    db.commit()
+    assert bumps(lambda: (db.delete(link), db.commit()))
+
 
 class _LineageProbe:
   """Stands in for the database lineage check and records where it ran."""
@@ -294,3 +303,33 @@ async def test_out_of_process_revocation_is_caught_by_the_safety_recheck(
   probe.active = False  # e.g. an operator script: no in-process commit signal
   with pytest.raises(routes._BrokerRevoked):
     await asyncio.wait_for(anext(stream), timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_busy_stream_still_runs_the_out_of_process_safety_recheck(
+  monkeypatch,
+):
+  monkeypatch.setattr(routes, '_BROKER_OUT_OF_PROCESS_RECHECK_SECONDS', 0.05)
+  probe = _LineageProbe()
+
+  async def chunks():
+    while True:
+      yield b'tick'
+      await asyncio.sleep(0.005)  # far more often than the safety interval
+
+  snapshot = routes._BrokerSnapshot(
+    url='https://unused.example/mcp', auth_header=None, secret=None,
+    connector_id=7, generation='x' * 64,
+    access_revision=broker_access_signal.current_revision(),
+  )
+  monkeypatch.setattr(routes, '_broker_lineage_active', probe)
+  stream = routes._until_broker_revoked(chunks(), 7, snapshot)
+  assert await anext(stream) == b'tick'
+  probe.active = False  # revoked out of process: no in-process commit signal
+
+  async def drain():
+    async for _ in stream:
+      pass
+
+  with pytest.raises(routes._BrokerRevoked):
+    await asyncio.wait_for(drain(), timeout=2)

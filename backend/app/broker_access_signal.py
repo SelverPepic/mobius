@@ -1,8 +1,9 @@
 """Wake open MCP broker exchanges only when their access may have changed.
 
-A brokered MCP exchange can stream for minutes. Its access depends on three
+A brokered MCP exchange can stream for minutes. Its access depends on four
 kinds of rows: the connection itself (enabled, healthy, same generation), the
-owner's sign-in epoch, and, for a shared browser, one browser grant. Polling
+owner's sign-in epoch, and, for a shared browser, one browser grant plus the
+owner's mobius.you account link that an account grant is bound to. Polling
 those rows per open stream costs a database query every tick on the event
 loop, so instead every committed session write that touches one of those
 tables advances one in-process revision. An open exchange waits on that
@@ -25,10 +26,13 @@ from sqlalchemy.orm import Session
 from app import models
 from app.browser_access import BrowserAccessGrant
 
+# Every table the broker lineage check reads must be listed here, or a change
+# to it would go unseen until the slow safety recheck.
 ACCESS_TABLES = frozenset({
   models.Connector.__tablename__,
   models.Owner.__tablename__,
   BrowserAccessGrant.__tablename__,
+  models.IdentityAccountLink.__tablename__,
 })
 _PENDING_KEY = "mobius_broker_access_changed"
 
