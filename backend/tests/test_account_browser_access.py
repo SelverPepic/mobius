@@ -5,6 +5,7 @@ from urllib.parse import parse_qs, urlsplit
 import httpx
 import pytest
 from fastapi import HTTPException
+from starlette.requests import Request
 
 from app import account_browser_access as account, browser_access as access, models
 from app.config import get_settings
@@ -154,6 +155,74 @@ def test_account_route_registration_retry_and_revocation_cleanup(client, auth, d
   assert response.json()["directory_cleanup_pending"] is True
   assert db.get(access.BrowserAccessGrant, grant_id).revoked_at is not None
   assert client.get("/api/connect/browser-access", headers=auth).json()["grants"][0]["directory_cleanup_pending"] is True
+
+
+@pytest.mark.parametrize("configured,canonical", [
+  ("https://shared.example:443", "https://shared.example"),
+  ("https://shared.example:8443", "https://shared.example:8443"),
+])
+def test_account_registration_pins_canonical_https_origin(
+  client, auth, db, monkeypatch, configured, canonical,
+):
+  from app.routes import browser_access as routes
+  monkeypatch.setattr(get_settings(), "frontend_origin", configured)
+  owner = db.query(models.Owner).one()
+  db.add(models.IdentityAccountLink(owner_id=owner.id,
+    access_token_encrypted="fixture-token-ciphertext", scopes_json=[]))
+  db.commit()
+  async def remote(db, owner_id, method, suffix, payload=None):
+    assert method == "POST" and suffix == "/grants"
+    return httpx.Response(200, json={
+      "issuer": account.issuer_origin(), "grant_id": payload["grant_id"],
+      "origin": canonical, "handle": "alice", "subject": "user_alice",
+    })
+  monkeypatch.setattr(routes, "_issuer_request", remote)
+  client.base_url = canonical
+  response = client.post("/api/connect/browser-access/accounts", headers={
+    **auth, "Origin": canonical, "Sec-Fetch-Site": "same-origin",
+  }, json={"recipient_handle": "alice"})
+  assert response.status_code == 200, response.text
+  grant = db.get(access.BrowserAccessGrant, response.json()["grant"]["id"])
+  assert grant.origin == canonical
+  assert access.validate_grant(db, grant.id, grant.epoch, owner.id).id == grant.id
+  monkeypatch.setattr(get_settings(), "frontend_origin", canonical)
+  assert access.validate_grant(db, grant.id, grant.epoch, owner.id).id == grant.id
+
+
+@pytest.mark.parametrize("configured,canonical", [
+  ("https://shared.example:443", "https://shared.example"),
+  ("https://shared.example:8443", "https://shared.example:8443"),
+])
+def test_cookie_origin_accepts_only_same_canonical_https_origin(monkeypatch, configured, canonical):
+  from app.routes import browser_access as routes
+  monkeypatch.setattr(get_settings(), "frontend_origin", configured)
+  def request(origin):
+    return Request({"type": "http", "headers": [(b"origin", origin.encode())]})
+  routes._cookie_request(request(canonical))
+  routes._cookie_request(request(configured))
+  wrong_port = "https://shared.example:8443" if canonical.endswith("shared.example") else "https://shared.example"
+  for foreign in (wrong_port, "https://other.example",
+                  "http://shared.example", "https://shared.example@evil.example",
+                  "https://shared.example/path", "https://shared.example?x=1",
+                  "https://shared.example#fragment", "https://shared.example:bad"):
+    with pytest.raises(HTTPException) as error:
+      routes._cookie_request(request(foreign))
+    assert error.value.status_code == 403
+
+
+@pytest.mark.parametrize("invalid", [
+  "https://user@shared.example", "https://shared.example/path",
+  "https://shared.example?x=1", "https://shared.example#fragment",
+  "https://shared.example?", "https://shared.example#",
+  "https://shared.example:bad", "https://shared.example:65536",
+  "https://sh%61red.example", "https://shared.example\\@evil.example",
+])
+def test_account_origin_rejects_unsafe_config(monkeypatch, invalid):
+  from app.routes import browser_access as routes
+  monkeypatch.setattr(get_settings(), "frontend_origin", invalid)
+  with pytest.raises(HTTPException) as error:
+    routes._origin()
+  assert error.value.status_code == 409
 
 
 def test_callback_requires_same_origin_finalize_and_redirects_without_code(client, db, monkeypatch):

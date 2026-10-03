@@ -157,11 +157,16 @@ def _check_account_binding(db: Session, grant: BrowserAccessGrant) -> None:
     settings.mobius_sso_issuer if settings.mobius_sso_enabled
     else settings.mobius_account_origin
   ).rstrip("/")
+  from app.routes.browser_access import _origin
+  try:
+    current_origin = _origin()
+  except HTTPException as exc:
+    raise _unauthorized() from exc
   if (
     not grant.grantor_binding
     or grant.grantor_binding != account_binding(db, grant.owner_id)
     or grant.issuer != current_issuer
-    or grant.origin != settings.frontend_origin.rstrip("/")
+    or grant.origin != current_origin
   ):
     raise _unauthorized()
 

@@ -101,17 +101,40 @@ def _remote_json(response: httpx.Response, *, allowed=(200, 201)) -> dict:
 
 
 def _origin() -> str:
-  origin = get_settings().frontend_origin.rstrip("/")
-  parsed = urlsplit(origin)
-  if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
-    raise HTTPException(409, "Browser sharing requires a directly reachable HTTPS address.")
-  return origin
+  try:
+    return _canonical_https_origin(get_settings().frontend_origin)
+  except ValueError as exc:
+    raise HTTPException(409, "Browser sharing requires a directly reachable HTTPS address.") from exc
+
+
+def _canonical_https_origin(value: str) -> str:
+  """Pin browser grants to the same serialized HTTPS origin as browsers use."""
+  if (not isinstance(value, str) or value != value.strip()
+      or any(ord(char) <= 32 for char in value)
+      or any(char in value for char in ("?", "#", "\\", "%"))):
+    raise ValueError("invalid origin")
+  parsed = urlsplit(value)
+  if (parsed.scheme != "https" or not parsed.hostname or parsed.username is not None
+      or parsed.password is not None or parsed.path not in ("", "/")
+      or parsed.query or parsed.fragment):
+    raise ValueError("invalid origin")
+  port = parsed.port  # Also rejects malformed or out-of-range ports.
+  if port == 0 or parsed.netloc.endswith(":"):
+    raise ValueError("invalid port")
+  host = parsed.hostname
+  if ":" in host:
+    host = "[" + host + "]"
+  return "https://" + host + (f":{port}" if port and port != 443 else "")
 
 
 def _cookie_request(request: Request) -> None:
   # Cookie-bearing session renewal must be same ORIGIN, not merely same site.
   # The app's opaque-frame bearer exception does not authorize these cookies.
-  if request.headers.get("origin") != _origin():
+  try:
+    same_origin = _canonical_https_origin(request.headers.get("origin")) == _origin()
+  except ValueError:
+    same_origin = False
+  if not same_origin:
     raise HTTPException(403, "Open this invitation on the receiving Möbius address.")
 
 
