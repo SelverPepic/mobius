@@ -11,6 +11,7 @@ import sqlite3
 import subprocess
 import sys
 
+import pytest
 from sqlalchemy import create_engine
 
 from app import one_way_upgrades as upgrades
@@ -26,6 +27,20 @@ def _host():
     "private_transcript_host", ROOT / "scripts/mobius-rebuild-host.py")
   module = importlib.util.module_from_spec(spec)
   spec.loader.exec_module(module)
+  return module
+
+
+def _historical_host(tmp_path):
+  """Load the committed prior worker, without copying a fake implementation."""
+  source = subprocess.run(
+    ["git", "show", "36c0ce1016:scripts/mobius-rebuild-host.py"],
+    cwd=ROOT, capture_output=True, check=True).stdout
+  path = tmp_path / "worker-revision-2.py"
+  path.write_bytes(source)
+  spec = importlib.util.spec_from_file_location("private_prior_host_worker", path)
+  module = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(module)
+  assert module.WORKER_REVISION == 2
   return module
 
 
@@ -91,3 +106,34 @@ def test_exact_transcript_archive_survives_and_old_host_rollback_is_refused(
   assert not any(isinstance(event, tuple) and "up" in event[1] for event in events)
   assert events[-1]["state"] == "needs_recovery"
   assert events[-1]["code"] == "newer_version_required"
+
+
+@pytest.mark.xfail(
+  strict=True,
+  reason="Known first-upgrade defect: installed 36c0ce1016 worker REV2 has no rollback floor preflight",
+)
+def test_installed_prior_worker_must_not_start_level_zero_after_activation(
+    tmp_path, monkeypatch):
+  """Red until a floor-aware worker is active *before* the first level-1 gate.
+
+  The previous release's real worker (not the candidate REV3 worker) performs
+  the first replacement. Its Docker boundary is mocked, but the gate and
+  SQLite floor probe are real. No host/container side effects occur.
+  """
+  path, _raw, seen = _legacy(tmp_path)
+  upgrades.run_gate(str(path), seen.existing_tables)
+  prior = _historical_host(tmp_path)
+  # REV2 has no FLOOR_PROBE; use the current identical host-side probe solely
+  # to establish the disposable DB's activated floor before invoking REV2.
+  assert _floor(_host(), path) == 1
+  calls = []
+  monkeypatch.setattr(prior, "write_status", lambda *a, **kw: None)
+  monkeypatch.setattr(prior, "app_container", lambda *_: ("failed-candidate", "sha256:candidate"))
+  monkeypatch.setattr(prior, "restart_ledger", lambda *a, **kw: True)
+  monkeypatch.setattr(prior, "compose", lambda *a, **kw: calls.append(a) or None)
+  monkeypatch.setattr(prior, "wait_healthy", lambda *a, **kw: False)
+  prior.rollback({"data_dir": str(tmp_path)}, "operation", "a" * 40,
+                 "health_check_failed", "candidate failed", "sha256:previous")
+  assert not any("up" in args and "--force-recreate" in args for args in calls), (
+    "installed REV2 worker attempted to start its level-0 rollback image after floor 1"
+  )

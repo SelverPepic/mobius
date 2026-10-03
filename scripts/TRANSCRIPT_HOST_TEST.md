@@ -13,7 +13,12 @@ transcript gate, compares both normalized messages and the byte-exact preserved
 legacy archive, executes the Host's exact floor probe, and checks that its
 rollback policy refuses a level-0 image after activation without Compose `up`.
 The Docker image probes and app fencing are simulated; this is **not** evidence
-that a real worker, mounted volume, or systemd unit works.
+that a real worker, mounted volume, or systemd unit works. A second test loads
+the **exact committed previous worker** (`36c0ce1016`, revision 2) through
+`git show`, activates a real disposable level-1 database, and checks that the
+worker must not Compose-up its level-0 rollback image. It is a **strict
+expected failure**: that historical worker has no floor-aware rollback.
+One pass plus one xfail is *not* a deployment pass.
 
 On a **fresh disposable systemd/Docker host**, the read-only preflight is
 `scripts/test-transcript-host-cutover.sh <candidate-full-sha> <local-image>`.
@@ -60,11 +65,20 @@ disposable systemd host are prerequisites for the real worker test. ARM64
 Host-worker proof additionally needs explicit architecture support in the
 production installer/worker; this task does not change them.
 
-When those prerequisites exist, the host test must: start a level-0 image on
-fresh data; create an owner/service token and noncanonical duplicate-ID chat
-fixture; install the helper from that image's checkout; request the level-1
-image through the app inbox; verify the **container ID changed**, served SHA,
-worker adoption, exact `chat_messages` order and archive bytes, and floor 1;
+**First-upgrade blocker:** `36c0ce1016` installs worker revision 2. It runs
+the first level-0→1 replacement and, on failure or interrupted recovery,
+unconditionally tries to recreate the old image; candidate revision 3 is
+offered only after the replacement is healthy. Candidate adoption therefore
+cannot protect the first activation. A floor-aware worker must be active
+**before** the gate can raise the floor. Verify the installed active worker's
+revision **and byte hash** against reviewed source, not just the candidate
+image's worker. Do not mark readiness green while the strict xfail persists.
+
+When that prerequisite is addressed, the host test must: start a level-0
+image on fresh data; create an owner/service token and noncanonical duplicate-ID
+chat fixture; install the floor-aware helper before activation; request the
+level-1 image through the app inbox; verify the **container ID changed**,
+served SHA, exact `chat_messages` order and archive bytes, and floor 1;
 then, in a **separate fresh fixture**, inject a candidate failure *after its
 gate activates but before the worker declares health* and prove the actual
 worker reports `needs_recovery/newer_version_required` without starting the
