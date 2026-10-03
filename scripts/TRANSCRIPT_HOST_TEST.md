@@ -34,13 +34,27 @@ and an isolated, throwaway disk/volume. From the **candidate commit**:
 ```sh
 SHA=$(git rev-parse HEAD)
 DATE=$(git show -s --format=%cs HEAD)
+BASE=36c0ce1016df68a379bbebaed91993606298d33c
+# Use the existing local-source provenance path for an unpushed candidate.
+# Default Docker builds fetch BUILD_SHA from GitHub and cannot see private Git.
+CONTEXT=$(mktemp -d)
+trap 'rm -rf "$CONTEXT"' EXIT
+git diff --quiet HEAD && test -z "$(git ls-files --others --exclude-standard)"
+git bundle create "$CONTEXT/platform.bundle" HEAD "^$BASE"
 docker buildx build --platform linux/arm64 --load \
   --build-arg BUILD_SHA="$SHA" --build-arg BUILD_DATE="$DATE" \
+  --build-arg MOBIUS_USE_LOCAL_PLATFORM_SOURCE=1 \
+  --build-arg MOBIUS_LOCAL_PLATFORM_SHA="$SHA" \
+  --build-arg MOBIUS_LOCAL_PLATFORM_BASE_SHA="$BASE" \
+  --build-arg MOBIUS_LOCAL_PLATFORM_DATE="$DATE" \
+  --build-context "mobius-local-platform-source=$CONTEXT" \
   -t "mobius-transcript-private:sha-$SHA" .
 scripts/test-transcript-host-cutover.sh "$SHA" "mobius-transcript-private:sha-$SHA"
 scripts/wt-pytest.sh backend/tests/test_transcript_host_cutover.py -q
 ```
 
+The bundle stays private and goes only to this local build. The image build
+uses the existing exact-SHA/base proof; no image or Git branch is pushed.
 These commands validate the **local ARM64 image identity and isolated policy
 test only**. They do not invoke a public workflow or push. A local `docker
 compose up` of the candidate on a disposable database can additionally probe
