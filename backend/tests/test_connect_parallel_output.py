@@ -75,7 +75,7 @@ def _post_output(host_id, request_id, chunks):
   connect_routes.connect_output.append(
     host_id, request_id, [chunk.model_dump() for chunk in chunks],
   )
-  command.output.notify()
+  command.notify()
 
 
 @pytest.mark.asyncio
@@ -210,10 +210,10 @@ async def test_missing_output_stays_visible_as_a_sequence_jump(client, auth):
 
 
 def test_live_output_notification_keeps_no_duplicate_chunks():
-  log = connect_routes._OutputLog()
-  log.notify()
-  assert not hasattr(log, "chunks")
-  assert not hasattr(log, "read")
+  command = connect_routes._ActiveCommand("a" * 16, 60, cmd="true")
+  command.notify()
+  assert not hasattr(command, "chunks")
+  assert not hasattr(command, "output")
 
 
 @pytest.mark.asyncio
@@ -246,7 +246,7 @@ async def test_reconnect_reconciles_every_command_the_runner_reports(
 
   replacement = connect_routes._Channel()
   connect_routes._replace_channel(host_id, replacement)
-  await connect_routes._reconcile_runner(host_id, replacement, {
+  connect_routes._reconcile_runner(host_id, {
     "active_request_ids": ["6" * 16, "8" * 16],
     "pending_result_ids": [],
   })

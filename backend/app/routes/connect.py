@@ -56,7 +56,6 @@ import io
 import math
 import sqlite3
 import json
-import re
 import secrets
 import time
 from hashlib import sha256
@@ -131,14 +130,10 @@ def _hosts_dir() -> Path:
   return d
 
 
-_HOST_ID_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]{0,63}")
-
-
 def _host_path(host_id: str) -> Path:
-  # host ids are minted by _new_id() ("h_" + 16 hex), so anything outside a
-  # short safe filename is not a host: this also keeps an overlong id from
-  # reaching the filesystem, where it fails as ENAMETOOLONG (HTTP 500).
-  if not _HOST_ID_RE.fullmatch(host_id or ""):
+  # Host ids are minted by _new_id(). Anything else is not a host, and is
+  # refused before it can reach the filesystem.
+  if not connect_output.HOST_ID_RE.fullmatch(host_id or ""):
     raise HTTPException(status_code=400, detail="Invalid host id.")
   return _hosts_dir() / f"{host_id}.json"
 
@@ -161,6 +156,9 @@ def _save_host(host: dict) -> None:
 def _list_hosts() -> list[dict]:
   out: list[dict] = []
   for p in sorted(_hosts_dir().glob("*.json")):
+    # A stray file is not a host; it must not break every host listing.
+    if not connect_output.HOST_ID_RE.fullmatch(p.stem):
+      continue
     try:
       out.append(json.loads(p.read_text("utf-8")))
     except (OSError, ValueError):
@@ -233,25 +231,19 @@ class _Channel:
     self.queue: asyncio.Queue[dict] = asyncio.Queue()
     self.control_pending: dict[str, asyncio.Future] = {}
     self.closed = asyncio.Event()
-    self.connected_at = _now()
 
-
-class _OutputLog:
-  """Only a notification event; chunks have one authoritative disk owner."""
-
-  def __init__(self) -> None:
-    self._changed = asyncio.Event()
-
-  def notify(self) -> None:
-    self._changed.set()
-    self._changed = asyncio.Event()
-
-  async def wait_for_change(self, timeout: float) -> None:
-    changed = self._changed
-    try:
-      await asyncio.wait_for(changed.wait(), timeout=timeout)
-    except asyncio.TimeoutError:
-      pass
+  def close(self) -> None:
+    """End this transport; a waiting disconnect learns it went unconfirmed."""
+    for fut in self.control_pending.values():
+      if not fut.done():
+        fut.set_result({
+          "exit_code": 1,
+          "stderr": (
+            "The machine’s connection closed before it confirmed that its "
+            "daemon stopped."
+          ),
+        })
+    self.closed.set()
 
 
 def _command_label(cmd: str | None, script: str | None) -> str | None:
@@ -275,7 +267,12 @@ def _command_label(cmd: str | None, script: str | None) -> str | None:
 
 
 class _ActiveCommand:
-  """One command owned by a paired host across transport reconnects."""
+  """One command owned by a paired host across transport reconnects.
+
+  Everyone waiting on it (the exec caller, a retried caller, output long-polls)
+  sleeps on one change notification and then re-reads the command: it
+  started, printed output, or finished with `result`.
+  """
 
   def __init__(
     self,
@@ -296,7 +293,6 @@ class _ActiveCommand:
     browser_owner_id: int | None = None,
     browser_owner_token_epoch: int | None = None,
   ) -> None:
-    loop = asyncio.get_running_loop()
     self.request_id = request_id
     self.timeout = timeout
     self.cmd = cmd
@@ -314,12 +310,25 @@ class _ActiveCommand:
     self.browser_grant_epoch = browser_grant_epoch
     self.browser_owner_id = browser_owner_id
     self.browser_owner_token_epoch = browser_owner_token_epoch
-    self.started = asyncio.Event()
-    if started_at is not None:
-      self.started.set()
-    self.result: asyncio.Future = loop.create_future()
-    self.output = _OutputLog()
+    # The public final result, set once when the command finishes.
+    self.result: dict | None = None
+    self._changed = asyncio.Event()
     self.label = _command_label(cmd, script)
+
+  def notify(self) -> None:
+    self._changed.set()
+    self._changed = asyncio.Event()
+
+  async def wait_for_change(self, timeout: float) -> None:
+    try:
+      await asyncio.wait_for(self._changed.wait(), timeout=max(0.01, timeout))
+    except asyncio.TimeoutError:
+      pass
+
+  def finish(self, result: dict) -> None:
+    if self.result is None:
+      self.result = result
+    self.notify()
 
   @classmethod
   def from_record(cls, record: dict) -> _ActiveCommand:
@@ -392,15 +401,20 @@ class _ActiveCommand:
     return event
 
 
-def _active_public(command: _ActiveCommand) -> dict:
-  return {
-    "id": command.request_id,
-    "state": command.state,
-    "created_at": command.created_at,
-    "started_at": command.started_at,
-    "timeout": command.timeout,
-    "label": command.label,
-  }
+def _active_public(host_id: str) -> list[dict]:
+  return [
+    {
+      "id": command.request_id,
+      "state": command.state,
+      "created_at": command.created_at,
+      "started_at": command.started_at,
+      "timeout": command.timeout,
+      "label": command.label,
+    }
+    for command in sorted(
+      _host_commands(host_id).values(), key=lambda item: item.created_at,
+    )
+  ]
 
 
 def _ledger_read(operation, *args):
@@ -453,10 +467,10 @@ def _mark_command_started(host_id: str, request_id: str) -> bool:
     return False
   if command.started_at is None:
     command.started_at = _now()
-    command.started.set()
   if command.state != "canceling":
     command.state = "running"
   _persist_commands(host_id)
+  command.notify()
   return True
 
 
@@ -471,8 +485,6 @@ def _finish_command(host_id: str, request_id: str, result: dict) -> bool:
   connect_output.finish(host_id, request_id, command.fingerprint,
                         finished_at, output_seq, public_result)
   _host_commands(host_id).pop(request_id, None)
-  if not command.result.done():
-    command.result.set_result(public_result)
   host = _load_host(host_id)
   if host is not None:
     host["active_commands"] = [
@@ -484,7 +496,7 @@ def _finish_command(host_id: str, request_id: str, result: dict) -> bool:
     # into a growing JSON file that every state transition must rewrite.
     host.pop("last_command", None)
     _save_host(host)
-  command.output.notify()
+  command.finish(public_result)
   return True
 
 
@@ -501,23 +513,45 @@ def _finish_command_as_lost(
   })
 
 
-async def _request_command_cancel(
+def _send_to_runner(host_id: str, event: dict) -> None:
+  channel = _channels.get(host_id)
+  if channel is not None:
+    channel.queue.put_nowait(event)
+
+
+_UNSTARTED_ENDINGS = {
+  "canceled": ("command canceled before it started", 130),
+  "expired": ("command expired before the runner confirmed it started", 124),
+}
+
+
+def _finish_unstarted(
+  host_id: str, command: _ActiveCommand, outcome: str = "canceled",
+) -> None:
+  stderr, exit_code = _UNSTARTED_ENDINGS[outcome]
+  _finish_command(host_id, command.request_id, {
+    "stderr": stderr, "exit_code": exit_code, "outcome": outcome,
+  })
+
+
+def _cancel_command(
   host_id: str,
   command: _ActiveCommand,
-) -> bool:
-  ch = _channels.get(host_id)
-  host = _load_host(host_id)
-  if ch is None and (
-    int((host or {}).get("runner_protocol") or 0) != _RUNNER_PROTOCOL_VERSION
-    or (host or {}).get("runner_transport") != "sse"
-  ):
-    return False
-  if command.state != "canceling":
+  unstarted_outcome: str = "canceled",
+) -> None:
+  """Ask the runner to stop one command.
+
+  A runner confirms a start (POST /state) before it spawns anything, and
+  abandons the spawn when that confirmation is refused. A command it has not
+  confirmed can therefore never begin later, so it finishes here at once. A
+  started command stays `canceling` until the runner reports how it ended.
+  """
+  if command.started_at is None:
+    _finish_unstarted(host_id, command, unstarted_outcome)
+  elif command.state != "canceling":
     command.state = "canceling"
     _persist_commands(host_id)
-  if ch is not None:
-    await ch.queue.put({"type": "cancel", "request_id": command.request_id})
-  return True
+  _send_to_runner(host_id, {"type": "cancel", "request_id": command.request_id})
 
 
 def browser_grant_pending_commands(grant_id: str) -> list[dict]:
@@ -532,37 +566,27 @@ def browser_grant_pending_commands(grant_id: str) -> list[dict]:
 
 
 def cancel_browser_grant_commands(grant_id: str) -> list[dict]:
-  """Request cancellation of only this grant's active commands.
+  """Stop only this grant's active commands; return those still unfinished.
 
-  Returns unfinished commands, never a claim that a remote stop succeeded.
-  The canceling state survives restart and reconnect; offline commands are
-  deliberately not forgotten or replayed as fresh execs.
+  Never a claim that a remote stop succeeded. The canceling state survives
+  restart and reconnect; offline commands are not forgotten or replayed.
   """
   if not isinstance(grant_id, str) or not grant_id:
     return []
   pending: list[dict] = []
   for host in _list_hosts():
     host_id = host["id"]
-    changed = False
-    for command in _host_commands(host_id).values():
+    for command in list(_host_commands(host_id).values()):
       if command.browser_grant_id != grant_id:
         continue
-      if command.state != "canceling":
-        command.state = "canceling"
-        changed = True
-      channel = _channels.get(host_id)
-      if channel is not None:
-        channel.queue.put_nowait({
-          "type": "cancel", "request_id": command.request_id,
+      _cancel_command(host_id, command)
+      if command.result is None:
+        pending.append({
+          "host_id": host_id,
+          "request_id": command.request_id,
+          "state": command.state,
+          "remote_confirmed": False,
         })
-      pending.append({
-        "host_id": host_id,
-        "request_id": command.request_id,
-        "state": "canceling",
-        "remote_confirmed": False,
-      })
-    if changed:
-      _persist_commands(host_id)
   return pending
 
 
@@ -810,12 +834,7 @@ def _public_host(host: dict) -> dict:
   """Registry view safe to hand to the owner/app (no token hash)."""
   ch = _channels.get(host["id"])
   _prune_recent_commands(host)
-  active = [
-    _active_public(command)
-    for command in sorted(
-      _host_commands(host["id"]).values(), key=lambda item: item.created_at,
-    )
-  ]
+  active = _active_public(host["id"])
   runner_protocol = (
     _RUNNER_PROTOCOL_VERSION if ch is not None
     else host.get("runner_protocol")
@@ -918,13 +937,14 @@ def _recent_command(host: dict, request_id: str) -> dict | None:
 def _forget_host(host_id: str) -> None:
   ch = _channels.pop(host_id, None)
   if ch is not None:
-    for fut in ch.control_pending.values():
-      if not fut.done():
-        fut.cancel()
+    ch.close()
+  # Every waiter still gets an answer; the host's history goes with it.
   for command in (_commands.pop(host_id, None) or {}).values():
-    if not command.result.done():
-      command.result.cancel()
-    command.output.notify()
+    command.finish(_format_result(command.request_id, {
+      "stderr": "the machine was removed from Connect",
+      "exit_code": 125,
+      "outcome": "lost",
+    }))
   _host_path(host_id).unlink(missing_ok=True)
   connect_output.delete_host(host_id)
 
@@ -964,28 +984,16 @@ async def _await_command_result(
   command: _ActiveCommand,
 ) -> dict:
   begins_at = command.started_at or command.created_at
-  remaining = max(
-    0.01,
-    begins_at + command.timeout + _RESULT_GRACE_SECONDS - _now(),
-  )
-  try:
-    return await asyncio.wait_for(
-      asyncio.shield(command.result), timeout=remaining,
-    )
-  except asyncio.TimeoutError:
-    cancel_sent = await _request_command_cancel(host_id, command)
-    detail = "The command timed out and Connect asked the machine to stop it."
-    if not cancel_sent:
-      _finish_command_as_lost(
-        host_id,
-        command.request_id,
-        "runner did not report a final result before its reporting grace elapsed",
+  deadline = begins_at + command.timeout + _RESULT_GRACE_SECONDS
+  while command.result is None:
+    if _now() >= deadline:
+      _cancel_command(host_id, command)
+      raise HTTPException(
+        status_code=504,
+        detail="The command timed out and Connect asked the machine to stop it.",
       )
-      detail = (
-        "The command timed out, but this machine’s runner is too old to stop "
-        "it remotely. Update the runner in Connect."
-      )
-    raise HTTPException(status_code=504, detail=detail)
+    await command.wait_for_change(deadline - _now())
+  return command.result
 
 
 @router.post(
@@ -1252,33 +1260,27 @@ async def exec_on_host(
   )
   commands[request_id] = command
   _persist_commands(host_id)
-  await ch.queue.put(command.event())
-  try:
-    try:
-      await asyncio.wait_for(
-        command.started.wait(), timeout=_START_ACK_TIMEOUT,
-      )
-    except asyncio.TimeoutError:
-      await _request_command_cancel(host_id, command)
-      _finish_command(host_id, request_id, {
-        "stdout": "",
-        "stderr": "command expired before the runner confirmed it started",
-        "exit_code": 124,
-        "outcome": "expired",
-      })
+  ch.queue.put_nowait(command.event())
+  # HTTP caller lifetime and command lifetime are deliberately independent.
+  # `mach` sends an explicit cancel request on Ctrl-C; an edge timeout or
+  # backend shutdown must not silently kill remote work.
+  while command.started_at is None and command.result is None:
+    if _now() >= not_after:
+      _cancel_command(host_id, command, unstarted_outcome="expired")
       return _connect_error(
         504, "The machine did not start the command before it expired.",
         "command_expired",
       )
-    # Execution time belongs to the runner and begins only after its start ack.
+    await command.wait_for_change(not_after - _now())
+  if command.result is not None:
+    # It ended before it started: canceled, or its machine was removed.
     if body.stream:
-      return _started_response(command)
-    return await _await_command_result(host_id, command)
-  except asyncio.CancelledError:
-    # HTTP caller lifetime and command lifetime are deliberately independent.
-    # `mach` sends an explicit cancel request on Ctrl-C; an edge timeout or
-    # backend shutdown must not silently kill remote work.
-    raise
+      return {"request_id": request_id, "state": "finished"}
+    return command.result
+  # Execution time belongs to the runner and begins only after its start ack.
+  if body.stream:
+    return _started_response(command)
+  return await _await_command_result(host_id, command)
 
 
 @router.get("/hosts/{host_id}/commands")
@@ -1290,13 +1292,10 @@ async def list_host_commands(
   if host is None:
     raise HTTPException(status_code=404, detail="No such host.")
   _prune_recent_commands(host)
-  running = [
-    _active_public(command)
-    for command in sorted(
-      _host_commands(host_id).values(), key=lambda item: item.created_at,
-    )
-  ]
-  return {"running": running, "recent": _ledger_read(connect_output.recent, host_id)}
+  return {
+    "running": _active_public(host_id),
+    "recent": _ledger_read(connect_output.recent, host_id),
+  }
 
 
 @router.get("/hosts/{host_id}/commands/{request_id}/output")
@@ -1319,32 +1318,29 @@ async def read_command_output(
   deadline = _now() + max(0.0, min(float(wait), _MAX_OUTPUT_WAIT_SECONDS))
   while True:
     command = _find_command(host_id, request_id)
-    entry = _ledger_read(connect_output.finished, host_id, request_id)
+    entry, page, complete = _ledger_read(
+      connect_output.view, host_id, request_id, after,
+    )
     if command is None and entry is None:
       # Move still-retained legacy terminal metadata before its short cache
       # expires. The ledger then owns it indefinitely.
       _prune_recent_commands(host)
-      entry = _ledger_read(connect_output.finished, host_id, request_id)
+      entry, page, complete = _ledger_read(
+        connect_output.view, host_id, request_id, after,
+      )
     if command is None and entry is None:
       raise HTTPException(status_code=404, detail="Connect has no command with that id.")
-    view = _ledger_read(connect_output.page, host_id, request_id, after)
-    if command is None or view["chunks"] or _now() >= deadline:
-      expected = entry.get("output_seq") if entry else None
+    if command is None or page["chunks"] or _now() >= deadline:
+      result = entry["result"] if entry else None
       return {
         "request_id": request_id,
         "state": command.state if command is not None else "finished",
-        **view,
-        "result": entry.get("result") if entry else None,
-        "output_seq": expected,
-        "output_complete": (
-          _ledger_read(connect_output.complete, host_id, request_id, expected)
-          and not (entry["result"] or {}).get("output_error")
-          if entry else False
-        ),
+        **page,
+        "result": result,
+        "output_seq": entry["output_seq"] if entry else None,
+        "output_complete": complete and not (result or {}).get("output_error"),
       }
-    await command.output.wait_for_change(
-      max(0.01, min(_HEARTBEAT_SECONDS, deadline - _now())),
-    )
+    await command.wait_for_change(min(_HEARTBEAT_SECONDS, deadline - _now()))
 
 
 @router.post("/hosts/{host_id}/commands/{request_id}/cancel")
@@ -1359,14 +1355,9 @@ async def cancel_host_command(
   command = _find_command(host_id, request_id)
   if command is None:
     raise HTTPException(status_code=404, detail="That command is no longer running.")
-  if not await _request_command_cancel(host_id, command):
-    return _connect_error(
-      409,
-      "This machine’s runner must be updated before commands can be stopped "
-      "remotely. The current command is still running.",
-      "runner_update_required",
-    )
-  return {"ok": True, "request_id": request_id, "state": command.state}
+  _cancel_command(host_id, command)
+  state = "finished" if command.result is not None else command.state
+  return {"ok": True, "request_id": request_id, "state": state}
 
 
 def _cap_stream(text: str) -> tuple[str, bool]:
@@ -1405,10 +1396,7 @@ def _format_result(request_id: str, result: dict) -> dict:
 def _replace_channel(host_id: str, ch: _Channel) -> None:
   old = _channels.get(host_id)
   if old is not None:
-    for fut in old.control_pending.values():
-      if not fut.done():
-        fut.cancel()
-    old.closed.set()
+    old.close()
   _channels[host_id] = ch
 
 
@@ -1437,12 +1425,8 @@ def _runner_result(host_id: str, body: ResultBody) -> None:
   })
 
 
-async def _reconcile_runner(
-  host_id: str,
-  ch: _Channel,
-  hello: dict,
-) -> None:
-  """Join one runner's local state to the durable host-owned commands."""
+def _reconcile_runner(host_id: str, hello: dict) -> None:
+  """Join a newly connected runner's local state to the host-owned commands."""
   runner_active = {
     str(item) for item in (hello.get("active_request_ids") or []) if item
   }
@@ -1450,14 +1434,10 @@ async def _reconcile_runner(
     str(item) for item in (hello.get("pending_result_ids") or []) if item
   }
   for command in list(_host_commands(host_id).values()):
-    if command.browser_grant_id is not None and not _command_grant_active(command):
-      if command.state != "canceling":
-        command.state = "canceling"
-        _persist_commands(host_id)
     if command.request_id in runner_active:
       _mark_command_started(host_id, command.request_id)
-      if command.state == "canceling":
-        await ch.queue.put({"type": "cancel", "request_id": command.request_id})
+      if command.state == "canceling" or not _command_grant_active(command):
+        _cancel_command(host_id, command)
       continue
     if command.request_id in pending_ids:
       # The result follows the hello on this connection. Keeping the command
@@ -1466,19 +1446,21 @@ async def _reconcile_runner(
     if command.state == "dispatching" and (
       command.not_after is None or _now() <= command.not_after
     ):
-      await ch.queue.put(command.event())
+      if _command_grant_active(command):
+        _send_to_runner(host_id, command.event())
+      else:
+        # Its grant was revoked before this runner ever received it.
+        _finish_unstarted(host_id, command)
       continue
     # The backend remembered running work that this restarted runner no longer
     # owns. Clear it honestly rather than either duplicating it or blocking.
-    _finish_command(host_id, command.request_id, {
-      "stdout": "",
-      "stderr": "runner restarted before the command result was reported",
-      "exit_code": 125,
-      "outcome": "lost",
-    })
+    _finish_command_as_lost(
+      host_id, command.request_id,
+      "runner restarted before the command result was reported",
+    )
   # Work the runner still runs but Möbius no longer tracks has no caller left.
   for request_id in sorted(runner_active - set(_host_commands(host_id))):
-    await ch.queue.put({"type": "cancel", "request_id": request_id})
+    _send_to_runner(host_id, {"type": "cancel", "request_id": request_id})
 
 
 # --------------------------------------------------------------------------- #
@@ -1552,6 +1534,13 @@ async def stream(request: Request, inventory: StreamInventory | None = None) -> 
     host["platform"] = plat[:80]
   _save_host(host)
   if protocol_version != _RUNNER_PROTOCOL_VERSION:
+    # This runner replaced the one that ran any active command, and it cannot
+    # report or stop them. Finish them now so no caller waits on them.
+    for command in list(_host_commands(host_id).values()):
+      _finish_command_as_lost(
+        host_id, command.request_id,
+        "an incompatible Connect runner replaced the one running this command",
+      )
     raise HTTPException(
       status_code=426,
       detail="This Connect runner is no longer supported. Update it in Connect.",
@@ -1562,10 +1551,10 @@ async def stream(request: Request, inventory: StreamInventory | None = None) -> 
   _touch(host_id)
   # Runners that stream output wait for this before sending any; older runners
   # ignore event types they do not know.
-  await ch.queue.put({"type": "hello", "live_output": True})
+  ch.queue.put_nowait({"type": "hello", "live_output": True})
   # GET remains the published older-runner contract. New runners use POST so
   # concurrent-command recovery cannot exceed a proxy's request-line budget.
-  await _reconcile_runner(host_id, ch, inventory.model_dump() if inventory else {
+  _reconcile_runner(host_id, inventory.model_dump() if inventory else {
     "active_request_ids": request.query_params.getlist("active_request_id"),
     "pending_result_ids": request.query_params.getlist("pending_result_id"),
   })
@@ -1587,13 +1576,11 @@ async def stream(request: Request, inventory: StreamInventory | None = None) -> 
           evt = await asyncio.wait_for(ch.queue.get(), timeout=wait_seconds)
           if evt.get("type") == "exec":
             command = _find_command(host_id, evt.get("request_id"))
-            if (
-              command is None or command.state != "dispatching"
-              or not _command_grant_active(command)
-            ):
-              if command is not None and command.state == "dispatching":
-                command.state = "canceling"
-                _persist_commands(host_id)
+            if command is None or command.state != "dispatching":
+              continue
+            if not _command_grant_active(command):
+              # Its grant was revoked before delivery: never send it.
+              _finish_unstarted(host_id, command)
               continue
           yield f"data: {json.dumps(evt)}\n\n"
         except asyncio.TimeoutError:
@@ -1605,10 +1592,7 @@ async def stream(request: Request, inventory: StreamInventory | None = None) -> 
     finally:
       if _channels.get(host_id) is ch:
         del _channels[host_id]
-      for fut in ch.control_pending.values():
-        if not fut.done():
-          fut.cancel()
-      ch.closed.set()
+      ch.close()
       _touch(host_id)
 
   return StreamingResponse(
@@ -1633,7 +1617,7 @@ async def command_output(body: OutputBody, request: Request) -> dict:
   except (OSError, sqlite3.Error) as exc:
     raise HTTPException(status_code=503, detail="Connect output could not be saved.") from exc
   if command is not None:
-    command.output.notify()
+    command.notify()
   return {"ok": True, "next": next_cursor}
 
 

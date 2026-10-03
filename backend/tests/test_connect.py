@@ -168,9 +168,9 @@ def test_outbound_json_replaces_an_existing_public_mode_with_private_storage(
 def test_inbound_host_registry_is_private(tmp_path, monkeypatch):
   monkeypatch.setattr(connect_routes, "_hosts_dir", lambda: tmp_path)
 
-  connect_routes._save_host({"id": "h_example", "pairing_code": "ABCD-EFGH"})
+  connect_routes._save_host({"id": "h_0123456789abcdef", "pairing_code": "ABCD-EFGH"})
 
-  path = tmp_path / "h_example.json"
+  path = tmp_path / "h_0123456789abcdef.json"
   assert json.loads(path.read_text(encoding="utf-8"))["pairing_code"] == "ABCD-EFGH"
   assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
@@ -986,7 +986,7 @@ def test_host_rename_rejects_empty_or_unknown_hosts(client, auth):
     json={"name": "   "},
   )
   missing = client.patch(
-    "/api/connect/hosts/h_does_not_exist",
+    "/api/connect/hosts/h_0123456789abcdef",
     headers=auth,
     json={"name": "New name"},
   )
@@ -1351,7 +1351,7 @@ async def test_reconnect_keeps_one_command_and_returns_its_result(client, auth):
   connect_routes._channels.pop(pairing["id"])
   second = connect_routes._Channel()
   connect_routes._replace_channel(pairing["id"], second)
-  await connect_routes._reconcile_runner(pairing["id"], second, {
+  connect_routes._reconcile_runner(pairing["id"], {
     "active_request_ids": [request_id], "pending_result_ids": [],
   })
   assert second.queue.empty()
@@ -1497,7 +1497,8 @@ async def test_persisted_running_command_accepts_result_after_runtime_restart(
   connect_routes._commands.clear()
   connect_routes._host_id_by_token_hash.clear()
   channel = connect_routes._Channel()
-  await connect_routes._reconcile_runner(pairing["id"], channel, {
+  connect_routes._channels[pairing["id"]] = channel
+  connect_routes._reconcile_runner(pairing["id"], {
     "active_request_ids": [],
     "pending_result_ids": [request_id],
   })
@@ -1544,7 +1545,8 @@ async def test_offline_cancel_is_delivered_when_current_runner_reconnects(
   )
   assert response["state"] == "canceling"
   channel = connect_routes._Channel()
-  await connect_routes._reconcile_runner(pairing["id"], channel, {
+  connect_routes._channels[pairing["id"]] = channel
+  connect_routes._reconcile_runner(pairing["id"], {
     "active_request_ids": [request_id],
     "pending_result_ids": [],
   })
@@ -1742,6 +1744,125 @@ async def test_unacknowledged_dispatch_expires_and_sends_cancel(
   assert connect_routes.connect_output.finished(
     pairing["id"], request_id,
   )["result"]["outcome"] == "expired"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True, False])
+async def test_cancel_before_start_finishes_canceled_at_once(client, auth, stream):
+  pairing, runner_token = _paired_host(client, auth)
+  channel = connect_routes._Channel()
+  connect_routes._channels[pairing["id"]] = channel
+  request_id = "a1" * 8
+  caller = asyncio.create_task(connect_routes.exec_on_host(
+    pairing["id"],
+    connect_routes.ExecBody(cmd="never starts", request_id=request_id, stream=stream),
+    _owner=object(),
+  ))
+  assert (await asyncio.wait_for(channel.queue.get(), timeout=1))["type"] == "exec"
+
+  canceled = await connect_routes.cancel_host_command(
+    pairing["id"], request_id, _owner=object(),
+  )
+
+  assert canceled["state"] == "finished"
+  reply = await asyncio.wait_for(caller, timeout=1)
+  if stream:
+    assert reply == {"request_id": request_id, "state": "finished"}
+  else:
+    assert reply["outcome"] == "canceled" and reply["canceled"] is True
+  assert await asyncio.wait_for(channel.queue.get(), timeout=1) == {
+    "type": "cancel", "request_id": request_id,
+  }
+  assert connect_routes._host_commands(pairing["id"]) == {}
+  assert connect_routes.connect_output.finished(
+    pairing["id"], request_id,
+  )["result"]["outcome"] == "canceled"
+  # A late start acknowledgement is refused, so the runner never spawns it.
+  late_start = client.post(
+    "/api/connect/state",
+    headers={"Authorization": f"Bearer {runner_token}"},
+    json={"request_id": request_id, "state": "started"},
+  )
+  assert late_start.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_removing_a_host_answers_every_waiting_caller(client, auth):
+  pairing, _ = _paired_host(client, auth)
+  host = connect_routes._load_host(pairing["id"])
+  host["runner_capabilities"] = ["parallel"]
+  connect_routes._save_host(host)
+  channel = connect_routes._Channel()
+  connect_routes._channels[pairing["id"]] = channel
+  running_id, starting_id = "b1" * 8, "b2" * 8
+  running = asyncio.create_task(connect_routes.exec_on_host(
+    pairing["id"],
+    connect_routes.ExecBody(cmd="long task", request_id=running_id),
+    _owner=object(),
+  ))
+  await asyncio.wait_for(channel.queue.get(), timeout=1)
+  connect_routes._mark_command_started(pairing["id"], running_id)
+  starting = asyncio.create_task(connect_routes.exec_on_host(
+    pairing["id"],
+    connect_routes.ExecBody(cmd="not yet started", request_id=starting_id),
+    _owner=object(),
+  ))
+  await asyncio.wait_for(channel.queue.get(), timeout=1)
+
+  connect_routes._forget_host(pairing["id"])
+
+  for caller in (running, starting):
+    result = await asyncio.wait_for(caller, timeout=1)
+    assert result["outcome"] == "lost"
+    assert "removed" in result["stderr"]
+
+
+@pytest.mark.asyncio
+async def test_a_replaced_stream_answers_a_waiting_disconnect(client, auth):
+  pairing, _ = _paired_host(client, auth)
+  channel = connect_routes._Channel()
+  connect_routes._channels[pairing["id"]] = channel
+  waiting = asyncio.create_task(connect_routes._ask_runner_to_disconnect(channel))
+  assert (await asyncio.wait_for(channel.queue.get(), timeout=1))["type"] == "disconnect"
+
+  connect_routes._replace_channel(pairing["id"], connect_routes._Channel())
+
+  with pytest.raises(connect_routes.HTTPException) as raised:
+    await asyncio.wait_for(waiting, timeout=1)
+  assert raised.value.status_code == 502
+  assert "closed before it confirmed" in raised.value.detail
+
+
+def test_incompatible_runner_finishes_the_commands_it_replaced(client, auth):
+  pairing, runner_token = _paired_host(client, auth)
+  request_id = "c1" * 8
+  connect_routes._host_commands(pairing["id"])[request_id] = (
+    connect_routes._ActiveCommand(
+      request_id, 30, started_at=time.time(), state="running",
+    )
+  )
+  connect_routes._persist_commands(pairing["id"])
+
+  response = client.get(
+    "/api/connect/stream?protocol=3",
+    headers={"Authorization": f"Bearer {runner_token}"},
+  )
+
+  assert response.status_code == 426
+  assert connect_routes._host_commands(pairing["id"]) == {}
+  assert connect_routes.connect_output.finished(
+    pairing["id"], request_id,
+  )["result"]["outcome"] == "lost"
+
+
+def test_a_stray_registry_file_does_not_break_the_host_list(client, auth):
+  pairing, _ = _paired_host(client, auth)
+  (connect_routes._hosts_dir() / "legacy.json").write_text('{"id": "legacy"}')
+
+  response = client.get("/api/connect/hosts", headers=auth)
+
+  assert response.status_code == 200, response.text
+  assert [host["id"] for host in response.json()["hosts"]] == [pairing["id"]]
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group contract")

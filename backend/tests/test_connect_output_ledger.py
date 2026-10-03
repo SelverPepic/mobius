@@ -207,7 +207,7 @@ async def test_ledger_read_failure_is_explicit_503(client, auth, monkeypatch):
   await ch.queue.get()
   connect._mark_command_started(host_id, rid)
   await task
-  monkeypatch.setattr(connect_output, 'page',
+  monkeypatch.setattr(connect_output, 'view',
                       lambda *args: (_ for _ in ()).throw(sqlite3.OperationalError('disk')))
   response = client.get(f'/api/connect/hosts/{host_id}/commands/{rid}/output',
                         headers=auth)
@@ -228,8 +228,15 @@ def test_output_page_does_not_materialize_unread_text(monkeypatch):
           yield (seq,'stdout','x'*65536)
       return rows()
     def close(self):pass
-  monkeypatch.setattr(connect_output,'_open',lambda host_id:DB())
-  page=connect_output.page('h_'+'e'*16,'f'*16,0)
+  page=connect_output._page(DB(),'f'*16,0)
   assert len(loaded)<=9
   assert sum(len(c['text']) for c in page['chunks'])<=connect_output.PAGE_CHARS
   assert page['has_more'] and page['next']<page['available_next']
+
+
+def test_reading_history_creates_no_empty_ledger(client, auth):
+  host_id, _token, _ch = host(client, auth)
+  assert client.get('/api/connect/hosts', headers=auth).status_code == 200
+  listed = client.get(f'/api/connect/hosts/{host_id}/commands', headers=auth)
+  assert listed.json() == {'running': [], 'recent': []}
+  assert not connect_output._path(host_id).exists()
