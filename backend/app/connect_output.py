@@ -131,11 +131,6 @@ def recent(host_id: str, limit: int = 20) -> list[dict]:
   return items
 
 
-def page(host_id: str, request_id: str, after: int) -> dict:
-  with _ledger(host_id) as db:
-    return _page(db, request_id, after)
-
-
 def view(host_id: str, request_id: str, after: int) -> tuple[dict | None, dict, bool]:
   """One read of a command: its terminal entry, an output page, completeness."""
   with _ledger(host_id) as db:

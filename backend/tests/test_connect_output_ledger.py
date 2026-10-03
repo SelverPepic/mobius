@@ -109,8 +109,8 @@ def test_ledger_is_host_scoped_and_exact_seq(tmp_path, monkeypatch):
   connect_output.append(a, rid, [{'seq': 0, 'stream': 'stdout', 'text': 'first'}])
   with pytest.raises(ValueError):
     connect_output.append(a, rid, [{'seq': 0, 'stream': 'stdout', 'text': 'changed'}])
-  assert connect_output.page(a, rid, 0)['chunks'][0]['text'] == 'first'
-  assert connect_output.page(b, rid, 0)['chunks'] == []
+  assert connect_output.view(a, rid, 0)[1]['chunks'][0]['text'] == 'first'
+  assert connect_output.view(b, rid, 0)[1]['chunks'] == []
   assert (tmp_path / 'shared/connect/output' / f'{a}.sqlite3').stat().st_mode & 0o777 == 0o600
 
 
@@ -130,7 +130,7 @@ async def test_unknown_cross_host_and_disk_failure_do_not_ack(client, auth, monk
   monkeypatch.setattr(connect_output, 'append', lambda *args: (_ for _ in ()).throw(OSError('full')))
   failed = client.post('/api/connect/output', headers=token_a, json=payload)
   assert failed.status_code == 503
-  assert connect_output.page(host_a, rid, 0)['chunks'] == []
+  assert connect_output.view(host_a, rid, 0)[1]['chunks'] == []
 
 
 @pytest.mark.asyncio
@@ -166,7 +166,7 @@ def test_conflicting_seq_replay_is_rejected_without_partial_append(tmp_path, mon
     connect_output.append(host_id, rid, [
       {'seq': 1, 'stream': 'stdout', 'text': 'later'},
       {'seq': 0, 'stream': 'stdout', 'text': 'changed'}])
-  assert [c['seq'] for c in connect_output.page(host_id, rid, 0)['chunks']] == [0]
+  assert [c['seq'] for c in connect_output.view(host_id, rid, 0)[1]['chunks']] == [0]
 
 
 @pytest.mark.asyncio
