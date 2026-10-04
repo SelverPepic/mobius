@@ -3,6 +3,8 @@
 
 import os
 import re
+import secrets
+import tempfile
 from datetime import UTC, datetime
 import pathlib
 from typing import List
@@ -11,7 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, Path, UploadFile
 from fastapi.responses import FileResponse, Response
 from sqlalchemy.orm import Session
 
-from app import models
+from app import models, chat_queue
 from app.auth_helpers import TokenSource, get_auth_token_source
 from app.config import get_settings
 from app.database import get_db
@@ -107,57 +109,71 @@ async def upload_files(
 
   settings = get_settings()
   upload_dir = _resolve_upload_dir(settings.data_dir, chat_id)
-  saved = []
-  written: list[pathlib.Path] = []
-
-  try:
-    for file in files:
-      mime = (file.content_type or "application/octet-stream").split(";")[0].strip().lower()
-      # Stream-read in chunks with the per-file cap, aborting the instant it's
-      # exceeded, rather than buffering the whole upload before the size check —
-      # so a giant file can't balloon memory on the tight host before being
-      # rejected.
-      chunks: list[bytes] = []
-      total = 0
-      while True:
-        chunk = await file.read(1024 * 1024)
-        if not chunk:
-          break
-        total += len(chunk)
-        if total > _MAX_UPLOAD_BYTES:
-          raise HTTPException(
-            status_code=413,
-            detail=(
-              f"{file.filename} exceeds the "
-              f"{_MAX_UPLOAD_BYTES // (1024 * 1024)} MB limit."
-            ),
-          )
-        chunks.append(chunk)
-      content = b"".join(chunks)
-      name = _unique_name(upload_dir, _safe_filename(file.filename or "upload"))
-      dest = upload_dir / name
-      atomic_write(dest, content)
-      written.append(dest)
-      saved.append({
-        "name": name,
-        "path": str(dest),
-        "size": total,
-        "mime_type": mime,
-        "uploaded_at": datetime.now(UTC).isoformat(),
-      })
-
-    chat.uploads = list(chat.uploads or []) + saved
-    db.commit()
-  except BaseException:
-    # A later file over the cap, or a commit failure, must not leave the files
-    # already written this request orphaned on disk with no metadata row. Unlink
-    # them; the metadata change rolls back when the request's session closes.
-    for p in written:
+  # Multipart bodies are already spooled by FastAPI, but reading/capping them
+  # can still yield for disk I/O. Stage outside admission so answers and Stop
+  # do not wait behind a large upload. Only name allocation, final placement,
+  # and the refreshed metadata append need the shared queue lock.
+  with tempfile.TemporaryDirectory(prefix=".pending-", dir=upload_dir) as staging:
+    saved = await _stage_uploads(files, pathlib.Path(staging))
+    written: list[pathlib.Path] = []
+    async with chat_queue.get_lock(chat_id):
+      db.refresh(chat)
       try:
-        p.unlink()
-      except OSError:
-        pass
-    raise
+        for entry in saved:
+          name = _unique_name(upload_dir, entry["name"])
+          dest = upload_dir / name
+          pathlib.Path(entry["path"]).replace(dest)
+          written.append(dest)
+          entry.update(name=name, path=str(dest))
+        chat.uploads = list(chat.uploads or []) + saved
+        db.commit()
+      except BaseException:
+        for path in written:
+          try:
+            path.unlink()
+          except OSError:
+            pass
+        raise
+    return saved
+
+
+async def _stage_uploads(files, upload_dir):
+  saved = []
+  for file in files:
+    mime = (file.content_type or "application/octet-stream").split(";")[0].strip().lower()
+    # Stream-read in chunks with the per-file cap, aborting the instant it's
+    # exceeded, rather than buffering the whole upload before the size check —
+    # so a giant file can't balloon memory on the tight host before being
+    # rejected.
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+      chunk = await file.read(1024 * 1024)
+      if not chunk:
+        break
+      total += len(chunk)
+      if total > _MAX_UPLOAD_BYTES:
+        raise HTTPException(
+          status_code=413,
+          detail=(
+            f"{file.filename} exceeds the "
+            f"{_MAX_UPLOAD_BYTES // (1024 * 1024)} MB limit."
+          ),
+        )
+      chunks.append(chunk)
+    content = b"".join(chunks)
+    name = _unique_name(upload_dir, _safe_filename(file.filename or "upload"))
+    dest = upload_dir / name
+    atomic_write(dest, content)
+    saved.append({
+      "name": name,
+      "path": str(dest),
+      "size": total,
+      "mime_type": mime,
+      "uploaded_at": datetime.now(UTC).isoformat(),
+      "discard_token": secrets.token_urlsafe(24),
+    })
+
   return saved
 
 
@@ -181,9 +197,11 @@ def list_uploads(
   status_code=204,
   dependencies=[Depends(reject_cross_site)],
 )
-def delete_upload(
+async def delete_upload(
   chat_id: str,
   filename: str = Path(...),
+  only_if_unused: bool = False,
+  discard_token: str | None = None,
   principal: Principal = Depends(get_owner_or_chat_embed_principal),
   db: Session = Depends(get_db),
 ):
@@ -194,19 +212,47 @@ def delete_upload(
   require_chat_embed_operation(principal, "chat:uploads")
   chat = get_active_chat_for_principal(db, chat_id, principal)
 
-  settings = get_settings()
-  upload_dir = pathlib.Path(settings.data_dir) / "chats" / chat_id / "uploads"
-  file_path = validate_path_within_base(filename, upload_dir)
+  # Serialize with answer/send admission, and re-read after waiting: an answer
+  # accepted first owns its attachments; a discard accepted first removes the
+  # authoritative metadata before a subsequent answer can resolve it.
+  async with chat_queue.get_lock(chat_id):
+    db.refresh(chat)
+    if only_if_unused:
+      entry = next((u for u in (chat.uploads or []) if u.get("name") == filename), None)
+      if (not entry or not discard_token
+          or not secrets.compare_digest(entry.get("discard_token", ""), discard_token)
+          or _references_upload(chat.messages, filename)
+          or _references_upload(chat.pending_messages, filename)):
+        return Response(status_code=204)
 
-  if file_path.exists() and file_path.is_file():
-    file_path.unlink()
-    discard_image_preview(file_path, upload_dir)
+    settings = get_settings()
+    upload_dir = pathlib.Path(settings.data_dir) / "chats" / chat_id / "uploads"
+    file_path = validate_path_within_base(filename, upload_dir)
 
-  if chat.uploads:
-    chat.uploads = [u for u in chat.uploads if u.get("name") != filename]
-    db.commit()
+    if file_path.exists() and file_path.is_file():
+      file_path.unlink()
+      discard_image_preview(file_path, upload_dir)
+
+    if chat.uploads:
+      chat.uploads = [u for u in chat.uploads if u.get("name") != filename]
+      db.commit()
 
   return Response(status_code=204)
+
+
+def _references_upload(value, filename: str) -> bool:
+  """Conservatively keep structured attachments and text/path references.
+
+  Question answers can live inside assistant blocks, not just user messages.
+  False positives retain a file; false negatives would lose owner data.
+  """
+  if isinstance(value, str):
+    return filename in value
+  if isinstance(value, dict):
+    return any(_references_upload(item, filename) for item in value.values())
+  if isinstance(value, list):
+    return any(_references_upload(item, filename) for item in value)
+  return False
 
 
 @router.get("/{chat_id}/uploads/{filename}")

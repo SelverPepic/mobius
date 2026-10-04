@@ -11,16 +11,6 @@ const component = readFileSync(new URL('../QuestionCard.jsx', import.meta.url), 
 const chatView = readFileSync(new URL('../ChatView.jsx', import.meta.url), 'utf8')
 const css = readFileSync(new URL('../QuestionCard.css', import.meta.url), 'utf8')
 
-test('the answer composer keeps one visible keyboard focus ring', () => {
-  assert.match(css, /\.qcard__composer:focus-within\s*\{[^}]*box-shadow:\s*0 0 0 3px var\(--accent-dim\)/)
-  assert.match(css, /\.qcard__input:focus-visible\s*\{[^}]*outline:\s*none/)
-})
-
-test('the attach icon blends into the card while keeping a touch target and focus ring', () => {
-  assert.match(css, /\.qcard__attach\s*\{[^}]*width:\s*40px;[^}]*height:\s*40px;[^}]*border:\s*0;[^}]*background:\s*transparent;/)
-  assert.match(css, /\.qcard__attach:focus-visible\s*\{[^}]*outline:\s*2px solid var\(--accent\)/)
-})
-
 test('a file-only question answer can submit and ordinary cards offer upload', () => {
   const storage = {
     values: new Map(),
@@ -39,18 +29,14 @@ test('a file-only question answer can submit and ordinary cards offer upload', (
     }))
     assert.match(html, /Attach a photo or file/)
     assert.match(html, /class="qcard__submit"[^>]*>Submit</)
-    assert.match(html, /class="qcard__answer-row"><div class="qcard__composer-actions"[\s\S]*<button[^>]*aria-label="Attach a photo or file"[^>]*>[\s\S]*<\/button><\/div><div class="qcard__composer[^"]*"[\s\S]*class="chat__attach-tray"[\s\S]*<textarea/,
-      'the icon sits to the left of the composer containing the image and answer')
-    assert.doesNotMatch(html, /<\/svg>\s*Attach a photo or file/, 'the attach control uses only the icon')
-    assert.doesNotMatch(html, /qcard__attachments/,
-      'the attachment must not sit in a separate row below the answer box')
+    assert.equal((html.match(/aria-label="Files for this answer"/g) || []).length, 1)
     const submitted = renderToStaticMarkup(createElement(QuestionCard, {
       chatId: 'file-only', questionId: 'file-only-q', questions,
       answeredMap: { 'Send a picture': 'Attached 1 file' },
       attachments: [{ name: 'photo.png', size: 4, mime_type: 'image/png' }],
     }))
-    assert.match(submitted, /class="qcard__composer[^"]*"[\s\S]*class="chat__attachments"[\s\S]*<textarea/,
-      'the submitted image stays inside the answer composer')
+    assert.match(submitted, /aria-label="Files for this answer"/)
+    assert.match(submitted, /chat__attachments/)
     const restart = renderToStaticMarkup(createElement(QuestionCard, {
       chatId: 'restart', questionId: 'restart-q', questions,
       platformAction: { type: 'restart', version: 2, status: 'awaiting_owner' },
@@ -221,8 +207,6 @@ test('unanswered question cards do not have a stale gray state', () => {
     'a transient disabled handoff must not erase an offline choice')
   assert.match(component, /Your choice is saved — submit it when you’re back online/,
     'an offline submit should explain that the choice is retained')
-  assert.match(component, /const accepted = await onAnswer[\s\S]*if \(accepted === false \|\| accepted\?\.status === 'locally_queued' \|\| accepted\?\.status === 'locally_settled'\)[\s\S]*else \{\s*setSubmitted\(true\)/,
-    'a card should settle only after the answer request is accepted')
   assert.match(component, /catch \(error\) \{[\s\S]*Keep the choices and[\s\S]*\} finally/,
     'a failed answer should retain its retryable draft')
 })

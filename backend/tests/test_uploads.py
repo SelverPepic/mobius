@@ -330,3 +330,129 @@ def test_upload_multi_file_over_cap_cleans_partial(client, db, auth, chat, monke
   )
   db.refresh(chat)
   assert (chat.uploads or []) == []
+
+
+def test_discard_requires_exact_upload_receipt(client, db, auth, chat):
+  from pathlib import Path
+  record = client.post(
+    f"/api/chats/{chat.id}/uploads", headers=auth,
+    files=[("files", ("draft.txt", io.BytesIO(b"draft"), "text/plain"))],
+  ).json()[0]
+  path = Path(record["path"])
+  for token in (None, "stale-receipt"):
+    params = {"only_if_unused": "true"}
+    if token:
+      params["discard_token"] = token
+    assert client.delete(f"/api/chats/{chat.id}/uploads/draft.txt", headers=auth, params=params).status_code == 204
+    assert path.exists()
+  owner_file = path.parent / "owner.txt"
+  owner_file.write_text("not uploaded by this browser")
+  assert client.delete(
+    f"/api/chats/{chat.id}/uploads/owner.txt", headers=auth,
+    params={"only_if_unused": "true", "discard_token": record["discard_token"]},
+  ).status_code == 204
+  assert owner_file.exists()
+  assert client.delete(
+    f"/api/chats/{chat.id}/uploads/draft.txt", headers=auth,
+    params={"only_if_unused": "true", "discard_token": record["discard_token"]},
+  ).status_code == 204
+  assert not path.exists()
+  db.refresh(chat)
+  assert chat.uploads == []
+
+
+def test_discard_preserves_message_pending_and_card_references(client, db, auth, chat):
+  from pathlib import Path
+  record = client.post(
+    f"/api/chats/{chat.id}/uploads", headers=auth,
+    files=[("files", ("accepted.txt", io.BytesIO(b"keep"), "text/plain"))],
+  ).json()[0]
+  for column, message in [
+    ("messages", {"role": "user", "attachments": [{"name": record["name"]}]}),
+    ("pending_messages", {"attachments": [{"name": record["name"]}]}),
+    ("messages", {"blocks": [{"type": "question", "attachments": [record]}]}),
+    ("messages", {"content": f"See {record['path']}"}),
+  ]:
+    from app.chat_writer import get_writer, ReplaceTranscript, ClearPending, AppendPending
+    writer = get_writer()
+    writer.submit(ReplaceTranscript(
+      chat_id=chat.id, messages=[message] if column == "messages" else [],
+    )).result(timeout=5)
+    writer.submit(ClearPending(chat_id=chat.id)).result(timeout=5)
+    if column == "pending_messages":
+      writer.submit(AppendPending(chat_id=chat.id, user_msg=message)).result(timeout=5)
+    assert client.delete(
+      f"/api/chats/{chat.id}/uploads/{record['name']}", headers=auth,
+      params={"only_if_unused": "true", "discard_token": record["discard_token"]},
+    ).status_code == 204
+    assert Path(record["path"]).exists()
+    db.refresh(chat)
+    assert chat.uploads == [record]
+
+
+def test_discard_waits_for_answer_admission_and_rereads(client, db, auth, chat):
+  import asyncio
+  from pathlib import Path
+  from app import chat_queue
+  from app.deps import Principal
+  from app.routes.uploads import delete_upload
+
+  record = client.post(
+    f"/api/chats/{chat.id}/uploads", headers=auth,
+    files=[("files", ("race.txt", io.BytesIO(b"keep"), "text/plain"))],
+  ).json()[0]
+  principal = Principal(owner=db.query(models.Owner).first(), app_id=None)
+
+  async def race():
+    async with chat_queue.get_lock(chat.id):
+      discard = asyncio.create_task(delete_upload(
+        chat.id, record["name"], only_if_unused=True,
+        discard_token=record["discard_token"], principal=principal, db=db,
+      ))
+      await asyncio.sleep(0)
+      assert not discard.done()
+      from app.chat_writer import get_writer, ReplaceTranscript
+      await asyncio.wrap_future(get_writer().submit(ReplaceTranscript(
+        chat_id=chat.id, messages=[{"blocks": [{"attachments": [record]}]}],
+      )))
+    response = await discard
+    assert response.status_code == 204
+
+  asyncio.run(race())
+  assert Path(record["path"]).exists()
+
+
+def test_upload_reads_outside_admission_then_commits_under_lock(db, chat):
+  import asyncio
+  from pathlib import Path
+  from fastapi import UploadFile
+  from app import chat_queue
+  from app.deps import Principal
+  from app.routes.uploads import upload_files
+  from app.config import get_settings
+
+  principal = Principal(owner=db.query(models.Owner).first(), app_id=None)
+
+  async def race():
+    read_finished = asyncio.Event()
+
+    class ObservedUpload(UploadFile):
+      async def read(self, size=-1):
+        result = await super().read(size)
+        if not result:
+          read_finished.set()
+        return result
+
+    file = ObservedUpload(file=io.BytesIO(b"new"), filename="outside.txt")
+    async with chat_queue.get_lock(chat.id):
+      upload = asyncio.create_task(upload_files(chat.id, [file], principal, db))
+      await asyncio.wait_for(read_finished.wait(), timeout=1)
+      assert not upload.done(), "body read must finish without admission; placement must wait"
+      db.refresh(chat)
+      assert not chat.uploads
+    return await upload
+
+  records = asyncio.run(race())
+  assert Path(records[0]["path"]).read_bytes() == b"new"
+  upload_dir = Path(get_settings().data_dir) / "chats" / chat.id / "uploads"
+  assert not list(upload_dir.glob(".pending-*"))

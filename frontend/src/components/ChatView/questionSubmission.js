@@ -1,3 +1,20 @@
+/** Resolve typed/selected input identically for single and multi-select cards. */
+export function resolveQuestionAnswer(answer, otherText) {
+  if (Array.isArray(answer)) {
+    return answer.map(value => value === '__other__' ? otherText?.trim() || '' : value)
+      .filter(Boolean).join(', ')
+  }
+  if (answer === '__other__') return otherText?.trim() || ''
+  return answer || ''
+}
+
+export function questionAnswersReady(questions, answers, otherTexts, files) {
+  return questions.every(question => (
+    Boolean(resolveQuestionAnswer(answers[question.question], otherTexts[question.question]))
+    || files.length > 0
+  ))
+}
+
 /** Derive explicit saved-option choices without interpreting custom answer text. */
 export function questionOptionSubmission(questions, answers) {
   const selected_options = {}

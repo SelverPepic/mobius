@@ -313,9 +313,6 @@
 .qcard__file-input {
   display: none;
 }
-.qcard__composer-actions {
-  flex: none;
-}
 .qcard__attach {
   display: inline-flex;
   align-items: center;
@@ -339,12 +336,6 @@
 .qcard__attach:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
-}
-.qcard__composer .chat__attach-tray {
-  padding: 10px 10px 0;
-}
-.qcard__composer .chat__attachments {
-  padding: 10px 10px 0;
 }
 
 .qcard__submit-error {
@@ -433,4 +424,25 @@
   font-size: 14px;
   line-height: 1.4;
   overflow-wrap: anywhere;
+}
+
+.qcard__attachments {
+  margin-top: 12px;
+}
+.qcard__attachment-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.qcard--grouped .qcard__attachments {
+  margin-inline: 16px;
+  margin-bottom: 12px;
+}
+@media (max-width: 560px) {
+  .qcard--grouped .qcard__attachments {
+    margin-inline: 14px;
+  }
 }

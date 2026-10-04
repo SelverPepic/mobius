@@ -282,31 +282,45 @@ def _content_with_uploads(chat: models.Chat, content: str) -> str:
   return content
 
 
-def _question_answer_with_attachments(
-  chat: models.Chat, answers: dict, attachments: list[dict] | None,
-) -> dict:
-  """Give a live question's provider the same verified files as a chat send.
-
-  The persisted answer remains the owner's exact choice. Only the provider
-  result gets file context, and only for names already uploaded to this chat.
-  """
+def _canonical_question_attachments(
+  chat: models.Chat, attachments: list[dict] | None,
+) -> list[dict] | None:
+  """Resolve card-level file references once, before either answer path writes."""
   if not attachments:
-    return answers
+    return None
   uploads = {entry.get("name"): entry for entry in (chat.uploads or [])}
-  lines = []
+  canonical = []
   for attachment in attachments:
     name = attachment.get("name") if isinstance(attachment, dict) else None
-    if not isinstance(name, str) or not name:
-      raise HTTPException(status_code=409, detail="An attached file is no longer available.")
-    entry = uploads.get(name)
+    entry = uploads.get(name) if isinstance(name, str) and name else None
     path = _safe_upload_path(entry.get("path"), get_settings().data_dir) if entry else None
     if not path:
       raise HTTPException(status_code=409, detail="An attached file is no longer available.")
-    lines.append(f"- {name} → {path} ({entry.get('mime_type', 'unknown')})")
-  enriched = dict(answers)
-  last = next(reversed(enriched))
-  enriched[last] = f"{enriched[last]}\n\n[Attached files:\n" + "\n".join(lines) + "]"
-  return enriched
+    if not any(item["name"] == name for item in canonical):
+      canonical.append({
+        "name": name, "path": path,
+        "size": entry.get("size", 0),
+        "mime_type": entry.get("mime_type", "application/octet-stream"),
+      })
+  return canonical
+
+
+def _question_answer_with_attachments(
+  answers: dict, attachments: list[dict] | None,
+) -> dict:
+  """Add card-level context to the legacy native result, not to one answer."""
+  if not attachments:
+    return answers
+  lines = [
+    f"- {entry['name']} → {entry['path']} ({entry.get('mime_type', 'unknown')})"
+    for entry in attachments
+  ]
+  # Native results are a question-to-answer map. A separate context entry
+  # preserves every answer verbatim, including on multi-question cards.
+  key = "[Attached files]"
+  while key in answers:
+    key = "[" + key + "]"
+  return {**answers, key: "\n".join(lines)}
 
 
 async def _append_to_pending(
@@ -1054,9 +1068,9 @@ async def _send_message_impl(
           and saved_card is not None):
         body = _confine_agent_card_answer(body, saved_card)
         agent_exact_retry = _is_exact_agent_card_retry(body, saved_card)
-      provider_answers = _question_answer_with_attachments(
-        chat, body.answers, body.attachments,
-      )
+      body = body.model_copy(update={
+        "attachments": _canonical_question_attachments(chat, body.attachments),
+      })
       try:
         quiet_answer = bool(saved_card and questions.closes_without_reply(
           saved_card, body.answers, body.selected_options,
@@ -1131,6 +1145,7 @@ async def _send_message_impl(
         event = {
           "type": "answers_applied", "question_id": body.question_id,
           "answers": body.answers,
+          "attachments": body.attachments or [],
         }
         sink = get_active_sink(chat_id)
         if sink is not None:
@@ -1197,7 +1212,9 @@ async def _send_message_impl(
             detail="The question is no longer accepting answers.",
           )
         if not pending.future.done():
-          pending.future.set_result(provider_answers)
+          pending.future.set_result(_question_answer_with_attachments(
+            body.answers, body.attachments,
+          ))
         # Tell every connected client (and the catch-up replay) the question
         # is answered. Without this, an already-open stream — or any client
         # that reconnects mid-turn — never learns the answer: the live
@@ -1212,6 +1229,7 @@ async def _send_message_impl(
           "type": "answers_applied",
           "question_id": body.question_id or pending.question_id,
           "answers": body.answers,
+          "attachments": body.attachments or [],
         }
         sink = get_active_sink(chat_id)
         bc = get_broadcast(chat_id)
@@ -1273,6 +1291,7 @@ async def _send_message_impl(
             "type": "answers_applied",
             "question_id": body.question_id,
             "answers": body.answers,
+            "attachments": body.attachments or [],
           })
       except chat_queue.PendingAdmissionBlocksPromotion as exc:
         if exc.reason == "activation":

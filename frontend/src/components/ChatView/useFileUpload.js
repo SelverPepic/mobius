@@ -9,6 +9,7 @@ import { getAuthHeaders, BASE } from '../../api/client.js'
  *   files: Array,
  *   addFiles: (fileList: File[]) => Promise<void>,
  *   removeFile: (id: string) => void,
+ *   discardFiles: (opts?: {exceptNames?: string[]}) => void,
  *   clearFiles: (opts?: {revoke?: boolean}) => void,
  *   restoreFiles: (files: Array) => void,
  *   releaseFiles: (files: Array) => void,
@@ -20,6 +21,7 @@ export default function useFileUpload({ chatId, initialFiles = [], onFilesChange
     name: file.name,
     size: file.size,
     mime_type: file.mime_type,
+    discard_token: file.discard_token,
     objectUrl: file.objectUrl || null,
     status: file.status || 'done',
     error: file.error || null,
@@ -29,6 +31,8 @@ export default function useFileUpload({ chatId, initialFiles = [], onFilesChange
   // without closing over a stale `files` state value.
   const filesRef = useRef(files)
   filesRef.current = files
+  // Explicit removal/settlement and unmount own otherwise-orphaned successes.
+  const discardedIds = useRef(new Map())
   const onFilesChangeRef = useRef(onFilesChange)
   onFilesChangeRef.current = onFilesChange
 
@@ -52,8 +56,20 @@ export default function useFileUpload({ chatId, initialFiles = [], onFilesChange
   useEffect(() => () => {
     for (const f of filesRef.current) {
       if (f.objectUrl) URL.revokeObjectURL(f.objectUrl)
+      // Completed uploads are durable drafts. In-flight uploads have no saved
+      // server name yet, and cannot be restored after this hook unmounts.
+      if (f.status === 'uploading') discardedIds.current.set(f.id, new Set())
     }
   }, [])
+
+  const discardUpload = useCallback((file) => {
+    // Never infer deletion authority from a local/browser-supplied filename.
+    if (!file?.name || !file.discard_token) return
+    const query = new URLSearchParams({ only_if_unused: 'true', discard_token: file.discard_token })
+    fetch(`${BASE}/api/chats/${chatId}/uploads/${encodeURIComponent(file.name)}?${query}`, {
+      method: 'DELETE', headers: getAuthHeaders(),
+    }).catch(() => {})
+  }, [chatId])
 
   const addFiles = useCallback(async (fileList) => {
     if (!fileList.length) return
@@ -89,10 +105,17 @@ export default function useFileUpload({ chatId, initialFiles = [], onFilesChange
         } else {
           // Update name from server response (sanitized filename).
           const data = await res.json().catch(() => [])
-          const serverName = data?.[0]?.name
+          const uploaded = data?.[0]
+          if (!uploaded?.name) throw new Error('Upload response is missing file metadata')
+          const exceptNames = discardedIds.current.get(chip.id)
+          if (exceptNames) {
+            discardedIds.current.delete(chip.id)
+            if (!exceptNames.has(uploaded.name)) discardUpload(uploaded)
+            continue
+          }
           commitFiles(prev => prev.map(c =>
             c.id === chip.id
-              ? { ...c, status: 'done', ...(serverName ? { name: serverName } : {}) }
+              ? { ...c, name: uploaded.name, size: uploaded.size, mime_type: uploaded.mime_type, discard_token: uploaded.discard_token, status: 'done' }
               : c
           ))
         }
@@ -100,9 +123,11 @@ export default function useFileUpload({ chatId, initialFiles = [], onFilesChange
         commitFiles(prev => prev.map(c =>
           c.id === chip.id ? { ...c, status: 'error', error: err.message } : c
         ))
+      } finally {
+        discardedIds.current.delete(chip.id)
       }
     }
-  }, [chatId, commitFiles])
+  }, [chatId, commitFiles, discardUpload])
 
   const removeFile = useCallback((id) => {
     // Extract the side effects (URL revoke + network DELETE) from the
@@ -112,13 +137,9 @@ export default function useFileUpload({ chatId, initialFiles = [], onFilesChange
     const removing = filesRef.current.find(c => c.id === id)
     if (removing?.objectUrl) URL.revokeObjectURL(removing.objectUrl)
     commitFiles(prev => prev.filter(c => c.id !== id))
-    if (removing?.status === 'done' && removing.name) {
-      fetch(`${BASE}/api/chats/${chatId}/uploads/${encodeURIComponent(removing.name)}`, {
-        method: 'DELETE',
-        headers: getAuthHeaders(),
-      }).catch(() => {})
-    }
-  }, [chatId, commitFiles])
+    if (removing?.status === 'uploading') discardedIds.current.set(id, new Set())
+    if (removing?.status === 'done') discardUpload(removing)
+  }, [commitFiles, discardUpload])
 
   const releaseFiles = useCallback((fileList) => {
     for (const f of fileList || []) {
@@ -132,10 +153,19 @@ export default function useFileUpload({ chatId, initialFiles = [], onFilesChange
     commitFiles([])
   }, [releaseFiles, commitFiles])
 
+  const discardFiles = useCallback(({ exceptNames = [] } = {}) => {
+    const keep = new Set(exceptNames)
+    for (const file of filesRef.current) {
+      if (file.status === 'uploading') discardedIds.current.set(file.id, keep)
+      else if (!keep.has(file.name)) discardUpload(file)
+    }
+    clearFiles()
+  }, [clearFiles, discardUpload])
+
   const restoreFiles = useCallback((fileList) => {
     const restored = Array.isArray(fileList) ? fileList : []
     commitFiles(restored)
   }, [commitFiles])
 
-  return { files, addFiles, removeFile, clearFiles, restoreFiles, releaseFiles }
+  return { files, addFiles, removeFile, clearFiles, restoreFiles, releaseFiles, discardFiles }
 }

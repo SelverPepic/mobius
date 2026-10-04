@@ -6020,7 +6020,7 @@ export default function ChatView({
     >
       {fileDropActive && (
         <div className="chat__file-drop-target" aria-hidden="true">
-          <div className="chat__file-drop-card">Drop files to attach</div>
+          <div className="chat__file-drop-card">Drop files into the message composer</div>
         </div>
       )}
       {/* Single polite live region — announces state transitions only.

@@ -17,27 +17,17 @@ import {
 } from '../../lib/selectableTextControl.js'
 import { getOnlineSnapshot } from '../../lib/connectivityStore.js'
 import useFileUpload from './useFileUpload.js'
-import { FileChips } from './ChatInputBar.jsx'
+import FileChips from './FileChips.jsx'
 import Attachments from './Attachments.jsx'
 import { pastedFiles, filePasteNeedsDefaultPrevented } from './pasteUpload.js'
 import { Paperclip } from '@openai/apps-sdk-ui/components/Icon'
-import { questionOptionSubmission } from './questionSubmission.js'
+import { resolveQuestionAnswer, questionAnswersReady, questionOptionSubmission } from './questionSubmission.js'
 import {
   isRestartCardAction,
   restartCardSelectedOptions,
   restartCardStatusDetail,
   restartCardStatusLabel,
 } from './restartCard.js'
-
-
-function resolveAnswer(answer, otherText) {
-  if (Array.isArray(answer)) {
-    return answer.map(v => v === '__other__' ? otherText?.trim() || '' : v)
-      .filter(Boolean).join(', ')
-  }
-  if (answer === '__other__') return otherText?.trim() || ''
-  return answer || ''
-}
 
 
 const CUSTOM_ANSWER_MAX_HEIGHT = 180
@@ -151,16 +141,16 @@ export default function QuestionCard({
     () => readQuestionDraft(draftKey).otherTexts,
   )
   const [submitting, setSubmitting] = useState(false)
-  const [submitted, setSubmitted] = useState(false)
+  const [submitted, setSubmitted] = useState(null)
   const [submitError, setSubmitError] = useState('')
   const pointerSelectionRef = useRef(null)
   const preparedSubmissionRef = useRef(null)
   const fileInputRef = useRef(null)
   const initialFilesRef = useRef(null)
   if (initialFilesRef.current === null) initialFilesRef.current = readQuestionDraft(draftKey).files
-  const { files, addFiles, removeFile, clearFiles } = useFileUpload({ chatId, initialFiles: initialFilesRef.current })
+  const { files, addFiles, removeFile, clearFiles, discardFiles } = useFileUpload({ chatId, initialFiles: initialFilesRef.current })
   const readyFiles = files.filter(file => file.status === 'done')
-  const uploadingFiles = files.some(file => file.status === 'uploading')
+  const pendingFiles = files.some(file => file.status !== 'done')
 
   const localAnswers = useContext(LocalAnswersContext)
   const localAnswer = (localAnswers || []).find(record => (
@@ -174,10 +164,10 @@ export default function QuestionCard({
   // owner answer or bypassing the server's continuation hold.
   const completedAction = Boolean(actionStatusLabel)
     && platformAction?.status !== 'awaiting_owner'
-  const answered = submitted || !!answeredMap || completedAction
+  const answered = Boolean(submitted) || !!answeredMap || completedAction
   const locallyQueued = !answered && Boolean(localAnswer)
   const selectionLocked = answered || locallyQueued
-  const displayAnswers = answeredMap || localAnswer?.body?.answers || {}
+  const displayAnswers = answeredMap || localAnswer?.body?.answers || submitted?.answers || {}
   const grouped = questions.length > 1
   const restartAction = isRestartCardAction(platformAction)
   const writtenRestartAction = restartAction && platformAction?.version === 2
@@ -195,28 +185,22 @@ export default function QuestionCard({
   useEffect(() => {
     if (answered) {
       clearQuestionDraft(draftKey)
+      if (files.length) discardFiles({
+        exceptNames: (attachments || localAnswer?.body?.attachments || submitted?.attachments || [])
+          .map(file => file.name),
+      })
       return
     }
     writeQuestionDraft(draftKey, answers, otherTexts, undefined, files)
-  }, [draftKey, answers, otherTexts, files, answered])
+  }, [draftKey, answers, otherTexts, files, answered, attachments, localAnswer, submitted, discardFiles])
 
-  const allAnswered = questions.every(q => {
-    const a = answers[q.question]
-    if (!a) return q === questions[0] && readyFiles.length > 0
-    if (Array.isArray(a)) {
-      if (a.length === 0) return false
-      if (a.includes('__other__') && !otherTexts[q.question]?.trim()) return false
-      return true
-    }
-    if (a === '__other__') return !!otherTexts[q.question]?.trim() || (q === questions[0] && readyFiles.length > 0)
-    return true
-  })
+  const allAnswered = questionAnswersReady(questions, answers, otherTexts, readyFiles)
   const selectedOptions = restartCardSelectedOptions(
     platformAction,
     questions,
     answers,
   )
-  const canSubmit = allAnswered && !uploadingFiles && (!restartAction || selectedOptions !== null)
+  const canSubmit = allAnswered && !pendingFiles && (!restartAction || selectedOptions !== null)
 
   function selectOption(question, label) {
     if (selectionLocked || disabled) return
@@ -284,8 +268,8 @@ export default function QuestionCard({
     preparedSubmissionRef.current = null
     const resolved = {}
     const lines = questions.map(q => {
-      const val = resolveAnswer(answers[q.question], otherTexts[q.question])
-        || (q === questions[0] && readyFiles.length ? `Attached ${readyFiles.length} file${readyFiles.length === 1 ? '' : 's'}` : '')
+      const val = resolveQuestionAnswer(answers[q.question], otherTexts[q.question])
+        || (readyFiles.length ? `Attached ${readyFiles.length} file${readyFiles.length === 1 ? '' : 's'}` : '')
       resolved[q.question] = val
       return `- ${q.question}: ${val.replace(/\n/g, '\n  ')}`
     })
@@ -303,7 +287,7 @@ export default function QuestionCard({
       if (accepted === false || accepted?.status === 'locally_queued' || accepted?.status === 'locally_settled') {
         if (preparedSubmission) onCancelAnswer?.(preparedSubmission)
       } else {
-        setSubmitted(true)
+        setSubmitted({ answers: resolved, attachments: readyFiles })
         clearFiles()
       }
     } catch (error) {
@@ -337,13 +321,6 @@ export default function QuestionCard({
   return (
     <div
       className={`qcard${grouped ? ' qcard--grouped' : ''}${answered ? ' qcard--answered' : ''}`}
-      onDrop={event => {
-        if (selectionLocked || disabled || submitting || platformAction) return
-        const dropped = Array.from(event.dataTransfer?.files || [])
-        if (!dropped.length) return
-        event.preventDefault()
-        addFiles(dropped)
-      }}
       data-scroll-anchor-key={draftKey}
       ref={answered ? null : pendingCardRef}
       aria-disabled={disabled && !answered ? true : undefined}
@@ -386,7 +363,7 @@ export default function QuestionCard({
         const inactive = selectionLocked || disabled || submitting
 
         const answeredValue = displayAnswers[q.question]
-          || (submitted ? resolveAnswer(answers[q.question], otherTexts[q.question]) : '')
+          || (submitted ? resolveQuestionAnswer(answers[q.question], otherTexts[q.question]) : '')
         const answeredArr = selectionLocked && isMulti
           ? (answeredValue ? answeredValue.split(', ').map(s => s.trim()) : [])
           : []
@@ -497,32 +474,18 @@ export default function QuestionCard({
             {(!completedAction || respondedRestartAction)
               && (!restartAction || writtenRestartAction) && (
               <div className="qcard__answer-row">
-                {qi === 0 && !selectionLocked && !disabled && !platformAction && (
-                  <div className="qcard__composer-actions">
-                    <input ref={fileInputRef} type="file" multiple className="qcard__file-input"
-                      aria-label="Attach files to your answer"
-                      onChange={e => { const selected = Array.from(e.target.files || []); e.target.value = ''; addFiles(selected) }} />
-                    <button type="button" className="qcard__attach" aria-label="Attach a photo or file"
-                      title="Attach a photo or file" disabled={submitting} onClick={() => fileInputRef.current?.click()}>
-                      <Paperclip width={18} height={18} aria-hidden="true" />
-                    </button>
-                  </div>
-                )}
                 <div className={`qcard__composer${isOtherSelected || answeredWithOther ? ' qcard__composer--active' : ''}`}>
-                  {qi === 0 && (selectionLocked
-                    ? <Attachments attachments={attachments || localAnswer?.body?.attachments} chatId={chatId} />
-                    : files.length > 0 && <FileChips files={files} onRemove={removeFile} chatId={chatId} />)}
                   <CustomAnswerArea
                     answered={selectionLocked}
-                    canSubmit={allAnswered}
+                    canSubmit={canSubmit}
                     disabled={inactive}
                     placeholder={writtenRestartAction
                       ? 'Or tell me what you’d like to do instead…'
                       : hasOptions ? undefined : 'Type your answer…'}
                     onChange={text => setOtherText(q.question, text)}
-                    onPasteFiles={platformAction || selectionLocked || disabled ? undefined : addFiles}
+                    onPasteFiles={platformAction || inactive ? undefined : addFiles}
                     onSubmitShortcut={(questionCard) => {
-                      if (allAnswered) handleSubmit(questionCard, null)
+                      if (canSubmit) handleSubmit(questionCard, null)
                     }}
                     question={q.question}
                     value={selectionLocked
@@ -536,6 +499,30 @@ export default function QuestionCard({
         )
         })}
       </div>
+      {!platformAction && (
+        <div className="qcard__attachments" role="group" aria-label="Files for this answer">
+          {selectionLocked
+            ? <Attachments attachments={attachments || localAnswer?.body?.attachments || submitted?.attachments} chatId={chatId} />
+            : !disabled && <>
+              <div className="qcard__attachment-actions">
+                <input ref={fileInputRef} type="file" multiple className="qcard__file-input"
+                  disabled={submitting}
+                  aria-label="Attach files to your answer"
+                  onChange={e => {
+                    const selected = Array.from(e.target.files || [])
+                    e.target.value = ''
+                    if (!submitting) addFiles(selected)
+                  }} />
+                <button type="button" className="qcard__attach" aria-label="Attach a photo or file"
+                  title="Attach a photo or file" disabled={submitting} onClick={() => fileInputRef.current?.click()}>
+                  <Paperclip width={18} height={18} aria-hidden="true" />
+                </button>
+                <span>Files for {grouped ? 'all answers' : 'this answer'} · attach or paste</span>
+              </div>
+              <FileChips files={files} onRemove={removeFile} chatId={chatId} disabled={submitting} />
+            </>}
+        </div>
+      )}
       {!completedAction && (answered || !disabled) && (
         <>
           {locallyQueued && (
