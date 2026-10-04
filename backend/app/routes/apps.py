@@ -72,9 +72,9 @@ from app.database import get_db
 from app.deps import (
   get_current_owner, get_current_owner_for_lifecycle_control,
   get_current_owner_or_app, get_principal, get_principal_or_public_service,
-  Principal,
+  Principal, revocable_browser_stream,
   get_owner_or_app_with_manage_apps, reject_cross_site,
-  require_nondelegated_owner_control,
+  require_nondelegated_owner_control, require_nondelegated_owner_or_app_control,
 )
 from app.resource_access import live_app, live_app_or_404
 from app.timeutil import now_naive_utc, SOFT_DELETE_TTL
@@ -1489,10 +1489,10 @@ async def update_check(
   # fetching the candidate and comparing it with the recorded baseline.
   async with fs_locks.source_dir_lock(str(repo)):
     try:
-      candidate = await _fetch_update_candidate(
-        repo,
-        fetch_manifest_url,
-        strict=False,
+      # Discovery needs only the complete package identity, not its payload.
+      # The summary fetch enforces the same root-Git origin guard as install.
+      candidate = await asyncio.to_thread(
+        install.fetch_git_package_summary, repo, fetch_manifest_url,
       )
       pending, pending_state = await asyncio.to_thread(
         _current_pending_update,
@@ -1501,28 +1501,38 @@ async def update_check(
         installed_manifest_url, manifest_url, candidate.manifest,
       ):
         return _unknown()
-      recorded_tree = await asyncio.to_thread(
-        app_git.read_ref_tree, repo, app_git.UPSTREAM_BRANCH,
+      # The durable pending receipt wins before parsing/comparing a baseline.
+      # This fence stays inside the source lock after the fetch/identity check.
+      if pending is not None:
+        return _pending_result(pending, pending_state)
+      recorded_package = await asyncio.to_thread(
+        install.package_content_digest_from_git, repo, app_git.UPSTREAM_BRANCH,
       )
+      # Real legacy owner data has no package manifest. Preserve its bridge /
+      # executable-source comparison, while ordinary packages stream bytes.
+      recorded_tree = None
+      if recorded_package is None:
+        recorded_tree = await asyncio.to_thread(
+          app_git.read_ref_tree, repo, app_git.UPSTREAM_BRANCH,
+        )
+        # Only real pre-manifest owner data needs source bytes. Re-read the
+        # immutable candidate already fetched above, never another network ref.
+        legacy_candidate = await asyncio.to_thread(
+          install.read_git_install_candidate,
+          repo, candidate.commit, fetch_manifest_url, strict=False,
+        )
     except (
       HTTPException, OSError, subprocess.SubprocessError, RuntimeError,
       TypeError, ValueError,
     ):
       return _unknown()
-    if pending is not None:
-      return _pending_result(pending, pending_state)
     # One digest owns the complete declared package: manifest/capabilities,
     # executable source, icon, static assets, and seeds. A trusted catalog
     # app's migration bridge has no manifest to compare, so its first real
     # release is offered once: install replaces the bridge on exactly this
     # predicate, and later checks compare exact packages.
-    if "mobius.json" in recorded_tree:
-      try:
-        _, recorded_digest = install.package_content_digest_from_tree(
-          recorded_tree,
-        )
-      except install.PackageContentError:
-        return _unknown()
+    if recorded_package is not None:
+      _, recorded_digest = recorded_package
       update_available = recorded_digest != candidate.source_digest
     elif install.replaces_migration_bridge(
       recorded_tree,
@@ -1541,8 +1551,8 @@ async def update_check(
       except (AttributeError, KeyError, TypeError, ValueError, HTTPException):
         return _unknown()
       update_available = (
-        _recorded_update_source(recorded_tree, candidate.runtime_tree)
-        != candidate.runtime_tree
+        _recorded_update_source(recorded_tree, legacy_candidate.runtime_tree)
+        != legacy_candidate.runtime_tree
         or any(
           capability_changes[key]
           for key in ("added", "removed", "changed")
@@ -1743,7 +1753,7 @@ async def stream_app_events(
       get_system_broadcast().unsubscribe(queue)
 
   return StreamingResponse(
-    generate(),
+    revocable_browser_stream(generate(), principal),
     media_type="text/event-stream",
     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
   )
@@ -1754,7 +1764,7 @@ async def stream_app_events(
   response_model=schemas.AppConflictResolverChatOut,
   dependencies=[
     Depends(reject_cross_site),
-    Depends(_require_nondelegated_control),
+    Depends(require_nondelegated_owner_or_app_control),
   ],
 )
 async def create_conflict_resolver_chat(

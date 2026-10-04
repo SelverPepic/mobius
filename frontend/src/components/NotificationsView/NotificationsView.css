@@ -397,6 +397,10 @@
   font-weight: 600;
 }
 
+.notifications__row--error .notifications__row-icon {
+  color: var(--danger);
+}
+
 .notifications__row-body {
   display: -webkit-box;
   overflow: hidden;

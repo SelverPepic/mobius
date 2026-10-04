@@ -8,7 +8,7 @@ from starlette.concurrency import run_in_threadpool
 
 from app import chat_queue, models
 from app.broadcast import get_system_broadcast
-from app.chat_continuity import apply_checkpoint, note_path, write_note
+from app.chat_continuity import apply_checkpoint, checkpoint_coverage, note_path, write_note
 from app.chat_titles import renamed_event
 from app.chat_writer import AuthorizeCheckpoint, await_ack, get_writer
 from app.config import get_settings
@@ -27,7 +27,7 @@ class CheckpointBody(BaseModel):
   summary: str | None = Field(default=None, max_length=8_000)
 
 
-def _save_note(data_dir: str, chat_id: str, body: CheckpointBody) -> dict | None:
+def _save_note(data_dir: str, chat_id: str, body: CheckpointBody, run_token: str) -> dict | None:
   with SessionLocal() as db:
     chat = db.get(models.Chat, chat_id)
     if chat is None:
@@ -41,6 +41,7 @@ def _save_note(data_dir: str, chat_id: str, body: CheckpointBody) -> dict | None
       existing, name=chat.title or "",
       digest=(body.digest or "").strip() or None,
       summary=(body.summary or "").strip() or None,
+      coverage=checkpoint_coverage(list(chat.messages or []), run_token),
     ))
     return renamed_event(chat)
 
@@ -70,7 +71,7 @@ async def checkpoint_chat(
     if result.get("status") != "ok":
       raise HTTPException(status_code=409, detail="This run can no longer save this chat.")
     renamed = await run_in_threadpool(
-      _save_note, get_settings().data_dir, chat_id, body,
+      _save_note, get_settings().data_dir, chat_id, body, principal.run_id or "",
     )
   if renamed is not None and result.get("title_applied"):
     get_system_broadcast().publish(renamed)

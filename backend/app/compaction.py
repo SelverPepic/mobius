@@ -7,9 +7,10 @@ Only that provider-neutral result is stored and replayed into the selected
 provider's first real turn; the disposable synthesis session is never attached
 to the chat.
 
-The visible transcript is always included as a freshness backstop; legacy chats
-without a running note use it as their sole source. The route and writer actor own
-the atomic switch; this module only reads the source and produces compacted text.
+Callers include the visible transcript as a freshness backstop, or its uncovered
+tail when a verified note replaces the prefix. Legacy chats without a note use
+the transcript alone. The route and writer actor own the atomic switch; this
+module only reads the selected source and produces compacted text.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ import re
 import shutil
 import signal
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 from app.chat_notes import extract_cumulative_summary
@@ -201,8 +203,8 @@ async def summarize_chat(
   """Let the incoming provider synthesize its portable starting context.
 
   ``source_summary`` is the preferred, complete ``## Summary`` from the
-  per-chat note. The complete visible transcript is also included to close the
-  window where that note is stale. The selected provider/model performs the
+  per-chat note. The caller supplies the complete visible transcript unless it
+  has verified coverage allowing only the uncovered tail. The provider performs the
   synthesis in one or more disposable sessions; very large sources are folded
   progressively so no source interval is silently dropped or placed into an
   over-context prompt.
@@ -220,11 +222,10 @@ async def summarize_chat(
   if source:
     source_material = f"--- DETAILED RUNNING SUMMARY ---\n{source}"
     if transcript:
-      # The turn-end note backstop runs after the reply settles. Including the
-      # complete transcript closes that freshness window without assuming the
-      # missing material is necessarily at the tail.
+      # Include every supplied interval; coverage selection belongs to the
+      # caller, never to this bounded synthesis engine.
       source_material += (
-        "\n\n--- COMPLETE CURRENT CHAT TRANSCRIPT ---\n" + transcript
+        "\n\n--- CURRENT CHAT TRANSCRIPT ---\n" + transcript
       )
   else:
     source_material = f"--- LEGACY CHAT TRANSCRIPT ---\n{transcript}"
@@ -354,6 +355,7 @@ async def _run_claude_summarize_turn(
   )
   client = ClaudeSDKClient(options)
   parts: list[str] = []
+  errors: list[str] = []
   terminal_seen = False
   try:
     try:
@@ -368,15 +370,23 @@ async def _run_claude_summarize_turn(
         await client.query(prompt)
         async for msg in client.receive_response():
           if isinstance(msg, AssistantMessage):
+            if msg.error:
+              errors.append(msg.error)
+              errors.extend(
+                block.text for block in msg.content if isinstance(block, TextBlock)
+              )
             for block in msg.content:
               if isinstance(block, TextBlock):
                 parts.append(block.text)
           elif isinstance(msg, ResultMessage):
             terminal_seen = True
             if msg.is_error:
-              raise CompactionError(
-                "The incoming Claude agent could not compact the chat."
-              )
+              errors.extend(msg.errors or [])
+              if isinstance(msg.result, str):
+                errors.append(msg.result)
+              raise CompactionError(_provider_compaction_failure(
+                "\n".join(errors), status=msg.api_error_status,
+              ))
     except asyncio.TimeoutError:
       raise CompactionError(
         "Compaction receive loop timed out after "
@@ -422,8 +432,54 @@ def _codex_agent_text(stdout: bytes) -> str:
   return "".join(parts)
 
 
+def _provider_compaction_failure(text: str, status: int | None = None) -> str:
+  """Return only fixed, actionable messages for known synthesis refusals.
+
+  The summarizer serves both provider switches and manual /compact, so the
+  wording must hold for either caller.
+  """
+  unchanged = " Your existing conversation is unchanged."
+  sign_in = (
+    "The provider could not sign in. Reconnect that provider, "
+    "then try again." + unchanged
+  )
+  limit = (
+    "The provider has reached a usage or rate limit. "
+    "Try again when its allowance is available." + unchanged
+  )
+  if status == 401:
+    return sign_in
+  if status == 429:
+    return limit
+  if re.search(
+    r"request body is too large|request_body_too_large|"
+    r"unexpected status 413\b|context_length_exceeded", text, re.IGNORECASE,
+  ):
+    return "The provider rejected the compaction request as too large." + unchanged
+  if re.search(
+    r"out of credits|insufficient[_ ]credits|insufficient_quota|"
+    r"billing_error|credit balance is too low", text, re.IGNORECASE,
+  ):
+    return (
+      "The provider is out of credits. Add credits for that provider, "
+      "then try again." + unchanged
+    )
+  if re.search(
+    r"rate[_ ]limit|usage[_ ]limit|weekly limit|session limit|"
+    r"too many requests", text, re.IGNORECASE,
+  ):
+    return limit
+  if re.search(
+    r"authentication_failed|authentication (?:failed|error)|"
+    r"invalid authentication credentials|invalid_api_key|unauthorized|"
+    r"login required|not logged in", text, re.IGNORECASE,
+  ):
+    return sign_in
+  return "The incoming provider could not compact the chat."
+
+
 def _codex_compaction_failure(stdout: bytes, stderr: bytes) -> str:
-  """Classify a rejected synthesis without exposing raw provider output."""
+  """Classify failure events, never assistant prose or raw provider output."""
   errors: list[str] = []
   for line in stdout.decode("utf-8", "replace").splitlines():
     try:
@@ -433,7 +489,9 @@ def _codex_compaction_failure(stdout: bytes, stderr: bytes) -> str:
     if not isinstance(event, dict) or event.get("type") not in {"error", "turn.failed"}:
       continue
     error = event.get("error", event)
-    if isinstance(error, dict):
+    if isinstance(error, str):
+      errors.append(error)
+    elif isinstance(error, dict):
       errors.extend(
         value for key in ("code", "message")
         if isinstance(value := error.get(key), str)
@@ -441,15 +499,7 @@ def _codex_compaction_failure(stdout: bytes, stderr: bytes) -> str:
   # Older CLI versions report their terminal failure only on stderr. Match
   # known refusals, but never return or log arbitrary text from that stream.
   text = "\n".join(errors) if errors else stderr.decode("utf-8", "replace")
-  if re.search(
-    r"request body is too large|request_body_too_large|"
-    r"unexpected status 413\b|context_length_exceeded", text, re.IGNORECASE,
-  ):
-    return (
-      "The provider rejected the compaction request as too large. "
-      "Your existing conversation is unchanged."
-    )
-  return "The incoming provider could not compact the chat."
+  return _provider_compaction_failure(text)
 
 
 async def _run_codex_summarize_turn(
@@ -558,3 +608,59 @@ class CompactionError(Exception):
   declines to store a block or switch provider — a failed summarize must
   not lose the user's context silently.
   """
+
+
+@dataclass(frozen=True)
+class NoteRecoverySource:
+  """Snapshot fenced by the writer before a one-shot failure recovery."""
+
+  messages: list[dict]
+  note: str
+  provider: str
+  session_id: str
+  agent_settings: dict
+  generation: int = 0
+
+  async def summarize(self, *, data_dir: str) -> str:
+    from app.chat_continuity import recovery_source
+    summary, tail = recovery_source(self.note, self.messages)
+    # Reuse the same bounded, tool-free synthesizer. Only the source selection
+    # changes: the bound handoff replaces its covered transcript prefix.
+    return await summarize_chat(
+      tail, source_summary=summary, data_dir=data_dir,
+      provider_id=self.provider, model=self.agent_settings.get("model"),
+      effort=self.agent_settings.get("effort"),
+    )
+
+
+@dataclass(frozen=True)
+class PreparedNoteRecovery:
+  source: NoteRecoverySource
+  briefing: str
+
+
+class RecoverySynthesisHandle:
+  """Let Stop and planned restart cancel the private synthesis and its cleanup."""
+
+  from app.runner_registry import RunnerKind
+  kind = RunnerKind.COMPACTION
+
+  def __init__(self, chat_id: str, task: asyncio.Task):
+    self.chat_id = chat_id
+    self.task = task
+
+  async def stop(self, timeout: float = 2.0) -> bool:
+    self.task.cancel()
+    try:
+      await asyncio.wait_for(asyncio.shield(self.task), timeout=timeout)
+    except asyncio.CancelledError:
+      if not self.task.cancelled():
+        raise
+    except asyncio.TimeoutError:
+      return False
+    except Exception:
+      pass  # A completed failure is still stopped.
+    return self.task.done()
+
+  async def force_stop(self, timeout: float = 5.0) -> bool:
+    return await self.stop(timeout)

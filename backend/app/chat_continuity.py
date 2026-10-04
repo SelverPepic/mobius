@@ -10,6 +10,8 @@ keep in sync and no format version to branch on.
 from __future__ import annotations
 
 import os
+import json
+import hashlib
 import tempfile
 import re
 from datetime import UTC, datetime
@@ -49,6 +51,7 @@ def apply_checkpoint(
   digest: str | None = None,
   summary: str | None = None,
   now: datetime | None = None,
+  coverage: dict | None = None,
 ) -> str:
   """Return ``note`` with one save applied; other sections are preserved.
 
@@ -69,6 +72,13 @@ def apply_checkpoint(
     stamp = (now or datetime.now(UTC)).strftime("%Y-%m-%d %H:%M UTC")
     entry = f"### {stamp}\n\n{_as_note_text(summary)}"
     cumulative = f"{cumulative}\n\n{entry}" if cumulative else entry
+  if summary:
+    # Only an authored detailed handoff advances coverage; a rename or the
+    # short drawer blurb says nothing about what history was summarized.
+    meta = [line for line in meta if not line.startswith("recovery_coverage:")]
+    if coverage is not None:
+      bound = {**coverage, "summary_sha256": summary_fingerprint(cumulative or "")}
+      meta.append("recovery_coverage: " + json.dumps(bound, sort_keys=True))
   current = _as_note_text(digest) if digest is not None else old_digest
 
   one_line_name = " ".join(name.split())
@@ -98,3 +108,51 @@ def write_note(path: Path, text: str) -> None:
     except OSError:
       pass
     raise
+
+
+def summary_fingerprint(summary: str) -> str:
+  return hashlib.sha256(summary.encode("utf-8")).hexdigest()
+
+
+def checkpoint_coverage(messages: list[dict], run_token: str) -> dict:
+  """Bind sealed earlier turns, deliberately leaving this turn in the tail.
+
+  Steering can seal several assistant segments during one physical run. Stop
+  at its FIRST segment, then keep the preceding owner input in the tail too.
+  No current-turn tool result or concurrent steer is claimed as covered.
+  """
+  from app.chat_message_identity import assistant_message_run_id
+  from app.chat_writer import messages_fingerprint
+
+  frontier = next((i for i, row in enumerate(messages)
+    if row.get("role") == "assistant"
+    and assistant_message_run_id(row.get("id")) == run_token), len(messages))
+  count = next((i + 1 for i in range(frontier - 1, -1, -1)
+    if messages[i].get("role") == "assistant"), 0)
+  return {"message_count": count, "messages_sha256": messages_fingerprint(messages[:count])}
+
+
+def recovery_source(note: str, messages: list[dict]) -> tuple[str, list[dict]]:
+  """Use the detailed note only with its unchanged, explicitly saved prefix.
+
+  The author owns semantic completeness. This binding proves source identity,
+  not that a model remembered every fact. Legacy/unbound notes remain readable
+  but cannot silently replace transcript intervals during automatic recovery.
+  """
+  from app.chat_writer import messages_fingerprint
+
+  summary = extract_cumulative_summary(note) or ""
+  meta, _ = _split_frontmatter(note)
+  try:
+    raw = next(line.partition(":")[2] for line in meta
+               if line.startswith("recovery_coverage:"))
+    coverage = json.loads(raw)
+    count = coverage["message_count"]
+    if (type(count) is not int or not 0 <= count <= len(messages)
+        or coverage["summary_sha256"] != summary_fingerprint(summary)
+        or coverage["messages_sha256"] != messages_fingerprint(messages[:count])
+        or not summary.strip()):
+      raise ValueError
+  except (StopIteration, KeyError, TypeError, ValueError):
+    raise ValueError("The saved handoff does not have verified conversation coverage.") from None
+  return summary, messages[count:]

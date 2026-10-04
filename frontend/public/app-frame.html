@@ -187,7 +187,7 @@
         mode = d.mode || infer(bg);
       }
     } catch (e) {}
-    if (!bg) {
+    if (!bg && !(location.pathname.endsWith('/shell/shared') || location.pathname.endsWith('/shell/shared/'))) {
       try {
         var raw = localStorage.getItem('mobius-theme');
         if (raw) {
@@ -244,7 +244,7 @@
     // Opaque app frames use a memory-only storage shim with an EMPTY slot, so it must NOT write — else it clobbers the owner's
     // real theme with the dark default and the shell re-reads it (drawer bleed).
     try {
-      if (window.parent === window) {
+      if (window.parent === window && !(location.pathname.endsWith('/shell/shared') || location.pathname.endsWith('/shell/shared/'))) {
         localStorage.setItem('mobius-theme', JSON.stringify({ bg: bg, mode: mode }));
       }
     } catch (e) {}
@@ -317,12 +317,11 @@
     }
     /* No grey/blue tap-flash on any interactive element across mini-apps (mobile). */
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
-    /* Native-app feel: no text-selection bounding box over buttons / labels /
-       UI chrome when tapped or long-pressed. Re-enabled on the things you
-       genuinely select into: form fields and contenteditable (CodeMirror's
-       editor surface is contenteditable, so editors stay selectable). The
-       News report renders in its own iframe, so its body text is unaffected. */
-    body { -webkit-user-select: none; user-select: none; }
+    /* Content is selectable by default. Limit accidental touch selection to
+       controls and drag handles; app styles can still opt specific surfaces out. */
+    body { -webkit-user-select: text; user-select: text; }
+    button, [role="button"], input[type="button"], input[type="submit"], input[type="reset"],
+    [draggable="true"], [data-split-role="handle"] { -webkit-user-select: none; user-select: none; }
     input, textarea, [contenteditable], [contenteditable] * { -webkit-user-select: text; user-select: text; }
     /* Keep ordinary taps and pans responsive. The parent shell owns the page
        viewport; a map, image, canvas, or document that needs zoom opts its own

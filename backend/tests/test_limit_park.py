@@ -346,6 +346,44 @@ def test_park_exit_non_limit_error_stays_plain():
   assert sink.events[-1] == {"type": "error", "message": "syntax error"}
 
 
+@pytest.mark.parametrize("runner_result", [
+  None,
+  {},
+  # Codex may first report the depleted credits as a reached rate limit.
+  {"api_error_status": 429, "rate_limit_resets_at": "2099-05-08T12:34:00Z"},
+])
+def test_exhausted_workspace_credits_is_a_manual_credits_pause(runner_result):
+  text = "Your workspace is out of credits. Add credits to continue."
+  sink = _Sink()
+  kwargs = chat_mod._park_exit(sink, runner_result, text, provider_id="codex")
+  assert kwargs == {"parked": False}
+  assert sink.events[-1] == {
+    "type": "error",
+    "message": text,
+    "resumable": True,
+    "pause": {"kind": "credits", "provider": "codex"},
+  }
+
+
+def test_structured_credits_flag_pauses_whatever_the_wording():
+  # The workspace-member variant and the runner's fallback wording carry no
+  # exact sentence; the runner's structured flag still makes it a credits pause.
+  text = "Codex usage limit reached."
+  sink = _Sink()
+  result = {"api_error_status": 429, "credits_depleted": True}
+  assert chat_mod._park_exit(sink, result, text, provider_id="codex") == {
+    "parked": False,
+  }
+  assert sink.events[-1]["pause"] == {"kind": "credits", "provider": "codex"}
+
+
+def test_other_credit_failures_stay_plain_errors():
+  text = "Payment failed: card declined. Add credits to continue."
+  sink = _Sink()
+  assert chat_mod._park_exit(sink, {}, text) == {"parked": False}
+  assert sink.events[-1] == {"type": "error", "message": text}
+
+
 def test_model_capacity_parks_for_a_short_automatic_retry():
   sink = _Sink()
   kwargs = chat_mod._park_exit(
@@ -731,7 +769,10 @@ def test_owner_message_queues_behind_future_limit_park(
   assert response.json()["status"] == "queued"
   assert scheduled == []
   assert _run_row("rt-park-owner-queue")["status"] == "parked"
-  assert _chat_row(cid)["pending"] == [{
+  pending = _chat_row(cid)["pending"]
+  accepted_at = pending[0].pop("_owner_input_at")
+  assert datetime.fromisoformat(accepted_at).tzinfo == UTC
+  assert pending == [{
     "role": "user",
     "content": "also check the weekly limit",
     "ts": response.json()["ts"],
@@ -3168,9 +3209,9 @@ def test_unrelated_failures_never_consume_old_or_concurrent_oom_kills(
   )
   sink = _Sink()
   for _ in range(3):
-    assert chat_mod._park_exit(sink, {"error": message}, message) == {
-      "parked": False,
-    }
+    disposition = chat_mod._park_exit(sink, {"error": message}, message)
+    assert disposition["parked"] is False
+    assert disposition.get("oversized", False) == ("request body is too large" in message)
   assert all("pause" not in event for event in sink.events)
   assert all(message in event["message"] for event in sink.events)
 
@@ -3180,11 +3221,11 @@ def test_unrelated_failures_never_consume_old_or_concurrent_oom_kills(
   ({"api_error_status": 413}, None),
   ({}, "Request Entity Too Large"),
 ])
-def test_oversized_request_preserves_reason_and_offers_remedy_without_retry(
+def test_oversized_request_preserves_reason_and_requests_changed_context_recovery(
   result, message,
 ):
   sink = _Sink()
-  assert chat_mod._park_exit(sink, result, message) == {"parked": False}
+  assert chat_mod._park_exit(sink, result, message) == {"parked": False, "oversized": True}
   assert len(sink.events) == 1
   event = sink.events[0]
   assert "pause" not in event

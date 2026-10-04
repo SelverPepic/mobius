@@ -5677,6 +5677,151 @@ def _add_legacy_helper_interruption(eng) -> None:
     ))
 
 
+def _add_note_recovery_attempted(eng) -> None:
+  """Retain the one-shot size-recovery budget across physical restarts."""
+  from sqlalchemy import inspect as sa_inspect, text
+
+  inspector = sa_inspect(eng)
+  if "chat_runs" not in inspector.get_table_names():
+    return
+  if "note_recovery_attempted" in {c["name"] for c in inspector.get_columns("chat_runs")}:
+    return
+  with eng.begin() as conn:
+    conn.execute(text(
+      "ALTER TABLE chat_runs ADD COLUMN note_recovery_attempted BOOLEAN NOT NULL DEFAULT 0"
+    ))
+def _add_agent_write_journal(eng) -> None:
+  """Add empty shared write-delivery records without changing chat history."""
+  from sqlalchemy import text
+  with eng.begin() as conn:
+    conn.execute(text("""
+      CREATE TABLE IF NOT EXISTS agent_write_streams (
+        run_id VARCHAR(64) NOT NULL PRIMARY KEY REFERENCES chat_runs(id) ON DELETE CASCADE,
+        chat_id VARCHAR(64) NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+        sealed BOOLEAN NOT NULL, accepted_count INTEGER NOT NULL,
+        accepted_bytes INTEGER NOT NULL, diagnostics JSON NOT NULL,
+        item_receipts JSON NOT NULL, failure_delivered_by VARCHAR(64)
+      )
+    """))
+    conn.execute(text("""
+      CREATE TABLE IF NOT EXISTS agent_write_intents (
+        root_run_id VARCHAR(64) NOT NULL, operation_id VARCHAR(100) NOT NULL,
+        chat_id VARCHAR(64) NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+        source_run_id VARCHAR(64) NOT NULL REFERENCES chat_runs(id) ON DELETE CASCADE,
+        ordinal INTEGER NOT NULL, item_id VARCHAR(256) NOT NULL,
+        item_fingerprint VARCHAR(64) NOT NULL, tool VARCHAR(100) NOT NULL,
+        arguments_json TEXT NOT NULL, status VARCHAR(16) NOT NULL,
+        stage VARCHAR(32) NOT NULL, reason VARCHAR(500),
+        created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL,
+        PRIMARY KEY (root_run_id, operation_id)
+      )
+    """))
+    for statement in (
+      "CREATE INDEX IF NOT EXISTS ix_agent_write_streams_chat_id ON agent_write_streams(chat_id)",
+      "CREATE INDEX IF NOT EXISTS ix_agent_write_intents_chat_id ON agent_write_intents(chat_id)",
+      "CREATE INDEX IF NOT EXISTS ix_agent_write_run_order ON agent_write_intents(source_run_id,status,ordinal)",
+      "CREATE INDEX IF NOT EXISTS ix_agent_write_item ON agent_write_intents(source_run_id,item_id)",
+    ):
+      conn.execute(text(statement))
+
+
+def _add_chat_run_browser_lineage(eng) -> None:
+  """Retain the browser initiator on physical runs across restarts."""
+  from sqlalchemy import inspect as sa_inspect, text
+
+  for table in ("chat_runs", "delegations"):
+    inspector = sa_inspect(eng)
+    if not inspector.has_table(table):
+      continue
+    columns = {c["name"] for c in inspector.get_columns(table)}
+    with eng.begin() as conn:
+      if "browser_grant_id" not in columns:
+        conn.execute(text(f"ALTER TABLE {table} ADD COLUMN browser_grant_id VARCHAR(64)"))
+      if "browser_grant_epoch" not in columns:
+        conn.execute(text(f"ALTER TABLE {table} ADD COLUMN browser_grant_epoch INTEGER"))
+      conn.execute(text(
+        f"CREATE INDEX IF NOT EXISTS ix_{table}_browser_grant_id "
+        f"ON {table} (browser_grant_id)"
+      ))
+
+
+def _add_browser_access_tables(eng) -> None:
+  """Create empty sharing tables; frozen DDL never grants access."""
+  from sqlalchemy import inspect as sa_inspect, text
+  if not sa_inspect(eng).has_table("owner"):
+    return
+  statements = (
+    "CREATE TABLE IF NOT EXISTS browser_access_grants (id VARCHAR(64) NOT NULL PRIMARY KEY, owner_id INTEGER NOT NULL REFERENCES owner(id), label VARCHAR(128) NOT NULL, epoch INTEGER NOT NULL, created_at TIMESTAMP NOT NULL, revoked_at TIMESTAMP)",
+    "CREATE INDEX IF NOT EXISTS ix_browser_access_grants_owner_id ON browser_access_grants(owner_id)",
+    "CREATE TABLE IF NOT EXISTS browser_access_invites (id VARCHAR(64) NOT NULL PRIMARY KEY, grant_id VARCHAR(64) NOT NULL REFERENCES browser_access_grants(id), secret_hash VARCHAR(64) NOT NULL, owner_token_epoch INTEGER NOT NULL, created_at TIMESTAMP NOT NULL, expires_at TIMESTAMP NOT NULL, consumed_at TIMESTAMP)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ix_browser_access_invites_secret_hash ON browser_access_invites(secret_hash)",
+    "CREATE INDEX IF NOT EXISTS ix_browser_access_invites_grant_id ON browser_access_invites(grant_id)",
+    "CREATE TABLE IF NOT EXISTS browser_access_sessions (id VARCHAR(64) NOT NULL PRIMARY KEY, grant_id VARCHAR(64) NOT NULL REFERENCES browser_access_grants(id), secret_hash VARCHAR(64) NOT NULL, owner_token_epoch INTEGER NOT NULL, created_at TIMESTAMP NOT NULL, idle_expires_at TIMESTAMP NOT NULL, revoked_at TIMESTAMP)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ix_browser_access_sessions_secret_hash ON browser_access_sessions(secret_hash)",
+    "CREATE INDEX IF NOT EXISTS ix_browser_access_sessions_grant_id ON browser_access_sessions(grant_id)",
+  )
+  with eng.begin() as conn:
+    for statement in statements:
+      conn.execute(text(statement))
+
+
+def _add_embed_browser_lineage(eng) -> None:
+  """Embedded app chats retain the browser authority that opened them."""
+  from sqlalchemy import inspect as sa_inspect, text
+  if not sa_inspect(eng).has_table("chat_embed_grants"):
+    return
+  columns = {c["name"] for c in sa_inspect(eng).get_columns("chat_embed_grants")}
+  with eng.begin() as conn:
+    for name, sqltype in (("browser_grant_id", "VARCHAR(64)"), ("browser_grant_epoch", "INTEGER"), ("browser_session_id", "VARCHAR(64)")):
+      if name not in columns:
+        conn.execute(text(f"ALTER TABLE chat_embed_grants ADD COLUMN {name} {sqltype}"))
+
+
+def _add_browser_account_grants(eng) -> None:
+  from sqlalchemy import inspect as sa_inspect, text
+  if not sa_inspect(eng).has_table("browser_access_grants"):
+    return
+  columns = {c["name"] for c in sa_inspect(eng).get_columns("browser_access_grants")}
+  with eng.begin() as conn:
+    for name, sqltype in (
+      ("kind", "VARCHAR(16) NOT NULL DEFAULT 'invitation'"),
+      ("issuer", "VARCHAR(255)"), ("subject", "VARCHAR(128)"),
+      ("recipient_handle", "VARCHAR(128)"), ("origin", "VARCHAR(255)"),
+      ("remote_status", "VARCHAR(24)"),
+      ("grantor_binding", "VARCHAR(128)"),
+    ):
+      if name not in columns:
+        conn.execute(text(f"ALTER TABLE browser_access_grants ADD COLUMN {name} {sqltype}"))
+    conn.execute(text("CREATE TABLE IF NOT EXISTS browser_account_pending (id VARCHAR(64) NOT NULL PRIMARY KEY, grant_id VARCHAR(64) NOT NULL REFERENCES browser_access_grants(id), state_hash VARCHAR(64) NOT NULL UNIQUE, cookie_hash VARCHAR(64) NOT NULL, verifier VARCHAR(128) NOT NULL, nonce VARCHAR(64) NOT NULL, grant_epoch INTEGER NOT NULL, owner_token_epoch INTEGER NOT NULL, issuer VARCHAR(255) NOT NULL, subject VARCHAR(128) NOT NULL, expires_at TIMESTAMP NOT NULL, consumed_at TIMESTAMP, verified_at TIMESTAMP, verified_expires_at TIMESTAMP)"))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_browser_account_pending_grant_id ON browser_account_pending(grant_id)"))
+    conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_browser_account_pending_cookie_hash ON browser_account_pending(cookie_hash)"))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_browser_account_pending_expires_at ON browser_account_pending(expires_at)"))
+
+
+def _add_goal_hold(eng) -> None:
+  """Add explicit pause attribution without inventing intent for old stops."""
+  from sqlalchemy import inspect as sa_inspect, text
+
+  inspector = sa_inspect(eng)
+  if "chat_goals" not in inspector.get_table_names():
+    return
+  if "hold_json" not in {c["name"] for c in inspector.get_columns("chat_goals")}:
+    with eng.begin() as conn:
+      conn.execute(text("ALTER TABLE chat_goals ADD COLUMN hold_json JSON"))
+
+
+def _add_run_owner_input_at(eng) -> None:
+  """Remember new owner admissions; never infer authority for historical runs."""
+  from sqlalchemy import inspect as sa_inspect, text
+
+  inspector = sa_inspect(eng)
+  if "chat_runs" not in inspector.get_table_names():
+    return
+  if "owner_input_at" not in {c["name"] for c in inspector.get_columns("chat_runs")}:
+    with eng.begin() as conn:
+      conn.execute(text("ALTER TABLE chat_runs ADD COLUMN owner_input_at DATETIME"))
+
+
 _SCHEMA_MIGRATIONS = (
   # Full IDs are permanent identities, not sequence positions. Append new
   # work in execution order; never renumber a shipped ID to reconcile sources.
@@ -5764,6 +5909,14 @@ _SCHEMA_MIGRATIONS = (
   ("0075_notification_seen_at", _add_notification_seen_at),
   ("0076_legacy_helper_interruption", _add_legacy_helper_interruption),
   ("0077_chat_archive", _add_chat_archive),
+  ("0077_note_recovery_attempted", _add_note_recovery_attempted),
+  ("0078_browser_access_tables", _add_browser_access_tables),
+  ("0079_chat_run_browser_lineage", _add_chat_run_browser_lineage),
+  ("0080_embed_browser_lineage", _add_embed_browser_lineage),
+  ("0078_agent_write_journal", _add_agent_write_journal),
+  ("0081_browser_account_grants", _add_browser_account_grants),
+  ("0081_goal_hold", _add_goal_hold),
+  ("0082_run_owner_input_at", _add_run_owner_input_at),
 )
 
 

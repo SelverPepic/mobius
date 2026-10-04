@@ -134,6 +134,12 @@ def _row_for_principal(
   return row
 
 
+def _require_guest_child_lineage(row: models.Delegation, principal: Principal) -> None:
+  """A guest may not start a clean owner or another guest's child run."""
+  if principal.browser_grant_id is not None and row.browser_grant_id != principal.browser_grant_id:
+    raise HTTPException(status_code=403, detail="This helper belongs to another browser authority.")
+
+
 async def _ensure_started(
   db: Session, row: models.Delegation, prompt: str,
 ) -> None:
@@ -265,6 +271,7 @@ async def submit_or_attach(
       effort=selection.get("effort"),
       cwd=cwd,
       notify_parent_on_complete=body.notify_parent_on_complete,
+      browser_grant_id=principal.browser_grant_id,
     )
     try:
       row, attached = create_or_attach_delegation(db, intent)
@@ -465,6 +472,7 @@ async def retry_delegation(
   against a newer park.
   """
   row = _row_for_principal(db, delegation_id, principal)
+  _require_guest_child_lineage(row, principal)
   started = await retry_limit_park(db, row, run_token=body.run_token)
   db.rollback()
   row = _row_for_principal(db, delegation_id, principal)
@@ -533,6 +541,7 @@ async def message_delegation(
   parent waits for its result or stops it.
   """
   row = _row_for_principal(db, delegation_id, principal)
+  _require_guest_child_lineage(row, principal)
   if principal.chat_id and principal.chat_id != row.parent_chat_id:
     raise HTTPException(
       status_code=403, detail="Only the helper's parent chat may message it.",
@@ -552,6 +561,7 @@ async def message_delegation(
   async with chat_queue.get_transition_lock(row.child_chat_id):
     db.rollback()
     row = _row_for_principal(db, delegation_id, principal)
+    _require_guest_child_lineage(row, principal)
     if row.cancelled_at is not None or row.interrupted_at is not None or row.scope != "write":
       raise HTTPException(status_code=409, detail="This helper cannot resume; start a new helper.")
     row.notify_parent_on_complete = True
