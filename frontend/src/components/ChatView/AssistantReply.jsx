@@ -66,7 +66,12 @@ function AssistantReply({
   if (!msg) return null
 
   const lastVisibleRow = rows.findLastIndex(row => !row.message.hidden)
-  return <PeerTimelineContext.Provider value={displayTimeline}><li className="chat__reply">
+  return <PeerTimelineContext.Provider value={displayTimeline}><li
+    className="chat__reply"
+    // The whole active reply is the current response: activity presentation may
+    // move its live tools into an earlier row than the streaming one.
+    data-current-response={activeRowIndex >= 0 ? 'true' : undefined}
+  >
     <ul className="chat__reply-rows" role="presentation">
       {rows.map((row, index) => {
         const active = index === activeRowIndex

@@ -75,13 +75,14 @@ test('projected helper and peer boundaries survive the chosen live source once, 
   const helper = { type: 'helper_result', id: 'helper', activityId: 'helper:one' }
   const peer = { type: 'tool', tool: 'PeerMessage', tool_use_id: 'peer-one' }
   const projected = [peer, old, helper]
-  assert.deepEqual(mergeProjectedActivity([live], projected, [old]), [peer, live, helper])
+  const stamped = { ...live, raw_index: 0 }
+  assert.deepEqual(mergeProjectedActivity([live], projected, [old]), [peer, stamped, helper])
   assert.deepEqual(mergeProjectedActivity([peer, live, helper], projected, [old]), [peer, live, helper])
   const folded = foldPeerActivity([row(0, [old]).message], {
     slots: new Map([[1, [helper]]]), tools: new Map(), positions: new Map(),
   }, 'chat')
   assert.equal(folded.slots.size, 0)
-  assert.deepEqual(mergeProjectedActivity([live], folded.messages[0].blocks, [old]), [live, helper])
+  assert.deepEqual(mergeProjectedActivity([live], folded.messages[0].blocks, [old]), [stamped, helper])
 })
 
 test('prepended mail never shifts the recorded boundary of another note in a folded source', () => {
@@ -91,6 +92,19 @@ test('prepended mail never shifts the recorded boundary of another note in a fol
     slots: new Map([[1, [{ id: 'before', sender_name: 'Before' }]]]), tools: new Map(), positions: new Map([[b.message.id, notes]]),
   }, 'chat')
   const { rows, positions } = presentAssistantActivity([a, { ...b, message: projected.messages[1] }], { activeIndex: 1, positions: projected.positions })
+  const entries = rows[0].message.blocks.map((item, idx) => ({ item, idx }))
+  const shown = insertPositionedActivity(entries, positions.get(a.message.id), a.message.blocks, 'chat')
+  assert.deepEqual(shown.map(e => e.item.tool_use_id), ['a', 'peer-before', 'b', 'peer-inside', 'c'])
+})
+
+test('prepended mail never shifts the recorded boundary of another note in a live source', () => {
+  const a = row(0, [tool('a')]), b = row(1, [tool('b'), tool('c')])
+  const notes = [{ id: 'inside', display_position: { assistant_message_id: b.message.id, block_index: 1 }, sender_name: 'Inside' }]
+  const projected = foldPeerActivity([a.message, b.message], {
+    slots: new Map([[1, [{ id: 'before', sender_name: 'Before' }]]]), tools: new Map(), positions: new Map([[b.message.id, notes]]),
+  }, 'chat')
+  const live = mergeProjectedActivity([tool('b'), tool('c', 'running')], projected.messages[1].blocks, b.message.blocks)
+  const { rows, positions } = presentAssistantActivity([a, { ...b, message: { ...b.message, blocks: live } }], { activeIndex: 1, positions: projected.positions })
   const entries = rows[0].message.blocks.map((item, idx) => ({ item, idx }))
   const shown = insertPositionedActivity(entries, positions.get(a.message.id), a.message.blocks, 'chat')
   assert.deepEqual(shown.map(e => e.item.tool_use_id), ['a', 'peer-before', 'b', 'peer-inside', 'c'])
@@ -110,7 +124,7 @@ test('projected helper boundaries survive saved prose with stamped source coordi
   const projected = foldPeerActivity([row(0, raw).message], {
     slots: new Map([[1, [helper]]]), tools: new Map(), positions: new Map(),
   }, 'chat').messages[0].blocks
-  assert.deepEqual(mergeProjectedActivity(live, projected, raw), [...live, helper])
+  assert.deepEqual(mergeProjectedActivity(live, projected, raw), [...live.map((block, raw_index) => ({ ...block, raw_index })), helper])
 })
 
 

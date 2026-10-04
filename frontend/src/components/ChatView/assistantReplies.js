@@ -133,6 +133,9 @@ export function presentAssistantReply(rows, { activeIndex = -1, positions = new 
   return presented
 }
 
+// Message-level cards with their own decided treatment (see isAgentWorkBlock):
+// a continuation cause or Wait wake opens a fragment, a Goal outcome or ended
+// Wait closes one. Activity never joins across them.
 const hasLeadingCause = message => message.continuation_reason
   || message.wait_summaries?.some(waitWokeItsAnswer)
 const hasTrailingOutcome = message => message.goal_summaries?.length

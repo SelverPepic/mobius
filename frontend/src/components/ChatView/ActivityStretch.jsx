@@ -210,7 +210,7 @@ function GroupedActivityStretch({
     ? [...new Set(compositeSegments.filter(segment => segment.detail_ref)
         .map(segment => activityDetailUrl(chatId, segment.detail_ref)))]
     : detailRef ? [activityDetailUrl(chatId, detailRef)] : []
-  const needsDetail = urls.some(Boolean)
+  const needsDetail = urls.length > 0
   const detail = useActivityDetails({
     urls,
     requested: detailRequested || userOpen,

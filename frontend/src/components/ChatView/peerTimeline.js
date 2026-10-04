@@ -1,4 +1,5 @@
 /* Project retained peer mail onto transcript boundaries without changing delivery or stored messages. */
+import { isAgentWorkBlock } from './activityGrouping.js'
 /** Stored coordinates of one projected block. Recorded positions name a
  * boundary in the stored message's blocks; projections that renumber those
  * blocks (the compact transcript and assistant-fragment folding) declare the
@@ -110,11 +111,7 @@ const isTransparentActivitySeparator = block => (
 )
 
 export const isActivityBlock = block => (
-  block?.type === 'tool'
-  || block?.type === 'thinking'
-  || block?.type === 'activity'
-  || block?.type === 'helper_result'
-  || isTransparentActivitySeparator(block)
+  isAgentWorkBlock(block) || isTransparentActivitySeparator(block)
 )
 
 /** Synthetic mail has no stored index. Other projected copies keep theirs. */
@@ -196,5 +193,8 @@ export function mergeProjectedActivity(liveBlocks = [], projectedBlocks = [], ra
   })
   const before = missing(projectedBlocks.slice(0, start))
   const after = missing(projectedBlocks.slice(start + rawBlocks.length))
-  return before.length || after.length ? [...before, ...liveBlocks, ...after] : liveBlocks
+  if (!before.length && !after.length) return liveBlocks
+  // Recorded positions count stored blocks, never the projected rows inserted
+  // here. Stamp that coordinate before prepending, as foldPeerActivity does.
+  return [...before, ...liveBlocks.map(withStoredBlockIndex), ...after]
 }

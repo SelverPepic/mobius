@@ -110,7 +110,8 @@ test('projected peer rows join a newer live payload once without replacing it', 
   const peer = { type: 'tool', tool: 'PeerMessage', tool_use_id: 'peer-note' }
   assert.deepEqual(
     mergeProjectedActivity([bash, later], [peer, bash], [bash]),
-    [peer, bash, later],
+    // Live blocks keep their stored coordinate past the prepended peer row.
+    [peer, { ...bash, raw_index: 0 }, { ...later, raw_index: 1 }],
   )
   assert.deepEqual(
     mergeProjectedActivity([peer, bash, later], [peer, bash], [bash]),
