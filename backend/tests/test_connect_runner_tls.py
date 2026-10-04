@@ -113,11 +113,11 @@ def test_every_command_message_uses_its_own_connection_context(monkeypatch):
         owner = runner._CommandRunner(f"https://host{n}.test", f"test{n}", context=ctx)
         owner.live_output = True
         owner._post_started("one")
-        output = runner._CommandOutput()
-        output.append("stdout", "chunk")
-        assert owner.flush_output({"request_id": "one", "output": output}, drain=True)
-        output.close()
-        owner._post_result("one", "done", "", 0, "completed")
+        command = runner._Command("one", 30)
+        command.output = runner._CommandOutput()
+        command.output.append("stdout", "chunk")
+        assert owner.flush_output(command, drain=True)
+        owner._post_result(command, "done", "", 0, "completed")
         assert owner.pending_messages() == []
     assert len(calls) == 6
     for n in range(2):
@@ -127,11 +127,20 @@ def test_every_command_message_uses_its_own_connection_context(monkeypatch):
             assert kwargs["token"] == f"test{n}"
 
 
-@pytest.mark.parametrize("failed_refresh", [False, True])
-def test_reconnect_replaces_trust_snapshot_but_keeps_pending_results(
-    monkeypatch, failed_refresh,
-):
-    contexts, streams, posts, attempts = [], [], [], []
+def test_disconnect_confirmation_uses_the_connection_context(monkeypatch):
+    calls = []
+    monkeypatch.setattr(runner, "_post",
+                        lambda url, payload, **kwargs: calls.append((url, kwargs)))
+    monkeypatch.setattr(runner, "_remove_connection", lambda *_args: 1)
+    ctx = object()
+    owner = runner._CommandRunner("https://host.test", "test-only", context=ctx)
+    runner._handle_disconnect({}, "https://host.test", "test-only", owner, "d1")
+    assert calls == [("https://host.test/api/connect/result",
+                      {"token": "test-only", "context": ctx})]
+
+
+def test_reconnect_keeps_the_connection_context_and_pending_results(monkeypatch):
+    contexts, streams, posts = [], [], []
     stop, first_post = threading.Event(), threading.Event()
     monkeypatch.setattr(runner.time, "sleep", lambda _delay: None)
     monkeypatch.setattr(runner, "STREAM_HEALTHY_SECONDS", 0)
@@ -140,9 +149,6 @@ def test_reconnect_replaces_trust_snapshot_but_keeps_pending_results(
                         lambda self: self.flush_pending_results())
 
     def create_context():
-        attempts.append(True)
-        if failed_refresh and len(attempts) == 2:
-            raise OSError("trust store temporarily unavailable")
         value = object()
         contexts.append(value)
         return value
@@ -152,7 +158,7 @@ def test_reconnect_replaces_trust_snapshot_but_keeps_pending_results(
     def post(url, payload, **kwargs):
         posts.append((payload["request_id"], kwargs["context"]))
         first_post.set()
-        if kwargs["context"] is contexts[0]:
+        if len(posts) == 1:
             raise urllib.error.URLError("first stream lost")
         return {}
 
@@ -182,7 +188,7 @@ def test_reconnect_replaces_trust_snapshot_but_keeps_pending_results(
         {"url": "https://host.test", "token": "test-only", "host_id": "h_test"},
         stop,
     )
-    assert len(attempts) == (3 if failed_refresh else 2)
-    assert len(contexts) == 2
-    assert streams == contexts
-    assert posts == [("expired", contexts[0]), ("expired", contexts[1])]
+    # One trust snapshot per connection, shared by every stream and POST.
+    assert len(contexts) == 1
+    assert streams == contexts * 2
+    assert posts == [("expired", contexts[0]), ("expired", contexts[0])]
