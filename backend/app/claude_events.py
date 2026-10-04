@@ -718,6 +718,15 @@ def dispatch_sdk_message(
               "segment_id": segment_id,
             })
         continue
+      if isinstance(block, TextBlock) and sdk_msg.error:
+        # The CLI wraps a failed API call (a safety refusal, auth or billing
+        # failure, an exhausted retry) in a synthetic assistant message whose
+        # text is the error report. It is not model prose: the turn's
+        # ResultMessage carries the same report as its error and owns the one
+        # error block, and a CLI-internal retry that later succeeds leaves no
+        # failure to show. Publishing it here duplicated the error as plain
+        # text, once per failed attempt.
+        continue
       if isinstance(block, TextBlock):
         # The text already streamed live via text_delta events; this is the
         # AUTHORITATIVE full text of the just-completed assistant item. Do NOT
