@@ -5878,9 +5878,14 @@ def _move_chat_media_out_of_generated(eng) -> None:
 
   def old_files(chat_id: str) -> list[Path]:
     old_dir = chats_root / chat_id / "generated"
-    if not old_dir.is_dir():
+    # Never follow a symlink: copying its target into media/ would serve a
+    # file from outside the chat, which the media route otherwise refuses.
+    if old_dir.is_symlink() or not old_dir.is_dir():
       return []
-    return [source for source in old_dir.iterdir() if source.is_file()]
+    return [
+      source for source in old_dir.iterdir()
+      if source.is_file() and not source.is_symlink()
+    ]
 
   def first_collision(sources: list[Path], media_dir: Path) -> str | None:
     for source in sources:
@@ -5940,7 +5945,7 @@ def _move_chat_media_out_of_generated(eng) -> None:
       for source in sources:
         source.unlink()
       old_dir = chats_root / chat_id / "generated"
-      if old_dir.is_dir() and not any(old_dir.iterdir()):
+      if not old_dir.is_symlink() and old_dir.is_dir() and not any(old_dir.iterdir()):
         old_dir.rmdir()
     except OSError as error:
       log.warning(

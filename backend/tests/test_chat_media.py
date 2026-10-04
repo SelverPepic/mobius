@@ -40,6 +40,45 @@ def test_moves_files_and_rewrites_urls(db, chat):
   assert chat.pending_messages[0]["content"]["preview"] == new_url
 
 
+def test_symlinks_in_the_legacy_folder_are_never_copied(db, chat, tmp_path):
+  outside = tmp_path / "outside-secret.txt"
+  outside.write_bytes(b"secret")
+  chat.messages = [{"role": "assistant", "content": (
+    f"/api/chats/{chat.id}/generated/real.png "
+    f"/api/chats/{chat.id}/generated/link.png"
+  )}]
+  db.commit()
+  old_dir = _chat_root(chat.id) / "generated"
+  old_dir.mkdir(parents=True)
+  (old_dir / "real.png").write_bytes(b"real")
+  (old_dir / "link.png").symlink_to(outside)
+
+  _move_chat_media_out_of_generated(db.get_bind())
+
+  media = _chat_root(chat.id) / "media"
+  assert (media / "real.png").read_bytes() == b"real"
+  assert not (media / "link.png").exists()
+  assert outside.read_bytes() == b"secret"
+
+
+def test_a_symlinked_legacy_folder_is_not_followed(db, chat, tmp_path):
+  outside = tmp_path / "outside"
+  outside.mkdir()
+  (outside / "secret.png").write_bytes(b"secret")
+  chat.messages = [{"role": "assistant", "content": (
+    f"/api/chats/{chat.id}/generated/secret.png"
+  )}]
+  db.commit()
+  root = _chat_root(chat.id)
+  root.mkdir(parents=True, exist_ok=True)
+  (root / "generated").symlink_to(outside, target_is_directory=True)
+
+  _move_chat_media_out_of_generated(db.get_bind())
+
+  assert not (root / "media" / "secret.png").exists()
+  assert (outside / "secret.png").read_bytes() == b"secret"
+
+
 def test_leaves_links_to_other_chats_untouched(db, chat):
   foreign = "/api/chats/someone-else/generated/example.png"
   chat.messages = [{"role": "assistant", "content": f"Discussing {foreign}"}]
