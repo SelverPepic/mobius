@@ -1,27 +1,19 @@
-"""Unhandled route exceptions must leave a trace agents can read.
+"""Unhandled route exceptions must leave a bounded trace agents can read.
 
-uvicorn logs "Exception in ASGI application" on `uvicorn.error`, whose only
-handler writes to the container's stdout. Startup copies those errors into
-the shared chat log so a one-off 500 (for example a failed archive) can be
-diagnosed from inside Möbius.
+uvicorn's own "Exception in ASGI application" report reaches only the
+container's stdout. The request-error telemetry middleware, which already sees
+every route exception, writes the traceback to the shared chat log once per
+route and exception type per window, so a crash loop cannot flood the file.
 """
 
-import asyncio
 import logging
 from types import SimpleNamespace
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
-from app import chat_logging, startup
-from app.startup import DatabaseBootResult, StartupContext, run_startup_plan
-
-_ROUTED_LOGGERS = (
-  "uvicorn.error",
-  "app.providers.models",
-  "moebius.memory",
-  "app.helper_hosts",
-  "app.claude_helper_host",
-)
+from app import chat_logging, main
 
 
 class _Capture(logging.Handler):
@@ -34,93 +26,59 @@ class _Capture(logging.Handler):
 
 
 @pytest.fixture
-def capture(monkeypatch):
-  """Route the chat log into memory and restore every touched logger."""
+def chat_log(monkeypatch):
+  """Route the shared chat-log handler into memory; no database involved."""
   handler = _Capture()
   monkeypatch.setattr(chat_logging, "_chat_log_handler", handler)
-  saved = {
-    name: (list(logging.getLogger(name).handlers), logging.getLogger(name).level)
-    for name in _ROUTED_LOGGERS
-  }
-  uvicorn_errors = logging.getLogger("uvicorn.error")
-  uvicorn_errors.handlers = [
-    h for h in uvicorn_errors.handlers
-    if not isinstance(h, startup._ErrorsToChatLog)
-  ]
-  uvicorn_errors.setLevel(logging.INFO)
-  try:
-    yield handler
-  finally:
-    for name, (handlers, level) in saved.items():
-      logging.getLogger(name).handlers = handlers
-      logging.getLogger(name).setLevel(level)
+  chat_logger = logging.getLogger("moebius.chat")
+  monkeypatch.setattr(chat_logger, "handlers", [])
+  monkeypatch.setattr(chat_logger, "level", chat_logger.level)
+  return handler
 
 
-def _forwarders():
-  return [
-    h for h in logging.getLogger("uvicorn.error").handlers
-    if isinstance(h, startup._ErrorsToChatLog)
-  ]
+def _crashing_client(monkeypatch):
+  monkeypatch.setattr(main.activity, "record_request_error", lambda *a: None)
+  app = FastAPI()
+
+  @app.get("/crash/{item}")
+  def crash(item: str):
+    raise RuntimeError(f"boom {item}")
+
+  @app.get("/other")
+  def other():
+    raise KeyError("missing")
+
+  app.add_middleware(main._RequestErrorTelemetryMiddleware)
+  return TestClient(app, raise_server_exceptions=False)
 
 
-def test_route_crash_reaches_chat_log_without_quieting_uvicorn(capture):
-  uvicorn_errors = logging.getLogger("uvicorn.error")
-  startup._route_diagnostics_to_chat_log(None)
-  startup._route_diagnostics_to_chat_log(None)  # idempotent across calls
-  assert len(_forwarders()) == 1
+def test_route_crash_writes_its_traceback_to_the_chat_log(chat_log, monkeypatch):
+  client = _crashing_client(monkeypatch)
 
-  uvicorn_errors.info("Application startup complete.")
-  try:
-    raise RuntimeError("boom")
-  except RuntimeError as exc:
-    uvicorn_errors.error("Exception in ASGI application\n", exc_info=exc)
+  assert client.get("/crash/secret-name").status_code == 500
 
-  assert [r.getMessage() for r in capture.records] == [
-    "Exception in ASGI application\n",
-  ]
-  assert capture.records[0].exc_info is not None
-  # Console lifecycle lines still pass uvicorn's own level gate.
-  assert uvicorn_errors.isEnabledFor(logging.INFO)
+  [record] = chat_log.records
+  assert record.levelno == logging.ERROR
+  # The route template, never the raw path, identifies the failure.
+  assert record.getMessage() == "unhandled exception in route GET /crash/{item}"
+  assert isinstance(record.exc_info[1], RuntimeError)
+  assert "boom secret-name" in chat_log.format(record)
 
 
-def test_shutdown_cancellation_is_not_recorded_as_a_crash(capture):
-  startup._route_diagnostics_to_chat_log(None)
-  try:
-    raise asyncio.CancelledError()
-  except asyncio.CancelledError as exc:
-    logging.getLogger("uvicorn.error").error(
-      "Exception in ASGI application\n", exc_info=exc,
-    )
-
-  assert capture.records == []
-
-
-@pytest.mark.asyncio
-async def test_forwarder_is_attached_when_database_boot_is_degraded(
-  capture, monkeypatch,
+def test_crash_burst_writes_one_traceback_per_route_and_type_per_window(
+  chat_log, monkeypatch,
 ):
-  def fail_init():
-    raise RuntimeError("broken migration")
+  clock = [1000.0]
+  monkeypatch.setattr(main, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+  client = _crashing_client(monkeypatch)
 
-  ctx = StartupContext(
-    app=SimpleNamespace(state=SimpleNamespace()),
-    settings=SimpleNamespace(data_dir="/tmp"),
-    boot_id="test-boot",
-    init_db=fail_init,
-    install_pm_commit_launcher=lambda _source, _target: False,
-    assert_provider_defaults=lambda _names: None,
-    logger=logging.getLogger("test.startup"),
-  )
-  # Keep the production routing task itself, but skip unrelated process work.
-  monkeypatch.setattr(startup, "PROCESS_STARTUP_TASKS", tuple(
-    task for task in startup.PROCESS_STARTUP_TASKS
-    if task.name in {"route diagnostics to chat log", "initialize database"}
-  ))
-  monkeypatch.setattr(startup, "record_memory_checkpoint", lambda _name: None)
+  for i in range(50):
+    client.get(f"/crash/{i}")
+  client.get("/other")
+  assert [type(r.exc_info[1]) for r in chat_log.records] == [
+    RuntimeError, KeyError,
+  ]
 
-  result = await run_startup_plan(ctx)
-
-  assert result == DatabaseBootResult(
-    failure_reason="database_initialization_failed",
-  )
-  assert len(_forwarders()) == 1
+  clock[0] += main._RequestErrorTelemetryMiddleware._TRACEBACK_WINDOW_SEC
+  client.get("/crash/again")
+  assert len(chat_log.records) == 3
