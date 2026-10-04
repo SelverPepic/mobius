@@ -567,17 +567,28 @@ async def end_grant(db: Session, grant: BrowserAccessGrant, *, contact_directory
   from app.chat import stop_browser_grant_runs
   from app.routes.connect import cancel_browser_grant_commands
   result = GrantEnd()
+
+  def failed(exc: Exception) -> None:
+    if result.stop_error is None:
+      result.stop_error = exc
+
   try:
     result.pending_commands = cancel_browser_grant_commands(grant.id)
+  except Exception as exc:
+    failed(exc)
+  try:
     await cancel_browser_grant_calls(grant.id)
+  except Exception as exc:
+    failed(exc)
+  try:
     await stop_browser_grant_runs(grant.id, db)
   except HTTPException as exc:
     if isinstance(exc.detail, dict) and exc.detail.get("code") == "browser_grant_stop_incomplete":
       result.pending_chat_ids = exc.detail["chat_ids"]
     else:
-      result.stop_error = exc
+      failed(exc)
   except Exception as exc:
-    result.stop_error = exc
+    failed(exc)
   if grant.kind == "account" and grant.remote_status != "revoked":
     from app import account_browser_access
     outcome = "credential_rejected"

@@ -271,3 +271,30 @@ def test_browser_tables_migrate_without_current_model_metadata(tmp_path):
   with engine.begin() as connection:
     connection.execute(text("INSERT INTO browser_access_grants (id,owner_id,label,epoch,created_at) VALUES ('guest',1,'Alice',0,CURRENT_TIMESTAMP)"))
     assert connection.execute(text("SELECT label FROM browser_access_grants")).scalar_one() == "Alice"
+
+
+@pytest.mark.asyncio
+async def test_ending_a_grant_runs_every_stop_step_when_one_fails(db, monkeypatch):
+  from app import app_services, chat, browser_access
+  from app.routes import connect
+  owner = _owner(db, "owner")
+  grant, _ = create_invitation(db, owner, "recipient")
+  grant = revoke_grant(db, grant.id, owner.id)
+  calls = []
+
+  def broken_commands(grant_id):
+    raise OSError("ledger unavailable")
+
+  async def stop_calls(grant_id):
+    calls.append("calls")
+
+  async def stop_runs(grant_id, session):
+    calls.append("runs")
+
+  monkeypatch.setattr(connect, "cancel_browser_grant_commands", broken_commands)
+  monkeypatch.setattr(app_services, "cancel_browser_grant_calls", stop_calls)
+  monkeypatch.setattr(chat, "stop_browser_grant_runs", stop_runs)
+  ended = await browser_access.end_grant(db, grant)
+  assert calls == ["calls", "runs"]
+  assert isinstance(ended.stop_error, OSError)
+  assert ended.stop_pending
