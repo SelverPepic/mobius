@@ -8,6 +8,7 @@ therefore serve bounded diagnostics without executing partial maintenance.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 from dataclasses import dataclass, field
@@ -659,6 +660,9 @@ class _ErrorsToChatLog(logging.Handler):
     self._target = target
 
   def emit(self, record: logging.LogRecord) -> None:
+    # A request cancelled by a forced shutdown is not a route crash.
+    if record.exc_info and isinstance(record.exc_info[1], asyncio.CancelledError):
+      return
     self._target.handle(record)
 
 
@@ -676,6 +680,9 @@ def _capture_platform_activation_snapshot(context: StartupContext) -> None:
 
 
 PROCESS_STARTUP_TASKS = (
+  # First and database-independent: a degraded-database boot is exactly when
+  # route crashes most need to reach the chat log.
+  StartupTask("route diagnostics to chat log", _route_diagnostics_to_chat_log),
   StartupTask("refresh pm-commit launcher", _refresh_commit_launcher),
   StartupTask("validate provider defaults", _validate_provider_defaults),
   StartupTask(
@@ -773,11 +780,6 @@ DATABASE_STARTUP_TASKS = (
     "reconcile app cron supervision",
     _reconcile_app_cron,
     checkpoint="startup_metadata_reconciled",
-  ),
-  StartupTask(
-    "route diagnostics to chat log",
-    _route_diagnostics_to_chat_log,
-    checkpoint="startup_app_source_ready",
   ),
   # Last, after every fallible startup step: this server loaded the late
   # edits merged back at boot, so the swap no longer needs its rollback.
