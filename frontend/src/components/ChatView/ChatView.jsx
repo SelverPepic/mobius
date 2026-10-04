@@ -35,7 +35,6 @@ import {
   olderHistoryShouldLoad,
 } from './scroll/policy.js'
 import { activationRetryDelay, chatEntryFrame } from './chatRuntimeState.js'
-import { isResumableError } from './recoveryCard.js'
 import {
   remapSavedReadingAnchor,
   retireSavedReadingPosition,
@@ -358,7 +357,7 @@ function tailResumableBlock(messages) {
     const message = messages[i]
     if (message.role !== 'assistant' || !message.blocks?.length) return null
     const tail = message.blocks[message.blocks.length - 1]
-    return isResumableError(tail) ? tail : null
+    return tail.type === 'error' && tail.resumable ? tail : null
   }
   return null
 }

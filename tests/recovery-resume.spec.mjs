@@ -63,6 +63,7 @@ async function mount(page, { rejectFirst = false, loseFirstAck = false, creditPa
     ...partial,
     blocks: [partial.blocks[0], {
       type: 'error', message: 'Your workspace is out of credits. Add credits to continue.',
+      resumable: true, pause: { kind: 'credits', provider: 'codex' },
     }],
   } : partial
   const messages = [{ role: 'user', content: 'Original question A', cid: 'original-a', ts: 1788800000100 }, initialAnswer]

@@ -1,5 +1,4 @@
 /* Goal-command parsing and the shared footer progress-rail view model. */
-import { isResumableError } from './recoveryCard.js'
 
 /**
  * Return the objective carried by a real leading `/goal` command.
@@ -152,7 +151,7 @@ export function goalPresentationFromRuntime(runtime, fallback = null) {
 function hasResumableTail(message) {
   if (message?.role !== 'assistant' || !Array.isArray(message.blocks)) return false
   const tail = message.blocks[message.blocks.length - 1]
-  return isResumableError(tail)
+  return tail?.type === 'error' && tail.resumable === true
 }
 
 function previousVisibleMessageIndex(messages, beforeIndex) {

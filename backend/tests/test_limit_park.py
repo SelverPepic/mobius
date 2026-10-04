@@ -346,6 +346,27 @@ def test_park_exit_non_limit_error_stays_plain():
   assert sink.events[-1] == {"type": "error", "message": "syntax error"}
 
 
+@pytest.mark.parametrize("runner_result", [None, {}])
+def test_exhausted_workspace_credits_is_a_manual_credits_pause(runner_result):
+  text = "Your workspace is out of credits. Add credits to continue."
+  sink = _Sink()
+  kwargs = chat_mod._park_exit(sink, runner_result, text, provider_id="codex")
+  assert kwargs == {"parked": False}
+  assert sink.events[-1] == {
+    "type": "error",
+    "message": text,
+    "resumable": True,
+    "pause": {"kind": "credits", "provider": "codex"},
+  }
+
+
+def test_other_credit_failures_stay_plain_errors():
+  text = "Payment failed: card declined. Add credits to continue."
+  sink = _Sink()
+  assert chat_mod._park_exit(sink, {}, text) == {"parked": False}
+  assert sink.events[-1] == {"type": "error", "message": text}
+
+
 def test_model_capacity_parks_for_a_short_automatic_retry():
   sink = _Sink()
   kwargs = chat_mod._park_exit(

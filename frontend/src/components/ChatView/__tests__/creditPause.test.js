@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { createServer } from 'vite'
-import { isCreditPause, isResumableError, ownsRecoveryAction } from '../recoveryCard.js'
+import { ownsRecoveryAction } from '../recoveryCard.js'
 import { supersedeResumedPauseBlocks } from '../chatRuntimeState.js'
 import { streamItemsToAssistantPayload } from '../streamPromotion.js'
 
@@ -17,13 +17,17 @@ const { default: ErrorCard, errorCardViewModel } = await vite.ssrLoadModule('/sr
 const { default: MsgContent } = await vite.ssrLoadModule('/src/components/ChatView/MsgContent.jsx')
 after(() => vite.close())
 
-const creditBlock = { type: 'error', message: 'Your workspace is out of credits. Add credits to continue.' }
+// The backend classifies the provider rejection once and stamps this pause.
+const creditBlock = {
+  type: 'error',
+  message: 'Your workspace is out of credits. Add credits to continue.',
+  resumable: true,
+  pause: { kind: 'credits', provider: 'codex' },
+}
 const message = { role: 'assistant', content: '', blocks: [creditBlock] }
 
-test('the exact workspace-credit rejection becomes a calm pause without rewriting history', () => {
+test('a credits pause renders as a calm card without rewriting history', () => {
   const original = structuredClone(creditBlock)
-  assert.equal(isCreditPause(creditBlock), true)
-  assert.equal(isResumableError(creditBlock), true)
   const vm = errorCardViewModel(creditBlock)
   assert.equal(vm.benign, true)
   assert.equal(vm.parked, false)
@@ -79,15 +83,14 @@ test('accepted continuation supersedes the old credit pause only in the render p
   assert.equal(supersedeResumedPauseBlocks([message])[0], message)
 })
 
-test('unrelated payment failures remain errors rather than invitations to retry', () => {
+test('the card follows the backend pause kind, never the error text', () => {
   for (const block of [
     { type: 'error', message: 'Payment authorization failed.' },
-    { type: 'error', message: '402 Payment Required' },
-    { type: 'error', message: 'Could not load credits.' },
-    { type: 'text', message: creditBlock.message },
+    { type: 'error', message: creditBlock.message },
   ]) {
-    assert.equal(isCreditPause(block), false)
-    assert.equal(isResumableError(block), false)
-    assert.equal(errorCardViewModel(block).benign, false)
+    const vm = errorCardViewModel(block)
+    assert.equal(vm.credits, false)
+    assert.equal(vm.benign, false)
+    assert.equal(vm.label, 'Error')
   }
 })

@@ -4,7 +4,6 @@ import LifecycleIcon from './LifecycleIcon.jsx'
 import { ChevronRight, Clock, Pause, Warning } from '@openai/apps-sdk-ui/components/Icon'
 import MessageCopyButton from './MessageCopyButton.jsx'
 import { isResourcePause } from './waitingPresentation.js'
-import { isCreditPause } from './recoveryCard.js'
 
 // The single renderer for the error/pause/park card family. MsgContent consumes
 // both persisted blocks and the converted live stream, so source selection
@@ -19,13 +18,12 @@ import { isCreditPause } from './recoveryCard.js'
 // without a reset time and reads "Paused". Both are WAIT
 // states (any `pause`) and get the soft `.chat__text--parked` treatment; the
 // danger-red "Error" card is reserved for genuine failures (no `pause`). Old
-// saved credit rejections are recognized by the shared recovery policy;
-// other old blocks without `pause` retain the error rendering.
+// persisted blocks predate `pause` and fall back to the error rendering.
 // A platform-resource wait (memory, storage) carries a check time but is not a
 // quota: Möbius continues it by itself, so it
 // reads as "Waiting" and never offers the auto-continue toggle.
 export function errorCardViewModel(block) {
-  const credits = isCreditPause(block)
+  const credits = block.pause?.kind === 'credits'
   const resourceWait = isResourcePause(block)
   const modelCapacity = block.pause?.kind === 'model_capacity'
   const modelCapacityExhausted = block.pause?.kind === 'model_capacity_exhausted'
@@ -38,7 +36,7 @@ export function errorCardViewModel(block) {
       'This Goal paused repeatedly without a visible owner for the next action.',
     )
   )
-  const benign = !!block.pause || goalHandoff || credits
+  const benign = !!block.pause || goalHandoff
   return {
     credits,
     parked,
