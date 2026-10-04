@@ -97,6 +97,7 @@ import ConnectionStatus from './ConnectionStatus.jsx'
 import ProgressRail from './ProgressRail.jsx'
 import GoalPlanDetails from './GoalPlanDetails.jsx'
 import GoalDraftChip from './GoalDraftChip.jsx'
+import GoalAutoResumePrompt from './GoalAutoResumePrompt.jsx'
 import WaitingChip from './WaitingChip.jsx'
 import AssistantReply from './AssistantReply.jsx'
 import ArchivedChatNotice from './ArchivedChatNotice.jsx'
@@ -6370,6 +6371,14 @@ export default function ChatView({
             </div>
           )}
         </div>
+        {!embedded && actionableGoalPresentation && !autoResumeEnabled && (
+          <GoalAutoResumePrompt
+            goalKey={goalPresentation?.id || activeGoalObjective}
+            saving={autoResumeSaving}
+            error={autoResumeErrorSource === 'goal' ? autoResumeError : ''}
+            onEnable={(next) => handleAutoResumeChange(next, 'goal')}
+          />
+        )}
         <ProgressRail
           items={progressRail}
           resetKey={goalPresentation?.id || visibleGoalObjective || 'build-progress'}
