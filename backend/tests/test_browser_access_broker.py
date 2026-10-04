@@ -20,7 +20,7 @@ def test_bound_capability_rechecks_owner_and_browser_grant(tmp_path):
     grant, _ = create_invitation(db, owner, 'recipient')
     cap = connectors.mint_broker_capability(
       7, 'x' * 64, owner_id=owner.id, owner_epoch=owner.token_epoch,
-      browser_grant_id=grant.id, browser_grant_epoch=grant.epoch,
+      browser_grant_id=grant.id,
     )
     claims = connectors.verify_broker_capability(cap, 7, 'x' * 64, db=db)
     assert claims['browser_grant_id'] == grant.id
@@ -113,7 +113,7 @@ def test_turn_plan_issues_bound_broker_token_from_run_session(tmp_path):
     plan = connectors.build_turn_plan(
       db, include_owner_connectors=True,
       owner_id=owner.id, owner_epoch=owner.token_epoch,
-      browser_grant_id=grant.id, browser_grant_epoch=grant.epoch,
+      browser_grant_id=grant.id,
     )
     assert plan is not None
     server = next(iter(plan.claude_servers.values()))
@@ -176,8 +176,9 @@ def test_open_stream_lineage_recheck_sees_fresh_revocation(tmp_path, monkeypatch
     snapshot = routes._BrokerSnapshot(
       url=connector.url, auth_header=None, secret=None,
       connector_id=connector.id, generation=connector.capability_id,
+      # Capabilities minted before the grant epoch retired still carry it.
       lineage={'owner_id': owner.id, 'owner_epoch': owner.token_epoch,
-               'browser_grant_id': grant.id, 'browser_grant_epoch': grant.epoch},
+               'browser_grant_id': grant.id, 'browser_grant_epoch': 0},
     )
     assert routes._broker_lineage_active(connector.id, snapshot)
     revoke_grant(db, grant.id, owner.id)

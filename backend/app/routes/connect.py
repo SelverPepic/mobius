@@ -292,9 +292,6 @@ class _ActiveCommand:
     not_after: float | None = None,
     fingerprint: str | None = None,
     browser_grant_id: str | None = None,
-    browser_grant_epoch: int | None = None,
-    browser_owner_id: int | None = None,
-    browser_owner_token_epoch: int | None = None,
   ) -> None:
     loop = asyncio.get_running_loop()
     self.request_id = request_id
@@ -310,10 +307,9 @@ class _ActiveCommand:
     self.fingerprint = fingerprint or _command_fingerprint(
       cmd, cwd, timeout, script=script, shell=shell,
     )
+    # A guest-started command carries its grant so revocation can find and
+    # stop it, also after a restart.
     self.browser_grant_id = browser_grant_id
-    self.browser_grant_epoch = browser_grant_epoch
-    self.browser_owner_id = browser_owner_id
-    self.browser_owner_token_epoch = browser_owner_token_epoch
     self.started = asyncio.Event()
     if started_at is not None:
       self.started.set()
@@ -343,10 +339,9 @@ class _ActiveCommand:
         if record.get("not_after") is not None else None
       ),
       fingerprint=str(record.get("fingerprint") or ""),
+      # Records written before the grant epoch retired also hold
+      # browser_grant_epoch/browser_owner_id/browser_owner_token_epoch; unused.
       browser_grant_id=record.get("browser_grant_id"),
-      browser_grant_epoch=record.get("browser_grant_epoch"),
-      browser_owner_id=record.get("browser_owner_id"),
-      browser_owner_token_epoch=record.get("browser_owner_token_epoch"),
     )
 
   def record(self) -> dict:
@@ -361,9 +356,6 @@ class _ActiveCommand:
     }
     if self.browser_grant_id is not None:
       record["browser_grant_id"] = self.browser_grant_id
-      record["browser_grant_epoch"] = self.browser_grant_epoch
-      record["browser_owner_id"] = self.browser_owner_id
-      record["browser_owner_token_epoch"] = self.browser_owner_token_epoch
     # Replay needs the command only during the short pre-start dispatch window.
     # Do not retain command text (which may contain sensitive arguments) for the
     # remainder of a long-running command.
@@ -1118,42 +1110,15 @@ def _started_response(command: _ActiveCommand) -> dict:
   return {"request_id": command.request_id, "state": command.state}
 
 
-def _browser_command_authority(principal: Principal | None) -> tuple[str | None, int | None, int | None, int | None]:
-  """Bind command admission to the live recipient grant, not just a JWT."""
-  if not isinstance(principal, Principal) or principal.browser_grant_id is None:
-    return None, None, None, None
-  with SessionLocal() as db:
-    owner = db.get(models.Owner, principal.owner.id)
-    if owner is None or owner.token_epoch != principal.owner.token_epoch:
-      raise HTTPException(status_code=401, detail="Browser access unavailable.")
-    browser_access.validate_grant(
-      db, principal.browser_grant_id, principal.browser_grant_epoch, owner.id,
-    )
-    if principal.browser_session_id is not None:
-      browser_access.validate_session(
-        db, principal.browser_session_id, principal.browser_grant_id, owner.id,
-      )
-  return (
-    principal.browser_grant_id, principal.browser_grant_epoch,
-    principal.owner.id, principal.owner.token_epoch,
-  )
-
-
 def _command_grant_active(command: _ActiveCommand) -> bool:
   """Recheck durable guest authority before a recovered exec can be replayed."""
   if command.browser_grant_id is None:
     return True
   with SessionLocal() as db:
-    owner = db.get(models.Owner, command.browser_owner_id)
-    if owner is None or owner.token_epoch != command.browser_owner_token_epoch:
-      return False
-    try:
-      browser_access.validate_grant(
-        db, command.browser_grant_id, command.browser_grant_epoch, owner.id,
-      )
-    except HTTPException:
-      return False
-  return True
+    return browser_access.is_live(
+      db, browser_access.BrowserLineage(command.browser_grant_id),
+      db.query(models.Owner.id).scalar(),
+    )
 
 
 @router.post("/hosts/{host_id}/exec")
@@ -1163,8 +1128,9 @@ async def exec_on_host(
   _owner: models.Owner = Depends(get_owner_or_app_with_connect_manage),
   _principal: Principal = Depends(get_principal),
 ) -> dict:
-  browser_grant_id, browser_grant_epoch, browser_owner_id, browser_owner_token_epoch = (
-    _browser_command_authority(_principal)
+  # get_principal already proved the guest's grant and session are live.
+  browser_grant_id = (
+    _principal.browser_grant_id if isinstance(_principal, Principal) else None
   )
   host = _load_host(host_id)
   if host is None:
@@ -1246,9 +1212,6 @@ async def exec_on_host(
     not_after=not_after,
     fingerprint=fingerprint,
     browser_grant_id=browser_grant_id,
-    browser_grant_epoch=browser_grant_epoch,
-    browser_owner_id=browser_owner_id,
-    browser_owner_token_epoch=browser_owner_token_epoch,
   )
   commands[request_id] = command
   _persist_commands(host_id)

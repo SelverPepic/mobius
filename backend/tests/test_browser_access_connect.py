@@ -6,8 +6,9 @@ import pytest
 from fastapi import HTTPException
 
 from app import connect_runner
-from app.browser_access import create_invitation, revoke_grant
-from app.deps import Principal, require_installation_owner_control
+from app import auth
+from app.browser_access import BrowserLineage, create_invitation, revoke_grant
+from app.deps import Principal, get_principal, require_installation_owner_control
 from app.models import Owner
 from app.routes import connect
 
@@ -60,10 +61,7 @@ async def _start(host_id, channel, request_id, principal):
 async def test_revoke_cancels_only_recipient_commands_not_owner_commands(db):
   owner = _owner(db)
   grant, _ = create_invitation(db, owner, "laptop")
-  guest = Principal(
-    owner=owner, app_id=None, browser_grant_id=grant.id,
-    browser_grant_epoch=grant.epoch,
-  )
+  guest = Principal(owner=owner, app_id=None, browser=BrowserLineage(grant.id))
   own = Principal(owner=owner, app_id=None)
   host_id, channel = _host()
   guest_command = await _start(host_id, channel, "a" * 16, guest)
@@ -80,11 +78,12 @@ async def test_revoke_cancels_only_recipient_commands_not_owner_commands(db):
   assert owner_command.state == "running"
   assert (await channel.queue.get())["request_id"] == "a" * 16
   assert host_id in connect._channels
+  # Admission trusts the request principal, which no revoked bearer can obtain.
+  bearer = auth.create_access_token(
+    {"sub": owner.username}, token_epoch=owner.token_epoch, browser=guest.browser,
+  )
   with pytest.raises(HTTPException) as denied:
-    await connect.exec_on_host(
-      host_id, connect.ExecBody(cmd="printf safe", request_id="c" * 16),
-      _owner=owner, _principal=guest,
-    )
+    get_principal(bearer, db)
   assert denied.value.status_code == 401
 
 
@@ -93,11 +92,16 @@ async def test_cancel_pending_survives_restart_and_reconnect_without_replay(db):
   owner = _owner(db)
   grant, _ = create_invitation(db, owner, "laptop")
   host_id, _ = _host()
-  command = connect._ActiveCommand(
-    "a" * 16, 60, cmd="printf safe", browser_grant_id=grant.id,
-    browser_grant_epoch=grant.epoch, browser_owner_id=owner.id,
-    browser_owner_token_epoch=owner.token_epoch,
-  )
+  # A record persisted before the grant epoch retired stays readable.
+  command = connect._ActiveCommand.from_record({
+    "id": "a" * 16, "timeout": 60, "cmd": "printf safe", "state": "running",
+    "started_at": 1.0, "browser_grant_id": grant.id, "browser_grant_epoch": 0,
+    "browser_owner_id": owner.id, "browser_owner_token_epoch": owner.token_epoch,
+  })
+  assert command.browser_grant_id == grant.id
+  assert set(command.record()) & {
+    "browser_grant_epoch", "browser_owner_id", "browser_owner_token_epoch",
+  } == set()
   connect._host_commands(host_id)[command.request_id] = command
   connect._persist_commands(host_id)
   revoke_grant(db, grant.id, owner.id)
@@ -122,8 +126,6 @@ async def test_revocation_before_startup_reconciliation_blocks_guest_replay(db):
   host_id, _ = _host()
   guest_command = connect._ActiveCommand(
     "a" * 16, 60, cmd="printf guest", browser_grant_id=grant.id,
-    browser_grant_epoch=grant.epoch, browser_owner_id=owner.id,
-    browser_owner_token_epoch=owner.token_epoch,
   )
   owner_command = connect._ActiveCommand("b" * 16, 60, cmd="printf owner")
   connect._host_commands(host_id).update({
@@ -146,7 +148,7 @@ async def test_revocation_before_startup_reconciliation_blocks_guest_replay(db):
 def test_guest_cannot_mint_installation_connect_authority(db):
   owner = _owner(db)
   grant, _ = create_invitation(db, owner, "laptop")
-  guest = Principal(owner=owner, app_id=None, browser_grant_id=grant.id)
+  guest = Principal(owner=owner, app_id=None, browser=BrowserLineage(grant.id))
   with pytest.raises(HTTPException) as denied:
     require_installation_owner_control(guest)
   assert denied.value.status_code == 403
@@ -157,8 +159,8 @@ async def test_shared_finished_retry_never_reexecutes_or_adopts_another_grant(db
   owner = _owner(db)
   first, _ = create_invitation(db, owner, "first")
   second, _ = create_invitation(db, owner, "second")
-  a = Principal(owner=owner, app_id=None, browser_grant_id=first.id, browser_grant_epoch=first.epoch)
-  b = Principal(owner=owner, app_id=None, browser_grant_id=second.id, browser_grant_epoch=second.epoch)
+  a = Principal(owner=owner, app_id=None, browser=BrowserLineage(first.id))
+  b = Principal(owner=owner, app_id=None, browser=BrowserLineage(second.id))
   host_id, channel = _host()
   rid = "f" * 16
   command = await _start(host_id, channel, rid, a)
