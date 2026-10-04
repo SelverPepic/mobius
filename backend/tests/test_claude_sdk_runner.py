@@ -632,13 +632,9 @@ class _CardBus(_ChatBus):
   """A bus that owns exactly one continuation card, as the live sink does."""
 
   question_id = "card-9"
-  closing_save_id = "save-3"
 
   def has_continuation_card(self, question_id: str) -> bool:
     return question_id == self.question_id
-
-  def ends_turn(self, receipt_id: str) -> bool:
-    return receipt_id == self.closing_save_id or self.has_continuation_card(receipt_id)
 
 
 def _post_tool_use_hooks(options) -> list:
@@ -709,7 +705,7 @@ async def test_owner_card_hook_cuts_the_turn_before_the_receipt_reaches_the_mode
 
   client = clients[0]
   assert decisions == [
-    {"continue_": False, "stopReason": "A confirmed turn-ending result ends the turn."},
+    {"continue_": False, "stopReason": "Saved owner card ends the turn."},
   ]
   # Generation is cut at its source, so nothing is interrupted; the original
   # prompt is the ONLY query — the card end never requeries.
@@ -775,88 +771,6 @@ async def test_owner_card_hook_leaves_the_turn_running_without_a_current_card(
   assert result["error"] is None
   handle_owner = registry.get_handle("card-chat-" + label, RunnerKind.CLAUDE_SDK)
   assert handle_owner is None
-
-
-_CLOSING_SAVE = {
-  "tool_name": "mcp__mobius_control__checkpoint_chat",
-  "tool_input": {"summary": "Done.", "end_turn": True},
-}
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(("receipt_id", "ends"), [("save-3", True), ("save-old", False)])
-async def test_confirmed_closing_save_ends_the_turn_without_another_model_call(
-  monkeypatch, receipt_id, ends,
-):
-  """A closing save this run confirmed ends the turn like a saved card; any
-  other save receipt (or a failed save) leaves the loop running."""
-  decisions: list[dict] = []
-
-  class _Client(_FakeClient):
-    async def receive_response(self):
-      decisions.append(await _fire_card_end_hook(self.options, **_CLOSING_SAVE,
-        tool_response=[{"type": "text", "text": json.dumps(
-          {"state": "saved_turn_ends", "turn_end_id": receipt_id})}]))
-      handle = registry.get_handle("closing-" + receipt_id, RunnerKind.CLAUDE_SDK)
-      assert handle.owner_card_end is ends
-      yield (_tool_boundary_interrupt_result(session_id="sess-1", stop_reason="tool_use")
-             if ends else _success_result())
-
-  clients = _install_fake_client(monkeypatch, _Client)
-  bus = _CardBus()
-  bus.assistant_blocks = []
-  result = await _run_turn("closing-" + receipt_id, bc=bus, prompt="work")
-
-  assert decisions == ([{"continue_": False,
-                         "stopReason": "A confirmed turn-ending result ends the turn."}]
-                       if ends else [{"continue_": True}])
-  assert clients[0].interrupts == 0
-  assert clients[0].queries == ["work"]
-  assert result["error"] is None
-  assert result.get("terminal_status", "completed") == "completed"
-
-
-@pytest.mark.asyncio
-async def test_closing_save_never_ends_a_turn_with_owner_input_or_native_work_pending():
-  """A closing save ends the turn only when nothing still needs the model.
-
-  An owner message admitted into this response (consumed or not) must get its
-  answer, and Claude-native background work (a Workflow or background Agent)
-  must not be abandoned before its parent reacts to the result.
-  """
-  from app.chat_event_sink import ChatEventSink
-  from app.broadcast import ChatBroadcast
-
-  chat_id = "closing-save-pending"
-  handle = ActiveClaudeClient(_NativeClient(None), chat_id=chat_id)
-  sink = ChatEventSink(ChatBroadcast(chat_id), chat_id, run_token="run")
-  registry.register(handle)
-  try:
-    handle.mark_ready()
-    assert handle.may_end_at_closing_save()
-    receipt_id = sink.record_closing_save()
-    assert receipt_id and sink.ends_turn(receipt_id)
-
-    # The owner speaks after the receipt was issued: the cut is refused.
-    assert await steer_into_active_turn(chat_id, "one more thing") is True
-    assert not handle.may_end_at_closing_save()
-    assert not sink.ends_turn(receipt_id)
-    assert sink.record_closing_save() is None
-    handle._steers.clear()
-    assert sink.ends_turn(receipt_id)
-
-    handle.native_work.task_started("wf-1", "local_workflow", "tool-1")
-    assert not handle.may_end_at_closing_save()
-    handle.native_work.task_finished("wf-1")
-    assert not handle.may_end_at_closing_save()  # Its parent has not reacted yet.
-    handle.native_work.root_continuation_observed()
-    assert handle.may_end_at_closing_save()
-    # An ordinary background shell never owns turn completion.
-    handle.native_work.task_started("sh-1", "local_bash", "tool-2")
-    assert handle.may_end_at_closing_save()
-  finally:
-    await _flush_native(handle)
-    registry.unregister(chat_id, handle.kind)
 
 
 @pytest.mark.asyncio
