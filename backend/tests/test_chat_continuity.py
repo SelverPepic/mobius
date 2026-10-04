@@ -173,3 +173,24 @@ def test_retirement_rescues_journal_saves_into_the_note(tmp_path, monkeypatch):
   two = Path(tmp_path, "shared/memory/chats/c2/index.md").read_text(encoding="utf-8")
   assert extract_section(two, "Digest") == "Two now."
   assert extract_cumulative_summary(two) == "Section-less\n### Odd heading\nold note"
+
+
+def test_closing_save_receipt_is_bound_to_the_live_run_sink(client, chat):
+  from app.broadcast import ChatBroadcast
+  from app.chat_event_sink import ChatEventSink, register_active_sink, unregister_active_sink
+
+  headers = _start(chat)
+  sink = ChatEventSink(ChatBroadcast(chat.id), chat.id, run_token="continuity-run")
+  register_active_sink(chat.id, sink)
+  try:
+    plain = _save(client, headers, summary="Mid-turn progress.")
+    assert plain.status_code == 204
+    closing = _save(client, headers, summary="Closing entry.", end_turn=True)
+    assert closing.status_code == 200
+    receipt_id = closing.json()["turn_end_id"]
+    assert sink.ends_turn(receipt_id) and not sink.ends_turn("someone-else")
+    assert "Closing entry." in _note(chat)
+  finally:
+    unregister_active_sink(chat.id, sink)
+  # Without this run's live sink the save still stands; the turn just continues.
+  assert _save(client, headers, summary="After.", end_turn=True).status_code == 204

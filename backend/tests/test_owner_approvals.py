@@ -10,12 +10,12 @@ from app import auth as auth_mod, chat as chat_mod, models, questions
 from app.broadcast import create_broadcast
 from app.chat_event_sink import (
   ChatEventSink,
-  _owner_card_receipt_id,
   register_active_sink,
   unregister_active_sink,
 )
 from app.chat_writer import AnswerQuestion, Barrier, FinishRun, StartTurn, get_writer
 from app.database import SessionLocal
+from app.owner_card_receipts import owner_card_receipt_id as _owner_card_receipt_id
 from app.routes import chats_stream
 
 
@@ -241,6 +241,36 @@ def test_completed_receipt_ends_only_the_exact_saved_card_turn(
       }],
     }))
     assert handle.finishes == 1
+  finally:
+    registry.unregister(chat.id, handle.kind)
+
+
+def test_confirmed_closing_save_ends_only_its_own_turn(client, chat, approval_run):
+  """A closing save ends the turn at the same provider-neutral boundary as a card."""
+  from app.runner_registry import registry
+  handle = _FakeCardHandle(chat.id)
+  registry.register(handle)
+  try:
+    sink, headers = approval_run
+    async def deliver(turn_end_id):
+      sink.publish({"type": "tool_start", "tool": "checkpoint_chat", "input": "",
+                    "tool_use_id": f"save-{turn_end_id}"})
+      sink.publish({
+        "type": "tool_output", "output_complete": True, "output_exit_code": 0,
+        "tool_use_id": f"save-{turn_end_id}",
+        "content": json.dumps({"state": "saved_turn_ends", "turn_end_id": turn_end_id}),
+      })
+      await asyncio.sleep(0)
+
+    asyncio.run(deliver("an-earlier-turns-save"))
+    assert handle.finishes == 0
+    saved = client.post("/api/chat/continuity/checkpoints", headers=headers,
+                        json={"summary": "Done.", "end_turn": True})
+    assert saved.status_code == 200, saved.text
+    assert handle.finishes == 0  # The save never cuts its own response.
+    asyncio.run(deliver(saved.json()["turn_end_id"]))
+    assert handle.finishes == 1
+    assert not any("owner_card_question_id" in block for block in sink.assistant_blocks)
   finally:
     registry.unregister(chat.id, handle.kind)
 
