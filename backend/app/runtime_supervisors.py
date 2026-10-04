@@ -92,20 +92,15 @@ class RuntimeSupervisors:
       coroutine, name=f"mobius:{name}",
     )
 
-  def reclaim_boot_file_cache(self, *, startup_succeeded: bool) -> None:
+  def reclaim_boot_file_cache(self) -> None:
     """Release file pages boot left cached, once the server is ready.
 
     Boot reconciles the platform checkout, may finish an update swap, and
     bootstraps apps before any turn exists, so no settled-turn cleanup follows
     that git and tool I/O. Startup maintenance also reads much of the main
-    database file; only after every startup task succeeded and the database
-    supervisors are running is that one file advised too. One pass per
-    process at readiness, off the event loop.
+    database file, so that one file is advised too. One pass at readiness,
+    off the event loop.
     """
-    if "boot-file-cache-reclaim" in self._tasks:
-      return
-    advise_database = startup_succeeded and self.database_service_readiness()[0]
-
     async def reclaim():
       from app.file_cache import reclaim_background_work_cache
       try:
@@ -114,8 +109,6 @@ class RuntimeSupervisors:
         )
       except Exception:
         self.log.debug("boot file cache advice failed", exc_info=True)
-      if not advise_database:
-        return
       from app.database import reclaim_startup_database_file_cache
       try:
         result = await asyncio.to_thread(reclaim_startup_database_file_cache)

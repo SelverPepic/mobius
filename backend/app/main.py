@@ -317,9 +317,7 @@ async def lifespan(app):
         exc_info=True,
       )
     record_memory_checkpoint("startup_ready")
-    supervisors.reclaim_boot_file_cache(
-      startup_succeeded=not startup_context.failed_tasks,
-    )
+    supervisors.reclaim_boot_file_cache()
   from app import app_setup
   # Like cron mutation, restoration never runs inside the test runtime (its
   # readiness probe would reach other tests' HTTP doubles); its own tests

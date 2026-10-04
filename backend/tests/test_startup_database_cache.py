@@ -1,6 +1,5 @@
-"""Only a successful boot may advise clean pages of the main SQLite file."""
+"""Healthy startup advises away clean pages of the main SQLite file."""
 
-import asyncio
 import fcntl
 import logging
 import os
@@ -103,21 +102,17 @@ def test_advice_is_read_only_and_preserves_wal_contents_and_cache_policy(
     engine.dispose()
 
 
-def supervisors(monkeypatch, *, ready=True):
-  owner = RuntimeSupervisors(
+def supervisors():
+  return RuntimeSupervisors(
     settings=SimpleNamespace(data_dir="/tmp"),
     logger=logging.getLogger("test.startup-cache"),
     restart_authorization=None, restart_fallback_chats=[],
   )
-  monkeypatch.setattr(owner, "database_service_readiness", lambda: (ready, ""))
-  return owner
 
 
 @pytest.mark.asyncio
-async def test_database_cache_advice_runs_once_off_loop_at_successful_boot(
-  monkeypatch, caplog,
-):
-  owner = supervisors(monkeypatch)
+async def test_database_cache_advice_runs_off_loop_at_boot(monkeypatch, caplog):
+  owner = supervisors()
   loop_thread = threading.get_ident()
   calls = []
   monkeypatch.setattr(file_cache, "reclaim_background_work_cache", lambda _: None)
@@ -131,13 +126,8 @@ async def test_database_cache_advice_runs_once_off_loop_at_successful_boot(
 
   monkeypatch.setattr(database, "reclaim_startup_database_file_cache", advise)
   caplog.set_level(logging.INFO, logger="test.startup-cache")
-  owner.reclaim_boot_file_cache(startup_succeeded=True)
-  task = owner._tasks["boot-file-cache-reclaim"]
-  owner.reclaim_boot_file_cache(startup_succeeded=True)
-  assert owner._tasks["boot-file-cache-reclaim"] is task
-  await task
-  owner.reclaim_boot_file_cache(startup_succeeded=True)
-  await asyncio.sleep(0)
+  owner.reclaim_boot_file_cache()
+  await owner._tasks["boot-file-cache-reclaim"]
   assert len(calls) == 1 and calls[0] != loop_thread
   [line] = [r.getMessage() for r in caplog.records if "database file cache" in r.getMessage()]
   assert "advised_bytes=4096" in line
@@ -147,26 +137,8 @@ async def test_database_cache_advice_runs_once_off_loop_at_successful_boot(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("startup_succeeded,ready", [(False, True), (True, False)])
-async def test_incomplete_startup_keeps_database_cache_untouched(
-  monkeypatch, startup_succeeded, ready,
-):
-  owner = supervisors(monkeypatch, ready=ready)
-  tools = []
-  monkeypatch.setattr(file_cache, "reclaim_background_work_cache", tools.append)
-  monkeypatch.setattr(
-    database, "reclaim_startup_database_file_cache",
-    lambda: pytest.fail("incomplete startup must not advise database pages"),
-  )
-  owner.reclaim_boot_file_cache(startup_succeeded=startup_succeeded)
-  await owner._tasks["boot-file-cache-reclaim"]
-  assert tools == ["/tmp"]
-  await owner.stop()
-
-
-@pytest.mark.asyncio
 async def test_optional_cache_advice_failures_stay_inside_the_boot_task(monkeypatch):
-  owner = supervisors(monkeypatch)
+  owner = supervisors()
   calls = []
 
   def fail_tools(_):
@@ -178,7 +150,7 @@ async def test_optional_cache_advice_failures_stay_inside_the_boot_task(monkeypa
 
   monkeypatch.setattr(file_cache, "reclaim_background_work_cache", fail_tools)
   monkeypatch.setattr(database, "reclaim_startup_database_file_cache", fail_database)
-  owner.reclaim_boot_file_cache(startup_succeeded=True)
+  owner.reclaim_boot_file_cache()
   task = owner._tasks["boot-file-cache-reclaim"]
   await task
   assert calls == ["attempted"]
