@@ -8,7 +8,7 @@ from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 from starlette.requests import HTTPConnection
 
-from app import auth, browser_access, connect_outbound, models
+from app import access_signal, auth, browser_access, connect_outbound, models
 from app.app_capabilities import storage_grant
 from app.browser_access import BrowserLineage
 from app.config import get_settings
@@ -1370,7 +1370,12 @@ def get_owner_or_app_with_filesystem_access(
 
 
 def revocable_browser_stream(iterator, principal: Principal):
-  """Do not deliver another event from an already-open revoked browser stream."""
+  """End an open guest stream once its grant, session or owner sign-in ends.
+
+  Liveness is rechecked off the event loop and only when access may have
+  changed (``access_signal``), so streamed events cost no queries and an idle
+  stream still closes promptly on revocation or logout.
+  """
   if principal.browser is None:
     return iterator
   # Read plain values now, while the request's ORM session is still open.
@@ -1379,14 +1384,24 @@ def revocable_browser_stream(iterator, principal: Principal):
   )
 
 
+def _browser_stream_active(lineage: BrowserLineage, owner_id: int, owner_epoch: int) -> bool:
+  with SessionLocal() as db:
+    owner = db.get(models.Owner, owner_id)
+    return (owner is not None and owner.token_epoch == owner_epoch
+            and browser_access.is_live(db, lineage, owner_id))
+
+
 async def _until_browser_revoked(iterator, lineage: BrowserLineage, owner_id: int, owner_epoch: int):
+  # The request authorized this stream before the revision could be read,
+  # so check once up front (checked=None) and then only on change.
+  chunks = access_signal.until_revoked(
+    iterator, lambda: _browser_stream_active(lineage, owner_id, owner_epoch),
+    checked=None, recheck_seconds=access_signal.OUT_OF_PROCESS_RECHECK_SECONDS,
+  )
   try:
-    async for chunk in iterator:
-      with SessionLocal() as db:
-        owner = db.get(models.Owner, owner_id)
-        if (owner is None or owner.token_epoch != owner_epoch
-            or not browser_access.is_live(db, lineage, owner_id)):
-          return
+    async for chunk in chunks:
       yield chunk
+  except access_signal.AccessRevoked:
+    return
   finally:
-    await iterator.aclose()
+    await chunks.aclose()

@@ -1933,7 +1933,12 @@ live grant/session rather than trusting JWT expiry. Revocation is terminal
 Guest-started agent runs and child delegations retain durable grant lineage;
 renewing or resuming work cannot manufacture installation-owner authority.
 Turn-issued MCP broker capabilities also carry owner/grant lineage; upload and
-response streams stop forwarding after their authority is revoked. Bytes already
+response streams stop forwarding after their authority is revoked. Guest event
+streams and broker exchanges share `access_signal.until_revoked`: committed
+writes to access tables advance one in-process revision, and an open stream
+rechecks liveness in a worker thread only when it moves (or after a 30-second
+safety interval for out-of-process writes), so idle streams close on revocation
+and busy ones cost no query per event. Bytes already
 forwarded to a remote service cannot be recalled.
 Installation identity, credential, access administration and lifecycle controls
 remain separately gated; ordinary readable owner-input cards retain their

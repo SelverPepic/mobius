@@ -151,6 +151,66 @@ async def test_open_browser_event_stream_stops_before_next_revoked_event(db):
   assert closed == [True]
 
 
+def _guest_stream_fixture(db, name):
+  from app.browser_access import BrowserLineage, create_invitation, redeem_invitation
+  from app.deps import Principal
+  owner = models.Owner(username=name, hashed_password="unused")
+  db.add(owner); db.commit()
+  grant, invitation = create_invitation(db, owner, "Guest")
+  secret, session, _, _ = redeem_invitation(db, invitation)
+  principal = Principal(owner=owner, app_id=None, browser=BrowserLineage(grant.id, session.id))
+  return owner, grant, secret, principal
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["logout", "revoke"])
+async def test_idle_guest_stream_closes_promptly_when_access_ends(db, ending):
+  import asyncio
+  from app.browser_access import logout_session, revoke_grant
+  from app.deps import revocable_browser_stream
+  owner, grant, secret, principal = _guest_stream_fixture(db, "idle-" + ending)
+  closed = []
+  async def events():
+    try:
+      yield "first"
+      await asyncio.Event().wait()  # nothing more to send for a long time
+    finally:
+      closed.append(True)
+  stream = revocable_browser_stream(events(), principal)
+  assert await anext(stream) == "first"
+  waiting = asyncio.create_task(anext(stream))
+  await asyncio.sleep(0.05)
+  assert not waiting.done()
+  if ending == "logout":
+    logout_session(db, secret)
+  else:
+    revoke_grant(db, grant.id, owner.id)
+  with pytest.raises(StopAsyncIteration):
+    await asyncio.wait_for(waiting, timeout=2)
+  assert closed == [True]
+
+
+@pytest.mark.asyncio
+async def test_busy_guest_stream_does_not_query_per_event(db, monkeypatch):
+  import threading
+  from app import browser_access
+  from app.deps import revocable_browser_stream
+  _, _, _, principal = _guest_stream_fixture(db, "busy-owner")
+  checks = []
+  real = browser_access.is_live
+  def counted(*args, **kwargs):
+    checks.append(threading.current_thread() is threading.main_thread())
+    return real(*args, **kwargs)
+  monkeypatch.setattr(browser_access, "is_live", counted)
+  async def events():
+    for index in range(200):
+      yield index
+  chunks = [chunk async for chunk in revocable_browser_stream(events(), principal)]
+  assert chunks == list(range(200))
+  # One check when the stream opens, off the event loop; none per event.
+  assert checks == [False]
+
+
 def test_private_service_bearer_retains_browser_attribution(https, auth, db):
   from app.app_services import service_environment
   from app.deps import _resolve_owner
