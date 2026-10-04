@@ -32,7 +32,11 @@ export function subscribeChatCompaction(listener) {
   return () => listeners.delete(listener)
 }
 
-export function compactionNotice(kind) {
+// A view that started the provider switch has Send disabled and its settings
+// already say the chat is being prepared, so "will send" would contradict it.
+// Other views and devices can still send, and their message waits; tell them.
+export function compactionNotice(kind, { sendBlockedBySwitch = false } = {}) {
+  if (sendBlockedBySwitch) return null
   if (kind === 'provider_switch') {
     return 'Switching this chat’s provider… New messages will send when it finishes.'
   }

@@ -44,20 +44,15 @@ def _publish(chat_id: str, kind: CompactionKind | None) -> None:
 def compacting(chat_id: str, kind: CompactionKind) -> Iterator[None]:
   """Mark ``chat_id`` as rebuilding its context for the duration of the block.
 
-  Callers already hold the chat's transition lock, so at most one rebuild per
-  chat is active; the registry still restores the prior state on exit rather
-  than assuming it.
+  Callers hold the chat's transition lock, so at most one rebuild per chat is
+  ever active and a plain set/remove is enough.
   """
   with _guard:
-    previous = _active.get(chat_id)
     _active[chat_id] = kind
   _publish(chat_id, kind)
   try:
     yield
   finally:
     with _guard:
-      if previous is None:
-        _active.pop(chat_id, None)
-      else:
-        _active[chat_id] = previous
-    _publish(chat_id, previous)
+      _active.pop(chat_id, None)
+    _publish(chat_id, None)

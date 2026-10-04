@@ -6411,7 +6411,10 @@ export default function ChatView({
           canRequestSteer={canRequestSteer}
           canSubmitSteer={canSubmitSteer}
           sendFailure={sendFailure}
-          notice={compactionNotice(serverCompactingKind || (compactingChat ? 'compact' : null))}
+          notice={compactionNotice(
+            serverCompactingKind || (compactingChat ? 'compact' : null),
+            { sendBlockedBySwitch: providerSwitching },
+          )}
           submissionBlocked={
             (!activationSettled && !activationFailed)
             || providerSwitching
