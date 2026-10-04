@@ -64,7 +64,7 @@ RUNNER_PROTOCOL_VERSION = 4
 # Increment this for every shipped runner change that an existing installation
 # should receive. Protocol only describes wire compatibility; compatible
 # releases can keep using the same protocol while still offering an update.
-RUNNER_RELEASE = 6
+RUNNER_RELEASE = 7
 # What this runner can do, announced on every stream. Möbius gates behavior on
 # these names, never on release numbers: independently maintained copies of
 # this runner can reach the same release number with different abilities.
@@ -274,14 +274,14 @@ def _remove_connection(url, host_id):
     return len(conns)
 
 
-def _post(url, payload, token=None, timeout=30):
+def _post(url, payload, token=None, timeout=30, *, context=None):
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, method="POST")
     req.add_header("Content-Type", "application/json")
     if token:
         req.add_header("Authorization", "Bearer " + token)
     try:
-        with _open_url(req, timeout=timeout) as resp:
+        with _open_url(req, timeout=timeout, context=context) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except http.client.HTTPException as exc:
         raise urllib.error.URLError(exc) from exc
@@ -951,9 +951,12 @@ class _CommandRunner:
     reports why it could not.
     """
 
-    def __init__(self, base, token):
+    def __init__(self, base, token, *, context=None):
         self.base = base
         self.token = token
+        # This connection's verified TLS context. A fresh default context
+        # reloads the system trust store, so command POSTs share this one.
+        self.context = context
         self.lock = threading.Lock()
         self.flush_lock = threading.Lock()
         self.active = {}
@@ -1019,7 +1022,7 @@ class _CommandRunner:
                 try:
                     _post(
                         self.base + "/api/connect/result", message,
-                        token=self.token,
+                        token=self.token, context=self.context,
                     )
                 except urllib.error.HTTPError as exc:
                     # A 4xx means the server refuses this exact payload, so an
@@ -1068,7 +1071,8 @@ class _CommandRunner:
                 response = _post(self.base + "/api/connect/output", {
                     "request_id": command.request_id,
                     "chunks": batch,
-                }, token=self.token, timeout=_OUTPUT_POST_TIMEOUT_SECONDS)
+                }, token=self.token, timeout=_OUTPUT_POST_TIMEOUT_SECONDS,
+                    context=self.context)
             except urllib.error.HTTPError as exc:
                 if 400 <= exc.code < 500 and exc.code not in (408, 425, 429):
                     # Rejection is not acknowledgement. Keep the known
@@ -1162,7 +1166,7 @@ class _CommandRunner:
         try:
             _post(self.base + "/api/connect/state", {
                 "request_id": request_id, "state": "started",
-            }, token=self.token)
+            }, token=self.token, context=self.context)
         except urllib.error.HTTPError as exc:
             # A runner can be upgraded before its server. Protocol v1 has no
             # start endpoint but still accepts this runner's final result.
@@ -1336,7 +1340,10 @@ def _handle_disconnect(conn, base, token, commands, request_id):
             "stderr": str(exc), "exit_code": 1,
         }
     try:
-        _post(base + "/api/connect/result", payload, token=token)
+        _post(
+            base + "/api/connect/result", payload,
+            token=token, context=commands.context,
+        )
     except urllib.error.URLError as exc:
         print("failed to report disconnect: %s" % exc)
 
@@ -1346,7 +1353,7 @@ def _serve_connection(conn, stop_event=None):
     token = conn["token"]
     ctx = ssl.create_default_context()
     plat = "%s %s" % (platform.system(), platform.release())
-    commands = _CommandRunner(base, token)
+    commands = _CommandRunner(base, token, context=ctx)
     backoff = 1
     # Only a stream opened during the current attempt can establish health. Do
     # not let a healthy prior stream make a new handshake failure look

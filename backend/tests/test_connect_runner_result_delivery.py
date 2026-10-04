@@ -46,7 +46,7 @@ def test_flush_drops_a_permanently_rejected_result(monkeypatch):
     _pending_result(runner, "r1")
     attempts = []
 
-    def fake_post(url, payload, token=None):
+    def fake_post(url, payload, token=None, context=None):
         attempts.append(payload["request_id"])
         raise _http_error(422)
 
@@ -65,7 +65,7 @@ def test_flush_keeps_a_transiently_failed_result(monkeypatch):
     runner = connect_runner._CommandRunner("https://x", "t")
     _pending_result(runner, "r1")
 
-    def fake_post(url, payload, token=None):
+    def fake_post(url, payload, token=None, context=None):
         raise _http_error(503)
 
     monkeypatch.setattr(connect_runner, "_post", fake_post)
@@ -94,7 +94,7 @@ def test_flush_keeps_a_result_through_a_network_error(monkeypatch):
     runner = connect_runner._CommandRunner("https://x", "t")
     _pending_result(runner, "r1")
 
-    def fake_post(url, payload, token=None):
+    def fake_post(url, payload, token=None, context=None):
         raise urllib.error.URLError("connection refused")
 
     monkeypatch.setattr(connect_runner, "_post", fake_post)

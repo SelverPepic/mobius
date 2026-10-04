@@ -395,20 +395,22 @@ export function readComposerHandoff(chatId, storage) {
   }
 }
 
-/** Remove only markers that still belong to `input`; a newer handoff wins. */
+/** Claim one matching handoff synchronously; stale or duplicate consumers lose. */
 export function consumeComposerHandoff(
   chatId,
   input,
   { autoSend = false, storage } = {},
 ) {
   const target = availableStorage(storage)
-  if (!target || chatId == null || typeof input !== 'string') return
+  if (!target || chatId == null || typeof input !== 'string') return false
   try {
     const parsed = JSON.parse(target.getItem(COMPOSER_HANDOFF_KEY) || 'null')
     if (String(parsed?.chatId) === String(chatId)
         && parsed?.input === input
         && parsed?.autoSend === !!autoSend) {
       target.removeItem(COMPOSER_HANDOFF_KEY)
+      return true
     }
   } catch { /* unavailable browser storage */ }
+  return false
 }

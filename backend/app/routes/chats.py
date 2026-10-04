@@ -56,6 +56,7 @@ from app.chat import (
   continuation_wait_for_chat,
 )
 from app.broadcast import get_system_broadcast
+from app.chat_compaction_state import compaction_kind
 from app.recovery_notifications import (
   complete_recovery_action,
   publish_recovery_notification,
@@ -769,6 +770,7 @@ def _chat_detail_response(
     "total": total,
     "offset": start,
     "running": running,
+    "compacting": compaction_kind(chat.id),
     "run_id": run_id,
     "run_status": "running" if running and run_id else run_status,
     "runtime_revision": runtime_revision,
@@ -1836,6 +1838,7 @@ def get_chat_runtime(
   run_id, run_status, runtime_revision = _latest_run_snapshot(db, chat.id)
   response = {
     "running": running,
+    "compacting": compaction_kind(chat.id),
     "restart_observation_key": restart_observation_key(db, chat.id),
     "run_id": run_id,
     "run_status": "running" if running and run_id else run_status,
@@ -2702,6 +2705,7 @@ async def _compact_chat_locked(
   db: Session,
 ):
   """Run one provider switch while settings PATCHes are excluded."""
+  from app.chat_compaction_state import compacting
   from app.chat_writer import (
     SwitchProviderWithCompaction, await_ack, get_writer,
     messages_fingerprint,
@@ -2794,116 +2798,119 @@ async def _compact_chat_locked(
   if auth_error is not None:
     raise HTTPException(status_code=409, detail=auth_error)
 
-  messages = list(chat.messages or [])
-  source_messages_hash = messages_fingerprint(messages)
-  source_summary = load_cumulative_summary(data_dir, chat_id)
-  source_summary_hash = (
-    hashlib.sha256(source_summary.encode("utf-8")).hexdigest()
-    if source_summary is not None
-    else None
-  )
-  try:
-    summary = await summarize_chat(
-      messages,
+  # Only a switch that will actually run marks the chat; refused or replayed
+  # requests return above without flashing the notice in every view.
+  with compacting(chat_id, "provider_switch"):
+    messages = list(chat.messages or [])
+    source_messages_hash = messages_fingerprint(messages)
+    source_summary = load_cumulative_summary(data_dir, chat_id)
+    source_summary_hash = (
+      hashlib.sha256(source_summary.encode("utf-8")).hexdigest()
+      if source_summary is not None
+      else None
+    )
+    try:
+      summary = await summarize_chat(
+        messages,
+        data_dir=data_dir,
+        provider_id=body.provider,
+        source_summary=source_summary,
+        model=settings_patch.get("model"),
+        effort=settings_patch.get("effort"),
+      )
+    except CompactionError as exc:
+      raise HTTPException(status_code=422, detail=str(exc))
+    except Exception as exc:
+      log.warning(
+        "provider-switch synthesis failed for chat %s: %s", chat_id, exc,
+      )
+      raise HTTPException(
+        status_code=502,
+        detail="The incoming provider could not prepare the chat.",
+      )
+
+    # The note is a separate file the agent saves as it works. If it was
+    # rewritten while synthesis ran, retry from the fresh detailed source rather
+    # than committing a handoff the incoming provider derived from stale data.
+    latest_summary = load_cumulative_summary(data_dir, chat_id)
+    latest_hash = (
+      hashlib.sha256(latest_summary.encode("utf-8")).hexdigest()
+      if latest_summary is not None
+      else None
+    )
+    if latest_hash != source_summary_hash:
+      raise HTTPException(
+        status_code=409,
+        detail=(
+          "The chat summary changed while preparing the switch. Try again."
+        ),
+      )
+
+    ack = get_writer().submit(
+      SwitchProviderWithCompaction(
+        chat_id=chat_id,
+        switch_id=body.switch_id,
+        expected_provider=source_provider,
+        provider=body.provider,
+        settings_patch=settings_patch,
+        summary=summary,
+        source_messages_hash=source_messages_hash,
+        source_summary_hash=source_summary_hash,
+        data_dir=data_dir,
+        request_fingerprint=request_fingerprint,
+      )
+    )
+    try:
+      result = await await_ack(ack)
+    except Exception:
+      raise HTTPException(
+        status_code=503, detail="Could not save the provider switch; try again."
+      )
+    if result.get("status") == "conflict":
+      reason = result.get("reason")
+      if reason == "busy":
+        detail = "Chat is busy — finish or stop the turn before switching."
+      elif reason == "provider_pinned":
+        detail = (
+          "This chat runs in the background and stays on its original "
+          "provider; its provider can't be switched."
+        )
+      elif reason == "request_mismatch":
+        detail = "That provider-switch request id has different settings."
+      else:
+        detail = "The chat changed while preparing the switch. Try again."
+      raise HTTPException(status_code=409, detail=detail)
+
+    # The actor used its own session. Refresh this request's identity map before
+    # mirroring the committed choice to new-chat defaults.
+    db.expire_all()
+    settings_obj = _coerce_agent_settings(result.get("agent_settings_json"))
+    _mirror_agent_defaults(
+      db,
       data_dir=data_dir,
       provider_id=body.provider,
-      source_summary=source_summary,
-      model=settings_patch.get("model"),
-      effort=settings_patch.get("effort"),
+      settings_obj=settings_obj,
     )
-  except CompactionError as exc:
-    raise HTTPException(status_code=422, detail=str(exc))
-  except Exception as exc:
-    log.warning(
-      "provider-switch synthesis failed for chat %s: %s", chat_id, exc,
-    )
-    raise HTTPException(
-      status_code=502,
-      detail="The incoming provider could not prepare the chat.",
-    )
-
-  # The note is a separate file the agent saves as it works. If it was
-  # rewritten while synthesis ran, retry from the fresh detailed source rather
-  # than committing a handoff the incoming provider derived from stale data.
-  latest_summary = load_cumulative_summary(data_dir, chat_id)
-  latest_hash = (
-    hashlib.sha256(latest_summary.encode("utf-8")).hexdigest()
-    if latest_summary is not None
-    else None
-  )
-  if latest_hash != source_summary_hash:
-    raise HTTPException(
-      status_code=409,
-      detail=(
-        "The chat summary changed while preparing the switch. Try again."
-      ),
-    )
-
-  ack = get_writer().submit(
-    SwitchProviderWithCompaction(
-      chat_id=chat_id,
-      switch_id=body.switch_id,
-      expected_provider=source_provider,
-      provider=body.provider,
-      settings_patch=settings_patch,
-      summary=summary,
-      source_messages_hash=source_messages_hash,
-      source_summary_hash=source_summary_hash,
-      data_dir=data_dir,
-      request_fingerprint=request_fingerprint,
-    )
-  )
-  try:
-    result = await await_ack(ack)
-  except Exception:
-    raise HTTPException(
-      status_code=503, detail="Could not save the provider switch; try again."
-    )
-  if result.get("status") == "conflict":
-    reason = result.get("reason")
-    if reason == "busy":
-      detail = "Chat is busy — finish or stop the turn before switching."
-    elif reason == "provider_pinned":
-      detail = (
-        "This chat runs in the background and stays on its original "
-        "provider; its provider can't be switched."
+    if result.get("status") == "committed":
+      activity.log_event(
+        "provider_switch",
+        chat_id=chat_id,
+        provider=body.provider,
+        from_provider=source_provider,
       )
-    elif reason == "request_mismatch":
-      detail = "That provider-switch request id has different settings."
-    else:
-      detail = "The chat changed while preparing the switch. Try again."
-    raise HTTPException(status_code=409, detail=detail)
 
-  # The actor used its own session. Refresh this request's identity map before
-  # mirroring the committed choice to new-chat defaults.
-  db.expire_all()
-  settings_obj = _coerce_agent_settings(result.get("agent_settings_json"))
-  _mirror_agent_defaults(
-    db,
-    data_dir=data_dir,
-    provider_id=body.provider,
-    settings_obj=settings_obj,
-  )
-  if result.get("status") == "committed":
-    activity.log_event(
-      "provider_switch",
-      chat_id=chat_id,
-      provider=body.provider,
-      from_provider=source_provider,
-    )
-
-  return {
-    "ok": True,
-    "protocol": "provider-switch-v1",
-    "switch_id": body.switch_id,
-    "summary": (result.get("stored") or {}).get("content", ""),
-    "stored": result.get("stored"),
-    "provider": body.provider,
-    "agent_settings_json": settings_obj or None,
-    "effective": providers.effective_agent_settings(
-      data_dir, settings_obj or None, provider=body.provider,
-    ),
-  }
+    return {
+      "ok": True,
+      "protocol": "provider-switch-v1",
+      "switch_id": body.switch_id,
+      "summary": (result.get("stored") or {}).get("content", ""),
+      "stored": result.get("stored"),
+      "provider": body.provider,
+      "agent_settings_json": settings_obj or None,
+      "effective": providers.effective_agent_settings(
+        data_dir, settings_obj or None, provider=body.provider,
+      ),
+    }
 
 
 @router.post(
@@ -2929,6 +2936,7 @@ async def compact_chat(
     PersistCompaction, alloc_run_token, await_ack, get_writer,
     messages_fingerprint,
   )
+  from app.chat_compaction_state import compacting
   from app.compaction import (
     CompactionError, summarize_chat,
   )
@@ -2952,67 +2960,70 @@ async def compact_chat(
         status_code=409,
         detail="Chat is busy — finish or stop the current turn before compacting.",
       )
-    source_provider = chat.provider or "claude"
-    messages = list(chat.messages or [])
-    data_dir = get_settings().data_dir
-    try:
+    # Other tabs, panes and devices learn the chat is busy from this state;
+    # a send made meanwhile waits on the transition lock above.
+    with compacting(chat_id, "compact"):
+      source_provider = chat.provider or "claude"
+      messages = list(chat.messages or [])
+      data_dir = get_settings().data_dir
       try:
-        note = note_path(data_dir, chat_id).read_text(encoding="utf-8")
-      except OSError:
-        note = ""
-      source_summary = extract_cumulative_summary(note)
-      source_messages = messages
-      source_note_hash = None
+        try:
+          note = note_path(data_dir, chat_id).read_text(encoding="utf-8")
+        except OSError:
+          note = ""
+        source_summary = extract_cumulative_summary(note)
+        source_messages = messages
+        source_note_hash = None
+        try:
+          source_summary, source_messages = recovery_source(note, messages)
+        except ValueError:
+          # Legacy or changed notes cannot replace history. Preserve the old
+          # full-transcript backstop, including its existing work limits.
+          pass
+        else:
+          source_note_hash = hashlib.sha256(note.encode("utf-8")).hexdigest()
+        instructions = body.instructions if body is not None else None
+        settings_obj = chat.agent_settings_json or {}
+        summary = await summarize_chat(
+          source_messages,
+          data_dir=data_dir,
+          provider_id=source_provider,
+          source_summary=source_summary,
+          model=settings_obj.get("model"),
+          effort=settings_obj.get("effort"),
+          custom_instructions=instructions,
+        )
+      except CompactionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+      except Exception as exc:
+        log.warning("legacy compaction failed for chat %s: %s", chat_id, exc)
+        raise HTTPException(
+          status_code=502, detail="The summarize turn failed; not compacting."
+        )
       try:
-        source_summary, source_messages = recovery_source(note, messages)
-      except ValueError:
-        # Legacy or changed notes cannot replace history. Preserve the old
-        # full-transcript backstop, including its existing work limits.
-        pass
-      else:
-        source_note_hash = hashlib.sha256(note.encode("utf-8")).hexdigest()
-      instructions = body.instructions if body is not None else None
-      settings_obj = chat.agent_settings_json or {}
-      summary = await summarize_chat(
-        source_messages,
-        data_dir=data_dir,
-        provider_id=source_provider,
-        source_summary=source_summary,
-        model=settings_obj.get("model"),
-        effort=settings_obj.get("effort"),
-        custom_instructions=instructions,
-      )
-    except CompactionError as exc:
-      raise HTTPException(status_code=422, detail=str(exc))
-    except Exception as exc:
-      log.warning("legacy compaction failed for chat %s: %s", chat_id, exc)
-      raise HTTPException(
-        status_code=502, detail="The summarize turn failed; not compacting."
-      )
-    try:
-      result = await await_ack(get_writer().submit(PersistCompaction(
-        chat_id=chat_id,
-        run_token=alloc_run_token(),
-        summary=summary,
-        expected_provider=source_provider,
-        source_messages_hash=messages_fingerprint(messages),
-        source_note_hash=source_note_hash,
-      )))
-    except Exception:
-      raise HTTPException(
-        status_code=503, detail="Could not store the compaction; try again."
-      )
-    if result.get("status") == "conflict":
-      raise HTTPException(
-        status_code=409,
-        detail="The chat changed while compacting. Try again.",
-      )
-    return {
-      "ok": True,
-      "summary": summary,
-      "command": f"POST /api/chats/{chat_id}/compact",
-      "stored": result.get("stored"),
-    }
+        result = await await_ack(get_writer().submit(PersistCompaction(
+          chat_id=chat_id,
+          run_token=alloc_run_token(),
+          summary=summary,
+          expected_provider=source_provider,
+          source_messages_hash=messages_fingerprint(messages),
+          source_note_hash=source_note_hash,
+        )))
+      except Exception:
+        raise HTTPException(
+          status_code=503, detail="Could not store the compaction; try again."
+        )
+      if result.get("status") == "conflict":
+        raise HTTPException(
+          status_code=409,
+          detail="The chat changed while compacting. Try again.",
+        )
+      return {
+        "ok": True,
+        "summary": summary,
+        "command": f"POST /api/chats/{chat_id}/compact",
+        "stored": result.get("stored"),
+      }
 
 
 # An app that opens a chat ABOUT one of its dated reports passes the report's

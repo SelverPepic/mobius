@@ -626,6 +626,17 @@ def dispatch_sdk_message(
       current_session_id = sdk_msg.session_id
     if native_work is not None:
       native_work.root_continuation_observed()
+    if sdk_msg.error:
+      # The CLI wraps a failed API call (a safety refusal, auth or billing
+      # failure, an exhausted retry) in a synthetic assistant message: its
+      # text is the error report and its usage is zeroed. Neither came from
+      # the model. The turn's ResultMessage carries the same report as its
+      # error and owns the one error block, and a CLI-internal retry that
+      # later succeeds leaves no failure to show. Publishing it would repeat
+      # the error as prose once per attempt and reset the context meter to 0.
+      # The session id and continuation boundary above still apply: the call
+      # was made, and its result closes the turn.
+      return current_session_id, None
     if usage_state is not None and sdk_msg.usage:
       usage_state["latest_model_usage"] = dict(sdk_msg.usage)
     server_tools: dict[str, str] = {}

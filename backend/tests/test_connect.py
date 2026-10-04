@@ -1875,6 +1875,28 @@ def test_stray_incompatible_runner_does_not_end_the_current_runners_work(client,
   assert connect_routes.connect_output.finished(pairing["id"], request_id) is None
 
 
+def test_stray_incompatible_runner_leaves_the_current_runners_details(client, auth):
+  pairing, runner_token = _paired_host(client, auth)
+  host = connect_routes._load_host(pairing["id"])
+  host.update(
+    runner_protocol=connect_routes._RUNNER_PROTOCOL_VERSION,
+    runner_capabilities=["parallel"], platform="Linux 6",
+  )
+  connect_routes._save_host(host)
+  connect_routes._channels[pairing["id"]] = connect_routes._Channel()
+
+  response = client.get(
+    "/api/connect/stream?protocol=3&platform=OldOS",
+    headers={"Authorization": f"Bearer {runner_token}"},
+  )
+
+  assert response.status_code == 426
+  kept = connect_routes._load_host(pairing["id"])
+  assert kept["runner_protocol"] == connect_routes._RUNNER_PROTOCOL_VERSION
+  assert kept["runner_capabilities"] == ["parallel"]
+  assert kept["platform"] == "Linux 6"
+
+
 @pytest.mark.asyncio
 async def test_never_started_command_at_result_deadline_finishes_expired(
   client, auth, monkeypatch,
@@ -1995,7 +2017,7 @@ def test_runner_uses_standard_urllib_for_protocol_four_stream(monkeypatch):
   )
   monkeypatch.setattr(
     connect_runner, "_post",
-    lambda url, payload, token=None: posted.append((url, payload, token)),
+    lambda url, payload, token=None, context=None: posted.append((url, payload, token)),
   )
 
   connect_runner._serve_connection(
@@ -2159,7 +2181,7 @@ def test_runner_disconnect_scopes_to_one_of_several_connections(monkeypatch):
   )
   monkeypatch.setattr(
     connect_runner, "_post",
-    lambda url, payload, token=None: posted.append(payload),
+    lambda url, payload, token=None, context=None: posted.append(payload),
   )
 
   connect_runner._serve_connection(
@@ -2211,7 +2233,7 @@ def test_runner_retries_a_result_until_ordinary_https_succeeds(monkeypatch):
   first_attempt = threading.Event()
   second_attempt = threading.Event()
 
-  def post(_url, payload, token=None):
+  def post(_url, payload, token=None, context=None):
     attempts.append((payload, token))
     if len(attempts) == 1:
       first_attempt.set()
@@ -2692,7 +2714,7 @@ def test_serve_connection_retries_after_auth_rejection(monkeypatch):
   )
   monkeypatch.setattr(
     connect_runner, "_post",
-    lambda url, payload, token=None: posted.append(payload),
+    lambda url, payload, token=None, context=None: posted.append(payload),
   )
 
   connect_runner._serve_connection(
@@ -2746,7 +2768,7 @@ def test_serve_connection_retries_when_proxy_stops_forwarding_heartbeats(
   )
   monkeypatch.setattr(
     connect_runner, "_post",
-    lambda url, payload, token=None: posted.append(payload),
+    lambda url, payload, token=None, context=None: posted.append(payload),
   )
 
   connect_runner._serve_connection(
@@ -2850,7 +2872,7 @@ def test_serve_connection_reconnects_immediately_after_healthy_rotation(
   )
   monkeypatch.setattr(
     connect_runner, "_post",
-    lambda url, payload, token=None: posted.append(payload),
+    lambda url, payload, token=None, context=None: posted.append(payload),
   )
 
   connect_runner._serve_connection({

@@ -1372,6 +1372,13 @@ class StreamInventory(BaseModel):
     return value
 
 
+def _unsupported_runner() -> HTTPException:
+  return HTTPException(
+    status_code=426,
+    detail="This Connect runner is no longer supported. Update it in Connect.",
+  )
+
+
 @router.get("/stream")
 @router.post("/stream")
 async def stream(request: Request, inventory: StreamInventory | None = None) -> StreamingResponse:
@@ -1384,6 +1391,11 @@ async def stream(request: Request, inventory: StreamInventory | None = None) -> 
   runner_release = _reported_runner_release(
     request.query_params.get("release"),
   )
+  incompatible = protocol_version != _RUNNER_PROTOCOL_VERSION
+  if incompatible and host_id in _channels:
+    # A stray old runner sharing the token while a current one is connected
+    # must neither describe this machine nor end the current runner's work.
+    raise _unsupported_runner()
   # Persist transport compatibility and implementation release independently.
   # A protocol-compatible legacy runner may stay connected while Connect still
   # offers the owner the current implementation.
@@ -1402,21 +1414,16 @@ async def stream(request: Request, inventory: StreamInventory | None = None) -> 
     host["platform"] = plat[:80]
   host["last_seen"] = _now()
   _save_host(host)
-  if protocol_version != _RUNNER_PROTOCOL_VERSION:
-    # When no current runner is connected, this runner replaced the one that
-    # ran any active command, and it cannot report or stop them. Finish them
-    # now so no caller waits on them. A stray old runner sharing the token
-    # while a current one is connected must not end that runner's live work.
-    if host_id not in _channels:
-      for command in list(_host_commands(host_id).values()):
-        _finish_command_as_lost(
-          host_id, command.request_id,
-          "an incompatible Connect runner replaced the one running this command",
-        )
-    raise HTTPException(
-      status_code=426,
-      detail="This Connect runner is no longer supported. Update it in Connect.",
-    )
+  if incompatible:
+    # No current runner is connected, so this runner replaced the one that ran
+    # any active command, and it cannot report or stop them. Finish them now
+    # so no caller waits on them.
+    for command in list(_host_commands(host_id).values()):
+      _finish_command_as_lost(
+        host_id, command.request_id,
+        "an incompatible Connect runner replaced the one running this command",
+      )
+    raise _unsupported_runner()
   ch = _Channel()
   # A reconnecting runner replaces any stale channel.
   _replace_channel(host_id, ch)
