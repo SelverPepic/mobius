@@ -69,7 +69,7 @@ from app.peer_message import (
   peer_message_from_call, settle_peer_message,
 )
 from app.owner_card_receipts import (
-  turn_end_receipt_id as _turn_end_receipt_id,
+  owner_card_receipt_id as _owner_card_receipt_id,
 )
 from app.runtime_types import ChatEvent
 from app.secure_inputs import redact_reveal_markers
@@ -1097,7 +1097,7 @@ class ChatEventSink:
     # the carved presentation. Generic reduction establishes a missing exit
     # code first, so a failed command cannot mint successful protocol state.
     output_reduced = False
-    turn_end_receipt_id = None
+    owner_card_receipt_id = None
     if event_type == "tool_output":
       # An explicit secure-input reveal reaches the provider as a tool result,
       # but the marked envelope must not enter Möbius's live UI, transcript, or
@@ -1122,8 +1122,8 @@ class ChatEventSink:
         event.get("output_complete") is True
         and event.get("output_exit_code") in (None, 0)
       ):
-        turn_end_receipt_id = _turn_end_receipt_id(event.get("content"))
-        if turn_end_receipt_id is None and not (event.get("content") or "").strip():
+        owner_card_receipt_id = _owner_card_receipt_id(event.get("content"))
+        if owner_card_receipt_id is None and not (event.get("content") or "").strip():
           # A provider that streams output deltas may omit its re-aggregated
           # copy on completion (see events.py's no-clobber rule). The receipt
           # text still lives in the tool block's streamed output, and the
@@ -1132,7 +1132,7 @@ class ChatEventSink:
             self.assistant_blocks, event.get("tool_use_id"),
           )
           if blk is not None:
-            turn_end_receipt_id = _turn_end_receipt_id(blk.get("output"))
+            owner_card_receipt_id = _owner_card_receipt_id(blk.get("output"))
       output_reduced = self._reduce_tool_output(event)
       if not output_reduced and event.get("output_exit_code") is None:
         exit_code = tool_output_exit_code(full_tool_output)
@@ -1154,9 +1154,12 @@ class ChatEventSink:
     # identity lets both the live renderer and historical projection hide the
     # enclosing command/tool even though its result necessarily arrives AFTER
     # the card (the clean post-receipt finish boundary above).
-    turn_ends = turn_end_receipt_id is not None and self.ends_turn(turn_end_receipt_id)
-    if turn_ends and self.has_continuation_card(turn_end_receipt_id):
-      event["owner_card_question_id"] = turn_end_receipt_id
+    owner_card_receipt_matches = (
+      owner_card_receipt_id is not None
+      and self.has_continuation_card(owner_card_receipt_id)
+    )
+    if owner_card_receipt_matches:
+      event["owner_card_question_id"] = owner_card_receipt_id
 
     # Accumulate the event into assistant_blocks and decide whether a
     # save is due (immediate for save-triggering types, throttled
@@ -1241,13 +1244,13 @@ class ChatEventSink:
             thinking_stashes=stashes,
           )
         )
-    if turn_ends:
+    if owner_card_receipt_matches:
       # A completed provider event is the first universal boundary at which the
       # result is no longer in flight. It covers MCP and command-backed helpers
       # alike, without a timer or a second transport callback. Claude's root
-      # turns have normally already ended themselves at the card or closing
-      # save (its runner's PostToolUse hook), in which case this is a no-op claim.
-      self._request_finish_turn(turn_end_receipt_id)
+      # turns have normally already ended themselves at the card (its runner's
+      # PostToolUse hook), in which case this is a no-op claim.
+      self._request_finish_turn_after_owner_card(owner_card_receipt_id)
     return True
 
   async def finalize(
@@ -1563,8 +1566,8 @@ class ChatEventSink:
     # immediately after.
     self._last_save = time.monotonic()
 
-  def _request_finish_turn(self, receipt_id: str) -> None:
-    """Claim the clean turn end synchronously, then signal it asynchronously.
+  def _request_finish_turn_after_owner_card(self, question_id: str) -> None:
+    """Claim the clean card end synchronously, then signal it asynchronously.
 
     The provider-neutral card-end signal. A runner that already ended its own
     turn at the card (Claude's root agents do, before the receipt ever reaches
@@ -1576,11 +1579,10 @@ class ChatEventSink:
     completed tool result, so deferring the whole request to a task races that
     terminal and can leak its raw interruption error. Only the actual provider
     interrupt runs as a side task. Native provider questions have no
-    continuation marker and are never cut here. A confirmed closing save
-    recorded on this sink ends the turn the same way.
+    continuation marker and are never cut here.
     """
-    if not self.ends_turn(receipt_id):
-      raise ValueError("Turn-ending result is not current for this turn.")
+    if not self.has_continuation_card(question_id):
+      raise ValueError("Continuation owner-input card is not current for this turn.")
     from app.runner_registry import registry
     for handle in registry.get_handles(self.chat_id):
       begin = getattr(handle, "begin_finish_after_owner_card", None)
@@ -1603,8 +1605,22 @@ class ChatEventSink:
           warn=True,
         )
 
-  def record_closing_save(self) -> str:
-    """Name a confirmed closing save so this turn's end hook can honor it."""
+  def record_closing_save(self) -> str | None:
+    """Name a confirmed closing save so this turn's end hook can honor it.
+
+    Only a runner that stops at the tool boundary itself (it refuses the next
+    model request) may end a turn on a closing save; interrupting a provider
+    that already moved on would lose the saving and record an aborted turn.
+    A closing save sent beside another still-running tool is not honored
+    either: ending the turn could cut that tool or hide its failure.
+    """
+    from app.runner_registry import registry
+    if not any(getattr(handle, "ends_turn_at_tool_result", False)
+               for handle in registry.get_handles(self.chat_id)):
+      return None
+    if sum(1 for block in self.assistant_blocks
+           if block.get("type") == "tool" and block.get("status") == "running") > 1:
+      return None
     receipt_id = secrets.token_urlsafe(12)
     self._closing_save_ids.add(receipt_id)
     return receipt_id

@@ -581,6 +581,8 @@ def test_bookkeeping_batch_guidance_preserves_durability_and_card_isolation():
   assert "send any other saves with your last real tool call" in flat
   assert "call `checkpoint_chat` with `end_turn` alone as the very last call" in flat
   assert "a confirmed closing save ends the turn without another model call" in flat
+  assert 'If it returns only "Saved.", end the turn normally' in flat
+  assert "saves before the card, without `end_turn`" in flat
   assert "Await every result and handle failures" in flat
   assert "never delay a required save just to form a batch" in flat
   assert "Owner-input cards remain separate and last" in flat

@@ -322,9 +322,12 @@ partner's latest message and address every concern.
   in the same step as your next real tool call, never alone mid-turn. To close
   a turn, send any other saves with your last real tool call, write the final
   reply, then call `checkpoint_chat` with `end_turn` alone as the very last
-  call: a confirmed closing save ends the turn without another model call. Await every result and handle failures;
-  never delay a required save just to form a batch, or parallelize dependent
-  writes. Owner-input cards remain separate and last.
+  call: a confirmed closing save ends the turn without another model call. If
+  it returns only "Saved.", end the turn normally. A turn that ends with an
+  owner-input card saves before the card, without `end_turn`. Await every
+  result and handle failures; never delay a required save just to form a
+  batch, or parallelize dependent writes. Owner-input cards remain separate and
+  last.
 
 **Calling this instance's backend — use `mapi`.** It is `curl` with
 `$API_BASE_URL` and the owner `Authorization: Bearer $AGENT_TOKEN` filled in,

@@ -91,4 +91,5 @@ def _closing_receipt(chat_id: str, run_id: str | None):
   sink = get_active_sink(chat_id)
   if sink is None or not run_id or sink.run_token != run_id:
     return None
-  return JSONResponse({"turn_end_id": sink.record_closing_save()})
+  receipt_id = sink.record_closing_save()
+  return JSONResponse({"turn_end_id": receipt_id}) if receipt_id else None

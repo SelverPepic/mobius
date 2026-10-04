@@ -1403,13 +1403,14 @@ exists and is useful even when the Memory app is not installed. Its consumers:
   default compaction.
 
 A closing save may pass `end_turn`. When that save succeeds for the live run,
-the route records a random receipt on the run's `ChatEventSink`
-(`record_closing_save`) and returns it as `turn_end_id`. The receipt ends the
-turn exactly as a saved owner card does: Claude's PostToolUse hook refuses the
-next model request, and the sink's provider-neutral turn-end boundary
-(`ends_turn`, used for Codex) interrupts at the completed tool result. A failed
-save issues no receipt, and a receipt from another run or turn is ignored, so
-the turn simply continues.
+the route asks the run's `ChatEventSink` for a receipt (`record_closing_save`)
+and returns it as `turn_end_id`. A receipt is issued only when the chat's
+runner stops at the tool boundary itself (`ends_turn_at_tool_result`: Claude's
+root runner, whose PostToolUse hook refuses the next model request) and no
+other tool of the turn is still running. The sink's interrupting card boundary
+never fires for a closing save, because interrupting a provider that already
+moved on would lose the saving and record an aborted turn. Without a receipt,
+or when the save fails, the turn simply continues.
 
 Two agent mechanisms with similar names deliberately remain separate.
 `app.background_agents` resolves the owner’s primary/fallback ordering for

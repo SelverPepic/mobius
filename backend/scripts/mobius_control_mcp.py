@@ -1188,7 +1188,9 @@ _TOOL_DEFINITIONS = {
       "call, never alone mid-turn. For the closing save, send other saves with "
       "your last real tool call, write your final reply, then call this alone "
       "and last with end_turn: once the save is confirmed the turn ends with no "
-      "further model call; if it fails, the turn continues."
+      "further model call. If it returns only Saved., end the turn normally; if "
+      "it fails, the turn continues. A turn ending with an owner-input card saves "
+      "before the card, without end_turn."
     ),
     "inputSchema": {
       "type": "object", "additionalProperties": False,

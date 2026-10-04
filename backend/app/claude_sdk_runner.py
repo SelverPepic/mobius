@@ -482,6 +482,10 @@ class ActiveClaudeClient:
   closed the broadcast for live SSE subscribers.
   """
 
+  # Its PostToolUse hook refuses the next model request, so a turn can end
+  # cleanly at a confirmed closing save (see ChatEventSink.record_closing_save).
+  ends_turn_at_tool_result = True
+
   def __init__(
     self, client: ClaudeSDKClient, chat_id: str, run_marker: str | None = None,
     *, sink=None,
