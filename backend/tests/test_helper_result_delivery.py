@@ -54,7 +54,8 @@ def test_wake_notice_delivers_report_not_narration(chat, db, separator, terminal
     notice = _compose_wake_notice(db, [row], {row.id: TOKEN})
     assert REPORT in notice and 'Looking at another' not in notice
     assert f'"status":"{terminal_status}"' in notice
-    assert '"result_truncated":false' in notice
+    # Omitted narration marks the result truncated, so the notice's fetch hint applies.
+    assert '"result_truncated":true' in notice
     assert ('Provider ended unexpectedly' in notice) == (terminal_status == 'failed')
   asyncio.run(scenario())
 
@@ -64,6 +65,43 @@ def test_result_keeps_latest_text_and_error_with_content_only_fallback():
     'blocks': [{'type': 'text', 'content': 'old narration'},
                {'type': 'text', 'content': 'report'},
                {'type': 'error', 'message': 'Provider stopped'}]}])
-  assert _assistant_result(chat) == 'report\n\nProvider stopped'
+  assert _assistant_result(chat) == ('report\n\nProvider stopped', True)
   chat.messages = [{'role': 'assistant', 'content': 'Legacy content-only report'}]
-  assert _assistant_result(chat) == 'Legacy content-only report'
+  assert _assistant_result(chat) == ('Legacy content-only report', False)
+
+
+def _finished_child(chat, db, events):
+  async def scenario():
+    get_writer().submit(StartTurn(chat_id=chat.id, run_token=TOKEN,
+      user_msg={'role': 'user', 'content': 'Test', 'ts': 10},
+      title_source='Test')).result(timeout=5)
+    sink = ChatEventSink(ChatBroadcast(chat.id), chat.id, run_token=TOKEN)
+    for event in events:
+      sink.publish(event)
+    await sink.finalize()
+    get_writer().submit(FinishRun(chat_id=chat.id, run_token=TOKEN,
+                                 terminal_status='completed')).result(timeout=5)
+    db.expire_all()
+  asyncio.run(scenario())
+  row = models.Delegation(id='result-helper', parent_chat_id='parent',
+                          child_chat_id=chat.id, task_key='inspect')
+  return _compose_wake_notice(db, [row], {row.id: TOKEN})
+
+
+def test_report_followed_by_short_text_is_marked_truncated(chat, db):
+  notice = _finished_child(chat, db, [
+    {'type': 'text', 'content': REPORT},
+    {'type': 'tool_start', 'tool': 'checkpoint_chat', 'tool_use_id': 'tool-1',
+     'input': '{}'},
+    {'type': 'tool_end', 'tool_use_id': 'tool-1'},
+    {'type': 'text', 'content': 'Checkpoint saved.'},
+  ])
+  assert '"result":"Checkpoint saved."' in notice
+  assert '"result_truncated":true' in notice
+  assert 'when a truncated result is not enough' in notice
+
+
+def test_single_report_block_is_not_truncated(chat, db):
+  notice = _finished_child(chat, db, [{'type': 'text', 'content': REPORT}])
+  assert f'"result":"{REPORT}"' in notice
+  assert '"result_truncated":false' in notice
