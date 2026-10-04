@@ -164,23 +164,6 @@ def wait_ack(ack: Future, *, timeout: float | None = None):
   return ack.result(timeout=ACK_TIMEOUT_SECS if timeout is None else timeout)
 
 
-def _replace_chat_media_path(value, old_prefix: str, new_prefix: str):
-  """Recursively rewrite media URLs inside JSON-compatible chat data."""
-  if isinstance(value, str):
-    return value.replace(old_prefix, new_prefix)
-  if isinstance(value, list):
-    return [
-      _replace_chat_media_path(item, old_prefix, new_prefix)
-      for item in value
-    ]
-  if isinstance(value, dict):
-    return {
-      key: _replace_chat_media_path(item, old_prefix, new_prefix)
-      for key, item in value.items()
-    }
-  return value
-
-
 # -- Commands (domain-level; a later milestone swaps their dispatch) -----
 @dataclass
 class _Command:
@@ -581,15 +564,6 @@ class BackfillAssistantIdentity(_Command):
   """
 
   chat_id: str = ""
-
-
-@dataclass
-class RewriteChatMediaPaths(_Command):
-  """Atomically rewrite one chat's legacy media URLs during boot."""
-
-  chat_id: str = ""
-  old_prefix: str = ""
-  new_prefix: str = ""
 
 
 @dataclass
@@ -2169,8 +2143,6 @@ class ChatWriterActor:
       return self._migrate_chat(db, cmd)
     if isinstance(cmd, BackfillAssistantIdentity):
       return self._backfill_assistant_identity(db, cmd)
-    if isinstance(cmd, RewriteChatMediaPaths):
-      return self._rewrite_chat_media_paths(db, cmd)
     if isinstance(cmd, ReconcileStartupChat):
       return self._reconcile_startup_chat(db, cmd)
     if isinstance(cmd, StartTurn):
@@ -3093,36 +3065,6 @@ class ChatWriterActor:
         row.complete = bool(row.complete or stash.complete)
       elif stash.complete and not row.complete:
         row.complete = True
-
-  def _rewrite_chat_media_paths(
-    self, db, cmd: "RewriteChatMediaPaths",
-  ) -> int:
-    """Rewrite both transcript blobs in one actor-owned transaction."""
-    from app.models import Chat
-
-    row = db.execute(select(
-      Chat.messages, Chat.pending_messages,
-    ).where(Chat.id == cmd.chat_id)).first()
-    if row is None:
-      return 0
-    messages, pending = row
-    rewritten_messages = _replace_chat_media_path(
-      messages, cmd.old_prefix, cmd.new_prefix,
-    )
-    rewritten_pending = _replace_chat_media_path(
-      pending, cmd.old_prefix, cmd.new_prefix,
-    )
-    values = {}
-    if rewritten_messages != messages:
-      values["messages"] = rewritten_messages
-    if rewritten_pending != pending:
-      values["pending_messages"] = rewritten_pending
-    if not values:
-      return 0
-    db.execute(update(Chat).where(Chat.id == cmd.chat_id).values(**values))
-    if not _commit_or_rollback(db):
-      raise _PersistFailed("RewriteChatMediaPaths did not persist")
-    return len(values)
 
   def _backfill_assistant_identity(
     self, db, cmd: "BackfillAssistantIdentity",

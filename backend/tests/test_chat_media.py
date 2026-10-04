@@ -1,91 +1,96 @@
+import uuid
 from pathlib import Path
 
 import pytest
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import Session
 
-import app.chat_media as chat_media
+import app.schema_migrations as migrations
 from app import models
-from app.chat_media import fix_forward_chat_media
 from app.config import get_settings
+from app.schema_migrations import _move_chat_media_out_of_generated
 
 
-def test_fix_forward_chat_media_moves_files_and_rewrites_urls(db, chat):
+def _chat_root(chat_id: str) -> Path:
+  return Path(get_settings().data_dir) / "chats" / chat_id
+
+
+def test_moves_files_and_rewrites_urls(db, chat):
   old_url = f"/api/chats/{chat.id}/generated/old.png"
   new_url = f"/api/chats/{chat.id}/media/old.png"
   chat.messages = [{"role": "assistant", "content": f"![image]({old_url})"}]
   chat.pending_messages = [{"content": {"preview": old_url}}]
   db.commit()
 
-  chat_root = Path(get_settings().data_dir) / "chats" / chat.id
-  old_dir = chat_root / "generated"
+  old_dir = _chat_root(chat.id) / "generated"
   old_dir.mkdir(parents=True)
   (old_dir / "old.png").write_bytes(b"old-image")
 
-  changed = fix_forward_chat_media(db, get_settings().data_dir)
+  _move_chat_media_out_of_generated(db.get_bind())
   db.refresh(chat)
 
-  assert changed == 3
   assert not old_dir.exists()
-  assert (chat_root / "media" / "old.png").read_bytes() == b"old-image"
+  assert (_chat_root(chat.id) / "media" / "old.png").read_bytes() == b"old-image"
   assert chat.messages[0]["content"] == f"![image]({new_url})"
   assert chat.pending_messages[0]["content"]["preview"] == new_url
 
 
-def test_fix_forward_chat_media_is_idempotent(db, chat):
-  first = fix_forward_chat_media(db, get_settings().data_dir)
-  second = fix_forward_chat_media(db, get_settings().data_dir)
-  assert first == 0
-  assert second == 0
-
-
-def test_fix_forward_chat_media_skips_unrelated_transcripts(
-  db, chat, monkeypatch,
-):
-  chat.messages = [{
-    "role": "assistant",
-    "content": (
-      "Discussing /api/chats/someone-else/generated/example.png "
-      "must not make this chat a migration candidate."
-    ),
-    "blocks": [{"type": "text", "content": "x" * 100_000}],
-  }]
+def test_leaves_links_to_other_chats_untouched(db, chat):
+  foreign = "/api/chats/someone-else/generated/example.png"
+  chat.messages = [{"role": "assistant", "content": f"Discussing {foreign}"}]
   db.commit()
 
-  def unexpected_writer():
-    raise AssertionError("unrelated transcript was selected for rewrite")
+  _move_chat_media_out_of_generated(db.get_bind())
+  db.refresh(chat)
 
-  monkeypatch.setattr(chat_media, "get_writer", unexpected_writer)
+  assert chat.messages[0]["content"] == f"Discussing {foreign}"
+  assert not (_chat_root(chat.id) / "media").exists()
 
-  assert fix_forward_chat_media(db, get_settings().data_dir) == 0
 
-
-def test_fix_forward_chat_media_rewrites_legacy_url_without_old_directory(
-  db, chat,
-):
+def test_rewrites_legacy_url_without_old_directory(db, chat):
   old_url = f"/api/chats/{chat.id}/generated/already-moved.png"
   new_url = f"/api/chats/{chat.id}/media/already-moved.png"
   chat.messages = [{"role": "assistant", "content": old_url}]
   db.commit()
 
-  assert fix_forward_chat_media(db, get_settings().data_dir) == 1
+  _move_chat_media_out_of_generated(db.get_bind())
   db.refresh(chat)
+
   assert chat.messages[0]["content"] == new_url
 
 
-def test_fix_forward_chat_media_preflights_conflicts(db, chat):
+def test_retry_after_interrupted_cleanup_finishes_the_move(db, chat):
+  """A crash after the link commit leaves both copies; a retry settles it."""
+  new_url = f"/api/chats/{chat.id}/media/old.png"
+  chat.messages = [{"role": "assistant", "content": new_url}]
+  db.commit()
+  for name in ("generated", "media"):
+    directory = _chat_root(chat.id) / name
+    directory.mkdir(parents=True)
+    (directory / "old.png").write_bytes(b"old-image")
+
+  _move_chat_media_out_of_generated(db.get_bind())
+  db.refresh(chat)
+
+  assert not (_chat_root(chat.id) / "generated").exists()
+  assert (_chat_root(chat.id) / "media" / "old.png").read_bytes() == b"old-image"
+  assert chat.messages[0]["content"] == new_url
+
+
+def test_conflicting_file_fails_before_any_change(db, chat):
   old_url = f"/api/chats/{chat.id}/generated/same.png"
   chat.messages = [{"role": "assistant", "content": old_url}]
   db.commit()
 
-  chat_root = Path(get_settings().data_dir) / "chats" / chat.id
-  old_dir = chat_root / "generated"
-  media_dir = chat_root / "media"
+  old_dir = _chat_root(chat.id) / "generated"
+  media_dir = _chat_root(chat.id) / "media"
   old_dir.mkdir(parents=True)
   media_dir.mkdir(parents=True)
   (old_dir / "same.png").write_bytes(b"old")
   (media_dir / "same.png").write_bytes(b"different")
 
   with pytest.raises(RuntimeError, match="Conflicting chat media file"):
-    fix_forward_chat_media(db, get_settings().data_dir)
+    _move_chat_media_out_of_generated(db.get_bind())
 
   db.refresh(chat)
   assert chat.messages[0]["content"] == old_url
@@ -93,59 +98,50 @@ def test_fix_forward_chat_media_preflights_conflicts(db, chat):
   assert (media_dir / "same.png").read_bytes() == b"different"
 
 
-def test_fix_forward_chat_media_keeps_both_copies_when_commit_fails(
-  db, chat, monkeypatch,
+def test_upgrade_runs_the_move_once_and_later_boots_skip_the_scan(
+  tmp_path, monkeypatch,
 ):
-  old_url = f"/api/chats/{chat.id}/generated/old.png"
-  chat.messages = [{"role": "assistant", "content": old_url}]
-  db.commit()
+  """An instance that never ran the move is fixed once, then never rescanned."""
+  data_dir = tmp_path / "data"
+  monkeypatch.setenv("DATA_DIR", str(data_dir))
+  eng = create_engine(f"sqlite:///{tmp_path / 'upgrade.db'}")
+  models.Base.metadata.create_all(eng)
+  migrations._ensure_migration_ledger(eng)
+  for version, _migration in migrations._SCHEMA_MIGRATIONS:
+    if version != "0083_chat_media_directory":
+      migrations._record_migration(eng, version)
 
-  chat_root = Path(get_settings().data_dir) / "chats" / chat.id
-  old_file = chat_root / "generated" / "old.png"
-  old_file.parent.mkdir(parents=True)
-  old_file.write_bytes(b"old-image")
+  chat_id = str(uuid.uuid4())
+  old_url = f"/api/chats/{chat_id}/generated/old.png"
+  with Session(eng) as session:
+    session.add(models.Chat(
+      id=chat_id,
+      title="Legacy",
+      messages=[{"role": "assistant", "content": old_url}],
+    ))
+    session.commit()
+  old_dir = data_dir / "chats" / chat_id / "generated"
+  old_dir.mkdir(parents=True)
+  (old_dir / "old.png").write_bytes(b"old-image")
 
-  from app import chat_writer
-  monkeypatch.setattr(chat_writer, "_commit_or_rollback", lambda _db: False)
-  with pytest.raises(chat_writer._PersistFailed, match="RewriteChatMediaPaths"):
-    fix_forward_chat_media(db, get_settings().data_dir)
+  migrations.run_migrations(eng)
 
-  assert old_file.read_bytes() == b"old-image"
-  assert (chat_root / "media" / "old.png").read_bytes() == b"old-image"
-  persisted = db.query(models.Chat).filter(models.Chat.id == chat.id).one()
-  assert persisted.messages[0]["content"] == old_url
+  def stored_content() -> str:
+    with Session(eng) as session:
+      return session.get(models.Chat, chat_id).messages[0]["content"]
 
+  assert stored_content() == f"/api/chats/{chat_id}/media/old.png"
+  assert (data_dir / "chats" / chat_id / "media" / "old.png").exists()
+  assert not old_dir.exists()
+  assert "0083_chat_media_directory" in {
+    row["version"] for row in migrations.schema_migration_history(eng)
+  }
 
-def test_fix_forward_chat_media_timeout_stays_valid_after_late_commit(
-  db, chat, monkeypatch,
-):
-  old_url = f"/api/chats/{chat.id}/generated/old.png"
-  new_url = f"/api/chats/{chat.id}/media/old.png"
-  chat.messages = [{"role": "assistant", "content": old_url}]
-  db.commit()
-
-  chat_root = Path(get_settings().data_dir) / "chats" / chat.id
-  old_file = chat_root / "generated" / "old.png"
-  new_file = chat_root / "media" / "old.png"
-  old_file.parent.mkdir(parents=True)
-  old_file.write_bytes(b"old-image")
-
-  pending_ack = None
-
-  def timeout_without_cancelling(ack):
-    nonlocal pending_ack
-    pending_ack = ack
-    raise TimeoutError("writer acknowledgement timed out")
-
-  monkeypatch.setattr(chat_media, "wait_ack", timeout_without_cancelling)
-  with pytest.raises(TimeoutError, match="acknowledgement timed out"):
-    fix_forward_chat_media(db, get_settings().data_dir)
-
-  assert old_file.read_bytes() == b"old-image"
-  assert new_file.read_bytes() == b"old-image"
-  assert pending_ack is not None
-  assert pending_ack.result(timeout=5) == 1
-
-  db.expire_all()
-  persisted = db.query(models.Chat).filter(models.Chat.id == chat.id).one()
-  assert persisted.messages[0]["content"] == new_url
+  # A legacy link that appears after completion stays as written: the
+  # recorded migration is not replayed, so no boot scans transcripts again.
+  with eng.begin() as conn:
+    conn.execute(text(
+      "UPDATE chats SET messages = :messages WHERE id = :chat_id"
+    ), {"messages": f'[{{"content": "{old_url}"}}]', "chat_id": chat_id})
+  migrations.run_migrations(eng)
+  assert stored_content() == old_url

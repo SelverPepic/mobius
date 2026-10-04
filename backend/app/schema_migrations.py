@@ -5822,6 +5822,97 @@ def _add_run_owner_input_at(eng) -> None:
       conn.execute(text("ALTER TABLE chat_runs ADD COLUMN owner_input_at DATETIME"))
 
 
+def _move_chat_media_out_of_generated(eng) -> None:
+  """Move old chat images from ``generated/`` to ``media/`` and relink them.
+
+  Chat images once lived in ``chats/<id>/generated/`` and transcripts linked
+  them as ``/api/chats/<id>/generated/<name>``. Current code writes and serves
+  only ``media/``. Finding the old links needs a ``LIKE`` over every stored
+  transcript, which no index can serve, so this runs once from the ledger
+  instead of at every boot.
+
+  Each step leaves a readable state if interrupted: copy into ``media/`` (the
+  old copy stays), commit the link rewrite, then delete the old copy. Every
+  name collision is checked before anything changes; a ``media/`` file with
+  different bytes fails closed rather than overwriting either image.
+  """
+  import filecmp
+  import shutil
+
+  from sqlalchemy import bindparam, inspect as sa_inspect, text
+
+  inspector = sa_inspect(eng)
+  if "chats" not in inspector.get_table_names():
+    return
+  columns = {column["name"] for column in inspector.get_columns("chats")}
+  transcripts = [
+    name for name in ("messages", "pending_messages") if name in columns
+  ]
+  if not transcripts:
+    return
+  chats_root = Path(os.environ.get("DATA_DIR", "/data")) / "chats"
+  legacy_link = "'%/api/chats/' || id || '/generated/%'"
+  with eng.connect() as conn:
+    chat_ids = set(conn.execute(text(
+      "SELECT id FROM chats WHERE " + " OR ".join(
+        f"CAST({name} AS TEXT) LIKE {legacy_link}" for name in transcripts
+      )
+    )).scalars())
+    # Orphaned directories without a chat row are left alone.
+    on_disk = sorted(
+      path.parent.name
+      for path in chats_root.glob("*/generated")
+      if path.is_dir()
+    ) if chats_root.is_dir() else []
+    for offset in range(0, len(on_disk), 500):
+      chat_ids.update(conn.execute(
+        text("SELECT id FROM chats WHERE id IN :ids").bindparams(
+          bindparam("ids", expanding=True),
+        ),
+        {"ids": on_disk[offset:offset + 500]},
+      ).scalars())
+
+  def old_files(chat_id: str) -> list[Path]:
+    old_dir = chats_root / chat_id / "generated"
+    if not old_dir.is_dir():
+      return []
+    return [source for source in old_dir.iterdir() if source.is_file()]
+
+  for chat_id in sorted(chat_ids):
+    for source in old_files(chat_id):
+      destination = chats_root / chat_id / "media" / source.name
+      if destination.exists() and (
+        not destination.is_file()
+        or not filecmp.cmp(source, destination, shallow=False)
+      ):
+        raise RuntimeError(
+          f"Conflicting chat media file for chat {chat_id}: {source.name}"
+        )
+
+  for chat_id in sorted(chat_ids):
+    media_dir = chats_root / chat_id / "media"
+    sources = old_files(chat_id)
+    for source in sources:
+      media_dir.mkdir(parents=True, exist_ok=True)
+      if not (media_dir / source.name).exists():
+        shutil.copy2(source, media_dir / source.name)
+    with eng.begin() as conn:
+      conn.execute(text(
+        "UPDATE chats SET " + ", ".join(
+          f"{name} = REPLACE({name}, :old, :new)" for name in transcripts
+        ) + " WHERE id = :chat_id"
+      ), {
+        "chat_id": chat_id,
+        "old": f"/api/chats/{chat_id}/generated/",
+        "new": f"/api/chats/{chat_id}/media/",
+      })
+    for source in sources:
+      source.unlink()
+    old_dir = chats_root / chat_id / "generated"
+    if old_dir.is_dir() and not any(old_dir.iterdir()):
+      old_dir.rmdir()
+
+
 _SCHEMA_MIGRATIONS = (
   # Full IDs are permanent identities, not sequence positions. Append new
   # work in execution order; never renumber a shipped ID to reconcile sources.
@@ -5917,6 +6008,7 @@ _SCHEMA_MIGRATIONS = (
   ("0081_browser_account_grants", _add_browser_account_grants),
   ("0081_goal_hold", _add_goal_hold),
   ("0082_run_owner_input_at", _add_run_owner_input_at),
+  ("0083_chat_media_directory", _move_chat_media_out_of_generated),
 )
 
 
