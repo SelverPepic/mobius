@@ -111,6 +111,10 @@ test('mini-app storage cannot see owner or another grant’s cache', () => {
   setActiveSharedBrowserGrantId('grant-A')
   assert.equal(setAppFrameStorage('app-1', 'note', 'guest-A'), true)
   assert.equal(readAppFrameStorage('app-1').note, 'guest-A')
+  // Renewal re-announces the same grant; caches keyed by the store survive it.
+  const store = localStore()
+  setActiveSharedBrowserGrantId('grant-A')
+  assert.equal(localStore(), store)
   setActiveSharedBrowserGrantId('grant-B')
   assert.equal(readAppFrameStorage('app-1').note, undefined)
   setActiveSharedBrowserGrantId(null)
