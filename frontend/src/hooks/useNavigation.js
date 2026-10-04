@@ -22,7 +22,7 @@ import {
 } from '../lib/navigationPersistence.js'
 import { drawerOpenBlockedByDrag } from '../lib/drawerLifecycle.js'
 import { shellReload } from '../lib/shellReloadState.js'
-import { isSharedBrowserRoute } from '../lib/sharedBrowserWorkspace.js'
+import { isOwnerWorkspace, ownerStore } from '../lib/workspaceStorage.js'
 import { recordClientError } from '../lib/errorLog.js'
 import * as tabModel from '../components/Shell/tabModel.js'
 import * as paneModel from '../components/Shell/paneModel.js'
@@ -91,11 +91,12 @@ export const deepLink = parseShellDeepLink(window.location)
 // instead of defaulting to a chat. Only the canvas needs an explicit
 // signal (chat is the default). shellReload / deepLink (an explicit
 // destination for THIS load) take precedence — see below.
-const sharedBrowserRoute = isSharedBrowserRoute(window.location.pathname)
-const effectiveShellReload = sharedBrowserRoute ? null : shellReload
-const restored = sharedBrowserRoute ? null : readRestoredCanvas(localStorage)
+// A guest has no owner cold-restore or return view; it restores from its own
+// navigationStorage when the hook mounts.
+const ownerWorkspace = isOwnerWorkspace()
+const restored = readRestoredCanvas(ownerStore())
 
-const returnView = sharedBrowserRoute ? null : consumeReturnView(sessionStorage)
+const returnView = ownerWorkspace ? consumeReturnView() : null
 
 // The app id cold-restored to the canvas (null unless the storage-restore
 // — not shellReload/deepLink — drove it). The restore is OPTIMISTIC: this
@@ -103,7 +104,7 @@ const returnView = sharedBrowserRoute ? null : consumeReturnView(sessionStorage)
 // live /api/apps list ONCE and demotes a restored-but-uninstalled canvas
 // to chat. See ARCHITECTURE.md (Navigation back-stack + drawer model).
 export const coldRestoredCanvasAppId =
-  (!effectiveShellReload?.activeView && !deepLink?.view && restored?.view === 'canvas')
+  (!shellReload?.activeView && !deepLink?.view && restored?.view === 'canvas')
     ? restored.appId
     : null
 
@@ -166,10 +167,10 @@ export default function useNavigation({
   // cold-restore, shell-reload) can never strand Back with nothing to pop. Lazy
   // so it's computed exactly once; `seedHome` is consumed by the mount effect.
   const [initialNav] = useState(() => resolveInitialNav({
-    shellReload: effectiveShellReload,
+    shellReload,
     deepLink,
-    returnView: sharedBrowserRoute ? null : returnView,
-    restored: sharedBrowserRoute ? readRestoredCanvas(navigationStorage) : restored,
+    returnView,
+    restored: ownerWorkspace ? restored : readRestoredCanvas(navigationStorage),
     storedChatId: safeStoredChatId(navigationStorage),
   }))
   // Settings is the ONLY view state navigation owns globally (§1). It is the
@@ -1374,11 +1375,11 @@ export default function useNavigation({
       }
       // A marked provider return, not an ordinary Settings link, may replace
       // the stale destination claimed by a prior shell reload.
-      const claimedReloadDestination = effectiveShellReload?.destinationClaimed && !deepLink?.providerReturn
+      const claimedReloadDestination = shellReload?.destinationClaimed && !deepLink?.providerReturn
         ? {
-            view: effectiveShellReload.activeView,
-            appId: effectiveShellReload.activeAppId ?? null,
-            chatId: effectiveShellReload.activeChatId ?? null,
+            view: shellReload.activeView,
+            appId: shellReload.activeAppId ?? null,
+            chatId: shellReload.activeChatId ?? null,
           }
         : null
       if (claimedReloadDestination) {
@@ -2229,7 +2230,7 @@ export default function useNavigation({
 
   // Fade back in after shell-reload.
   useEffect(() => {
-    if (!effectiveShellReload) return
+    if (!shellReload) return
     document.body.style.transition = 'opacity 0.2s ease'
     document.body.style.opacity = '1'
   }, [])

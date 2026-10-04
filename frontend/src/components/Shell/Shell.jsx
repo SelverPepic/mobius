@@ -2976,6 +2976,9 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
       // A reconnect may select a different account. Never paint its predecessor's
       // allowance while the new reading is in flight, including in open chats.
       void settingsQueries.providerUsage.reset(queryClient, ev.provider)
+    } else if (ev.type === 'provider_usage_changed') {
+      // Allowance changes leave sign-in and available models unchanged.
+      void settingsQueries.providerUsage.reset(queryClient, ev.provider)
     } else if (ev.type === 'app_activity') {
       // The durable marker was committed with an app-attributed notification.
       // A refetch surfaces the dot; if the app is already visible, the effect

@@ -1,14 +1,13 @@
 """Quiet delivery inherits revocable browser authority, never owner authority."""
 
 import pytest
-from fastapi import HTTPException
 
 from app import models
 from app.agent_write_channel import WriteIntent
 from app.agent_write_journal import pending_failure_reports
 from app.browser_access import create_invitation, revoke_grant
 from app.chat_writer import (
-  AdmitAgentWrites, AdmitProviderExecution, ClaimAgentWrite, PromotePending,
+  _PersistFailed, AdmitAgentWrites, AdmitProviderExecution, ClaimAgentWrite, PromotePending,
   SealAgentWrites, SettleAgentWrite, StartTurn, get_writer,
 )
 
@@ -27,7 +26,7 @@ def browser_run(chat, db):
   identity = {"chat_id": chat.id, "run_token": "browser-source"}
   submit(StartTurn(**identity,
     user_msg={"role": "user", "content": "Original task", "ts": 10},
-    browser_grant_id=grant.id, browser_grant_epoch=grant.epoch))
+    browser_grant_id=grant.id))
   submit(AdmitProviderExecution(**identity))
   return owner, grant, identity
 
@@ -56,7 +55,7 @@ def test_revocation_fences_quiet_admission_and_claim_but_allows_evidence(chat, d
   if boundary == "claim":
     admit(identity)
   revoke_grant(db, grant.id, owner.id)
-  with pytest.raises(HTTPException):
+  with pytest.raises(_PersistFailed):
     admit(identity) if boundary == "admit" else submit(ClaimAgentWrite(**identity))
   db.expire_all()
   intent = db.get(models.AgentWriteIntent, (identity["run_token"], "save"))
@@ -82,7 +81,6 @@ def test_late_effect_result_survives_browser_revocation(chat, db):
 def test_quiet_repair_preserves_browser_lineage_and_current_grant(chat, db, revoked):
   owner, grant, identity = browser_run(chat, db)
   fail(identity)
-  epoch = grant.epoch
   if revoked:
     revoke_grant(db, grant.id, owner.id)
   result = promote(identity)
@@ -94,11 +92,11 @@ def test_quiet_repair_preserves_browser_lineage_and_current_grant(chat, db, revo
   else:
     repair_id = result["promoted"]["_run_token"]
     repair = db.get(models.ChatRun, repair_id)
-    assert (repair.browser_grant_id, repair.browser_grant_epoch) == (grant.id, epoch)
+    assert repair.browser_grant_id == grant.id
     assert repair.root_run_id == identity["run_token"]
     # A grant revoked between repair creation and provider admission still fails.
     revoke_grant(db, grant.id, owner.id)
-    with pytest.raises(HTTPException):
+    with pytest.raises(_PersistFailed):
       submit(AdmitProviderExecution(chat_id=chat.id, run_token=repair_id))
     db.expire_all()
     assert db.get(models.ChatRun, repair_id).provider_execution_admitted is False
@@ -110,8 +108,7 @@ def test_rejected_queue_rows_survive_empty_drain_and_quiet_repair(chat, db, repa
   fail(identity)
   rejected_grant, _ = create_invitation(db, owner, "rejected browser")
   pending = {"role": "user", "content": "Retain rejected content", "cid": "rejected",
-    "ts": 20, "_browser_grant_id": rejected_grant.id,
-    "_browser_grant_epoch": rejected_grant.epoch}
+    "ts": 20, "_browser_grant_id": rejected_grant.id}
   db.expire_all()
   db.get(models.Chat, chat.id).pending_messages = [pending]
   db.commit()
