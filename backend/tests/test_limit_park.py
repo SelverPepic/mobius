@@ -365,6 +365,18 @@ def test_exhausted_workspace_credits_is_a_manual_credits_pause(runner_result):
   }
 
 
+def test_structured_credits_flag_pauses_whatever_the_wording():
+  # The workspace-member variant and the runner's fallback wording carry no
+  # exact sentence; the runner's structured flag still makes it a credits pause.
+  text = "Codex usage limit reached."
+  sink = _Sink()
+  result = {"api_error_status": 429, "credits_depleted": True}
+  assert chat_mod._park_exit(sink, result, text, provider_id="codex") == {
+    "parked": False,
+  }
+  assert sink.events[-1]["pause"] == {"kind": "credits", "provider": "codex"}
+
+
 def test_other_credit_failures_stay_plain_errors():
   text = "Payment failed: card declined. Add credits to continue."
   sink = _Sink()

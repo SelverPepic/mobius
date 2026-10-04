@@ -35,7 +35,7 @@ test('a credits pause renders as a calm card without rewriting history', () => {
   const html = renderToStaticMarkup(createElement(ErrorCard, { block: creditBlock }))
   assert.match(html, /chat__text--parked/)
   assert.match(html, /Your progress is saved/)
-  assert.match(html, /Add credits to your workspace or choose another provider, then Resume/)
+  assert.match(html, /Add credits to your workspace, then Resume/)
   assert.doesNotMatch(html, /role="alert"|>Error<|automatically|retry check|Rate limit/)
   assert.deepEqual(creditBlock, original)
 })
