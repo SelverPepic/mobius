@@ -1614,9 +1614,7 @@ class ChatEventSink:
     A closing save sent beside another still-running tool is not honored
     either: ending the turn could cut that tool or hide its failure.
     """
-    from app.runner_registry import registry
-    if not any(getattr(handle, "ends_turn_at_tool_result", False)
-               for handle in registry.get_handles(self.chat_id)):
+    if not self._runner_may_end_at_closing_save():
       return None
     if sum(1 for block in self.assistant_blocks
            if block.get("type") == "tool" and block.get("status") == "running") > 1:
@@ -1627,8 +1625,22 @@ class ChatEventSink:
 
   def ends_turn(self, receipt_id: str) -> bool:
     """Whether this turn produced this turn-ending receipt: a saved
-    continuation card or a confirmed closing save."""
-    return receipt_id in self._closing_save_ids or self.has_continuation_card(receipt_id)
+    continuation card or a confirmed closing save.
+
+    A closing save is rechecked at the cut: an owner message admitted after
+    its receipt was issued still needs an answer, so the turn continues.
+    """
+    if receipt_id in self._closing_save_ids:
+      return self._runner_may_end_at_closing_save()
+    return self.has_continuation_card(receipt_id)
+
+  def _runner_may_end_at_closing_save(self) -> bool:
+    from app.runner_registry import registry
+    for handle in registry.get_handles(self.chat_id):
+      may_end = getattr(handle, "may_end_at_closing_save", None)
+      if callable(may_end) and may_end():
+        return True
+    return False
 
   def has_continuation_card(self, question_id: str) -> bool:
     """Whether this turn saved exactly this continuation owner-input card.

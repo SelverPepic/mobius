@@ -817,6 +817,49 @@ async def test_confirmed_closing_save_ends_the_turn_without_another_model_call(
 
 
 @pytest.mark.asyncio
+async def test_closing_save_never_ends_a_turn_with_owner_input_or_native_work_pending():
+  """A closing save ends the turn only when nothing still needs the model.
+
+  An owner message admitted into this response (consumed or not) must get its
+  answer, and Claude-native background work (a Workflow or background Agent)
+  must not be abandoned before its parent reacts to the result.
+  """
+  from app.chat_event_sink import ChatEventSink
+  from app.broadcast import ChatBroadcast
+
+  chat_id = "closing-save-pending"
+  handle = ActiveClaudeClient(_NativeClient(None), chat_id=chat_id)
+  sink = ChatEventSink(ChatBroadcast(chat_id), chat_id, run_token="run")
+  registry.register(handle)
+  try:
+    handle.mark_ready()
+    assert handle.may_end_at_closing_save()
+    receipt_id = sink.record_closing_save()
+    assert receipt_id and sink.ends_turn(receipt_id)
+
+    # The owner speaks after the receipt was issued: the cut is refused.
+    assert await steer_into_active_turn(chat_id, "one more thing") is True
+    assert not handle.may_end_at_closing_save()
+    assert not sink.ends_turn(receipt_id)
+    assert sink.record_closing_save() is None
+    handle._steers.clear()
+    assert sink.ends_turn(receipt_id)
+
+    handle.native_work.task_started("wf-1", "local_workflow", "tool-1")
+    assert not handle.may_end_at_closing_save()
+    handle.native_work.task_finished("wf-1")
+    assert not handle.may_end_at_closing_save()  # Its parent has not reacted yet.
+    handle.native_work.root_continuation_observed()
+    assert handle.may_end_at_closing_save()
+    # An ordinary background shell never owns turn completion.
+    handle.native_work.task_started("sh-1", "local_bash", "tool-2")
+    assert handle.may_end_at_closing_save()
+  finally:
+    await _flush_native(handle)
+    registry.unregister(chat_id, handle.kind)
+
+
+@pytest.mark.asyncio
 async def test_owner_card_hook_defers_to_a_stop_that_already_owns_the_cut(
   monkeypatch,
 ):

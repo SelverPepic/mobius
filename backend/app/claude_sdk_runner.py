@@ -88,6 +88,7 @@ from app.owner_card_receipts import turn_end_receipt_id
 from app.platform_tools import (
   APPROVAL_TOOL_NAME,
   CHECKPOINT_CHAT_TOOL_NAME,
+  CLOSING_SAVE_ENV,
   CONTROL_SERVER_NAME,
   QUESTION_TOOL_NAME,
   RESTART_TOOL_NAME,
@@ -482,10 +483,6 @@ class ActiveClaudeClient:
   closed the broadcast for live SSE subscribers.
   """
 
-  # Its PostToolUse hook refuses the next model request, so a turn can end
-  # cleanly at a confirmed closing save (see ChatEventSink.record_closing_save).
-  ends_turn_at_tool_result = True
-
   def __init__(
     self, client: ClaudeSDKClient, chat_id: str, run_marker: str | None = None,
     *, sink=None,
@@ -512,6 +509,9 @@ class ActiveClaudeClient:
     self._finished: asyncio.Future[None] = (
       asyncio.get_running_loop().create_future()
     )
+    # Claude-native background work (Agent / Workflow tasks) this run owns.
+    # The runner keeps the turn open until it settles and its parent reacts.
+    self.native_work = NativeContinuationTracker()
 
   @property
   def accepts_native_prompt(self) -> bool:
@@ -526,6 +526,20 @@ class ActiveClaudeClient:
   @property
   def is_steerable(self) -> bool:
     return self._ready and self.accepts_native_prompt
+
+  def may_end_at_closing_save(self) -> bool:
+    """Whether a confirmed closing save may end this turn now.
+
+    Its PostToolUse hook refuses the next model request, so the turn can end
+    cleanly at the save's tool result. Not while an owner message admitted
+    into this response still needs the model's answer, and not while native
+    background work would be abandoned before its parent reacts to it.
+    """
+    return (
+      self.accepts_native_prompt
+      and not self._steers
+      and not self.native_work.pending_count
+    )
 
   def mark_ready(self) -> None:
     """The initial query is on the wire; steers can no longer overtake it."""
@@ -1150,6 +1164,9 @@ async def run_claude_sdk_turn(
     "1" if coordination_enabled else "0"
   )
   base_env["MOBIUS_GENERATED_DIR"] = str(generated_dir)
+  # The turn-end hook below ends this turn at a confirmed closing save, so the
+  # control server may offer checkpoint_chat's end_turn here.
+  base_env[CLOSING_SAVE_ENV] = "1"
 
   # Keep the SDK callback for tool policy and skill-read observability.
   # The pinned SDK owns input stream lifetime for permission callbacks.
@@ -1538,7 +1555,7 @@ async def run_claude_sdk_turn(
       # immediately before that turn's ResultMessage. Keep its exact
       # continuation boundary across provider responses so neither ordering is
       # reaped before Claude's parent reacts.
-      native_work = NativeContinuationTracker()
+      native_work = active_client.native_work
       # Root AssistantMessage usage is per model call, unlike the terminal
       # ResultMessage aggregate. Keep the latest call across retries, steers,
       # and native background follow-ups so context occupancy stays exact.

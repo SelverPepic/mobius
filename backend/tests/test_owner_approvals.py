@@ -262,7 +262,7 @@ def test_closing_save_never_interrupts_a_turn_from_the_sink(client, chat, approv
                          json={"summary": "Done.", "end_turn": True})
 
     assert close().status_code == 204
-    interrupting.ends_turn_at_tool_result = True  # Now a clean-ending runner.
+    interrupting.may_end_at_closing_save = lambda: True  # Now a clean-ending runner.
     sink.publish({"type": "tool_start", "tool": "Bash", "input": "sleep",
                   "tool_use_id": "sibling"})
     sink.publish({"type": "tool_start", "tool": "checkpoint_chat", "input": "",

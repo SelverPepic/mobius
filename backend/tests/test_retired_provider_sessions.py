@@ -6,6 +6,8 @@ resumed sessions which had received it kept emitting frames nothing reads,
 which showed up as raw text and silently lost the save.
 """
 
+import hashlib
+
 import pytest
 from sqlalchemy import create_engine, text
 
@@ -33,8 +35,11 @@ class _Provider:
     return {}
 
 
-async def _run_turn(monkeypatch, provider_id: str, provider_name: str, *, retired: bool):
-  chat_id = f"retired-{provider_id}-{retired}"
+async def _run_turn(
+  monkeypatch, provider_id: str, provider_name: str, *, retired: bool,
+  delegated: bool = False,
+):
+  chat_id = f"retired-{provider_id}-{retired}-{delegated}"
   with SessionLocal() as setup:
     setup.add(models.Owner(username="owner", hashed_password="unused", provider=provider_id))
     setup.add(models.Chat(
@@ -67,6 +72,24 @@ async def _run_turn(monkeypatch, provider_id: str, provider_name: str, *, retire
   monkeypatch.setattr(chat_mod, "get_provider", lambda _id: _Provider(provider_name))
   monkeypatch.setattr(chat_mod, "_complete_turn", fake_complete_turn)
   monkeypatch.setattr(chat_mod, "_record_run_metrics", fake_record_run_metrics)
+  refusals = []
+  if delegated:
+    with SessionLocal() as setup:
+      setup.add(models.Chat(id=f"parent-{chat_id}", title="parent", provider=provider_id))
+      setup.add(models.Delegation(
+        id=f"d-{chat_id}", app_id=None, parent_chat_id=f"parent-{chat_id}",
+        parent_root_run_id=f"parent-run-{chat_id}", task_key="retired",
+        child_chat_id=chat_id, provider=provider_id, model=None, effort=None,
+        scope="write", cwd="/tmp",
+        prompt_sha256=hashlib.sha256(b"Fix the broker polling.").hexdigest(),
+      ))
+      setup.commit()
+
+    async def fake_refusal(**_kwargs):
+      refusals.append(chat_id)
+      return chat_queue.TerminalDisposition.EMPTY_TERMINAL_CLEARED
+
+    monkeypatch.setattr(chat_mod, "_refuse_delegated_write_replay", fake_refusal)
   if provider_id == "codex":
     from app import codex_sdk_runner
     monkeypatch.setattr(codex_sdk_runner, "run_codex_sdk_turn", fake_runner)
@@ -91,6 +114,8 @@ async def _run_turn(monkeypatch, provider_id: str, provider_name: str, *, retire
     )
   finally:
     remove_broadcast(chat_id)
+  if delegated:
+    return calls, refusals
   assert len(calls) == 1
   return calls[0]
 
@@ -118,6 +143,22 @@ async def test_an_ordinary_session_still_resumes_natively(
   call = await _run_turn(monkeypatch, provider_id, provider_name, retired=False)
   assert call["session_id"] == "old-session"
   assert "<resumed_context>" not in call["user_message"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("provider_id", "provider_name"), PROVIDERS)
+@pytest.mark.parametrize("retired", [True, False])
+async def test_a_helper_never_resumes_a_retired_session(
+  monkeypatch, provider_id, provider_name, retired,
+):
+  """A helper's follow-up on a retired session gets the same no-replay
+  refusal as a lost helper session; an ordinary helper session is not refused."""
+  calls, refusals = await _run_turn(
+    monkeypatch, provider_id, provider_name, retired=retired, delegated=True,
+  )
+  assert refusals == ([f"retired-{provider_id}-True-True"] if retired else [])
+  if retired:
+    assert calls == []
 
 
 def test_resume_retired_is_false_for_unknown_or_missing_sessions(db):

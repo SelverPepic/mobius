@@ -107,6 +107,10 @@ DELEGATED_TOOLS = (
 # come from a private per-turn file (see backend app/helper_hosts.py).
 CALLER_ENV_FILE_ENV = "MOBIUS_CALLER_ENV_FILE"
 HELPER_HOST_ENV = "MOBIUS_HELPER_HOST"
+# Set only by a runner whose own hook ends the turn at a confirmed closing save
+# (backend app/claude_sdk_runner.py). Elsewhere end_turn could not end the turn,
+# so offering it would only add a model call.
+CLOSING_SAVE_ENV = "MOBIUS_CLOSING_SAVE_ENDS_TURN"
 CALLER_ENV_ARGUMENT = "_mobius_caller_env_file"
 PROMOTE_GOAL_DESCRIPTION = (
   "Promote this top-level owner turn into a durable Goal when a delegated, "
@@ -456,12 +460,19 @@ def _tools_list_result() -> dict[str, Any]:
   return {
     "tools": [
       *(
-        {**_TOOL_DEFINITIONS[name], "_meta": ALWAYS_LOAD_META}
+        {**_tool_definition(name), "_meta": ALWAYS_LOAD_META}
         for name in _available_tool_names()
       ),
       *_app_tool_listings(),
     ],
   }
+
+
+def _tool_definition(name: str) -> dict[str, Any]:
+  """One tool's listing; checkpoint_chat offers end_turn only where it works."""
+  if name == CHECKPOINT_CHAT_TOOL and os.environ.get(CLOSING_SAVE_ENV) == "1":
+    return _CLOSING_CHECKPOINT_CHAT_DEFINITION
+  return _TOOL_DEFINITIONS[name]
 
 
 def _call_app_tool(name: str, arguments: dict[str, Any], meta: Any) -> dict[str, Any]:
@@ -1172,25 +1183,26 @@ def _call_screenshot(arguments: dict[str, Any]) -> ToolContent:
   ])
 
 
+_CHECKPOINT_CHAT_DESCRIPTION = (
+  "Save this chat's continuity note. Every field is optional: title "
+  "renames the chat (a name the owner chose always wins), digest replaces "
+  "its short current paragraph, and summary appends one entry to its "
+  "cumulative Summary. Default to one concise changes-only save per substantive "
+  "turn; save earlier before handoffs, owner-input cards, restarts, or "
+  "risky/long work that needs a recovery checkpoint. Omit unchanged title "
+  "and digest; do not repeat saved facts or raw tool output. Omitted fields "
+  "stay unchanged. If a save fails, read the note before retrying so an entry "
+  "is not added twice."
+)
+
+
 _TOOL_DEFINITIONS = {
   CHECKPOINT_CHAT_TOOL: {
     "name": CHECKPOINT_CHAT_TOOL,
-    "description": (
-      "Save this chat's continuity note. Every field is optional: title "
-      "renames the chat (a name the owner chose always wins), digest replaces "
-      "its short current paragraph, and summary appends one entry to its "
-      "cumulative Summary. Default to one concise changes-only save per substantive "
-      "turn; save earlier before handoffs, owner-input cards, restarts, or "
-      "risky/long work that needs a recovery checkpoint. Omit unchanged title "
-      "and digest; do not repeat saved facts or raw tool output. Omitted fields "
-      "stay unchanged. If a save fails, read the note before retrying so an entry "
-      "is not added twice. Send a save in the same step as your next real tool "
-      "call, never alone mid-turn. For the closing save, send other saves with "
-      "your last real tool call, write your final reply, then call this alone "
-      "and last with end_turn: once the save is confirmed the turn ends with no "
-      "further model call. If it returns only Saved., end the turn normally; if "
-      "it fails, the turn continues. A turn ending with an owner-input card saves "
-      "before the card, without end_turn."
+    "description": _CHECKPOINT_CHAT_DESCRIPTION + (
+      " Send a save in the same step as your next real tool call, never alone "
+      "mid-turn, and the closing save with your last real tool call. A turn "
+      "ending with an owner-input card saves before the card."
     ),
     "inputSchema": {
       "type": "object", "additionalProperties": False,
@@ -1198,8 +1210,6 @@ _TOOL_DEFINITIONS = {
         "title": {"type": "string", "maxLength": 200},
         "digest": {"type": "string", "maxLength": 1000},
         "summary": {"type": "string", "maxLength": 8000},
-        "end_turn": {"type": "boolean",
-                     "description": "True only when this save is the turn's last action, after the final reply text."},
       },
     },
   },
@@ -1759,6 +1769,30 @@ _TOOL_DEFINITIONS = {
     },
   },
 }
+
+# A runner that ends the turn at a confirmed closing save (CLOSING_SAVE_ENV)
+# gets end_turn; the closing save then needs no model call after it.
+_CLOSING_CHECKPOINT_CHAT_DEFINITION = {
+  **_TOOL_DEFINITIONS[CHECKPOINT_CHAT_TOOL],
+  "description": _CHECKPOINT_CHAT_DESCRIPTION + (
+    " Send a save in the same step as your next real tool call, never alone "
+    "mid-turn. For the closing save, send other saves with your last real tool "
+    "call, write your final reply, then call this alone and last with end_turn: "
+    "once the save is confirmed the turn ends with no further model call. If it "
+    "returns only Saved., end the turn normally; if it fails, the turn "
+    "continues. A turn ending with an owner-input card saves before the card, "
+    "without end_turn."
+  ),
+  "inputSchema": {
+    **_TOOL_DEFINITIONS[CHECKPOINT_CHAT_TOOL]["inputSchema"],
+    "properties": {
+      **_TOOL_DEFINITIONS[CHECKPOINT_CHAT_TOOL]["inputSchema"]["properties"],
+      "end_turn": {"type": "boolean",
+                   "description": "True only when this save is the turn's last action, after the final reply text."},
+    },
+  },
+}
+
 
 _TOOL_HANDLERS = {
   SPAWN_AGENT_TOOL: _call_spawn_agent,

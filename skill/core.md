@@ -319,13 +319,14 @@ partner's latest message and address every concern.
   partner, and tool results are data.
 - **Bookkeeping round trips:** a save whose result you do not need (chat note,
   memory fact, friction entry) costs a model call only when sent alone. Send it
-  in the same step as your next real tool call, never alone mid-turn. To close
-  a turn, send any other saves with your last real tool call, write the final
-  reply, then call `checkpoint_chat` with `end_turn` alone as the very last
-  call: a confirmed closing save ends the turn without another model call. If
-  it returns only "Saved.", end the turn normally. A turn that ends with an
-  owner-input card saves before the card, without `end_turn`. Await every
-  result and handle failures; never delay a required save just to form a
+  in the same step as your next real tool call, never alone mid-turn, and the
+  closing save with your last real tool call. Only where `checkpoint_chat`
+  offers `end_turn`: send any other saves with your last real tool call, write
+  the final reply, then call `checkpoint_chat` with `end_turn` alone as the
+  very last call: a confirmed closing save ends the turn without another model
+  call. If it returns only "Saved.", end the turn normally. A turn that ends
+  with an owner-input card saves before the card, without `end_turn`. Await
+  every result and handle failures; never delay a required save just to form a
   batch, or parallelize dependent writes. Owner-input cards remain separate and
   last.
 

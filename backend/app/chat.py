@@ -5888,13 +5888,13 @@ async def _run_chat_impl_with_db(
   fresh_delegated_session = (
     run_policy is not None and not session_id and len(messages) > 1
   )
-  # A retired session is not resumed: its own history would keep the model
+  # A retired session is never resumed: its own history would keep the model
   # following a withdrawn instruction. A top-level chat starts fresh and is
-  # reseeded from its transcript, exactly as for a lost session. Delegated
-  # runs keep their existing no-replay rule and simply resume.
+  # reseeded from its transcript, exactly as for a lost session; a delegated
+  # run gets the same no-replay refusal as a lost helper session.
   session_runtime = provider_runtime_kind(provider)
   session_retired = (
-    run_policy is None and session_runtime in ("claude_sdk", "codex_sdk")
+    session_runtime in ("claude_sdk", "codex_sdk")
     and resume_retired(
       db, "claude" if session_runtime == "claude_sdk" else "codex", session_id,
     )
@@ -5999,7 +5999,7 @@ async def _run_chat_impl_with_db(
     else str(data_dir) if data_dir.exists() else str(Path.cwd())
   )
 
-  if fresh_delegated_session:
+  if fresh_delegated_session or (run_policy is not None and session_retired):
     return await _refuse_delegated_write_replay(
       bc=bc, db=db, chat_id=chat_id, run_token=run_token, run_gen=run_gen,
       provider_id=provider_id, agent_activity_binding=agent_activity_binding,

@@ -184,10 +184,13 @@ def test_closing_save_receipt_is_bound_to_the_live_run_sink(client, chat):
   class CleanEndingRunner:
     # Like Claude's root runner: its own hook stops at the tool boundary.
     kind = RunnerKind.CLAUDE_SDK
-    ends_turn_at_tool_result = True
 
     def __init__(self, chat_id):
       self.chat_id = chat_id
+      self.may_end = True
+
+    def may_end_at_closing_save(self) -> bool:
+      return self.may_end
 
     async def stop(self, timeout: float = 2.0) -> bool:
       return True
@@ -209,6 +212,14 @@ def test_closing_save_receipt_is_bound_to_the_live_run_sink(client, chat):
       receipt_id = closing.json()["turn_end_id"]
       assert sink.ends_turn(receipt_id) and not sink.ends_turn("someone-else")
       assert "Closing entry." in _note(chat)
+      # An empty closing save saves nothing, so it ends nothing either.
+      empty = _save(client, headers, summary="  ", end_turn=True)
+      assert empty.status_code == 204
+      # The runner rechecks at the cut: once an owner message is admitted (or
+      # native background work starts), the issued receipt no longer ends it.
+      runner.may_end = False
+      assert not sink.ends_turn(receipt_id)
+      assert _save(client, headers, summary="Owner spoke.", end_turn=True).status_code == 204
     finally:
       registry.unregister(chat.id, runner.kind)
     # A runner that cannot stop at the tool boundary (Codex, shared helper

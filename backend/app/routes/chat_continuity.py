@@ -70,7 +70,8 @@ async def checkpoint_chat(
   chat_id = principal.chat_id or ""
   title = " ".join((body.title or "").split()) or None
   if title is None and not (body.digest or "").strip() and not (body.summary or "").strip():
-    return _closing_receipt(chat_id, principal.run_id) if body.end_turn else None
+    # Nothing was saved, so there is no confirmed closing save to end on.
+    return None
   async with chat_queue.get_transition_lock(chat_id):
     result = await await_ack(get_writer().submit(AuthorizeCheckpoint(
       chat_id=chat_id, run_token=principal.run_id or "", title=title,

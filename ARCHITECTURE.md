@@ -1402,15 +1402,21 @@ exists and is useful even when the Memory app is not installed. Its consumers:
   long chat and for the provider-switch handoff below — preferred over a from-scratch
   default compaction.
 
-A closing save may pass `end_turn`. When that save succeeds for the live run,
-the route asks the run's `ChatEventSink` for a receipt (`record_closing_save`)
-and returns it as `turn_end_id`. A receipt is issued only when the chat's
-runner stops at the tool boundary itself (`ends_turn_at_tool_result`: Claude's
-root runner, whose PostToolUse hook refuses the next model request) and no
-other tool of the turn is still running. The sink's interrupting card boundary
-never fires for a closing save, because interrupting a provider that already
-moved on would lose the saving and record an aborted turn. Without a receipt,
-or when the save fails, the turn simply continues.
+A closing save may pass `end_turn`. The control server offers that field only
+when the run sets `MOBIUS_CLOSING_SAVE_ENDS_TURN` (Claude's private SDK runner,
+root or helper, whose PostToolUse hook refuses the next model request); on
+Codex and shared helper hosts it would only add a model call. When the save
+succeeds for the live run, the route asks the run's `ChatEventSink` for a
+receipt (`record_closing_save`) and returns it as `turn_end_id`. A receipt is
+issued only when the runner can stop cleanly now (`may_end_at_closing_save`: no
+owner message admitted into this response and no Claude-native background
+Agent/Workflow work pending) and no other tool of the turn is still running.
+The hook rechecks the runner at the cut, so an owner message that arrives after
+the receipt keeps the turn going and gets its answer. An empty save gets no
+receipt. The sink's interrupting card boundary never fires for a closing save,
+because interrupting a provider that already moved on would lose the saving and
+record an aborted turn. Without a receipt, or when the save fails, the turn
+simply continues.
 
 Two agent mechanisms with similar names deliberately remain separate.
 `app.background_agents` resolves the owner’s primary/fallback ordering for
