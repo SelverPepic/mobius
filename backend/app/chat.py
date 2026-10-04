@@ -3686,6 +3686,19 @@ _MODEL_CAPACITY_ERROR_MARKERS = (
 )
 
 
+# The provider's exhausted-workspace-credits rejection as plain error text, for
+# failures without the runner's structured ``credits_depleted`` flag. It is not
+# a timed limit: nothing resets on its own, so it is a manual pause the owner
+# continues after adding credits. Matched exactly so unrelated payment failures
+# keep the error card.
+_WORKSPACE_CREDITS_ERROR = "your workspace is out of credits. add credits to continue."
+
+
+def _is_workspace_credits_error_text(text: str | None) -> bool:
+  """Whether a provider rejected the turn because workspace credits ran out."""
+  return (text or "").strip().lower() == _WORKSPACE_CREDITS_ERROR
+
+
 def _is_model_capacity_error_text(text: str | None) -> bool:
   """Whether a provider says the specifically selected model is busy."""
   if not text:
@@ -4020,9 +4033,18 @@ def _park_exit(
       ),
     })
     return {"parked": False, "oversized": True}
+  # Checked before the limit branch: Codex reports depleted credits as a
+  # reached rate limit (429), but no reset time will refill them, so it is a
+  # manual pause the owner resumes after adding credits. Other credit
+  # failures are shown as plain errors.
+  if (
+    (runner_result or {}).get("credits_depleted") is True
+    or _is_workspace_credits_error_text(error_text)
+  ):
+    sink.publish(_pause_note(error_text, kind="credits", provider=provider_id))
+    return {"parked": False}
   # A false positive only parks the queue for manual resend; a false negative
-  # reinstates the limit storm. Out-of-credits does not reset by itself, so it
-  # is shown as an error rather than parked.
+  # reinstates the limit storm.
   limit = error_kind is ProviderErrorKind.USAGE_LIMIT
   model_capacity = _is_model_capacity_error_text(error_text)
   failed = bool(error_text) or runner_result is None
