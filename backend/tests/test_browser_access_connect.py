@@ -1,6 +1,7 @@
 """A recipient's Connect commands retain grant lineage across reconnects."""
 
 import asyncio
+import time
 
 import pytest
 from fastapi import HTTPException
@@ -34,7 +35,6 @@ def _host():
     "id": host_id,
     "name": "Box",
     "runner_protocol": connect_runner.RUNNER_PROTOCOL_VERSION,
-    "runner_transport": "sse",
     "runner_capabilities": ["parallel"],
     "token_sha256": "paired",
     "active_commands": [],
@@ -89,6 +89,35 @@ async def test_revoke_cancels_only_recipient_commands_not_owner_commands(db):
 
 
 @pytest.mark.asyncio
+async def test_revoke_during_dispatch_finishes_the_guest_command_at_once(db):
+  owner = _owner(db)
+  grant, _ = create_invitation(db, owner, "laptop")
+  guest = Principal(
+    owner=owner, app_id=None, browser_grant_id=grant.id,
+    browser_grant_epoch=grant.epoch,
+  )
+  host_id, channel = _host()
+  request_id = "a" * 16
+  caller = asyncio.create_task(connect.exec_on_host(
+    host_id, connect.ExecBody(cmd="printf safe", request_id=request_id, stream=True),
+    _owner=owner, _principal=guest,
+  ))
+  assert (await asyncio.wait_for(channel.queue.get(), 1))["type"] == "exec"
+
+  revoke_grant(db, grant.id, owner.id)
+  assert connect.cancel_browser_grant_commands(grant.id) == []
+
+  assert await asyncio.wait_for(caller, 1) == {
+    "request_id": request_id, "state": "finished",
+  }
+  assert connect._host_commands(host_id) == {}
+  assert connect.browser_grant_pending_commands(grant.id) == []
+  assert connect.connect_output.finished(
+    host_id, request_id,
+  )["result"]["outcome"] == "canceled"
+
+
+@pytest.mark.asyncio
 async def test_cancel_pending_survives_restart_and_reconnect_without_replay(db):
   owner = _owner(db)
   grant, _ = create_invitation(db, owner, "laptop")
@@ -97,6 +126,7 @@ async def test_cancel_pending_survives_restart_and_reconnect_without_replay(db):
     "a" * 16, 60, cmd="printf safe", browser_grant_id=grant.id,
     browser_grant_epoch=grant.epoch, browser_owner_id=owner.id,
     browser_owner_token_epoch=owner.token_epoch,
+    started_at=time.time(), state="running",
   )
   connect._host_commands(host_id)[command.request_id] = command
   connect._persist_commands(host_id)
@@ -105,7 +135,7 @@ async def test_cancel_pending_survives_restart_and_reconnect_without_replay(db):
   connect._commands.clear()
   replacement = connect._Channel()
   connect._channels[host_id] = replacement
-  await connect._reconcile_runner(host_id, replacement, {
+  connect._reconcile_runner(host_id, {
     "active_request_ids": [command.request_id], "pending_result_ids": [],
   })
   assert (await replacement.queue.get()) == {
@@ -134,13 +164,17 @@ async def test_revocation_before_startup_reconciliation_blocks_guest_replay(db):
   revoke_grant(db, grant.id, owner.id)
   connect._commands.clear()
   replacement = connect._Channel()
-  await connect._reconcile_runner(host_id, replacement, {
+  connect._channels[host_id] = replacement
+  connect._reconcile_runner(host_id, {
     "active_request_ids": [], "pending_result_ids": [],
   })
   event = await replacement.queue.get()
   assert event["type"] == "exec" and event["request_id"] == owner_command.request_id
   assert replacement.queue.empty()
   assert connect._find_command(host_id, guest_command.request_id) is None
+  assert connect.connect_output.finished(
+    host_id, guest_command.request_id,
+  )["result"]["outcome"] == "canceled"
 
 
 def test_guest_cannot_mint_installation_connect_authority(db):

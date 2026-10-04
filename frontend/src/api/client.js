@@ -670,6 +670,26 @@ async function listAffectingMutation(kind, path, options) {
   return response
 }
 
+/**
+ * A list-affecting write whose repeat is harmless (the server leaves an
+ * already-applied state unchanged), resent once if the connection fails.
+ *
+ * A phone returning from the background often sends its first request on a
+ * connection the network has already dropped; fetch then rejects with a
+ * TypeError before any response. One immediate resend opens a fresh
+ * connection. Only transport failures repeat: an HTTP status is the server's
+ * answer, and aborts or expired sessions are deliberate. Use only for
+ * operations that are safe to apply twice.
+ */
+async function repeatableListMutation(kind, path, options) {
+  try {
+    return await listAffectingMutation(kind, path, options)
+  } catch (error) {
+    if (!(error instanceof TypeError)) throw error
+    return await listAffectingMutation(kind, path, options)
+  }
+}
+
 async function pinnedMutation(path, {
   method,
   body,
@@ -1022,10 +1042,10 @@ export const api = {
     // Archiving files a chat under Archived without touching its history or
     // work; restoring returns it to Recents. Both answer the persisted
     // `{ archived_at, pinned_at }` so the drawer can settle its rows.
-    archive: (chatId) => listAffectingMutation(
+    archive: (chatId) => repeatableListMutation(
       'chats', `/chats/${encodeURIComponent(chatId)}/archive`, { method: 'POST' },
     ),
-    unarchive: (chatId) => listAffectingMutation(
+    unarchive: (chatId) => repeatableListMutation(
       'chats', `/chats/${encodeURIComponent(chatId)}/unarchive`, { method: 'POST' },
     ),
     remove: (chatId) => listAffectingMutation(
