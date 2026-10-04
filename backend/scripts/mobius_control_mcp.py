@@ -119,10 +119,21 @@ UPDATE_GOAL_DESCRIPTION = (
   "Advance this chat's Goal in one call. tasks edits the plan as one "
   "revision: a known id changes only the fields given (for example status "
   "completed with a result, and the next task running), a new id adds a task. "
-  "next_action records the exact next step. complete "
-  "records the verified outcome and closes the Goal; it is refused while "
-  "tasks or helpers are unfinished. With no arguments it returns the current "
-  "plan. goal_id attaches to a named retained Goal instead of the presented one."
+  "next_action records the exact next step. complete records only the verified "
+  "original outcome. If unreachable, first ask the owner an actionable question; "
+  "a temporary owner action or approval keeps the Goal open with its saved card. "
+  "If the owner defers a step, continue other authorized work. When none can "
+  "proceed, use defer with the reason and end normally: no repeat question, "
+  "automatic retry, or failed outcome. This holds the original Goal and releases "
+  "its claims; resolve existing helpers, cards and Waits first. "
+  "Only a genuinely unreachable outcome uses cannot_complete with reason, "
+  "efforts/partial results, and unmet_outcome; cancel means the owner called it "
+  "off. Settle every task honestly and wait for helpers before any outcome. "
+  "Tasks and outcome commit atomically; refusal saves neither. No proof-of-prose "
+  "approval validator substitutes for the agent's judgment. With no arguments it returns the current "
+  "plan. goal_id explicitly resumes a named retained Goal instead of the presented "
+  "one, including a held Goal only when the owner asked to continue that work. "
+  "Do not create a replacement Goal or reattach an unrelated follow-up."
 )
 DECLARE_WAIT_DESCRIPTION = (
   "Persist this top-level chat's one cross-turn wait: the chat resumes by "
@@ -447,11 +458,7 @@ def _tools_list_result() -> dict[str, Any]:
   return {
     "tools": [
       *(
-        {**_TOOL_DEFINITIONS[name], "_meta": {
-          **ALWAYS_LOAD_META,
-          **({"mobius/resultIndependent": True}
-             if name == CHECKPOINT_CHAT_TOOL else {}),
-        }}
+        {**_TOOL_DEFINITIONS[name], "_meta": ALWAYS_LOAD_META}
         for name in _available_tool_names()
       ),
       *_app_tool_listings(),
@@ -518,7 +525,7 @@ def _goal_report(payload: dict[str, Any], *, full: bool) -> str:
     line += f": {summary.get('completed', 0)}/{summary.get('total', 0)} tasks complete"
   lines = [line + "."]
   for label, key in (("Running", "running"), ("Ready", "ready")):
-    if summary.get(key):
+    if goal.get("status") == "open" and summary.get(key):
       lines.append(f"{label}: {', '.join(summary[key])}.")
   if goal.get("status") == "open":
     if summary.get("can_complete"):
@@ -530,6 +537,11 @@ def _goal_report(payload: dict[str, Any], *, full: bool) -> str:
         "Held work_keys (finished_claims accepts only these; name only work performed): "
         + ", ".join(goal["held_work_keys"]) + "."
       )
+  elif isinstance(goal.get("hold"), dict) and goal["hold"].get("cause") == "deferred":
+    lines.append("On hold: " + goal["hold"]["reason"])
+    lines.append("End normally. Resume only when the owner asks to continue; no automatic retry.")
+  elif goal.get("result") and (full or goal.get("status") != "completed"):
+    lines.append("Outcome: " + goal["result"] + ".")
   if full:
     lines.insert(0, f"Objective: {goal.get('objective')}")
     for task in (plan or {}).get("tasks") or []:
@@ -547,7 +559,7 @@ def _goal_report(payload: dict[str, Any], *, full: bool) -> str:
 
 
 def _call_update_goal(arguments: dict[str, Any]) -> str:
-  allowed = {"tasks", "next_action", "complete", "finished_claims", "goal_id"}
+  allowed = {"tasks", "next_action", "complete", "cannot_complete", "cancel", "defer", "finished_claims", "goal_id"}
   unknown = set(arguments) - allowed
   if unknown:
     raise ValueError(f"update_goal does not take: {', '.join(sorted(unknown))}")
@@ -1355,7 +1367,7 @@ _TOOL_DEFINITIONS = {
   REQUEST_QUESTION_TOOL: {
     "name": REQUEST_QUESTION_TOOL,
     "description": (
-      "Ask 1–3 ordinary clarifying questions. "
+      "Ask 1–10 ordinary clarifying questions; prefer a small batch when enough. "
       "Only the question text is required; card-only ids, headings, and an "
       "empty options list are supplied when omitted. "
       "The saved card blocks further work until the owner answers or Stops; "
@@ -1372,7 +1384,7 @@ _TOOL_DEFINITIONS = {
       "type": "object", "additionalProperties": False,
       "required": ["questions"],
       "properties": {"questions": {
-        "type": "array", "minItems": 1, "maxItems": 3,
+        "type": "array", "minItems": 1, "maxItems": 10,
         "items": {
           "type": "object", "additionalProperties": False,
           "required": ["question"],
@@ -1426,8 +1438,10 @@ _TOOL_DEFINITIONS = {
     "name": NOTIFY_OWNER_TOOL,
     "description": (
       "Send the owner a push notification for a meaningful event: a finished "
-      "long task, an error or question that needs them, or when they asked to "
-      "be told. Not for routine confirmations. target defaults to this chat's "
+      "long task, an error that needs them outside a card, or when they asked "
+      "to be told. Not for routine confirmations, and not for a saved "
+      "question, approval, restart or secure-input card: the card sends its "
+      "own notification. target defaults to this chat's "
       "in-app link; use /shell/?app=ID for an app. tag groups pushes about one "
       "thing so a newer one replaces the older. The push is skipped while the "
       "owner is viewing this chat. Never fire one from a script under test."
@@ -1556,7 +1570,7 @@ _TOOL_DEFINITIONS = {
       "properties": {
         "objective": {
           "type": "string",
-          "description": "Concise outcome and observable completion condition.",
+          "description": "Short, plain-language outcome shown to the owner. Put the route and verification criteria in tasks, not this heading.",
         },
         "tasks": {
           **_GOAL_TASKS_SCHEMA,
@@ -1576,9 +1590,22 @@ _TOOL_DEFINITIONS = {
         "tasks": _GOAL_TASKS_SCHEMA,
         "next_action": {"type": "string", "maxLength": 2000, "description": "Next step for unfinished work. Do not combine with complete."},
         "complete": {
-          "type": "string", "maxLength": 4000,
-          "description": "Verified evidence that the whole outcome holds. Do not combine with next_action; final task edits may share this call.",
+          "type": "boolean", "enum": [True],
+          "description": "Set true after verifying the whole outcome. No separate success summary. Keep useful verification evidence in task results or the chat checkpoint; communicate the outcome and any consequential caveats in your normal final reply. Do not combine with next_action; final task edits may share this call.",
         },
+        "cannot_complete": {
+          "type": "object", "additionalProperties": False,
+          "required": ["reason", "efforts", "unmet_outcome"],
+          "properties": {
+            "reason": {"type": "string", "minLength": 1, "maxLength": 1500},
+            "efforts": {"type": "string", "minLength": 1, "maxLength": 2000},
+            "unmet_outcome": {"type": "string", "minLength": 1, "maxLength": 1000},
+          },
+        },
+        "cancel": {"type": "string", "minLength": 1, "maxLength": 4000,
+                   "description": "Owner-called-off reason, not an unreachable-work shortcut."},
+        "defer": {"type": "string", "minLength": 1, "maxLength": 2000,
+                  "description": "Why remaining work is deferred, after other authorized work is done. Quietly holds this Goal, not an outcome or a new question; tasks may share this atomic call. Do not combine with next_action or outcomes."},
         "finished_claims": {
           "type": "array", "items": {"type": "string"}, "maxItems": 50,
           "description": "With complete only: exact held work_keys this Goal performed, not claim ids or invented names. Other held claims are released.",
