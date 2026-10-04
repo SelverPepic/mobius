@@ -202,6 +202,33 @@ for (const [path, options] of [
   })
 }
 
+for (const [path, options] of [
+  ['Navigation API', {}],
+  ['popstate fallback', { navigationApi: false }],
+]) {
+  test(`${path} reload on a base entry showing an app still seeds chat behind it`, async () => {
+    // Builder focus changes and tab closes restamp the base entry's route
+    // without pushing, so the first entry can name an app. Resuming it as-is
+    // would leave nothing behind it and Back would exit Möbius.
+    const learn = sessionHistory(options)
+    let mounted = await mountNavigation(learn, { tab: { kind: 'app', id: '119' } })
+    const appRoute = learn.currentState.route
+    mounted.unmount()
+
+    const engine = sessionHistory(options)
+    engine.history.replaceState({
+      __mobiusNav: true, kind: 'base', index: 0, route: appRoute, entryId: 'e0',
+    })
+    mounted = await mountNavigation(engine, { tab: { kind: 'app', id: '119' } })
+    assert.equal(engine.depth, 1, 'the chat seed sits behind the app entry')
+    assert.equal(engine.currentState.route.view, appRoute.view)
+    assert.equal(mounted.result.current.navigateBackward(), true, 'Back stays inside Möbius')
+    engine.settle()
+    assert.equal(engine.currentState.route.view, 'chat')
+    mounted.unmount()
+  })
+}
+
 test('Forward shortcut refuses an iframe-owned physical cursor', async () => {
   const engine = sessionHistory({ navigationApi: false })
   const mounted = await mountNavigation(engine, { tab: { kind: 'chat', id: 'a' } })

@@ -182,10 +182,16 @@ export function pushNavEntry(kind, route = null, {
   // Leave a shell-owned continuation on the source entry before pushing so a
   // reloaded popstate-only browser can still offer Forward without guessing
   // from navigation.canGoForward (which also includes non-shell entries).
+  // The marker is best-effort: a failed write (e.g. Safari's history rate
+  // limit) must not abort the real push below.
   if (isMobiusNavState(history.state)) {
     const source = { ...history.state, hasShellForward: true }
-    history.replaceState(source, '')
-    mirrorCurrentEntry(source)
+    try {
+      history.replaceState(source, '')
+      mirrorCurrentEntry(source)
+    } catch (error) {
+      recordClientError({ where: 'navHistory.markShellForward', error })
+    }
   }
   const state = navState(kind, {
     index: current == null ? 0 : current + 1,

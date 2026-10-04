@@ -105,8 +105,11 @@ test('a superseded create waiter cannot rotate the reopened New Chat draft', () 
   const settle = shellSource.match(
     /async function settleDraftFirstNewChat\(presentation\) \{([\s\S]*?)\n  \}\n\n  settleDraftFirstNewChatRef\.current/,
   )?.[1] || ''
-  const rotate = settle.match(
-    /if \(decision\.action === 'rotate'\) \{([\s\S]*?)\n    \}\n\n    if \(decision\.action !== 'accept'\)/,
+  assert.match(settle,
+    /if \(decision\.action === 'rotate'\) \{\s*await rotateDraftFirstNewChat\(presentation, decision\.chatId\)\s*return/,
+    'a conflict always resolves through the one rotation path')
+  const rotate = shellSource.match(
+    /async function rotateDraftFirstNewChat\(presentation, rotatedId\) \{([\s\S]*?)\n  \}\n\n  rotateDraftFirstNewChatRef\.current/,
   )?.[1] || ''
 
   const ownerCheck = rotate.indexOf(
@@ -119,7 +122,7 @@ test('a superseded create waiter cannot rotate the reopened New Chat draft', () 
   const durableDraftRead = rotate.indexOf('await readComposerDraftAsync(intentId)')
   const draftCopy = rotate.indexOf('persistComposerDraft(')
   const pointerMove = rotate.indexOf(
-    "rememberOpenNewChatIntent({ chatId: decision.chatId, status: 'allocating' })",
+    "rememberOpenNewChatIntent({ chatId: rotatedId, status: 'allocating' })",
   )
 
   assert.ok(ownerCheck >= 0, 'rotation must claim the live presentation')
@@ -140,6 +143,20 @@ test('a superseded create waiter cannot rotate the reopened New Chat draft', () 
   assert.equal(checksBeforeRead, 1)
   assert.equal(checksAfterRead, 1,
     'rotation must reclaim presentation ownership after durable hydration')
+})
+
+test('a conflict that arrives off-screen rotates silently once the owner returns', () => {
+  const rotate = shellSource.match(
+    /async function rotateDraftFirstNewChat\(presentation, rotatedId\) \{([\s\S]*?)\n  \}\n\n  rotateDraftFirstNewChatRef\.current/,
+  )?.[1] || ''
+  const defer = rotate.match(/const deferRotation = \(\) => \{([\s\S]*?)\n    \}/)?.[1] || ''
+  assert.match(defer, /\{ \.\.\.current, rotateTo: rotatedId \}/,
+    'the background conflict remembers its rotation decision')
+  assert.doesNotMatch(defer, /failure|failedNewChatPresentation|rememberOpenNewChatIntent/,
+    'a background conflict must not surface a failure or Retry the owner never saw')
+  assert.match(shellSource,
+    /if \(!session\?\.rotateTo \|\| !newChatPresentationIsCurrent\(session,[\s\S]*?\{ \.\.\.session, rotateTo: null \}[\s\S]*?rotateDraftFirstNewChatRef\.current\?\.\(resuming, session\.rotateTo\)/,
+    'returning applies the remembered rotation without re-sending the conflicting id')
 })
 
 test('an accepted allocation activates the already-mounted canonical composer', () => {
@@ -190,7 +207,7 @@ test('a provisional Send becomes one durable handoff and retries on proven recov
   )
   assert.match(
     shellSource,
-    /stageComposerHandoff\(decision\.chatId, autoSendDraft, \{ autoSend: true \}\)/,
+    /stageComposerHandoff\(rotatedId, autoSendDraft, \{ autoSend: true \}\)/,
     'an authoritative id rotation must move the queued handoff to its new owner',
   )
 })
@@ -199,6 +216,9 @@ test('a queued first Send continues in the same ChatView after allocation', () =
   assert.match(shellSource,
     /if \(!session\?\.materialized \|\| !session\.submitted[\s\S]*activeView !== 'chat'[\s\S]*String\(activeChatId\) !== String\(session\.chatId\)[\s\S]*readComposerHandoff\(session\.chatId\)\.autoSendDraft[\s\S]*requestComposer\(session\.chatId, \{[\s\S]*draft: autoSendDraft,[\s\S]*submit: true/,
     'a queued send resumes when its own materialized chat becomes visible, not only at allocation completion')
+  assert.match(shellSource,
+    /requestComposer\(session\.chatId, \{\s*draft: autoSendDraft,\s*submit: true,\s*\}\)[\s\S]{0,400}?newChatPresentationRef\.current = null\s*setNewChatPresentation\(current => \(\s*current\?\.token === session\.token \? null : current/,
+    'the queued Send handoff retires the creation so a later New Chat is never swallowed by refocus')
   assert.match(chatViewSource,
     /if \(hidden \|\| provisionalNewChat\) return\s*const request = pendingComposerSubmit/,
     'a restored stored handoff must not send before its chat row exists')

@@ -1780,7 +1780,9 @@ On narrow layouts the drawer is modeled as a *virtual route*: opening it pushes 
 The mobile design satisfies a few hard desiderata — no "two drawers" artifact during Chrome-Android swipe-back, the 250ms slide stays visible, one back-press exits the PWA from home, and closing the drawer (overlay tap / X) must never navigate. Three load-bearing invariants in `useNavigation.js` enforce this: (1) **`navTo` consumes the existing drawer-sentinel rather than pushing** when the drawer is open (it pushes one `'nav'` entry only if the drawer was closed), so an in-app nav reuses the drawer's history slot instead of growing the stack — keeping history pinned to a pre-drawer snapshot and killing the BFCache artifact; (2) **every close path funnels through `history.back()` → `handleBack`**, whose drawer-first guard (`if (drawerOpenRef && drawerPushedRef) { close; return }`) prevents over-popping `navStackRef`; (3) **`drawerPushedRef` is a ref, not state** (mutated synchronously in the same task as the history call) and is the single source of truth for "is a drawer-sentinel above the current entry." Activating the already-current destination is a close/no-op and must not create a duplicate history edge. Every shell-pushed entry is tagged `{__mobiusNav:true, kind}` via `navHistory.js` and written to *both* the classic History store and the Navigation API entry (`updateCurrentEntry`); both back handlers ignore untagged pops so sandboxed-iframe phantom entries can't over-pop — do not drop the tag from any push site or genuine sentinels read as phantoms and back-nav dies. Mini-apps install their own back-targets via the `moebius:nav-push` postMessage protocol (per-app counts in `appSentinelCountsRef`, capped at 20), consumed before navStack pops; `Shell.deleteChat` must scrub `navStackRef` of the deleted chat's entries or back lands on a 404'd chat. Three architectures were tried and rejected (per-nav pushState, `flushSync`-before-pushState, perpetual single-sentinel) — read `tests/navigation.spec.mjs` before changing anything.
 
 Ordinary reloads preserve a matching tagged chat/app route and its shell index,
-rather than reclassifying the current entry as a new base. Each shell push marks
+rather than reclassifying the current entry as a new base. A base entry that
+shows a non-chat surface is still replaced and gets the HOME seed behind it, so
+Back after reload reaches chat instead of leaving Möbius. Each shell push marks
 its tagged source with `hasShellForward`, so even a popstate-only browser can
 recover the Forward edge after reload without a second persisted history stack.
 Where available, the Navigation API's next entry verifies that Forward remains
@@ -1791,8 +1793,10 @@ New Chat's provisional row ownership outlives its visible presentation. Leaving
 releases the keyboard lease, not the creation session: Back/Forward must restore
 its composer without reading a not-yet-created row as a deletion. An off-screen
 allocation may publish success or failure but never redirect the workspace;
-conflicting ids wait for visible Retry before rotating the draft. A queued first
-Send waits for that chat to be materialized, visible, and runtime-ready. Consuming
+an off-screen id conflict is remembered and applies the same silent rotation
+when its chat is visible again. A queued first Send waits for that chat to be
+materialized, visible, and runtime-ready; handing it over retires the creation
+session. Consuming
 its durable handoff is a one-shot claim shared by retained/remounted views, not
 merely a component-local request token.
 

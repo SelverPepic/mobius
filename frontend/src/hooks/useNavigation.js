@@ -50,6 +50,13 @@ function _anyAppHasSentinels(map) {
   return false
 }
 
+// A shell `nav` entry above the first one has a shell entry behind it. After a
+// reload resumes such an entry, the destructive navStack is empty, but Back
+// still belongs to the shell rather than leaving Möbius.
+function hasShellEntryBelow(state) {
+  return navEntryIndex(state) > 0 && state?.kind === 'nav'
+}
+
 // A restorable route carries a `paneId` HINT (design §5). The hint is never a
 // foreign key — it may be stale after a close, move, reload, or Forward — so no
 // restore fails solely because the hinted pane is dead; `restoreRoute` degrades
@@ -1481,7 +1488,9 @@ export default function useNavigation({
       const existing = history.state
       const resumeEntry = !deepLink?.view && !returnView
         && !claimedReloadDestination
-        && (existing?.kind === 'base' || existing?.kind === 'nav')
+        // A base entry showing a non-chat surface still needs the HOME seed
+        // behind it, so only a chat base entry is resumed as-is.
+        && (existing?.kind === 'nav' || (existing?.kind === 'base' && !seedHome))
         && isMobiusNavState(existing)
         && sameRoute(existing.route, initialRoute)
       currentNavStateRef.current = resumeEntry
@@ -2102,7 +2111,7 @@ export default function useNavigation({
             && !_anyAppHasSentinels(appSentinelCountsRef.current)
             && appLocalPopsRef.current.length === 0
             && !isConsumedAppEntry(source)
-            && !(navEntryIndex(source) > 0 && source?.kind === 'nav')) return
+            && !hasShellEntryBelow(source)) return
         e.intercept({ handler() {
           currentNavStateRef.current = destination
           handleBack(destination, source)
@@ -2178,7 +2187,7 @@ export default function useNavigation({
             && !_anyAppHasSentinels(appSentinelCountsRef.current)
             && appLocalPopsRef.current.length === 0
             && !isConsumedAppEntry(source)
-            && !(navEntryIndex(source) > 0 && source?.kind === 'nav')) return
+            && !hasShellEntryBelow(source)) return
       handleBack(destination, source)
     }
     window.addEventListener('popstate', onPopState)
@@ -2192,7 +2201,7 @@ export default function useNavigation({
     if (cancelDrawerPreparation()) return true
     const current = currentNavStateRef.current
     const hasShellTarget = navStackRef.current.length > 0
-      || (navEntryIndex(current) > 0 && current?.kind === 'nav')
+      || hasShellEntryBelow(current)
       || drawerOpenRef.current
       || current?.kind === 'drawer'
       || current?.kind === 'dismissible'

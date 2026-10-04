@@ -803,6 +803,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
   const newChatPresentationSeqRef = useRef(0)
   const newChatAllocationPromisesRef = useRef(new Map())
   const settleDraftFirstNewChatRef = useRef(null)
+  const rotateDraftFirstNewChatRef = useRef(null)
   const builderNewChatRequestRef = useRef(null)
   const newChatIntentLoadedRef = useRef(false)
   const newChatIntentRef = useRef(null)
@@ -3598,6 +3599,136 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
       })
   }
 
+  // Another owner has authoritatively claimed this id. Copy the latest owner
+  // draft before creating the replacement. Keep the old key: another tab may
+  // still own that chat, and preserving text outranks reclaiming a tiny orphan
+  // here.
+  // Multiple presentations can await the same id-keyed create promise:
+  // navigate away, reopen New Chat, and the reopened presentation becomes the
+  // sole owner while the superseded waiter is still suspended. Claim
+  // presentation ownership BEFORE moving the intent pointer or copying its
+  // draft; otherwise that stale waiter can split the pointer from the textarea
+  // the user just reopened.
+  async function rotateDraftFirstNewChat(presentation, rotatedId) {
+    const intentId = String(presentation.chatId)
+    // A background conflict cannot move the owner's route or draft. Remember
+    // the decision on the retained session; returning to it applies the same
+    // silent rotation without re-sending the id already known to conflict.
+    const deferRotation = () => {
+      const current = newChatPresentationRef.current
+      if (current?.token !== presentation.token) return
+      const deferred = { ...current, rotateTo: rotatedId }
+      newChatPresentationRef.current = deferred
+      setNewChatPresentation(deferred)
+    }
+    if (!draftFirstPresentationIsCurrent(presentation)) {
+      deferRotation()
+      return
+    }
+    if (String(newChatIntentRef.current?.chatId ?? '') !== intentId) return
+    const saved = await readComposerDraftAsync(intentId)
+    const autoSendDraft = readComposerHandoff(intentId).autoSendDraft
+    // Durable hydration is asynchronous. Navigation, another New Chat tap,
+    // or a newer conflict may have replaced this waiter while IndexedDB was
+    // being read; claim both owners again before copying or moving the
+    // pointer.
+    if (!draftFirstPresentationIsCurrent(presentation)) {
+      deferRotation()
+      return
+    }
+    if (String(newChatIntentRef.current?.chatId ?? '') !== intentId) return
+    const copied = persistComposerDraft(
+      rotatedId,
+      saved.input,
+      saved.attachments,
+    )
+    if (!copied) {
+      if (autoSendDraft) {
+        consumeComposerHandoff(intentId, autoSendDraft, { autoSend: true })
+      }
+      const current = newChatPresentationRef.current
+      const failed = {
+        ...current,
+        submitted: false,
+        failure: autoSendDraft ? 'queue' : 'error',
+        failedAtRecoveryGeneration: recoveryGenerationRef.current,
+      }
+      if (newChatPresentationRef.current?.token === presentation.token) {
+        newChatPresentationRef.current = failed
+        setNewChatPresentation(failed)
+      }
+      rememberOpenNewChatIntent({ chatId: intentId, status: 'failed' })
+      return
+    }
+    if (autoSendDraft) {
+      stageComposerHandoff(rotatedId, autoSendDraft, { autoSend: true })
+      if (readComposerHandoff(rotatedId).autoSendDraft !== autoSendDraft) {
+        consumeComposerHandoff(intentId, autoSendDraft, { autoSend: true })
+        rememberOpenNewChatIntent({ chatId: rotatedId, status: 'failed' })
+        const current = newChatPresentationRef.current
+        const failed = {
+          ...current,
+          chatId: rotatedId,
+          submitted: false,
+          failure: 'queue',
+          failedAtRecoveryGeneration: recoveryGenerationRef.current,
+          materialized: false,
+          chatInfo: null,
+          paneActiveKey: current.viewMode === 'panes'
+            ? `chat:${rotatedId}`
+            : null,
+        }
+        newChatPresentationRef.current = failed
+        const ws = workspaceStateRef.current.ws
+        flushSync(() => {
+          setNewChatPresentation(failed)
+          applyModeDestination({
+            view: 'chat',
+            chatId: rotatedId,
+            appId: null,
+            paneId: ws.focusedPaneId,
+          })
+        })
+        requestComposer(rotatedId, {
+          focus: true,
+          restoreExistingDraft: true,
+        })
+        return
+      }
+    }
+    rememberOpenNewChatIntent({ chatId: rotatedId, status: 'allocating' })
+    const current = newChatPresentationRef.current
+    const replacement = {
+      ...current,
+      chatId: rotatedId,
+      failure: null,
+      failedAtRecoveryGeneration: null,
+      materialized: false,
+      chatInfo: null,
+      paneActiveKey: current.viewMode === 'panes'
+        ? `chat:${rotatedId}`
+        : null,
+    }
+    newChatPresentationRef.current = replacement
+    const ws = workspaceStateRef.current.ws
+    flushSync(() => {
+      setNewChatPresentation(replacement)
+      applyModeDestination({
+        view: 'chat',
+        chatId: rotatedId,
+        appId: null,
+        paneId: ws.focusedPaneId,
+      })
+    })
+    requestComposer(rotatedId, {
+      focus: true,
+      restoreExistingDraft: true,
+    })
+    void settleDraftFirstNewChat(replacement)
+  }
+
+  rotateDraftFirstNewChatRef.current = rotateDraftFirstNewChat
+
   async function settleDraftFirstNewChat(presentation) {
     const intentId = String(presentation.chatId)
     const result = await createDraftFirstChat(intentId)
@@ -3607,131 +3738,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
     if (newChatPresentationRef.current?.token !== presentation.token) return
 
     if (decision.action === 'rotate') {
-      // Another owner has authoritatively claimed this id. Copy the latest
-      // owner draft before creating the replacement. Keep the old key: another
-      // tab may still own that chat, and preserving text outranks reclaiming a
-      // tiny orphan here.
-      // Multiple presentations can await the same id-keyed create promise:
-      // navigate away, reopen New Chat, and the reopened presentation becomes
-      // the sole owner while the superseded waiter is still suspended. Claim
-      // presentation ownership BEFORE moving the intent pointer or copying its
-      // draft; otherwise that stale waiter can split the pointer from the
-      // textarea the user just reopened.
-      const deferConflict = () => {
-        if (newChatPresentationRef.current?.token !== presentation.token) return
-        // A background conflict cannot move the owner's route or draft.
-        // Returning to the retained session can retry the normal resolution.
-        const failed = failedNewChatPresentation(
-          newChatPresentationRef.current, result.verdict, recoveryGenerationRef.current,
-        )
-        newChatPresentationRef.current = failed
-        setNewChatPresentation(failed)
-        rememberOpenNewChatIntent({ chatId: intentId, status: 'failed' })
-      }
-      if (!draftFirstPresentationIsCurrent(presentation)) {
-        deferConflict()
-        return
-      }
-      if (String(newChatIntentRef.current?.chatId ?? '') !== intentId) return
-      const saved = await readComposerDraftAsync(intentId)
-      const autoSendDraft = readComposerHandoff(intentId).autoSendDraft
-      // Durable hydration is asynchronous. Navigation, another New Chat tap,
-      // or a newer conflict may have replaced this waiter while IndexedDB was
-      // being read; claim both owners again before copying or moving the
-      // pointer.
-      if (!draftFirstPresentationIsCurrent(presentation)) {
-        deferConflict()
-        return
-      }
-      if (String(newChatIntentRef.current?.chatId ?? '') !== intentId) return
-      const copied = persistComposerDraft(
-        decision.chatId,
-        saved.input,
-        saved.attachments,
-      )
-      if (!copied) {
-        if (autoSendDraft) {
-          consumeComposerHandoff(intentId, autoSendDraft, { autoSend: true })
-        }
-        const current = newChatPresentationRef.current
-        const failed = {
-          ...current,
-          submitted: false,
-          failure: autoSendDraft ? 'queue' : 'error',
-          failedAtRecoveryGeneration: recoveryGenerationRef.current,
-        }
-        if (newChatPresentationRef.current?.token === presentation.token) {
-          newChatPresentationRef.current = failed
-          setNewChatPresentation(failed)
-        }
-        rememberOpenNewChatIntent({ chatId: intentId, status: 'failed' })
-        return
-      }
-      if (autoSendDraft) {
-        stageComposerHandoff(decision.chatId, autoSendDraft, { autoSend: true })
-        if (readComposerHandoff(decision.chatId).autoSendDraft !== autoSendDraft) {
-          consumeComposerHandoff(intentId, autoSendDraft, { autoSend: true })
-          rememberOpenNewChatIntent({ chatId: decision.chatId, status: 'failed' })
-          const current = newChatPresentationRef.current
-          const failed = {
-            ...current,
-            chatId: decision.chatId,
-            submitted: false,
-            failure: 'queue',
-            failedAtRecoveryGeneration: recoveryGenerationRef.current,
-            materialized: false,
-            chatInfo: null,
-            paneActiveKey: current.viewMode === 'panes'
-              ? `chat:${decision.chatId}`
-              : null,
-          }
-          newChatPresentationRef.current = failed
-          const ws = workspaceStateRef.current.ws
-          flushSync(() => {
-            setNewChatPresentation(failed)
-            applyModeDestination({
-              view: 'chat',
-              chatId: decision.chatId,
-              appId: null,
-              paneId: ws.focusedPaneId,
-            })
-          })
-          requestComposer(decision.chatId, {
-            focus: true,
-            restoreExistingDraft: true,
-          })
-          return
-        }
-      }
-      rememberOpenNewChatIntent({ chatId: decision.chatId, status: 'allocating' })
-      const current = newChatPresentationRef.current
-      const replacement = {
-        ...current,
-        chatId: decision.chatId,
-        failure: null,
-        failedAtRecoveryGeneration: null,
-        materialized: false,
-        chatInfo: null,
-        paneActiveKey: current.viewMode === 'panes'
-          ? `chat:${decision.chatId}`
-          : null,
-      }
-      newChatPresentationRef.current = replacement
-      const ws = workspaceStateRef.current.ws
-      flushSync(() => {
-        setNewChatPresentation(replacement)
-        applyModeDestination({
-          view: 'chat',
-          chatId: decision.chatId,
-          appId: null,
-          paneId: ws.focusedPaneId,
-        })
-      })
-      requestComposer(decision.chatId, {
-        focus: true,
-        restoreExistingDraft: true,
-      })
-      void settleDraftFirstNewChat(replacement)
+      await rotateDraftFirstNewChat(presentation, decision.chatId)
       return
     }
 
@@ -3783,10 +3790,34 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
       draft: autoSendDraft,
       submit: true,
     })
-    const handedOff = { ...session, submitted: false }
-    newChatPresentationRef.current = handedOff
-    setNewChatPresentation(handedOff)
+    // The handoff is the creation's last act. Its visible ChatView may have
+    // reported ready long ago, so retire the session here; a surviving
+    // session would make the next New Chat refocus this chat instead.
+    newChatPresentationRef.current = null
+    setNewChatPresentation(current => (
+      current?.token === session.token ? null : current
+    ))
   }, [activeChatId, activeView, newChatPresentation, requestComposer])
+
+  // A conflict that arrived while this creation was off-screen applies the
+  // remembered rotation once its provisional chat is visible again, exactly
+  // as if the conflict had arrived while the owner was watching.
+  useEffect(() => {
+    const session = newChatPresentationRef.current
+    if (!session?.rotateTo || !newChatPresentationIsCurrent(session, {
+      viewMode: workspace.viewMode,
+      activeView,
+      activeChatId,
+      focusedPaneId: workspace.focusedPaneId,
+      paneActiveKey: session.paneId == null
+        ? null
+        : paneModel.activeKeyForOwner(workspace, session.paneId),
+    })) return
+    const resuming = { ...session, rotateTo: null }
+    newChatPresentationRef.current = resuming
+    setNewChatPresentation(resuming)
+    void rotateDraftFirstNewChatRef.current?.(resuming, session.rotateTo)
+  }, [activeChatId, activeView, newChatPresentation, workspace])
 
   const retryDraftFirstNewChat = useCallback(() => {
     const presentation = newChatPresentationRef.current

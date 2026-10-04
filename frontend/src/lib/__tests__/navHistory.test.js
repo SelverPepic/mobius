@@ -282,6 +282,22 @@ test('a shell push leaves a reload-safe Forward marker only on its tagged source
   }
 })
 
+test('a failed Forward marker write never aborts the real shell push', () => {
+  const { history } = installBrowserMocks({ withNavigation: false })
+  const consoleError = console.error
+  console.error = () => {}
+  try {
+    replaceNavEntry('base', '/shell/', { view: 'chat', chatId: 'a' })
+    history.replaceState = () => { throw new Error('SecurityError: history rate limit') }
+    const state = pushNavEntry('nav', { view: 'chat', chatId: 'b' })
+    assert.equal(history.state, state, 'the push still lands')
+    assert.equal(state.index, 1)
+  } finally {
+    console.error = consoleError
+    clearBrowserMocks()
+  }
+})
+
 test('app entries retain reversible runtime correlation for Forward', () => {
   const { history } = installBrowserMocks({ withNavigation: false })
   try {
