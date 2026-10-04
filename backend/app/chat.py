@@ -5899,11 +5899,11 @@ async def _run_chat_impl_with_db(
   # following a withdrawn instruction. A top-level chat starts fresh and is
   # reseeded from its transcript, exactly as for a lost session. Delegated
   # runs keep their existing no-replay rule and simply resume.
-  runtime_kind = provider_runtime_kind(provider)
+  session_runtime = provider_runtime_kind(provider)
   session_retired = (
-    run_policy is None and runtime_kind in ("claude_sdk", "codex_sdk")
+    run_policy is None and session_runtime in ("claude_sdk", "codex_sdk")
     and resume_retired(
-      db, "claude" if runtime_kind == "claude_sdk" else "codex", session_id,
+      db, "claude" if session_runtime == "claude_sdk" else "codex", session_id,
     )
   )
   # A close() below detaches chat_row. Precompute the only provider-time value
@@ -5914,7 +5914,7 @@ async def _run_chat_impl_with_db(
     _build_resumed_context(chat_row, keep_task=run_policy is not None)
     if (
       (session_id or fresh_delegated_session)
-      and runtime_kind in ("claude_sdk", "codex_sdk")
+      and provider_runtime_kind(provider) in ("claude_sdk", "codex_sdk")
       and run_policy is None
     )
     else None
@@ -6014,6 +6014,7 @@ async def _run_chat_impl_with_db(
 
   # SDK dispatch: route both Claude and Codex through their official
   # Agent SDK runners.
+  runtime_kind = provider_runtime_kind(provider)
   is_claude = runtime_kind == "claude_sdk"
   is_codex = runtime_kind == "codex_sdk"
   if is_codex:
