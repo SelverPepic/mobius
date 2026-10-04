@@ -37,21 +37,22 @@ class _Provider:
 
 async def _run_turn(
   monkeypatch, provider_id: str, provider_name: str, *, retired: bool,
-  delegated: bool = False,
+  delegated: bool = False, session_id: str | None = "old-session",
 ):
   chat_id = f"retired-{provider_id}-{retired}-{delegated}"
   with SessionLocal() as setup:
     setup.add(models.Owner(username="owner", hashed_password="unused", provider=provider_id))
     setup.add(models.Chat(
       id=chat_id, title="retired session", provider=provider_id,
-      session_id="old-session",
+      session_id=session_id,
       messages=[
         {"role": "user", "content": "Fix the broker polling.", "ts": 1},
         {"role": "assistant", "content": "The broker fix is committed.", "ts": 2},
       ],
     ))
     setup.commit()
-    record_session_link(setup, provider_id, "old-session", chat_id)
+    if session_id:
+      record_session_link(setup, provider_id, session_id, chat_id)
     if retired:
       setup.get(models.ChatSessionLink, (provider_id, "old-session")).resume_retired_at = now_naive_utc()
       setup.commit()
@@ -108,8 +109,12 @@ async def _run_turn(
   create_broadcast(chat_id)
   try:
     await chat_mod._run_chat_impl(
-      messages=[schemas.ChatMessage(role="user", content="Carry on.")],
-      chat_id=chat_id, session_id="old-session", provider_id=provider_id,
+      messages=[
+        schemas.ChatMessage(role="user", content="Fix the broker polling."),
+        schemas.ChatMessage(role="assistant", content="The broker fix is committed."),
+        schemas.ChatMessage(role="user", content="Carry on."),
+      ] if delegated else [schemas.ChatMessage(role="user", content="Carry on.")],
+      chat_id=chat_id, session_id=session_id, provider_id=provider_id,
       run_token=run_token,
     )
   finally:
@@ -148,15 +153,16 @@ async def test_an_ordinary_session_still_resumes_natively(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("provider_id", "provider_name"), PROVIDERS)
 @pytest.mark.parametrize("retired", [True, False])
-async def test_a_helper_never_resumes_a_retired_session(
+async def test_a_retired_helper_is_refused_instead_of_resumed(
   monkeypatch, provider_id, provider_name, retired,
 ):
-  """A helper's follow-up on a retired session gets the same no-replay
-  refusal as a lost helper session; an ordinary helper session is not refused."""
+  """Retirement clears a helper's session pointer, so its follow-up gets the
+  same no-replay refusal as a lost helper session; an ordinary helper resumes."""
   calls, refusals = await _run_turn(
-    monkeypatch, provider_id, provider_name, retired=retired, delegated=True,
+    monkeypatch, provider_id, provider_name, retired=False, delegated=True,
+    session_id=None if retired else "old-session",
   )
-  assert refusals == ([f"retired-{provider_id}-True-True"] if retired else [])
+  assert refusals == ([f"retired-{provider_id}-False-True"] if retired else [])
   if retired:
     assert calls == []
 
@@ -166,36 +172,77 @@ def test_resume_retired_is_false_for_unknown_or_missing_sessions(db):
   assert resume_retired(db, "claude", "never-seen") is False
 
 
-def test_migration_retires_exactly_the_sessions_that_received_quiet_writes(tmp_path):
+def _retirement_db(tmp_path, *, journal_applied_at):
   eng = create_engine(f"sqlite:///{tmp_path / 'retire.db'}")
   with eng.begin() as conn:
-    conn.execute(text("CREATE TABLE chat_runs (id VARCHAR(64) PRIMARY KEY, provider_session_id VARCHAR(128))"))
-    conn.execute(text("CREATE TABLE agent_write_streams (run_id VARCHAR(64) PRIMARY KEY)"))
+    conn.execute(text("CREATE TABLE schema_migrations (version VARCHAR(128) PRIMARY KEY, applied_at DATETIME)"))
+    conn.execute(text("CREATE TABLE chats (id VARCHAR(64) PRIMARY KEY, session_id VARCHAR(256))"))
+    conn.execute(text(
+      "CREATE TABLE chat_runs (id VARCHAR(64) PRIMARY KEY, chat_id VARCHAR(64), "
+      "started_at DATETIME, provider_session_id VARCHAR(256))"
+    ))
+    conn.execute(text("CREATE TABLE delegations (id VARCHAR(64) PRIMARY KEY, child_chat_id VARCHAR(64))"))
     conn.execute(text(
       "CREATE TABLE chat_session_links (provider VARCHAR(32), session_id VARCHAR(128), "
       "chat_id VARCHAR(64), first_seen_at DATETIME, last_seen_at DATETIME, "
       "PRIMARY KEY (provider, session_id))"
     ))
+    if journal_applied_at:
+      conn.execute(text("INSERT INTO schema_migrations VALUES ('0078_agent_write_journal', :at)"),
+                   {"at": journal_applied_at})
     conn.execute(text(
-      "INSERT INTO chat_runs VALUES ('run-quiet', 'tainted'), ('run-plain', 'clean'), "
-      "('run-none', NULL)"
+      "INSERT INTO chats VALUES ('top', 'tainted'), ('crashed', 'crashed-session'), "
+      "('old', 'clean'), ('host-helper', 'claude-host:h1:agent-1:tool-1'), "
+      "('old-helper', 'old-helper-session')"
     ))
-    conn.execute(text("INSERT INTO agent_write_streams VALUES ('run-quiet'), ('run-none')"))
+    conn.execute(text(
+      "INSERT INTO chat_runs VALUES "
+      "('r-top', 'top', '2026-10-02 10:00:00', 'tainted'), "
+      "('r-crashed', 'crashed', '2026-10-02 11:00:00', NULL), "
+      "('r-old', 'old', '2026-09-20 10:00:00', 'clean'), "
+      "('r-host', 'host-helper', '2026-10-02 12:00:00', NULL), "
+      "('r-old-helper', 'old-helper', '2026-09-20 12:00:00', 'old-helper-session')"
+    ))
+    conn.execute(text("INSERT INTO delegations VALUES ('d1', 'host-helper'), ('d2', 'old-helper')"))
     conn.execute(text(
       "INSERT INTO chat_session_links (provider, session_id, chat_id) VALUES "
-      "('claude', 'tainted', 'a'), ('codex', 'clean', 'b')"
+      "('claude', 'tainted', 'top'), ('codex', 'crashed-session', 'crashed'), "
+      "('codex', 'clean', 'old'), ('claude', 'old-helper-session', 'old-helper')"
     ))
+  return eng
 
-  migrations._retire_quiet_write_sessions(eng)
-  migrations._retire_quiet_write_sessions(eng)
-  migrations._drop_agent_write_journal(eng)
-  migrations._retire_quiet_write_sessions(eng)
 
+def _retired(eng):
   with eng.connect() as conn:
-    rows = dict(conn.execute(text(
+    links = dict(conn.execute(text(
       "SELECT session_id, resume_retired_at IS NOT NULL FROM chat_session_links"
     )).all())
-  assert rows == {"tainted": 1, "clean": 0}
+    pointers = dict(conn.execute(text("SELECT id, session_id FROM chats")).all())
+  return links, pointers
+
+
+def test_migration_retires_every_session_used_while_the_instruction_was_sent(tmp_path):
+  eng = _retirement_db(tmp_path, journal_applied_at="2026-10-01 18:00:00")
+  migrations._retire_quiet_write_sessions(eng)
+  migrations._retire_quiet_write_sessions(eng)
+
+  links, pointers = _retired(eng)
+  # A run's own session, and a chat's current session even when its run died
+  # before recording one; sessions only used before the window stay resumable.
+  assert links == {"tainted": 1, "crashed-session": 1, "clean": 0, "old-helper-session": 0}
+  # A helper resumes through its pointer (shared-host helpers have no session
+  # link at all), so a helper that ran in the window loses it.
+  assert pointers["host-helper"] is None
+  assert pointers["old-helper"] == "old-helper-session"
+  assert pointers["top"] == "tainted"  # Top-level chats reseed from history.
+
+
+def test_migration_retires_nothing_where_the_instruction_never_ran(tmp_path):
+  eng = _retirement_db(tmp_path, journal_applied_at=None)
+  migrations._retire_quiet_write_sessions(eng)
+  links, pointers = _retired(eng)
+  assert not any(links.values())
+  assert pointers["host-helper"] == "claude-host:h1:agent-1:tool-1"
 
 
 def test_migration_is_a_no_op_on_a_database_without_session_links(tmp_path):
