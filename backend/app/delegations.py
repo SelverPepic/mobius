@@ -20,9 +20,10 @@ import uuid
 
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, aliased
+from sqlalchemy.orm import Session, aliased, load_only
 
 from app import auth, models
+from app.browser_access import BrowserLineage, require_live
 from app.timeutil import now_naive_utc
 from app.usage_metrics import summarize_chat_run_tokens
 
@@ -112,7 +113,6 @@ class DelegationIntent:
   # name never re-files the helper.
   goal_task_id: str | None = None
   browser_grant_id: str | None = None
-  browser_grant_epoch: int | None = None
 
 
 def same_delegation_intent(
@@ -152,9 +152,7 @@ def _attach_existing_delegation(
     raise ValueError(
       "task key is already attached to different immutable work"
     )
-  if intent.browser_grant_id is not None and (
-    row.browser_grant_id, row.browser_grant_epoch
-  ) != (intent.browser_grant_id, intent.browser_grant_epoch):
+  if intent.browser_grant_id is not None and row.browser_grant_id != intent.browser_grant_id:
     raise ValueError("task key belongs to different browser authority")
   # Notification is an observation owner, not task identity. Reattachment
   # must not add a second observer: the submit route may transfer an
@@ -194,16 +192,11 @@ def create_or_attach_delegation(
       ),
     ).order_by(models.ChatRun.started_at.desc()).first()
   grant_id = intent.browser_grant_id or (spawning_run.browser_grant_id if spawning_run else None)
-  grant_epoch = (intent.browser_grant_epoch if intent.browser_grant_id is not None
-                 else spawning_run.browser_grant_epoch if spawning_run else None)
   if grant_id is not None:
-    from app.browser_access import validate_grant
-    owner_id = db.query(models.Owner.id).scalar()
-    validate_grant(db, grant_id, grant_epoch, owner_id)
+    require_live(db, BrowserLineage(grant_id), db.query(models.Owner.id).scalar())
   # Attachment must carry the same authority as the existing child. The
   # authenticated guest wins over an owner-authored parent physical run.
-  resolved_intent = replace(intent, browser_grant_id=grant_id,
-                            browser_grant_epoch=grant_epoch)
+  resolved_intent = replace(intent, browser_grant_id=grant_id)
   row = db.query(models.Delegation).filter(
     models.Delegation.parent_root_run_id == intent.parent_root_run_id,
     models.Delegation.task_key == intent.task_key,
@@ -217,7 +210,6 @@ def create_or_attach_delegation(
     parent_chat_id=intent.parent_chat_id,
     parent_root_run_id=intent.parent_root_run_id,
     browser_grant_id=grant_id,
-    browser_grant_epoch=grant_epoch,
     task_key=intent.task_key,
     goal_task_id=intent.goal_task_id,
     child_chat_id=child_id,
@@ -639,8 +631,7 @@ def _result_with_write_repair(db: Session, chat: models.Chat, run: models.ChatRu
     if (previous is None or previous.id in repair_runs or previous.chat_id != current.chat_id
         or (previous.root_run_id or previous.id) != (current.root_run_id or current.id)
         or previous.initiated_by_app_id != current.initiated_by_app_id
-        or (previous.browser_grant_id, previous.browser_grant_epoch)
-           != (current.browser_grant_id, current.browser_grant_epoch)):
+        or previous.browser_grant_id != current.browser_grant_id):
       break
     if reason == "quiet_write_failure":
       if control.get("source_work_id") != previous.id:
@@ -665,6 +656,39 @@ def derived_status(
     if load_result else None
   )
   result = _result_with_write_repair(db, chat, run) if chat is not None else ""
+  return _project_delegation_status(row, run, result)
+
+
+def delegation_statuses(
+  db: Session, rows: list[models.Delegation],
+) -> dict[str, str]:
+  """Project a helper collection with one read, without child transcripts.
+
+  Use the same exact latest-run ordering and status rules as result-bearing
+  reads. Plans need only statuses, not the runs' provider or activity payloads.
+  This snapshot belongs to this call; nothing is cached across lifecycle changes.
+  """
+  if not rows:
+    return {}
+  runs = db.query(models.ChatRun).join(
+    models.Delegation, models.ChatRun.id == _latest_child_run_id(),
+  ).filter(
+    models.Delegation.id.in_([row.id for row in rows]),
+  ).options(load_only(
+    models.ChatRun.id, models.ChatRun.chat_id, models.ChatRun.status,
+    raiseload=True,
+  )).all()
+  by_chat = {run.chat_id: run for run in runs}
+  return {
+    row.id: _project_delegation_status(row, by_chat.get(row.child_chat_id), "")[0]
+    for row in rows
+  }
+
+
+def _project_delegation_status(
+  row: models.Delegation, run: models.ChatRun | None, result: str,
+) -> tuple[str, models.ChatRun | None, str]:
+  """Shared status rules for full results and lightweight plan reads."""
   if row.interrupted_at is not None:
     notice = (
       "This legacy read-only helper was interrupted during the single-mode "
@@ -1232,15 +1256,10 @@ def delegation_execution_token(
     raise RuntimeError("Delegation has no durable run lineage")
   if run.chat_id != row.child_chat_id:
     raise RuntimeError("Delegation run does not belong to its child chat")
-  if (run.browser_grant_id, run.browser_grant_epoch) != (
-    row.browser_grant_id, row.browser_grant_epoch,
-  ):
+  if run.browser_grant_id != row.browser_grant_id:
     raise RuntimeError("Delegation run browser lineage does not match")
-  if run.browser_grant_id is not None:
-    from app.browser_access import validate_grant
-    validate_grant(db, run.browser_grant_id, run.browser_grant_epoch, owner.id)
-  elif run.browser_grant_epoch is not None:
-    raise RuntimeError("Incomplete browser grant lineage")
+  browser = BrowserLineage.of(run.browser_grant_id)
+  require_live(db, browser, owner.id)
   return auth.create_agent_token(
     row.child_chat_id,
     owner.username,
@@ -1249,8 +1268,7 @@ def delegation_execution_token(
     expires_delta=auth.AGENT_RUN_TOKEN_TTL,
     delegation_id=policy.delegation_id,
     delegation_chat=row.child_chat_id,
-    browser_grant_id=run.browser_grant_id,
-    browser_grant_epoch=run.browser_grant_epoch,
+    browser=browser,
   )
 
 

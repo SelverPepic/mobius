@@ -344,6 +344,7 @@ class ChatGoal(Base):
   objective = Column(Text, nullable=False)
   status = Column(String(16), nullable=False, default="open", server_default="open")
   plan_json = Column(JSON, nullable=True)
+  hold_json = Column(JSON, nullable=True)
   revision = Column(Integer, nullable=False, default=0, server_default="0")
   checkpoint = Column(Text, nullable=True)
   next_action = Column(Text, nullable=True)
@@ -385,8 +386,8 @@ class ChatRun(Base):
     String(64), ForeignKey("chats.id"), nullable=False, index=True
   )
   # "running" while in flight; terminal outcomes are "completed" for a clean
-  # turn, "failed" for a provider/setup error, "stopped" for an explicit user
-  # Stop, and "interrupted" for crash/supersession/watchdog recovery. Provider
+  # turn, "failed" for a provider/setup error, "stopped" for process Stop
+  # (not proof of Goal intent), and "interrupted" for crash/supersession recovery. Provider
   # limits additionally use the parked/resume_pending/parked_notified states.
   # A successfully drained planned restart reuses that retry path with
   # park_reason="restart"; an unplanned crash remains "interrupted".
@@ -398,8 +399,8 @@ class ChatRun(Base):
   provider_execution_admitted = Column(Boolean, nullable=True, default=False)
   # Browser initiator, retained across physical recovery and delegation. NULL
   # means an ordinary local/owner run, never an implicit shared grant.
+  # Upgraded databases may also keep a retired, unused browser_grant_epoch.
   browser_grant_id = Column(String(64), nullable=True, index=True)
-  browser_grant_epoch = Column(Integer, nullable=True)
   # Inclusive boundary of the peer-message page injected into this provider
   # admission. Both fields are NULL when no peer message was delivered. The
   # pair advances only after the provider call returns successfully. Admission
@@ -424,6 +425,9 @@ class ChatRun(Base):
   # Claimed before note-based size recovery makes any model call. This is
   # independent of continuation provenance: a direct owner run remains direct.
   note_recovery_attempted = Column(Boolean, nullable=False, default=False, server_default="0")
+  # When direct owner input was accepted. Exact physical recovery inherits it;
+  # automatic work and legacy runs have no evidence to override a later hold.
+  owner_input_at = Column(DateTime, nullable=True, default=None)
   provider = Column(String(32), nullable=True, default=None)
   # Objective shown by the shell while this exact run is attached to a Goal.
   # This belongs to the run rather than the transcript tail: mid-turn owner
@@ -539,8 +543,8 @@ class Delegation(Base):
   parent_root_run_id = Column(String(64), nullable=False, index=True)
   # Snapshot the spawning physical run's browser initiator. A logical Goal can
   # span later physical turns with different human participants.
+  # Upgraded databases may also keep a retired, unused browser_grant_epoch.
   browser_grant_id = Column(String(64), nullable=True, index=True)
-  browser_grant_epoch = Column(Integer, nullable=True)
   task_key = Column(String(128), nullable=False)
   # The parent Goal plan task this helper works on, recorded at spawn. The
   # helper's name is free; this is what places it under its task.
@@ -935,8 +939,9 @@ class ChatEmbedGrant(Base):
   )
   instance_id = Column(String(160), nullable=False, index=True)
   owner_epoch = Column(Integer, nullable=False)
+  # The opener's browser lineage (browser_access.BrowserLineage). Upgraded
+  # databases may also keep a retired, unused browser_grant_epoch.
   browser_grant_id = Column(String(64), nullable=True)
-  browser_grant_epoch = Column(Integer, nullable=True)
   browser_session_id = Column(String(64), nullable=True)
   role = Column(String(32), nullable=False, default="participant")
   operations_json = Column(JSON, nullable=False, default=list)

@@ -385,3 +385,21 @@ test('one reply owns its final References, including a folded source row', () =>
   assert.match(html, /data-key="reference-reply:assistant:1"/)
   assert.doesNotMatch(html, /data-key="reference-reply:assistant:2"/)
 })
+
+
+test('grouped replies carry authoritative manual recovery to their existing action', () => {
+  for (const kind of ['memory', 'storage', 'model_capacity']) {
+    const msg = { id: 'recover-run', role: 'assistant', blocks: [
+      { type: 'error', resumable: true, pause: { kind } },
+    ] }
+    const props = {
+      replyGroup: { rows: [{ message: msg, key: msg.id, anchorKey: msg.id, notes: [] }] },
+      activeMirrorMsg: msg, useDbActivePayload: true, onResume() {}, isLastMsg: true,
+    }
+    const manual = render(Active, { ...props, handoff: { kind: 'recovery' } })
+    assert.match(manual, /class="chat__resume chat__recovery-action"/)
+    const automatic = render(Active, { ...props, handoff: { kind: 'automatic' } })
+    assert.doesNotMatch(automatic, /class="chat__resume chat__recovery-action"/)
+    assert.doesNotMatch(manual, /will continue automatically|Trying again shortly/)
+  }
+})
