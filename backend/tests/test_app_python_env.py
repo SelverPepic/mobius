@@ -1040,6 +1040,40 @@ def test_store_update_whose_merged_service_fails_keeps_the_old_revision_live(
   _assert_no_unlinked_env_or_runtime(app_id)
 
 
+def test_store_update_undoes_its_first_pass_before_releasing_the_source_lock(
+  client, auth, db, monkeypatch, store,
+):
+  from app import fs_locks
+  _fake_builds(monkeypatch)
+  app_id, source, _ = _locally_edited_store_app(client, auth, db, store)
+  upstream = app_git.head_sha(source, app_git.UPSTREAM_BRANCH)
+  lock = fs_locks.source_dir_lock(str(source))
+  release = lock.release
+  at_release = []
+
+  def observe_release():
+    at_release.append((
+      (source / "lib.py").read_bytes(),
+      app_git.head_sha(source, app_git.UPSTREAM_BRANCH),
+    ))
+    release()
+
+  def fail_check(*_args):
+    raise app_python_env.PythonEnvBuildError("the merged service failed")
+
+  monkeypatch.setattr(lock, "release", observe_release)
+  monkeypatch.setattr(app_python_env, "_smoke", fail_check)
+  failed = store(
+    client, auth, lock="a==1\n", version="1.1.0", files={"lib.py": b"VALUE = 2\n"},
+  )
+
+  assert failed.status_code == 422, failed.text
+  # A writer that takes the lock the moment it is free finds the source and
+  # its upstream exactly as they were: nothing is restored behind its back.
+  assert at_release and set(at_release) == {(b"VALUE = 1\n", upstream)}
+  _assert_no_unlinked_env_or_runtime(app_id)
+
+
 def test_store_update_refuses_a_tree_that_changed_while_it_was_checked(
   client, auth, db, monkeypatch, store,
 ):

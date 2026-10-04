@@ -2785,11 +2785,13 @@ class InstallJournal:
     self.created_paths.clear()
 
   def rollback_materialization(self) -> None:
-    """Undo pre-commit filesystem work; never undo a durable install."""
+    """Undo pre-commit filesystem work once; never undo a durable install."""
     if self.durable:
       return
     _run_rollback_actions(self.rollback_actions)
     _cleanup(self.created_paths)
+    self.rollback_actions.clear()
+    self.created_paths.clear()
 
   def cleanup_superseded(self) -> None:
     """Remove backups/artifacts made obsolete by a successful commit."""
@@ -3690,10 +3692,8 @@ class ActivationPlan:
 class CheckedPythonTree:
   """A reconciled runtime tree whose Python entries passed outside the locks."""
 
-  # Content digest of the exact runtime tree that was checked.
+  # Content digest of every file the checked runtime tree serves.
   revision: str
-  # The upstream and local source trees it was reconciled from.
-  inputs: tuple[str | None, str | None]
   env: app_python_env.StagedEnv
 
 
@@ -3702,19 +3702,15 @@ class _UncheckedPythonTree(Exception):
 
   Building and smoke-running an env takes minutes at worst, so it must not run
   inside the install's SQLite write transaction or source-dir lock. The first
-  pass therefore stops before writing anything durable, and the install rolls
-  back, checks this tree, and reconciles again.
+  pass therefore stops before anything durable: the install rolls its source
+  writes back under the source-dir lock, checks this tree, and reconciles again.
   """
 
   def __init__(
-    self,
-    runtime: applied_app_runtime.PreparedRuntime,
-    inputs: tuple[str | None, str | None],
-    app_id: int | None,
+    self, runtime: applied_app_runtime.PreparedRuntime, app_id: int | None,
   ) -> None:
     super().__init__("reconciled Python tree needs checking")
     self.runtime = runtime
-    self.inputs = inputs
     self.app_id = app_id
 
 
@@ -3737,9 +3733,7 @@ async def _check_reconciled_python(pending: _UncheckedPythonTree) -> CheckedPyth
     ) from exc
   finally:
     shutil.rmtree(pending.runtime.root, ignore_errors=True)
-  return CheckedPythonTree(
-    revision=pending.runtime.revision, inputs=pending.inputs, env=env,
-  )
+  return CheckedPythonTree(revision=pending.runtime.revision, env=env)
 
 
 def _require_package_python_lock(
@@ -3769,14 +3763,17 @@ def _publish_install_python_env(
   app: models.App,
   checked: CheckedPythonTree | None,
   runtime: applied_app_runtime.PreparedRuntime,
-  inputs: tuple[str | None, str | None] | None,
   journal: InstallJournal,
   data_dir: Path,
 ) -> None:
-  """Link the env checked against exactly this tree, before its pointer is published."""
+  """Link the env checked against exactly this tree, before its pointer is published.
+
+  The revision digests every served file, so a match means the second pass
+  serves exactly the bytes the first pass checked, however it got there.
+  """
   if checked is None:
     return
-  if checked.revision != runtime.revision or checked.inputs != inputs:
+  if checked.revision != runtime.revision:
     raise HTTPException(409, detail={
       "code": "python_check_stale",
       "message": (
@@ -3859,18 +3856,6 @@ def _apply_manifest_metadata(
   app.project_templates_json = manifest.get("project_templates") or None
 
 
-def _reconciliation_inputs(source_dir: Path) -> tuple[str | None, str | None]:
-  """The upstream and local source an install reconciles, compared by tree.
-
-  Commit ids do not survive a rolled-back pass: an import without a Git origin
-  records a new upstream commit each time it reconciles.
-  """
-  return (
-    app_git.ref_tree_oid(source_dir, app_git.UPSTREAM_BRANCH),
-    app_git.ref_tree_oid(source_dir, app_git.LOCAL_BRANCH),
-  )
-
-
 async def _activate_install_source(
   db: Session,
   *,
@@ -3909,10 +3894,6 @@ async def _activate_install_source(
   _reject_if_source_dir_taken(db, str(source_dir), exclude_id=app.id)
   source_dir.mkdir(parents=True, exist_ok=True)
   python_declared = python_lock(manifest) is not None
-  inputs = (
-    await asyncio.to_thread(_reconciliation_inputs, source_dir)
-    if python_declared else None
-  )
   jsx_file = source_dir / "index.jsx"
   if not plan.cloned_install:
     for rel, content in plan.source_tree.items():
@@ -3977,7 +3958,7 @@ async def _activate_install_source(
     except BaseException:
       shutil.rmtree(runtime.root)
       raise
-    raise _UncheckedPythonTree(runtime, inputs, app.id if plan.updating else None)
+    raise _UncheckedPythonTree(runtime, app.id if plan.updating else None)
 
   await compile_jsx(
     entry_source,
@@ -4012,7 +3993,7 @@ async def _activate_install_source(
   )
   try:
     _publish_install_python_env(
-      app, plan.python_check, runtime_staged, inputs, journal, data_dir,
+      app, plan.python_check, runtime_staged, journal, data_dir,
     )
   except BaseException:
     shutil.rmtree(runtime_staged.root)
@@ -4230,7 +4211,7 @@ async def install_from_manifest(
   # Phases 3 and 4. A declared Python lock takes two passes: the first stops
   # with the exact reconciled runtime tree and rolls back, that tree's env is
   # built and smoke-run holding no lock, and the second publishes only if it
-  # reconciles to the same tree from the same inputs.
+  # reconciles to byte-identical runtime content.
   install_candidate = functools.partial(
     _install_candidate,
     db,
@@ -4955,6 +4936,14 @@ async def _install_candidate(
       else:
         # A conflict activates nothing, so its build is never linked.
         journal.commit_actions.append(lambda: app_python_env.discard_env(python_env))
+    except Exception:
+      # Undo this pass's source writes and upstream ref while the lock still
+      # excludes other writers, so a commit cannot land in between and then be
+      # overwritten. This includes the first pass of a Python check. The outer
+      # handlers still shape the response; their rollback then has nothing left.
+      db.rollback()
+      journal.rollback_materialization()
+      raise
     finally:
       # Release the per-source-dir lock (held across the merge + write for the
       # git path) BEFORE the seeds block takes app_storage_lock, preserving the
