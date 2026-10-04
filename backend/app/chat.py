@@ -4077,6 +4077,11 @@ def _park_exit(
       ),
     })
     return {"parked": False, "oversized": True}
+  # Checked before the limit branch: Codex can also report depleted credits as
+  # a reached rate limit (429), but no reset time will refill them.
+  if _is_workspace_credits_error_text(error_text):
+    sink.publish(_pause_note(error_text, kind="credits", provider=provider_id))
+    return {"parked": False}
   if runner_result is not None:
     limit = _is_limit_terminal(runner_result)
   else:
@@ -4143,9 +4148,7 @@ def _park_exit(
         resumable=True,
       ))
       return {"parked": False}
-    if _is_workspace_credits_error_text(error_text):
-      sink.publish(_pause_note(error_text, kind="credits", provider=provider_id))
-    elif error_text:
+    if error_text:
       sink.publish({"type": "error", "message": error_text})
     elif runner_result is None:
       # An EXCEPTION exit must always persist an error block. A bare

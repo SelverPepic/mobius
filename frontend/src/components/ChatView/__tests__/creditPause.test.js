@@ -1,4 +1,4 @@
-/* Credit exhaustion is an informational, manually continued chat pause. */
+/* Credit exhaustion is an informational, manually resumed chat pause. */
 import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createElement } from 'react'
@@ -35,7 +35,7 @@ test('a credits pause renders as a calm card without rewriting history', () => {
   const html = renderToStaticMarkup(createElement(ErrorCard, { block: creditBlock }))
   assert.match(html, /chat__text--parked/)
   assert.match(html, /Your progress is saved/)
-  assert.match(html, /Add credits to your workspace or choose another provider, then Continue/)
+  assert.match(html, /Add credits to your workspace or choose another provider, then Resume/)
   assert.doesNotMatch(html, /role="alert"|>Error<|automatically|retry check|Rate limit/)
   assert.deepEqual(creditBlock, original)
 })
@@ -47,24 +47,24 @@ test('live stream and persisted credit blocks have identical informative bodies'
   assert.equal(render(payload.blocks[0]), render(creditBlock))
 })
 
-test('only the actionable transcript tail offers Continue, never automatic paid recovery', () => {
+test('only the actionable transcript tail offers Resume, never automatic paid recovery', () => {
   const render = props => renderToStaticMarkup(createElement(MsgContent, {
     msg: message, isLastMsg: true, onResume() {},
     autoResumeAvailable: true, autoResumeEnabled: true, onAutoResumeChange() {},
     ...props,
   }))
   const html = render({})
-  assert.match(html, />Continue<\/button>/)
-  assert.doesNotMatch(html, /auto-continue|Try now|>Resume<\/button>/)
-  assert.doesNotMatch(render({ isLastMsg: false }), />Continue<\/button>/)
-  assert.doesNotMatch(render({ onResume: undefined }), />Continue<\/button>/)
+  assert.match(html, />Resume<\/button>/)
+  assert.doesNotMatch(html, /auto-continue|Try now/)
+  assert.doesNotMatch(render({ isLastMsg: false }), />Resume<\/button>/)
+  assert.doesNotMatch(render({ onResume: undefined }), />Resume<\/button>/)
   const ownership = { block: creditBlock, entryIndex: 0, lastEntryIndex: 0, isLastMessage: true, canResume: true }
   assert.equal(ownsRecoveryAction(ownership), true)
   assert.equal(ownsRecoveryAction({ ...ownership, questionOwnsTurn: true }), false)
   assert.equal(ownsRecoveryAction({ ...ownership, lastEntryIndex: 1 }), false)
 })
 
-test('credit continuation keeps existing pending and unavailable button states', () => {
+test('credit resume keeps existing pending and unavailable button states', () => {
   for (const [resumeState, label] of [[{ pending: true }, 'Resuming…'], [{ unavailable: true }, 'Reconnecting…']]) {
     const html = renderToStaticMarkup(createElement(MsgContent, {
       msg: message, isLastMsg: true, onResume() {}, resumeState,
@@ -74,7 +74,7 @@ test('credit continuation keeps existing pending and unavailable button states',
   }
 })
 
-test('accepted continuation supersedes the old credit pause only in the render projection', () => {
+test('accepted resume supersedes the old credit pause only in the render projection', () => {
   const messages = [message, { role: 'user', kind: 'continuation', content: '' }]
   const projected = supersedeResumedPauseBlocks(messages)
   assert.equal(projected[0].hidden, true)

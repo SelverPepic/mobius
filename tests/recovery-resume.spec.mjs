@@ -149,7 +149,7 @@ async function mount(page, { rejectFirst = false, loseFirstAck = false, creditPa
   await page.goto(`${BASE}/shell/?chat=${CHAT}`, { waitUntil: 'domcontentloaded' })
   await page.bringToFront()
   const surface = page.locator('[data-chat-surface="painted"]')
-  await expect(surface.getByRole('button', { name: creditPause ? 'Continue' : 'Resume', exact: true })).toBeVisible({ timeout: 15000 })
+  await expect(surface.getByRole('button', { name: 'Resume', exact: true })).toBeVisible({ timeout: 15000 })
   const composer = surface.getByRole('textbox', { name: 'Message Möbius…' })
   await composer.fill(draft)
   await surface.locator('input[type="file"]').setInputFiles({ name: 'draft-note.txt', mimeType: 'text/plain', buffer: Buffer.from('draft attachment') })
@@ -187,17 +187,17 @@ async function sampleGeometry(page, prefix = 'Paragraph 28:') {
 }
 
 for (const width of [1512, 390]) {
-  test(`workspace credits pause offers an explicit Continue at ${width}px without touching other work`, async ({ page }) => {
+  test(`workspace credits pause offers an explicit Resume at ${width}px without touching other work`, async ({ page }) => {
     const state = await mount(page, { creditPause: true })
     await page.setViewportSize({ width, height: 844 })
     const card = state.surface.locator('.chat__text--parked')
     await expect(card).toContainText('Credits needed')
     await expect(card).toContainText('Your progress is saved')
-    await expect(card.getByRole('button', { name: 'Continue', exact: true })).toBeEnabled()
+    await expect(card.getByRole('button', { name: 'Resume', exact: true })).toBeEnabled()
     await expect(card.getByRole('button', { name: /auto-continue/ })).toHaveCount(0)
     await expect(card.locator('[role="alert"]')).toHaveCount(0)
     expect(state.attempts).toEqual([])
-    await card.getByRole('button', { name: 'Continue', exact: true }).click()
+    await card.getByRole('button', { name: 'Resume', exact: true }).click()
     await state.requested.promise
     expect(state.attempts).toHaveLength(1)
     expect(state.attempts[0]).toMatchObject({ continuation: 'manual', resume_run_id: 'interrupted-a' })

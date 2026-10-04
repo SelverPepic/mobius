@@ -151,7 +151,7 @@ export default function ErrorCard({
             </div>
             <div className="chat__recovery-copy">
               {platformHold ? recoveryCopy : vm.credits
-                ? 'Your workspace is out of credits. Your progress is saved. Add credits to your workspace or choose another provider, then Continue.'
+                ? 'Your workspace is out of credits. Your progress is saved. Add credits to your workspace or choose another provider, then Resume.'
                 : vm.modelCapacityExhausted
                 ? 'Five automatic retries were used. Choose another model, then Resume to continue your saved work.'
                 : vm.goalHandoff

@@ -517,7 +517,7 @@ function MsgContentInner({
           canResume: !!onResume,
           questionOwnsTurn,
         })
-        const { parked, resourceWait, modelCapacity, credits } = errorCardViewModel(block)
+        const { parked, resourceWait, modelCapacity } = errorCardViewModel(block)
         const automaticContinuation = recoveryOwner && parked
           && handoff?.kind === 'automatic' && !!autoResumeEnabled
         // A resource wait owns its automatic retry. Offering Resume while the
@@ -577,7 +577,7 @@ function MsgContentInner({
               >
                 {resumeState?.pending ? 'Resuming…' : resumeState?.unavailable ? 'Reconnecting…' : parked
                   ? limitResetElapsed ? 'Try now' : (recoveryCredit?.actionLabel || 'Try now')
-                  : credits ? 'Continue' : 'Resume'}
+                  : 'Resume'}
               </button>
             )}
             {recoveryOwner && resumeState?.error && (

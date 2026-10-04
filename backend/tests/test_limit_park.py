@@ -346,7 +346,12 @@ def test_park_exit_non_limit_error_stays_plain():
   assert sink.events[-1] == {"type": "error", "message": "syntax error"}
 
 
-@pytest.mark.parametrize("runner_result", [None, {}])
+@pytest.mark.parametrize("runner_result", [
+  None,
+  {},
+  # Codex may first report the depleted credits as a reached rate limit.
+  {"api_error_status": 429, "rate_limit_resets_at": "2099-05-08T12:34:00Z"},
+])
 def test_exhausted_workspace_credits_is_a_manual_credits_pause(runner_result):
   text = "Your workspace is out of credits. Add credits to continue."
   sink = _Sink()
