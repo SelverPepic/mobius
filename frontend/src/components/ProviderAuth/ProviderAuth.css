@@ -245,11 +245,11 @@
 }
 
 .codex-auth__copy-error {
-  margin: 2px 0 0 32px;
+  margin: 2px 0 0;
 }
 
 .codex-auth__copy-result {
-  margin: 2px 0 0 32px;
+  margin: 2px 0 0;
   font-size: 13px;
 }
 
