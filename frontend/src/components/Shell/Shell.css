@@ -21,16 +21,6 @@
   background: var(--bg); /* CONTRACT: opaque app-wide fill — every surface beneath this must assume nothing shows through */
 }
 
-/* Match the iPhone Home Screen root's drawable-height contract from index.css.
-   The visual-viewport hook still fits the shell above an open keyboard. */
-@supports (-webkit-touch-callout: none) {
-  @media (display-mode: standalone) {
-    .shell {
-      height: var(--ios-standalone-height);
-    }
-  }
-}
-
 /* Android Chrome's transparent gesture nav can expose a compositor strip just
    beyond the layout viewport in installed edge-to-edge PWAs. The fixed shell
    paints to `bottom: 0`, but does not contribute pixels below that edge; a real
@@ -277,12 +267,10 @@
 }
 
 /* ── Bar-collapse mode (general apps: "look like a standalone app") ──
-   Unlike full immersive, the Möbius toolbar is hidden but the top
-   status-bar/notch strip is KEPT: the bar shrinks to exactly the safe-area
-   inset (its themed background stays), so the app's own header sits just below
-   the status bar like an installed/standalone PWA — never under the notch. On
-   a device with no top inset (desktop) the strip collapses to 0, so the app
-   header simply reaches the top. */
+   Hide the toolbar, retaining only any top safe-area inset inside the web
+   viewport. Its background is themed; the installed iOS status bar outside
+   that viewport remains opaque black in every theme. With no top inset the
+   strip collapses to zero and the app header reaches the viewport top. */
 .shell--barcollapsed .shell__bar {
   height: env(safe-area-inset-top, 0px);
   min-height: 0;

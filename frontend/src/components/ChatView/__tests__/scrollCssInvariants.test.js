@@ -57,12 +57,12 @@ test('the composer and transcript use the same shell-owned bottom inset', () => 
   const list = ruleBody('.chat__list')
 
   const inset = /var\(--shell-safe-bottom-inset,\s*env\(safe-area-inset-bottom,\s*0px\)\)/
-  const extra = /var\(--chat-foot-extra-bottom,\s*0px\)/
-  assert.match(foot, new RegExp(`bottom:\\s*calc\\(${inset.source}\\s*\\+\\s*${extra.source}\\)`))
+  assert.match(foot, new RegExp(`bottom:\\s*${inset.source}`))
   assert.match(
     list,
-    new RegExp(`var\\(--composer-h,\\s*80px\\)\\s*\\+\\s*${inset.source}\\s*\\+\\s*${extra.source}\\s*\\+\\s*16px`),
+    new RegExp(`var\\(--composer-h,\\s*80px\\)\\s*\\+\\s*${inset.source}\\s*\\+\\s*16px`),
   )
+  assert.doesNotMatch(css, /--chat-foot-extra-bottom/)
   assert.doesNotMatch(foot, /safe-area-inset-bottom[\s\S]*-\s*14px/)
   assert.doesNotMatch(list, /safe-area-inset-bottom[\s\S]*-\s*14px/)
 })

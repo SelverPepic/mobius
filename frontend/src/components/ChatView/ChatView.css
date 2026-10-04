@@ -190,7 +190,7 @@
      plus a small breathing-room margin so chips/queue tray growing
      the foot keeps the last message clear of the pill. Fallback
      80px is for the first paint before the RO fires. */
-  padding: 8px 6px calc(var(--composer-h, 80px) + var(--shell-safe-bottom-inset, env(safe-area-inset-bottom, 0px)) + var(--chat-foot-extra-bottom, 0px) + 16px);
+  padding: 8px 6px calc(var(--composer-h, 80px) + var(--shell-safe-bottom-inset, env(safe-area-inset-bottom, 0px)) + 16px);
   display: flex;
   flex-direction: column;
   gap: 24px;
@@ -2303,33 +2303,15 @@
      when fitted above the keyboard, which already covers the Home indicator.
      Android Chrome paints the shell's gesture backdrop in the unsafe band;
      dipping the composer into that band makes the backdrop clip the pill.
-     Keep the same full inset in `.chat__list`'s bottom padding so composer
+     Keep the same remaining inset in `.chat__list`'s bottom padding so composer
      placement and transcript clearance remain one geometry contract. */
-  bottom: calc(var(--shell-safe-bottom-inset, env(safe-area-inset-bottom, 0px)) + var(--chat-foot-extra-bottom, 0px));
+  bottom: var(--shell-safe-bottom-inset, env(safe-area-inset-bottom, 0px));
   left: 0;
   right: 0;
   padding: var(--chat-foot-pad-block) 12px;
   background: transparent;
   pointer-events: none;
   z-index: 5;
-}
-
-/* The installed iPhone's drawable viewport ends above a system-owned strip.
-   The opaque status-bar mode recovers most of it, but the composer's lower
-   border can still meet the drawable edge. Lift it 14px while the keyboard is
-   closed and reserve that same space for transcript clearance. The shell
-   zeroes its shared safe inset when fitted above an open keyboard, so this
-   extra lift disappears there. Browser tabs and Android remain unchanged. */
-@supports (-webkit-touch-callout: none) {
-  @media (display-mode: standalone) {
-    .chat {
-      --chat-foot-extra-bottom: clamp(0px, var(--shell-safe-bottom-inset, env(safe-area-inset-bottom, 0px)), 14px);
-    }
-
-    .chat__foot {
-      padding-bottom: clamp(0px, calc(8px - var(--shell-safe-bottom-inset, env(safe-area-inset-bottom, 0px))), 8px);
-    }
-  }
 }
 
 /* Bottom fade + gesture-strip fill. A STATIC gradient scrim tuned to the owner's
