@@ -5822,6 +5822,79 @@ def _add_run_owner_input_at(eng) -> None:
       conn.execute(text("ALTER TABLE chat_runs ADD COLUMN owner_input_at DATETIME"))
 
 
+def _retire_quiet_write_sessions(eng) -> None:
+  """Never resume a provider session that may hold the quiet-write instruction.
+
+  The instruction rode on every turn from the moment the write journal was
+  added (0078) until this release, and a resumed session keeps its own
+  history, so the model keeps emitting frames nothing reads any more: raw text
+  in the reply and a lost save. Every session a run used in that window is
+  retired, and so is each chat's current session if the chat ran in it, which
+  also covers runs that died before recording their session (a missing link is
+  added already retired). A helper's
+  session pointer is cleared instead (shared-host helpers resume through it
+  rather than a session link), so its next follow-up gets the ordinary
+  no-replay refusal. Idempotent; chat history is untouched.
+  """
+  from sqlalchemy import inspect as sa_inspect, text
+  tables = set(sa_inspect(eng).get_table_names())
+  if "chat_session_links" not in tables:
+    return
+  columns = {c["name"] for c in sa_inspect(eng).get_columns("chat_session_links")}
+  with eng.begin() as conn:
+    if "resume_retired_at" not in columns:
+      conn.execute(text("ALTER TABLE chat_session_links ADD COLUMN resume_retired_at DATETIME"))
+    if not {"schema_migrations", "chat_runs", "chats"} <= tables:
+      return
+    since = conn.execute(text(
+      "SELECT applied_at FROM schema_migrations WHERE version = '0078_agent_write_journal'"
+    )).scalar()
+    if since is None:
+      return  # This database never ran with the instruction.
+    window = "SELECT chat_id FROM chat_runs WHERE started_at >= :since"
+    conn.execute(text(f"""
+      UPDATE chat_session_links SET resume_retired_at = :now
+      WHERE resume_retired_at IS NULL AND (
+        session_id IN (
+          SELECT provider_session_id FROM chat_runs
+          WHERE started_at >= :since AND provider_session_id IS NOT NULL
+        )
+        OR session_id IN (
+          SELECT session_id FROM chats
+          WHERE session_id IS NOT NULL AND id IN ({window})
+        )
+      )
+    """), {"since": since, "now": datetime.now(UTC).replace(tzinfo=None)})
+    conn.execute(text(f"""
+      INSERT INTO chat_session_links
+        (provider, session_id, chat_id, first_seen_at, last_seen_at, resume_retired_at)
+      SELECT c.provider, c.session_id, MIN(c.id), :now, :now, :now FROM chats c
+      WHERE c.session_id IS NOT NULL AND c.provider IS NOT NULL AND c.provider <> ''
+        AND length(c.session_id) <= 128 AND c.id IN ({window})
+        AND NOT EXISTS (
+          SELECT 1 FROM chat_session_links l WHERE l.session_id = c.session_id
+        )
+      GROUP BY c.provider, c.session_id
+    """), {"since": since, "now": datetime.now(UTC).replace(tzinfo=None)})
+    if "delegations" in tables:
+      conn.execute(text(f"""
+        UPDATE chats SET session_id = NULL
+        WHERE session_id IS NOT NULL
+          AND id IN (SELECT child_chat_id FROM delegations)
+          AND id IN ({window})
+      """), {"since": since})
+
+
+def _drop_agent_write_journal(eng) -> None:
+  """Retire the text-frame write journal; saves are ordinary tool calls."""
+  from sqlalchemy import inspect as sa_inspect, text
+  tables = set(sa_inspect(eng).get_table_names())
+  with eng.begin() as conn:
+    for table in ("agent_write_intents", "agent_write_streams"):
+      if table in tables:
+        conn.execute(text(f"DROP TABLE {table}"))
+
+
 def _move_chat_media_out_of_generated(eng) -> None:
   """Move old chat images from ``generated/`` to ``media/`` and relink them.
 
@@ -6049,6 +6122,10 @@ _SCHEMA_MIGRATIONS = (
   ("0081_browser_account_grants", _add_browser_account_grants),
   ("0081_goal_hold", _add_goal_hold),
   ("0082_run_owner_input_at", _add_run_owner_input_at),
+  ("0082_drop_agent_write_journal", _drop_agent_write_journal),
+  # Window-based, so it needs no journal. A new ID (not an edited 0082) so
+  # databases that ran an earlier, journal-based draft also run this once.
+  ("0083_retire_quiet_write_sessions", _retire_quiet_write_sessions),
   ("0083_chat_media_directory", _move_chat_media_out_of_generated),
 )
 
