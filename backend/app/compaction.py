@@ -355,9 +355,9 @@ async def _run_claude_summarize_turn(
   )
   client = ClaudeSDKClient(options)
   parts: list[str] = []
-  # The CLI reports each failed API attempt, including ones it retries, as an
-  # assistant message flagged with `error`. Only the latest attempt and the
-  # terminal result explain why the turn ended.
+  # The CLI reports retries as system `api_retry` messages; a failed attempt
+  # arrives as an assistant message flagged with `error`. Only the latest
+  # assistant message and the terminal result explain why the turn ended.
   attempt_error: list[str] = []
   error_type: str | None = None
   terminal_seen = False
@@ -374,11 +374,11 @@ async def _run_claude_summarize_turn(
         await client.query(prompt)
         async for msg in client.receive_response():
           if isinstance(msg, AssistantMessage):
-            if msg.error:
-              error_type = msg.error
-              attempt_error = [
-                block.text for block in msg.content if isinstance(block, TextBlock)
-              ]
+            # Reset per message so an earlier attempt's error never goes stale.
+            error_type = msg.error
+            attempt_error = [
+              block.text for block in msg.content if isinstance(block, TextBlock)
+            ] if msg.error else []
             for block in msg.content:
               if isinstance(block, TextBlock):
                 parts.append(block.text)
@@ -388,11 +388,9 @@ async def _run_claude_summarize_turn(
               errors = list(msg.errors or [])
               if isinstance(msg.result, str):
                 errors.append(msg.result)
-              # The latest attempt's error type describes that attempt only;
-              # the terminal result's own text must not be overruled by it.
               raise CompactionError(_provider_compaction_failure(
                 "\n".join(errors or attempt_error), status=msg.api_error_status,
-                error_type=None if errors else error_type,
+                error_type=error_type,
               ))
     except asyncio.TimeoutError:
       raise CompactionError(

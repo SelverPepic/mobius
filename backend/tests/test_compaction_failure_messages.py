@@ -307,3 +307,54 @@ async def test_claude_retried_rate_limit_does_not_mask_terminal_result_text(
       "prompt", data_dir=str(tmp_path), model=None, effort=None,
     )
   assert "Reconnect" in str(failure.value)
+
+
+@pytest.mark.parametrize(("text", "status"), [
+  ("Login expired \u00b7 Please run /login", None),
+  (
+    "Your account does not have access to Claude. Please login again or "
+    "contact your administrator.",
+    403,
+  ),
+  ("Failed to authenticate: OAuth session expired. Please run /login.", None),
+])
+@pytest.mark.asyncio
+async def test_claude_auth_error_type_survives_repeated_result_text(
+  monkeypatch, tmp_path, text, status,
+):
+  # The CLI repeats the API error text in the terminal result; the structured
+  # error type must still classify wording that lacks sign-in keywords.
+  from claude_agent_sdk.types import AssistantMessage, ResultMessage, TextBlock
+
+  class Provider:
+    def build_env(self, **_kwargs):
+      return {}
+
+  class Client:
+    async def connect(self):
+      pass
+
+    async def query(self, _prompt):
+      pass
+
+    async def receive_response(self):
+      yield AssistantMessage(
+        content=[TextBlock(text=text)],
+        model="claude", error="authentication_failed",
+      )
+      yield ResultMessage(
+        subtype="success", duration_ms=1, duration_api_ms=1,
+        is_error=True, num_turns=1, session_id="s",
+        result=text, api_error_status=status,
+      )
+
+    async def disconnect(self):
+      pass
+
+  monkeypatch.setattr("app.providers.get_provider", lambda _pid: Provider())
+  monkeypatch.setattr("claude_agent_sdk.ClaudeSDKClient", lambda _opts: Client())
+  with pytest.raises(compaction.CompactionError) as failure:
+    await compaction._run_claude_summarize_turn(
+      "prompt", data_dir=str(tmp_path), model=None, effort=None,
+    )
+  assert "Reconnect" in str(failure.value)
