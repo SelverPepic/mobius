@@ -298,3 +298,39 @@ async def test_ending_a_grant_runs_every_stop_step_when_one_fails(db, monkeypatc
   assert calls == ["calls", "runs"]
   assert isinstance(ended.stop_error, OSError)
   assert ended.stop_pending
+
+
+@pytest.mark.asyncio
+async def test_ending_a_grant_still_records_cleanup_after_a_step_breaks_the_session(db, monkeypatch):
+  from app import account_browser_access, app_services, chat, browser_access
+  from app.browser_access import BrowserAccessGrant
+  from app.routes import connect
+  owner = _owner(db, "owner")
+  grant = BrowserAccessGrant(
+    id="g" * 24, owner_id=owner.id, label="Shared", kind="account",
+    recipient_handle="friend", remote_status="active",
+  )
+  db.add(grant)
+  db.commit()
+  grant = revoke_grant(db, grant.id, owner.id)
+
+  async def broken_runs(grant_id, session):
+    # A failed flush leaves the session needing a rollback.
+    session.add(BrowserAccessGrant(id="h" * 24, owner_id=None, label="x"))
+    session.flush()
+
+  async def unregister(session, row):
+    return "revoked"
+
+  async def no_calls(grant_id):
+    return None
+
+  monkeypatch.setattr(connect, "cancel_browser_grant_commands", lambda grant_id: [])
+  monkeypatch.setattr(app_services, "cancel_browser_grant_calls", no_calls)
+  monkeypatch.setattr(chat, "stop_browser_grant_runs", broken_runs)
+  monkeypatch.setattr(account_browser_access, "unregister", unregister)
+  ended = await browser_access.end_grant(db, grant)
+  assert ended.stop_error is not None
+  assert not ended.directory_cleanup_pending
+  db.expire_all()
+  assert db.get(BrowserAccessGrant, grant.id).remote_status == "revoked"

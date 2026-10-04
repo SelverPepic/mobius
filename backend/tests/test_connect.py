@@ -1875,6 +1875,28 @@ def test_stray_incompatible_runner_does_not_end_the_current_runners_work(client,
   assert connect_routes.connect_output.finished(pairing["id"], request_id) is None
 
 
+def test_stray_incompatible_runner_leaves_the_current_runners_details(client, auth):
+  pairing, runner_token = _paired_host(client, auth)
+  host = connect_routes._load_host(pairing["id"])
+  host.update(
+    runner_protocol=connect_routes._RUNNER_PROTOCOL_VERSION,
+    runner_capabilities=["parallel"], platform="Linux 6",
+  )
+  connect_routes._save_host(host)
+  connect_routes._channels[pairing["id"]] = connect_routes._Channel()
+
+  response = client.get(
+    "/api/connect/stream?protocol=3&platform=OldOS",
+    headers={"Authorization": f"Bearer {runner_token}"},
+  )
+
+  assert response.status_code == 426
+  kept = connect_routes._load_host(pairing["id"])
+  assert kept["runner_protocol"] == connect_routes._RUNNER_PROTOCOL_VERSION
+  assert kept["runner_capabilities"] == ["parallel"]
+  assert kept["platform"] == "Linux 6"
+
+
 @pytest.mark.asyncio
 async def test_never_started_command_at_result_deadline_finishes_expired(
   client, auth, monkeypatch,

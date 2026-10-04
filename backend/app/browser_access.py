@@ -569,6 +569,9 @@ async def end_grant(db: Session, grant: BrowserAccessGrant, *, contact_directory
   result = GrantEnd()
 
   def failed(exc: Exception) -> None:
+    # A failed step may leave the shared session unusable; the revocation is
+    # already committed, so roll back and let the remaining steps still run.
+    db.rollback()
     if result.stop_error is None:
       result.stop_error = exc
 
