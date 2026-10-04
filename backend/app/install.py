@@ -37,7 +37,7 @@ import tempfile
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping
 from urllib.parse import unquote, urljoin, urlparse
 
 import httpx
@@ -1370,6 +1370,9 @@ def read_pending_conflict_update_receipt(
   return receipt
 
 
+PackageContentBytes = bytes | app_git.GitTreeBlob
+
+
 def _install_candidate_digest(
   *,
   manifest: dict,
@@ -1377,12 +1380,12 @@ def _install_candidate_digest(
   source_identity: str | None,
   predecessor_source_identity: str | None,
   canonical_source_url: str,
-  entry_bytes: bytes,
+  entry_bytes: PackageContentBytes,
   icon_processed: bytes | None,
   bundled_job: bytes | None,
-  static_assets: dict[str, bytes],
-  source_files: dict[str, bytes],
-  seeds: dict[str, bytes],
+  static_assets: Mapping[str, PackageContentBytes],
+  source_files: Mapping[str, PackageContentBytes],
+  seeds: Mapping[str, PackageContentBytes],
 ) -> str:
   """Bind a deferred conflict resolution to the exact fetched candidate.
 
@@ -1394,12 +1397,17 @@ def _install_candidate_digest(
   """
   digest = hashlib.sha256()
 
-  def add(label: str, value: bytes) -> None:
+  def add(label: str, value: PackageContentBytes) -> None:
     label_bytes = label.encode("utf-8")
     digest.update(len(label_bytes).to_bytes(4, "big"))
     digest.update(label_bytes)
-    digest.update(len(value).to_bytes(8, "big"))
-    digest.update(value)
+    if isinstance(value, app_git.GitTreeBlob):
+      digest.update(value.size.to_bytes(8, "big"))
+      for chunk in value.chunks():
+        digest.update(chunk)
+    else:
+      digest.update(len(value).to_bytes(8, "big"))
+      digest.update(value)
 
   add(
     "manifest",
@@ -1435,12 +1443,12 @@ def _install_candidate_digest(
 def package_content_digest(
   *,
   manifest: dict,
-  entry_bytes: bytes,
+  entry_bytes: PackageContentBytes,
   icon_processed: bytes | None,
   bundled_job: bytes | None,
-  static_assets: dict[str, bytes],
-  source_files: dict[str, bytes],
-  seeds: dict[str, bytes],
+  static_assets: Mapping[str, PackageContentBytes],
+  source_files: Mapping[str, PackageContentBytes],
+  seeds: Mapping[str, PackageContentBytes],
 ) -> str:
   """Bind every installable package byte without binding its public URL.
 
@@ -1470,8 +1478,13 @@ class PackageContentError(ValueError):
   """An accepted source tree cannot reproduce its declared install package."""
 
 
+def _package_input_bytes(value: PackageContentBytes) -> bytes:
+  # Parsing manifest/icon/job syntax requires bytes; opaque assets do not.
+  return value.read_bytes() if isinstance(value, app_git.GitTreeBlob) else value
+
+
 def package_content_digest_from_tree(
-  tree: dict[str, bytes],
+  tree: Mapping[str, PackageContentBytes | None],
 ) -> tuple[str, str]:
   """Return manifest identity + package digest from an immutable source tree.
 
@@ -1480,16 +1493,22 @@ def package_content_digest_from_tree(
   when the manifest contract grows.
   """
   try:
-    manifest = json.loads(tree["mobius.json"])
+    manifest_bytes = tree["mobius.json"]
+    if manifest_bytes is None:
+      raise KeyError("mobius.json")
+    manifest = json.loads(_package_input_bytes(manifest_bytes))
     validate_manifest_contract(manifest)
   except (
     KeyError, UnicodeDecodeError, json.JSONDecodeError, ManifestContractError,
   ) as exc:
     raise PackageContentError("invalid or missing mobius.json") from exc
 
-  def required_bytes(relative: str, field: str) -> bytes:
+  def required_bytes(relative: str, field: str) -> PackageContentBytes:
     try:
-      return tree[relative]
+      value = tree[relative]
+      if value is None:
+        raise KeyError(relative)
+      return value
     except KeyError as exc:
       raise PackageContentError(
         f"missing declared {field} file ({relative})",
@@ -1502,7 +1521,10 @@ def package_content_digest_from_tree(
   }
   schedule = manifest.get("schedule")
   job_name = schedule.get("job") if isinstance(schedule, dict) else None
-  bundled_job = required_bytes(job_name, "schedule job") if job_name else None
+  bundled_job = (
+    _package_input_bytes(required_bytes(job_name, "schedule job"))
+    if job_name else None
+  )
   if bundled_job is not None:
     try:
       validate_schedule_job(manifest, bundled_job)
@@ -1514,7 +1536,7 @@ def package_content_digest_from_tree(
   if icon_name:
     try:
       icon_processed = icon_assets.normalize_icon(
-        required_bytes(icon_name, "icon"),
+        _package_input_bytes(required_bytes(icon_name, "icon")),
       )
     except icon_assets.InvalidIcon as exc:
       raise PackageContentError("invalid declared icon") from exc
@@ -1525,7 +1547,7 @@ def package_content_digest_from_tree(
       manifest.get("static_assets") or {},
     ).items()
   }
-  seeds: dict[str, bytes] = {}
+  seeds: dict[str, PackageContentBytes] = {}
   for destination, value in (manifest.get("storage_seeds") or {}).items():
     seeds[destination] = (
       json.dumps(
@@ -1544,6 +1566,22 @@ def package_content_digest_from_tree(
     source_files=source_files,
     seeds=seeds,
   )
+
+
+def package_content_digest_from_git(
+  source_dir: str | Path, ref: str,
+) -> tuple[str, str] | None:
+  """Digest every declared package byte without materializing its full tree.
+
+  Use the same canonical validation/digest as publication and installation.
+  None means a real legacy baseline without a manifest, not a broken package;
+  an invalid/missing declared input still fails closed with PackageContentError.
+  Callers hold the source lock. Blob ranges cannot escape this spool scope.
+  """
+  with app_git.open_ref_tree(source_dir, ref) as tree:
+    if "mobius.json" not in tree:
+      return None
+    return package_content_digest_from_tree(tree)
 
 
 def _git_runtime_source_tree(
@@ -2435,32 +2473,57 @@ class GitInstallCandidate:
     return tree
 
 
-def read_git_install_candidate(
-  source_dir: str | Path,
-  commit: str,
-  source_url: str,
-  *,
-  source_identity: str | None = None,
-  strict: bool = True,
-) -> GitInstallCandidate:
-  """Read every declared install input from one already-fetched commit."""
-  repo = Path(source_dir)
+def _reviewed_git_package_commit(source_dir: str | Path, commit: str) -> str:
   try:
-    resolved = app_git.head_sha(repo, commit).lower()
+    resolved = app_git.head_sha(source_dir, commit).lower()
   except (OSError, subprocess.SubprocessError, RuntimeError):
     resolved = ""
   if resolved != str(commit).lower():
     raise ValueError("reviewed Git commit is unavailable")
-  tree = app_git.read_ref_tree(repo, resolved)
+  return resolved
 
-  def required(relative: str, field: str) -> bytes:
+
+@dataclass(frozen=True)
+class _GitPackageInputs:
+  """Validated inputs whose opaque bodies may be borrowed from an open spool."""
+
+  manifest: dict
+  entry_bytes: PackageContentBytes
+  icon_processed: bytes | None
+  icon_warning: str | None
+  bundled_job: bytes | None
+  static_assets: dict[str, PackageContentBytes]
+  source_files: dict[str, PackageContentBytes]
+  seeds: dict[str, PackageContentBytes]
+
+  def content_digest(self) -> str:
+    return package_content_digest(
+      manifest=self.manifest,
+      entry_bytes=self.entry_bytes,
+      icon_processed=self.icon_processed,
+      bundled_job=self.bundled_job,
+      static_assets=self.static_assets,
+      source_files=self.source_files,
+      seeds=self.seeds,
+    )
+
+
+def _read_git_package_inputs(
+  tree: Mapping[str, PackageContentBytes | None], *, strict: bool,
+) -> _GitPackageInputs:
+  # Discovery intentionally differs from strict installation validation.
+  # Both readers share missing-input, schedule and non-fatal icon semantics.
+  def required(relative: str, field: str) -> PackageContentBytes:
     try:
-      return tree[relative]
+      value = tree[relative]
+      if value is None:
+        raise KeyError(relative)
+      return value
     except KeyError as exc:
       raise ValueError(f"candidate Git tree is missing {field} {relative}") from exc
 
   try:
-    manifest = json.loads(required("mobius.json", "manifest"))
+    manifest = json.loads(_package_input_bytes(required("mobius.json", "manifest")))
   except (json.JSONDecodeError, UnicodeDecodeError) as exc:
     raise ValueError("candidate Git manifest is invalid") from exc
   if strict:
@@ -2475,7 +2538,10 @@ def read_git_install_candidate(
   }
   schedule = manifest.get("schedule")
   job_name = schedule.get("job") if isinstance(schedule, dict) else None
-  bundled_job = required(job_name, "schedule job") if job_name else None
+  bundled_job = (
+    _package_input_bytes(required(job_name, "schedule job"))
+    if job_name else None
+  )
   if bundled_job is not None:
     try:
       validate_schedule_job(manifest, bundled_job)
@@ -2487,7 +2553,7 @@ def read_git_install_candidate(
   if manifest.get("icon"):
     try:
       icon_processed = icon_assets.normalize_icon(
-        required(manifest["icon"], "icon"),
+        _package_input_bytes(required(manifest["icon"], "icon")),
       )
     except icon_assets.InvalidIcon as exc:
       icon_warning = f"icon: {exc}"
@@ -2498,7 +2564,7 @@ def read_git_install_candidate(
       manifest.get("static_assets") or {},
     ).items()
   }
-  seeds: dict[str, bytes] = {}
+  seeds: dict[str, PackageContentBytes] = {}
   for destination, value in (manifest.get("storage_seeds") or {}).items():
     seeds[destination] = (
       json.dumps(
@@ -2507,6 +2573,47 @@ def read_git_install_candidate(
       if _seed_value_is_inline(value)
       else required(value, "storage seed")
     )
+
+  return _GitPackageInputs(
+    manifest=manifest,
+    entry_bytes=entry_bytes,
+    icon_processed=icon_processed,
+    icon_warning=icon_warning,
+    bundled_job=bundled_job,
+    static_assets=static_assets,
+    source_files=source_files,
+    seeds=seeds,
+  )
+
+
+def read_git_install_candidate(
+  source_dir: str | Path,
+  commit: str,
+  source_url: str,
+  *,
+  source_identity: str | None = None,
+  strict: bool = True,
+) -> GitInstallCandidate:
+  """Read every declared install input from one already-fetched commit."""
+  repo = Path(source_dir)
+  resolved = _reviewed_git_package_commit(repo, commit)
+  tree = app_git.read_ref_tree(repo, resolved)
+
+  inputs = _read_git_package_inputs(tree, strict=strict)
+  manifest = inputs.manifest
+  entry_bytes = _package_input_bytes(inputs.entry_bytes)
+  icon_processed = inputs.icon_processed
+  icon_warning = inputs.icon_warning
+  bundled_job = inputs.bundled_job
+  static_assets = {
+    key: _package_input_bytes(value) for key, value in inputs.static_assets.items()
+  }
+  source_files = {
+    key: _package_input_bytes(value) for key, value in inputs.source_files.items()
+  }
+  seeds = {
+    key: _package_input_bytes(value) for key, value in inputs.seeds.items()
+  }
 
   raw_base = _normalize_raw_base(
     source_url.rsplit("/mobius.json", 1)[0]
@@ -2535,15 +2642,7 @@ def read_git_install_candidate(
     source_files=source_files,
     seeds=seeds,
   )
-  content_digest = package_content_digest(
-    manifest=manifest,
-    entry_bytes=entry_bytes,
-    icon_processed=icon_processed,
-    bundled_job=bundled_job,
-    static_assets=static_assets,
-    source_files=source_files,
-    seeds=seeds,
-  )
+  content_digest = inputs.content_digest()
   return GitInstallCandidate(
     commit=resolved,
     candidate=InstallCandidate(
@@ -2567,14 +2666,38 @@ def read_git_install_candidate(
   )
 
 
-def fetch_git_install_candidate(
-  source_dir: str | Path,
-  source_url: str,
-  *,
-  source_identity: str | None = None,
-  strict: bool = True,
-) -> GitInstallCandidate:
-  """Fetch one Git ref, then read the complete package from its exact commit."""
+@dataclass(frozen=True)
+class GitPackageSummary:
+  """Complete package identity without retained opaque asset/seed payloads.
+
+  No package body or borrowed spool range escapes the read. A real legacy
+  comparison reads runtime source from this exact reviewed commit separately;
+  preview/install keep their full-byte candidate contract.
+  """
+
+  commit: str
+  manifest: dict
+  source_digest: str
+  icon_warning: str | None
+
+
+def read_git_package_summary(
+  source_dir: str | Path, commit: str, *, strict: bool = False,
+) -> GitPackageSummary:
+  """Read all discovery inputs, streaming opaque bodies into the canonical digest."""
+  repo = Path(source_dir)
+  resolved = _reviewed_git_package_commit(repo, commit)
+  with app_git.open_ref_tree(repo, resolved) as tree:
+    inputs = _read_git_package_inputs(tree, strict=strict)
+    return GitPackageSummary(
+      commit=resolved,
+      manifest=inputs.manifest,
+      source_digest=inputs.content_digest(),
+      icon_warning=inputs.icon_warning,
+    )
+
+
+def _fetch_git_package_commit(source_dir: str | Path, source_url: str) -> str:
   repo_ref = _derive_repo_ref(source_url)
   if repo_ref is None:
     raise ValueError("update source is not a root Git repository package")
@@ -2583,7 +2706,18 @@ def fetch_git_install_candidate(
   normalize = lambda value: value.rstrip("/").removesuffix(".git").lower()
   if actual_origin is None or normalize(actual_origin) != normalize(expected_origin):
     raise ValueError("installed Git origin does not match update source")
-  commit = app_git.fetch_origin_ref(source_dir, ref)
+  return app_git.fetch_origin_ref(source_dir, ref)
+
+
+def fetch_git_install_candidate(
+  source_dir: str | Path,
+  source_url: str,
+  *,
+  source_identity: str | None = None,
+  strict: bool = True,
+) -> GitInstallCandidate:
+  """Fetch one Git ref, then read the complete package from its exact commit."""
+  commit = _fetch_git_package_commit(source_dir, source_url)
   return read_git_install_candidate(
     source_dir,
     commit,
@@ -2591,6 +2725,14 @@ def fetch_git_install_candidate(
     source_identity=source_identity,
     strict=strict,
   )
+
+
+def fetch_git_package_summary(
+  source_dir: str | Path, source_url: str, *, strict: bool = False,
+) -> GitPackageSummary:
+  """Fetch a discovery candidate under the same origin guard as installation."""
+  commit = _fetch_git_package_commit(source_dir, source_url)
+  return read_git_package_summary(source_dir, commit, strict=strict)
 
 
 def install_candidate_content_digest(candidate: InstallCandidate) -> str:

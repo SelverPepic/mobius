@@ -189,15 +189,18 @@ class Broadcast:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", [False, True])
+@pytest.mark.parametrize("size_signal", [
+  {"api_error_status": 413}, {"context_window_exceeded": True},
+])
 async def test_terminal_recovery_finalizes_before_snapshot_and_preserves_on_failure(
-    client, chat, db, monkeypatch, failure):
+    client, chat, db, monkeypatch, failure, size_signal):
   _start(chat, db)
   registry.mark_starting(chat.id)
   gen = registry.current_generation(chat.id)
   bc = Broadcast(chat.id)
   sink = ChatEventSink(bc, chat.id, run_token="run")
   sink.publish({"type": "text", "content": "Completed work before failure."})
-  kwargs = chat_mod._park_exit(sink, {"api_error_status": 413}, "request body too large")
+  kwargs = chat_mod._park_exit(sink, size_signal, "Provider refused input.")
   async def fake(messages, **kwargs):
     assert any("Completed work before failure." in row.get("content", "") for row in messages)
     if failure:
