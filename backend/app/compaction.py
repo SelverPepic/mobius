@@ -439,11 +439,11 @@ def _provider_compaction_failure(text: str, status: int | None = None) -> str:
   """
   unchanged = " Your existing conversation is unchanged."
   sign_in = (
-    "The incoming provider could not sign in. Reconnect that provider, "
+    "The provider could not sign in. Reconnect that provider, "
     "then try again." + unchanged
   )
   limit = (
-    "The incoming provider has reached a usage or rate limit. "
+    "The provider has reached a usage or rate limit. "
     "Try again when its allowance is available." + unchanged
   )
   if status == 401:
@@ -460,7 +460,7 @@ def _provider_compaction_failure(text: str, status: int | None = None) -> str:
     r"billing_error|credit balance is too low", text, re.IGNORECASE,
   ):
     return (
-      "The incoming provider is out of credits. Add credits for that provider, "
+      "The provider is out of credits. Add credits for that provider, "
       "then try again." + unchanged
     )
   if re.search(
