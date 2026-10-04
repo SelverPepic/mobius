@@ -61,6 +61,7 @@ function frames(html) {
     errors: (html.match(/md-image-error/g) || []).length,
     frames: (html.match(/class="md-image-frame"/g) || []).length,
     sizedA: html.includes('--md-image-ratio:640 / 480'),
+    sizedB: html.includes('--md-image-ratio:300 / 600'),
   }
 }
 
@@ -82,7 +83,7 @@ test('only an explicit null marks an image unreadable', () => {
     `![a](${A}) ![b](${B}) ![broken](${BROKEN})`,
     { media_dimensions: map },
   ))
-  assert.deepEqual(frames(html), { errors: 1, frames: 2, sizedA: true })
+  assert.deepEqual(frames(html), { errors: 1, frames: 2, sizedA: true, sizedB: false })
 })
 
 test('(a) stream promotion keeps known sizes and frames newer images', () => {
@@ -92,7 +93,7 @@ test('(a) stream promotion keeps known sizes and frames newer images', () => {
     assistantMessageId: 'run',
   })
   assert.equal(promoted.content, newText)
-  assert.deepEqual(frames(renderMessage(promoted)), { errors: 0, frames: 2, sizedA: true })
+  assert.deepEqual(frames(renderMessage(promoted)), { errors: 0, frames: 2, sizedA: true, sizedB: false })
 })
 
 test('(b) a live reply over a sized partial frames newly streamed images', () => {
@@ -107,10 +108,10 @@ test('(b) a live reply over a sized partial frames newly streamed images', () =>
     chatId,
     isStreaming: true,
   }))
-  assert.deepEqual(frames(html), { errors: 0, frames: 2, sizedA: true })
+  assert.deepEqual(frames(html), { errors: 0, frames: 2, sizedA: true, sizedB: false })
 })
 
-test('(c) a joined steer replay frames images from the later row', () => {
+test('(c) a joined steer replay sizes images the later row knows', () => {
   const first = assistant(oldText, { media_dimensions: { [A]: sizeA } })
   const carrier = { role: 'user', hidden: true, steered: true, source_work_id: 'run', kind: 'peer_message' }
   const second = assistant(newText, {
@@ -129,6 +130,6 @@ test('(c) a joined steer replay frames images from the later row', () => {
     chatId,
     isStreaming: false,
   }))
-  // The first row now displays the joined text with its own smaller map.
-  assert.deepEqual(frames(html), { errors: 0, frames: 2, sizedA: true })
+  // The first row displays the joined text, so it uses the later row's size for b.
+  assert.deepEqual(frames(html), { errors: 0, frames: 2, sizedA: true, sizedB: true })
 })

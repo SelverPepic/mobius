@@ -90,7 +90,12 @@ export function presentAssistantReply(rows, { activeIndex = -1, positions = new 
         reply_text_owner: true,
         reply_live_text: index === activeIndex && after.length === 1,
       }
-      presented[owner.row].message = { ...ownerMessage, blocks: ownerBlocks }
+      // The owner now shows the later row's text, so it needs that row's
+      // image sizes too; the later row's entry wins for a shared path.
+      const mediaDimensions = ownerMessage.media_dimensions || current.media_dimensions
+        ? { ...ownerMessage.media_dimensions, ...current.media_dimensions }
+        : undefined
+      presented[owner.row].message = { ...ownerMessage, blocks: ownerBlocks, media_dimensions: mediaDimensions }
       const nextBlocks = [...sourceBlocks(projected)]
       nextBlocks[0] = { ...nextBlocks[0], content: '', source_text_offset: replay.sourceOffset + replay.text.length }
       presented[index].message = {
