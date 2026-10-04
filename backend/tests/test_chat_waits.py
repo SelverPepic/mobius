@@ -2257,28 +2257,16 @@ def test_wait_resume_existence_gate_does_not_load_chat_payloads(
   assert db.get(models.ChatWait, wait_id).status == ("cancelled" if deleted else "met")
 
 
-def test_wait_details_survive_reload_and_resolve_readable_owner_without_exposing_output(client, owner_token, db):
+def test_custom_command_output_is_never_reported_as_progress(client, owner_token, db):
   chat_id = _owner_chat(client, owner_token)
-  executor = _owner_chat(client, owner_token)
-  owner = db.get(models.Chat, executor)
-  owner.title = 'Deploying the website'
-  db.commit()
-  row = _command_wait(db, chat_id=chat_id, description='Website ready', command='test -f ready',
-    check_description='Whether the website is ready', on_ready='Check the published page', owner_chat_id=executor)
+  row = _command_wait(db, chat_id=chat_id, description='Website ready', command='test -f ready')
   row.last_output = 'do not expose arbitrary command output'
   row.last_exit_code = 1
   row.checks_count = 2
   db.commit()
-  db.expire_all()
-  view = chat_waits_mod.serialize_wait(db.get(models.ChatWait, row.id), db=db)
-  assert view['owner_chat'] == {'id': executor, 'title': 'Deploying the website'}
-  assert view['check_description'] == 'Whether the website is ready'
-  assert view['on_ready'] == 'Check the published page'
-  assert view['latest_result']['state'] == 'pending'
+  view = chat_waits_mod.serialize_wait(row, db=db)
+  assert view['latest_result'] is None
   assert 'do not expose' not in str(view)
-  owner.deleted_at = now_naive_utc()
-  db.commit()
-  assert chat_waits_mod.serialize_wait(row, db=db)['owner_chat'] is None
 
 
 @pytest.mark.parametrize('state,total,completed,expected', [
@@ -2291,7 +2279,7 @@ def test_typed_check_observations_keep_progress_separate_from_monitor_failure(
   chat_id = _owner_chat(client, owner_token)
   row = declare_wait(db, chat_id=chat_id, description='Checks finish', kind='github_checks',
     github_checks={'repository': 'owner/repo', 'pull_request': 7, 'head_sha': 'a' * 40},
-    deadline_secs=600, on_ready='Review all results')
+    deadline_secs=600)
   payload = {'state': state, 'summary': 'Observed check progress', 'completed': completed, 'total': total}
   async def check(command, **kwargs):
     assert 'pr-checks.py' in command and '--json' in command
@@ -2303,8 +2291,7 @@ def test_typed_check_observations_keep_progress_separate_from_monitor_failure(
   assert row.status == expected
   view = chat_waits_mod.serialize_wait(row, db=db)
   assert view['latest_result'] == payload
-  assert view['check_url'] == 'https://github.com/owner/repo/pull/7/checks'
-  assert 'Review all results' in chat_waits_mod._compose_resume_notice(row, 'met')
+  assert 'Observed check progress' in chat_waits_mod._compose_resume_notice(row, 'met')
 
 
 @pytest.mark.parametrize('exit_code,output', [(0, 'not json'), (0, '{"state":"pending","summary":"waiting","completed":4,"total":4}'), (0, '{"state":"met","summary":"ready","completed":1,"total":4}'), (-1, 'timeout')])
@@ -2320,7 +2307,7 @@ def test_broken_typed_observation_never_becomes_success_or_endless_pending(clien
   assert db.get(models.ChatWait, row.id).status == 'failed'
 
 
-def test_wait_route_accepts_typed_check_but_rejects_mixed_execution_and_bad_owner(client, owner_token, db):
+def test_wait_route_accepts_typed_check_but_rejects_mixed_execution(client, owner_token, db):
   chat_id = _owner_chat(client, owner_token)
   run_id = _seed_declaring_run(db, chat_id)
   db.get(models.ChatRun, run_id).status = "running"
@@ -2328,10 +2315,12 @@ def test_wait_route_accepts_typed_check_but_rejects_mixed_execution_and_bad_owne
   auth = _agent_run_auth(db, chat_id, run_id)
   payload = {'description': 'Checks finish', 'kind': 'github_checks',
     'github_checks': {'repository': 'owner/repo', 'pull_request': 7, 'head_sha': 'a' * 40},
-    'deadline_secs': 600, 'on_ready': 'Review all results'}
+    'deadline_secs': 600}
   response = client.post('/api/chat-waits', json=payload, headers=auth)
   assert response.status_code == 200, response.text
-  assert response.json()['on_ready'] == 'Review all results'
+  assert response.json()['kind'] == 'github_checks'
+  assert response.json()['latest_result'] is None
   assert response.json()['condition_owner'] == 'GitHub'
-  for extra in ({'command': 'true'}, {'delay_secs': 60}, {'owner_chat_id': 'missing-chat'}):
+  for extra in ({'command': 'true'}, {'delay_secs': 60}, {'deadline_secs': None},
+                {'github_checks': {'repository': 'owner/repo', 'pull_request': 7}}):
     assert client.post('/api/chat-waits', json={**payload, **extra}, headers=auth).status_code == 422

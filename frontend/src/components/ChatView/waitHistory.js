@@ -48,7 +48,6 @@ export function waitHistoryViewModel(summary) {
   const owner = String(summary?.condition_owner || '').trim() || null
   return {
     condition,
-    result: summary?.latest_result?.summary || null,
     ...outcome,
     ariaLabel: `${outcome.spoken}: ${condition}`,
     metadata: [owner, checks, duration].filter(Boolean).join(' · '),

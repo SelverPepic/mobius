@@ -64,9 +64,6 @@ def declare_wait(
   interval_secs: int | None = None,
   deadline_secs: int | None = None,
   github_checks: dict | None = None,
-  check_description: str | None = None,
-  on_ready: str | None = None,
-  owner_chat_id: str | None = None,
 ) -> dict:
   """Arm one bounded wait through the chat-bound platform API."""
   if sum(value is not None for value in (command, delay_secs, github_checks)) != 1:
@@ -80,9 +77,6 @@ def declare_wait(
     "condition_owner": condition_owner,
     "kind": "github_checks" if github_checks is not None else "command" if command else "timer",
     "github_checks": github_checks,
-    "check_description": check_description,
-    "on_ready": on_ready,
-    "owner_chat_id": owner_chat_id,
     "command": command,
     "delay_secs": delay_secs,
     "interval_secs": interval_secs,

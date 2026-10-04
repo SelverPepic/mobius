@@ -42,9 +42,6 @@ class WaitDeclare(BaseModel):
   condition_owner: str | None = Field(default=None, max_length=160)
   kind: str = Field(pattern="^(command|timer|github_checks)$")
   github_checks: GitHubChecks | None = None
-  check_description: str | None = Field(default=None, min_length=1, max_length=500)
-  on_ready: str | None = Field(default=None, min_length=1, max_length=500)
-  owner_chat_id: str | None = Field(default=None, max_length=64)
   command: str | None = Field(default=None, max_length=4000)
   delay_secs: int | None = Field(default=None, gt=0)
   interval_secs: int | None = Field(default=None, gt=0)
@@ -82,9 +79,6 @@ def declare(
       deadline_secs=payload.deadline_secs,
       created_by_run_id=principal.run_id,
       github_checks=payload.github_checks.model_dump() if payload.github_checks else None,
-      check_description=payload.check_description,
-      on_ready=payload.on_ready,
-      owner_chat_id=payload.owner_chat_id,
     )
   except WaitValidationError as exc:
     raise HTTPException(status_code=422, detail=str(exc))

@@ -166,9 +166,6 @@ def declare_wait(
   deadline_secs: int | None = None,
   created_by_run_id: str | None = None,
   github_checks: dict | None = None,
-  check_description: str | None = None,
-  on_ready: str | None = None,
-  owner_chat_id: str | None = None,
 ) -> models.ChatWait:
   """Validate and persist one armed wait for `chat_id`."""
   description = (description or "").strip()
@@ -179,19 +176,7 @@ def declare_wait(
     raise WaitValidationError("condition_owner must not exceed 160 characters")
   if kind not in ("command", "timer", "github_checks"):
     raise WaitValidationError("kind must be 'command', 'timer', or 'github_checks'")
-  details = {}
-  for name, value in (("check_description", check_description), ("on_ready", on_ready)):
-    if value is not None:
-      if not isinstance(value, str) or not value.strip() or len(value) > 500:
-        raise WaitValidationError(f"{name} must be a nonempty string of at most 500 characters")
-      details[name] = value.strip()
-  if owner_chat_id is not None:
-    owner_chat = db.query(models.Chat).filter(
-      models.Chat.id == owner_chat_id, models.Chat.deleted_at.is_(None),
-    ).first()
-    if owner_chat is None:
-      raise WaitValidationError("owner_chat_id must name an existing active chat")
-    details["owner_chat_id"] = owner_chat_id
+  details = None
   if kind == "github_checks":
     if command or delay_secs is not None:
       raise WaitValidationError("GitHub checks cannot also specify a command or timer")
@@ -199,8 +184,7 @@ def declare_wait(
       spec = GitHubChecks.model_validate(github_checks)
     except ValueError as exc:
       raise WaitValidationError("github_checks needs repository, pull_request, and head_sha") from exc
-    details["github_checks"] = spec.model_dump()
-    details.setdefault("check_description", f"GitHub checks for {spec.repository} #{spec.pull_request}")
+    details = {"github_checks": spec.model_dump()}
     condition_owner = condition_owner or "GitHub"
     command = spec.command()
   elif github_checks is not None:
@@ -276,7 +260,7 @@ def declare_wait(
     ),
     kind=kind,
     command=command,
-    condition_json=details or None,
+    condition_json=details,
     due_at=due_at,
     interval_secs=interval,
     deadline_at=deadline_at,
@@ -382,34 +366,16 @@ def wait_resume_blocker(db: Session, row: models.ChatWait) -> str | None:
 
 
 def _latest_observation(row: models.ChatWait) -> dict | None:
-  observation = None
-  if row.checks_count and row.kind == "github_checks":
-    observation = read_check_observation(0, row.last_output).model_dump()
-  elif row.checks_count and row.kind == "command":
-    state = "met" if row.last_exit_code == 0 else "failed" if row.status == "failed" else "pending"
-    observation = {"state": state, "summary": {
-      "met": "The condition was met.",
-      "pending": "The condition has not been met yet.",
-      "failed": "The check could not finish. The agent will investigate.",
-    }[state]}
-  return observation
+  """The typed checker's bounded progress; custom command output stays private."""
+  if row.kind != "github_checks" or not row.checks_count:
+    return None
+  return read_check_observation(0, row.last_output).model_dump()
 
 
 def serialize_wait(row: models.ChatWait, *, db: Session) -> dict:
   # Platform activation has no product deadline. Its non-null storage value is
   # retained only for compatibility with the original shared ChatWait schema.
   presented_deadline = None if row.kind == "platform_activation" else row.deadline_at
-  details = row.condition_json if isinstance(row.condition_json, dict) else {}
-  owner_chat = None
-  if owner_id := details.get("owner_chat_id"):
-    owner = db.query(models.Chat.id, models.Chat.title).filter(
-      models.Chat.id == owner_id, models.Chat.deleted_at.is_(None),
-    ).first()
-    if owner:
-      owner_chat = {"id": owner.id, "title": owner.title or "Untitled chat"}
-  check_url = None
-  if row.kind == "github_checks":
-    check_url = GitHubChecks.model_validate(details["github_checks"]).url
   return {
     "id": row.id,
     "chat_id": row.chat_id,
@@ -417,10 +383,6 @@ def serialize_wait(row: models.ChatWait, *, db: Session) -> dict:
     "condition_owner": row.condition_owner,
     "kind": row.kind,
     "command": row.command,
-    "check_description": details.get("check_description"),
-    "on_ready": details.get("on_ready"),
-    "owner_chat": owner_chat,
-    "check_url": check_url,
     "latest_result": _latest_observation(row),
     "status": row.status,
     "delivery_pending": row.status in _OUTCOMES and row.resume_delivered_at is None,
@@ -599,7 +561,6 @@ def terminal_wait_summaries_by_message_index(
     projected.setdefault(candidate_index, []).append({
       "id": row.id,
       "description": row.description,
-      "latest_result": _latest_observation(row) if row.kind == "github_checks" else None,
       "condition_owner": row.condition_owner,
       "status": row.status,
       "delivery_pending": row.status in _OUTCOMES and row.resume_delivered_at is None,
@@ -724,7 +685,6 @@ def _compose_resume_notice(row: models.ChatWait, outcome: str) -> str:
     "outcome": outcome,
     "kind": row.kind,
     "command": row.command,
-    "on_ready": (row.condition_json or {}).get("on_ready"),
     "checks_count": row.checks_count,
     "last_exit_code": row.last_exit_code,
     "declared_at": row.created_at.isoformat() if row.created_at else None,
@@ -1146,8 +1106,11 @@ async def _check_one(row_id: str) -> bool:
       output = observation.model_dump_json()
     else:
       met = exit_code == 0
-      # Custom commands retain their silent-unmet/error contract. Only the
-      # explicitly typed checker may report progress while still pending.
+      # Command waits have a deliberate three-way contract. A normal unmet
+      # predicate is silent exit 1; output is reserved for diagnostics or a met
+      # result. This catches shell quoting, missing auth/environment, missing
+      # executables, timeouts, and provider errors without guessing from brittle
+      # message substrings. Only the typed GitHub checker reports progress.
       check_failed = not met and not (
         exit_code == 1 and not (output or "").strip()
       )

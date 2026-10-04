@@ -457,11 +457,15 @@ def test_control_protocol_advertises_every_run_bound_tool(monkeypatch):
     "delay_secs",
     "interval_secs",
     "deadline_secs",
+    "github_checks",
   }
   assert "question card" in (
     wait_schema["properties"]["condition_owner"]["description"]
   )
   assert wait_schema["additionalProperties"] is False
+  assert wait_schema["properties"]["github_checks"]["required"] == [
+    "repository", "pull_request", "head_sha",
+  ]
   # Expose the owning route's existing limits before an agent spends a call
   # discovering them in a 422 (condition_owner was previously unbounded here).
   for name, length in (("description", 500), ("condition_owner", 160), ("command", 4000)):
@@ -722,6 +726,7 @@ def test_control_protocol_declares_wait_through_the_canonical_client(monkeypatch
     "description": "CI becomes green",
     "condition_owner": "GitHub checks",
     "kind": "command",
+    "github_checks": None,
     "command": "gh pr checks 123 --watch=false >/dev/null",
     "delay_secs": None,
     "interval_secs": 120,

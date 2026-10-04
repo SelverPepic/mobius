@@ -48,8 +48,6 @@ returns a failure. Both arm the same wait.
 {
   "description": "the new deploy answering its health check",
   "condition_owner": "the hosting provider's deploy",
-  "check_description": "Whether the website answers its health check",
-  "on_ready": "Verify the published website and report the result",
   "command": "test \"$(curl -s -o /dev/null -w '%{http_code}' https://app.example.com/health)\" = 200",
   "interval_secs": 120,
   "deadline_secs": 1800
@@ -64,28 +62,18 @@ command. Give exactly one of `github_checks`, `command`, or `delay_secs`:
   "description": "The published change's checks finish",
   "github_checks": {"repository": "owner/repo", "pull_request": 123,
                     "head_sha": "0123456789abcdef0123456789abcdef01234567"},
-  "on_ready": "Review every result before deciding the next step",
   "interval_secs": 120,
   "deadline_secs": 1800
 }
 ```
 
 This uses the existing GitHub connection, checks every page of check runs and
-commit statuses for that exact published head, and shows a bounded progress
-summary in the card. **Finished does not mean passed**: unsuccessful completed
-checks still wake the chat for review. A replaced head or unreadable result is
+commit statuses for that exact published head, and records a bounded progress
+summary (`latest_result`) that the wake-up result also carries. **Finished does
+not mean passed**: unsuccessful completed checks still wake the chat for review. A replaced head or unreadable result is
 a failed monitor, not an ordinary pending check. No checks yet stays pending.
 The existing `scripts/pr-checks.sh owner/repo PR SHA` entry point uses the same
 checker while preserving its 0/1/error contract for previously saved commands.
-
-For every wait, write `check_description` (what is actually inspected) and
-`on_ready` (what you will do afterward) in plain language. Standard GitHub
-checks supply their own check description. For an acknowledged internal
-executor, pass `owner_chat_id`: the card resolves its current title into a
-link. Keep `condition_owner` readable; do not bury chat ids in its prose.
-These descriptions are explanations, never authorization for the follow-up.
-The card keeps exact commands under **Technical details**. Never put credentials
-in commands or descriptions; raw diagnostic output is not user-facing progress.
 
 A custom command remains the escape hatch for other observable conditions.
 For example, `gh pr view 123 --repo owner/repo --json state -q .state |

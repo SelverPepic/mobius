@@ -145,10 +145,8 @@ DECLARE_WAIT_DESCRIPTION = (
   "internal work needs an acknowledged durable executor first. Give exactly "
   "one of github_checks, command or delay_secs. Prefer github_checks for a "
   "published pull request at an exact head; it reports progress without "
-  "shell scripting. Supply check_description (what is checked), on_ready "
-  "(the promised follow-up), and owner_chat_id for a linked internal owner. "
-  "Prefer a command when other readiness is "
-  "observable; use a timer when elapsed time is the condition or no safe "
+  "shell scripting. Prefer a command when readiness is observable in "
+  "other ways; use a timer when elapsed time is the condition or no safe "
   "read-only check is available. A command is a read-only check: exit 0 "
   "means met, silent exit 1 means not yet, anything else wakes the chat as a "
   "failed check. It does not inherit turn-only API credentials or "
@@ -247,9 +245,6 @@ def _declare_wait(
   interval_secs: int | None = None,
   deadline_secs: int | None = None,
   github_checks: dict | None = None,
-  check_description: str | None = None,
-  on_ready: str | None = None,
-  owner_chat_id: str | None = None,
 ) -> dict:
   try:
     return _WAITS.declare_wait(
@@ -260,9 +255,6 @@ def _declare_wait(
       interval_secs=interval_secs,
       deadline_secs=deadline_secs,
       github_checks=github_checks,
-      check_description=check_description,
-      on_ready=on_ready,
-      owner_chat_id=owner_chat_id,
     )
   except SystemExit as exc:
     raise RuntimeError(str(exc)) from exc
@@ -617,7 +609,7 @@ def _optional_int(arguments: dict[str, Any], name: str) -> int | None:
 def _call_declare_wait(arguments: dict[str, Any]) -> dict:
   allowed = {
     "description", "condition_owner", "command", "delay_secs", "interval_secs",
-    "deadline_secs", "github_checks", "check_description", "on_ready", "owner_chat_id",
+    "deadline_secs", "github_checks",
   }
   if not set(arguments).issubset(allowed):
     raise ValueError("declare_wait received unknown arguments")
@@ -634,9 +626,6 @@ def _call_declare_wait(arguments: dict[str, Any]) -> dict:
     raise ValueError("command waits need a condition_owner")
   if command and arguments.get("deadline_secs") is None:
     raise ValueError("command waits need an explicit deadline_secs")
-  for name in ("check_description", "on_ready", "owner_chat_id"):
-    if arguments.get(name) is not None and not isinstance(arguments[name], str):
-      raise ValueError(f"{name} must be a string")
   if arguments.get("github_checks") is not None and not isinstance(arguments["github_checks"], dict):
     raise ValueError("github_checks must be an object")
   return _declare_wait(
@@ -649,9 +638,6 @@ def _call_declare_wait(arguments: dict[str, Any]) -> dict:
     interval_secs=_optional_int(arguments, "interval_secs"),
     deadline_secs=_optional_int(arguments, "deadline_secs"),
     github_checks=arguments.get("github_checks"),
-    check_description=arguments.get("check_description"),
-    on_ready=arguments.get("on_ready"),
-    owner_chat_id=arguments.get("owner_chat_id"),
   )
 
 
@@ -1620,18 +1606,6 @@ _TOOL_DEFINITIONS = {
             "name only an executor that has acknowledged ownership. If only "
             "the partner can act, use a question card instead of this tool."
           ),
-        },
-        "check_description": {
-          "type": "string", "minLength": 1, "maxLength": 500,
-          "description": "Plain-language explanation of what the check actually inspects; no commands or internal ids.",
-        },
-        "on_ready": {
-          "type": "string", "minLength": 1, "maxLength": 500,
-          "description": "What this chat will do when ready, in plain language; does not grant permission.",
-        },
-        "owner_chat_id": {
-          "type": "string", "maxLength": 64,
-          "description": "Optional acknowledged executor chat; displayed as its readable linked title.",
         },
         "github_checks": {
           "type": "object",

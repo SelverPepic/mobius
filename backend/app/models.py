@@ -644,8 +644,8 @@ class ChatWait(Base):
   # `timer`: met when `due_at` passes.
   kind = Column(String(32), nullable=False)
   command = Column(Text, nullable=True, default=None)
-  # Wait details and typed check inputs live here (legacy rows may be NULL).
-  # Platform Restart waits retain their separate server-authored action
+  # Typed product waits keep their bounded, server-authored condition here.
+  # Command/timer rows leave it NULL. Platform Restart waits retain the action
   # identity and originating boot; a later ready boot wakes the owning chat.
   condition_json = Column(JSON, nullable=True, default=None)
   # The declaring physical/logical execution identities are captured at

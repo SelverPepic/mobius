@@ -17,10 +17,6 @@ class GitHubChecks(BaseModel):
   pull_request: int = Field(gt=0, strict=True)
   head_sha: str = Field(pattern=r"^[a-fA-F0-9]{7,40}$")
 
-  @property
-  def url(self) -> str:
-    return f"https://github.com/{self.repository}/pull/{self.pull_request}/checks"
-
   def command(self) -> str:
     script = Path(__file__).resolve().parents[2] / "scripts" / "pr-checks.py"
     return shlex.join([

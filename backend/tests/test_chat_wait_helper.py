@@ -65,9 +65,9 @@ def test_standard_check_details_cross_the_tool_boundary_without_shell_scripting(
   monkeypatch.setattr(control._WAITS, "_call", lambda *args: captured.append(args) or {"kind": "github_checks"})
   args = {"description": "Checks finish", "github_checks": {
     "repository": "owner/repo", "pull_request": 7, "head_sha": "a" * 40},
-    "deadline_secs": 600, "on_ready": "Review the results", "check_description": "Published checks", "owner_chat_id": "owner-chat"}
+    "deadline_secs": 600}
   assert control._cli_call(["call", "declare_wait", "--args-json", json.dumps(args)]) == 0
   payload = captured[0][2]
   assert payload["kind"] == "github_checks"
-  for name in ("github_checks", "on_ready", "check_description", "owner_chat_id"):
-    assert payload[name] == args[name]
+  assert payload["github_checks"] == args["github_checks"]
+  assert payload["command"] is None and payload["delay_secs"] is None
