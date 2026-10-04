@@ -27,6 +27,17 @@ def test_goal_copy_guidance_separates_owner_text_from_verification_evidence():
   assert 'maxLength' not in complete
 
 
+def test_notify_owner_leaves_owner_input_cards_to_their_own_notification():
+  """A saved card already notifies the owner; the tool must not invite a
+  duplicate push for a question."""
+  control = _control_module()
+  description = control._TOOL_DEFINITIONS["notify_owner"]["description"]
+  assert "question that needs them" not in description
+  assert "not for a saved question, approval, restart or secure-input card" in description
+  assert "the card sends its own notification" in description
+  assert "a finished long task" in description
+
+
 @pytest.mark.parametrize("top_level,coordination", [(True, True), (True, False), (False, True)])
 def test_helpers_are_builtin_without_subagents_app(monkeypatch, top_level, coordination):
   monkeypatch.delenv("MOBIUS_SUBAGENT_HELPER", raising=False)
