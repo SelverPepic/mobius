@@ -51,7 +51,10 @@ def read_check_observation(exit_code: int, output: str | None) -> CheckObservati
       return CheckObservation.model_validate_json(output or "")
     except ValueError:
       pass
+  # A crashed checker's own message (e.g. a traceback tail) beats a generic one.
+  detail = (output or "").strip()[-500:] if exit_code else ""
   return CheckObservation(
-    state="failed", summary="The GitHub check could not be read. The agent will investigate.",
+    state="failed",
+    summary=detail or "The GitHub check could not be read. The agent will investigate.",
     completed=0, total=0,
   )

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Read-only, bounded GitHub PR-head check observation.
+"""Read-only GitHub PR-head check observation.
 
-GitHub REST documentation: /rest/checks/runs, /rest/checks/suites, and
-/rest/commits/statuses. No API error text is included in output.
+One GraphQL query reads the pull request's head commit and its
+statusCheckRollup per-state counts, so the head and the counts come from the
+same moment. No API error text is included in output.
 """
 
 import argparse
@@ -10,131 +11,68 @@ import json
 import re
 import subprocess
 import sys
-import time
 
 SHA = re.compile(r"[0-9a-fA-F]{7,40}\Z")
 REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
-PAGE_SIZE = 100
-DEADLINE_SECONDS = 90
-CALL_TIMEOUT_SECONDS = 15
-FAILED_CONCLUSIONS = {"failure", "timed_out", "cancelled", "action_required", "startup_failure"}
-VALID_CONCLUSIONS = FAILED_CONCLUSIONS | {"success", "neutral", "skipped", "stale"}
+TIMEOUT_SECONDS = 30
+QUERY = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      commits(last: 1) { nodes { commit { oid statusCheckRollup { contexts {
+        checkRunCountsByState { state count }
+        statusContextCountsByState { state count }
+      } } } } }
+    }
+  }
+}
+"""
+# A check is finished unless it is in one of these states. Cancelled, skipped,
+# neutral and stale count as finished but not failed, as in app/github_checks.py.
+UNFINISHED = {"QUEUED", "IN_PROGRESS", "PENDING", "WAITING", "REQUESTED", "EXPECTED"}
+FAILED = {"FAILURE", "ERROR", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED"}
 
 
 class CheckError(Exception):
     """An observation cannot be trusted; the message is safe for display."""
 
 
-def api(path, deadline):
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        raise CheckError("GitHub check lookup timed out; try again later.")
+def query(repo, pr):
+    owner, name = repo.split("/")
     try:
-        result = subprocess.run(
-            ["gh", "api", path], capture_output=True, text=True,
-            timeout=min(CALL_TIMEOUT_SECONDS, remaining), check=False,
+        process = subprocess.run(
+            ["gh", "api", "graphql", "-f", "query=" + QUERY, "-f", "owner=" + owner,
+             "-f", "name=" + name, "-F", f"number={pr}"],
+            capture_output=True, text=True, timeout=TIMEOUT_SECONDS, check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise CheckError("Could not read GitHub checks; try again later.") from exc
-    if result.returncode:
+    if process.returncode:
         raise CheckError("Could not read GitHub checks; verify access and try again later.")
     try:
-        return json.loads(result.stdout)
-    except (ValueError, UnicodeError) as exc:
+        commit = json.loads(process.stdout)["data"]["repository"]["pullRequest"]["commits"]["nodes"][-1]["commit"]
+        head = commit["oid"]
+        contexts = (commit["statusCheckRollup"] or {}).get("contexts") or {}
+        counts = {}
+        for key in ("checkRunCountsByState", "statusContextCountsByState"):
+            for item in contexts.get(key) or []:
+                if type(item["count"]) is not int or item["count"] < 0:
+                    raise ValueError(item)
+                counts[item["state"]] = counts.get(item["state"], 0) + item["count"]
+    except (ValueError, LookupError, TypeError, AttributeError) as exc:
         raise CheckError("GitHub returned an unreadable check response; try again later.") from exc
-
-
-def object_page(path, key, deadline):
-    """Paginate count-bearing GitHub check collections, rejecting partial evidence."""
-    items = []
-    expected = None
-    page = 1
-    while True:
-        data = api(f"{path}?per_page=100&page={page}", deadline)
-        if not isinstance(data, dict) or type(data.get("total_count")) is not int or data["total_count"] < 0 or not isinstance(data.get(key), list):
-            raise CheckError("GitHub returned incomplete check data; try again later.")
-        if expected is None:
-            expected = data["total_count"]
-        elif expected != data["total_count"]:
-            raise CheckError("GitHub checks changed during lookup; try again later.")
-        chunk = data[key]
-        if len(chunk) > PAGE_SIZE or not all(isinstance(item, dict) for item in chunk):
-            raise CheckError("GitHub returned incomplete check data; try again later.")
-        items.extend(chunk)
-        if len(items) >= expected:
-            if len(items) != expected:
-                raise CheckError("GitHub returned inconsistent check totals; try again later.")
-            return items
-        if len(chunk) != PAGE_SIZE:
-            raise CheckError("GitHub returned an incomplete check page; try again later.")
-        page += 1
-
-
-def list_runs(repo, head, deadline):
-    suites = api(f"repos/{repo}/commits/{head}/check-suites?per_page=1", deadline)
-    if not isinstance(suites, dict) or type(suites.get("total_count")) is not int or suites["total_count"] < 0:
-        raise CheckError("GitHub returned incomplete check suites; try again later.")
-    # GitHub limits the commit-ref endpoint to the 1,000 newest suites.
-    if suites["total_count"] >= 1000:
-        raise CheckError("This commit has too many check suites to observe completely.")
-    # GitHub's default filter=latest ignores historical reruns.
-    return object_page(f"repos/{repo}/commits/{head}/check-runs", "check_runs", deadline)
-
-
-def list_statuses(repo, head, deadline):
-    latest = {}
-    page = 1
-    while True:
-        data = api(f"repos/{repo}/commits/{head}/statuses?per_page=100&page={page}", deadline)
-        if not isinstance(data, list) or len(data) > PAGE_SIZE:
-            raise CheckError("GitHub returned incomplete commit statuses; try again later.")
-        for status in data:
-            if (not isinstance(status, dict) or not isinstance(status.get("context"), str)
-                    or not status["context"] or not isinstance(status.get("state"), str)
-                    or status["state"] not in {"pending", "success", "failure", "error"}):
-                raise CheckError("GitHub returned an unreadable commit status; try again later.")
-            # GitHub documents reverse chronological order; first per context is newest.
-            latest.setdefault(status["context"], status["state"])
-        if len(data) < PAGE_SIZE:
-            return latest
-        page += 1
+    if not isinstance(head, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", head):
+        raise CheckError("GitHub did not provide a valid PR head; try again later.")
+    return head, counts
 
 
 def observe(repo, pr, expected_sha):
-    deadline = time.monotonic() + DEADLINE_SECONDS
-    pull = api(f"repos/{repo}/pulls/{pr}", deadline)
-    head = pull.get("head", {}).get("sha") if isinstance(pull, dict) and isinstance(pull.get("head"), dict) else None
-    if not isinstance(head, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", head):
-        raise CheckError("GitHub did not provide a valid PR head; try again later.")
+    head, counts = query(repo, pr)
     if not head.lower().startswith(expected_sha.lower()):
         return result("failed", "The requested commit is not the published pull-request head.", 0, 0)
-    runs = list_runs(repo, head, deadline)
-    statuses = list_statuses(repo, head, deadline)
-    final_pull = api(f"repos/{repo}/pulls/{pr}", deadline)
-    final_head = final_pull.get("head", {}).get("sha") if isinstance(final_pull, dict) and isinstance(final_pull.get("head"), dict) else None
-    if final_head != head:
-        return result("failed", "The PR head changed during this check; the wait targets an older commit.", 0, 0)
-    ids = set()
-    completed = failed = 0
-    for run in runs:
-        run_id = run.get("id")
-        if type(run_id) is not int or run_id in ids or run.get("head_sha") != head or not isinstance(run.get("status"), str):
-            raise CheckError("GitHub returned inconsistent check runs; try again later.")
-        ids.add(run_id)
-        status = run["status"]
-        if status == "completed":
-            conclusion = run.get("conclusion")
-            if not isinstance(conclusion, str) or conclusion not in VALID_CONCLUSIONS:
-                raise CheckError("GitHub returned an incomplete check result; try again later.")
-            completed += 1
-            failed += conclusion in FAILED_CONCLUSIONS
-        elif status not in {"queued", "in_progress", "waiting", "requested", "pending"}:
-            raise CheckError("GitHub returned an unknown check state; try again later.")
-    for status in statuses.values():
-        if status != "pending":
-            completed += 1
-            failed += status in {"failure", "error"}
-    total = len(runs) + len(statuses)
+    total = sum(counts.values())
+    completed = total - sum(n for state, n in counts.items() if state in UNFINISHED)
+    failed = sum(n for state, n in counts.items() if state in FAILED)
     if total == 0:
         return result("pending", "No checks have appeared for this commit yet.", 0, 0)
     if completed < total:

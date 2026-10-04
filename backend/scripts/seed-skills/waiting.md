@@ -67,10 +67,10 @@ command. Give exactly one of `github_checks`, `command`, or `delay_secs`:
 }
 ```
 
-This uses the existing GitHub connection, checks every page of check runs and
-commit statuses for that exact published head, and records a bounded progress
-summary that the wake-up result carries. **Finished does
-not mean passed**: unsuccessful completed checks still wake the chat for review. A replaced head or unreadable result is
+This uses the existing GitHub connection, counts every check run and commit
+status on that exact published head, and records a bounded progress summary
+that the wake-up result carries. **Finished does not mean passed**: failed,
+cancelled, or skipped checks still wake the chat for review. A replaced head or unreadable result is
 a failed monitor, not an ordinary pending check. No checks yet stays pending.
 The existing `/data/platform/scripts/pr-checks.sh owner/repo PR SHA` entry point uses the same
 checker while preserving its 0/1/error contract for previously saved commands.

@@ -54,7 +54,7 @@ class WaitDeclare(BaseModel):
     if self.kind == "command" and not (self.condition_owner or "").strip():
       raise ValueError("command waits need a condition_owner")
     if self.deadline_secs is None:
-      raise ValueError("command waits need an explicit deadline_secs")
+      raise ValueError("command and GitHub waits need an explicit deadline_secs")
     return self
 
 

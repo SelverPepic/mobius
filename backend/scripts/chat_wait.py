@@ -73,7 +73,7 @@ def declare_wait(
   if command and not (condition_owner or "").strip():
     raise SystemExit("command waits need --owner")
   if (command or github_checks) and deadline_secs is None:
-    raise SystemExit("command waits need --deadline")
+    raise SystemExit("command and GitHub waits need --deadline")
   return _call("POST", "/api/chat-waits", {
     "description": description,
     "condition_owner": condition_owner,

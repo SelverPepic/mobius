@@ -2290,7 +2290,10 @@ def test_broken_typed_observation_never_becomes_success_or_endless_pending(clien
   monkeypatch.setattr(chat_waits_mod, '_run_check', check)
   asyncio.run(chat_waits_mod._check_one(row.id))
   db.expire_all()
-  assert db.get(models.ChatWait, row.id).status == 'failed'
+  row = db.get(models.ChatWait, row.id)
+  assert row.status == 'failed'
+  if exit_code:
+    assert 'timeout' in row.last_output
 
 
 def test_wait_route_accepts_typed_check_but_rejects_mixed_execution(client, owner_token, db):
