@@ -657,7 +657,6 @@ class StartTurn(_Command):
   default_provider: str = "claude"
   initiated_by_app_id: int | None = None
   browser_grant_id: str | None = None
-  browser_grant_epoch: int | None = None
   # The rendered recovery control names its exact interrupted physical run.
   resume_run_id: str | None = None
   restore_archived: bool = False
@@ -929,7 +928,6 @@ class AppendPending(_Command):
   question_id: str | None = None
   initiated_by_app_id: int | None = None
   browser_grant_id: str | None = None
-  browser_grant_epoch: int | None = None
   owner_input: bool = False
   front: bool = False
   require_answer_match: bool = False
@@ -2648,9 +2646,7 @@ class ChatWriterActor:
       or run.provider_execution_admitted is not False
     ):
       raise _PersistFailed("AdmitProviderExecution: run is not eligible")
-    _require_browser_grant(
-      db, run.browser_grant_id, run.browser_grant_epoch,
-    )
+    _require_browser_grant(db, run.browser_grant_id)
     if (run.continuation_json or {}).get("reason") == "compaction" and (
       chat.pending_messages or chat.pending_question_id
     ):
@@ -3479,17 +3475,13 @@ class ChatWriterActor:
         db.rollback()
         return StartTurnRecoveryChanged()
     grant_id = cmd.browser_grant_id
-    grant_epoch = cmd.browser_grant_epoch
     if resuming and prior is not None:
-      if grant_id is not None and (grant_id, grant_epoch) != (
-        prior.browser_grant_id, prior.browser_grant_epoch,
-      ):
+      if grant_id is not None and grant_id != prior.browser_grant_id:
         raise _PersistFailed("Browser grant cannot resume a foreign run")
       grant_id = prior.browser_grant_id
-      grant_epoch = prior.browser_grant_epoch
     elif grant_id is None:
-      grant_id, grant_epoch = _delegation_browser_lineage(db, cmd.chat_id)
-    _require_browser_grant(db, grant_id, grant_epoch)
+      grant_id = _delegation_browser_lineage(db, cmd.chat_id)
+    _require_browser_grant(db, grant_id)
     if not existing:
       chat.provider = cmd.default_provider or "claude"
     # Build the agent history as schemas.ChatMessage objects, exactly as the
@@ -3571,7 +3563,6 @@ class ChatWriterActor:
         prior.initiated_by_app_id if prior is not None else cmd.initiated_by_app_id
       ),
       browser_grant_id=grant_id,
-      browser_grant_epoch=grant_epoch,
       goal_objective=goal_objective,
       goal_id=goal_id,
       owner_input_at=started_at if cmd.owner_input else None,
@@ -3942,27 +3933,22 @@ class ChatWriterActor:
       superseded.status = "completed"
       superseded.ended_at = started_at
       superseded.restart_nonce = None
-      _require_browser_grant(
-        db, superseded.browser_grant_id, superseded.browser_grant_epoch,
-      )
+      _require_browser_grant(db, superseded.browser_grant_id)
     continuation_grant = (
-      (superseded.browser_grant_id, superseded.browser_grant_epoch)
+      superseded.browser_grant_id
       if superseded is not None else _root_browser_lineage(db, cmd.root_run_id)
     )
     # A readable card may be answered by a guest even when the interrupted
     # run belonged to the owner. The answerer's queued provenance wins for the
     # newly admitted physical run; never mint a clean owner bearer for it.
     if source.get("_browser_grant_id") is not None:
-      continuation_grant = (
-        source["_browser_grant_id"], source.get("_browser_grant_epoch"),
-      )
-      _require_browser_grant(db, *continuation_grant)
+      continuation_grant = source["_browser_grant_id"]
+      _require_browser_grant(db, continuation_grant)
     db.add(ChatRun(
       id=cmd.run_token,
       chat_id=cmd.chat_id,
       status="running",
-      browser_grant_id=continuation_grant[0],
-      browser_grant_epoch=continuation_grant[1],
+      browser_grant_id=continuation_grant,
       root_run_id=(
         cmd.root_run_id
         if continues_logical_root(agent_message)
@@ -4141,8 +4127,7 @@ class ChatWriterActor:
       chat_id=cmd.chat_id,
       status="running",
       root_run_id=cmd.root_run_id,
-      browser_grant_id=activity_grant[0],
-      browser_grant_epoch=activity_grant[1],
+      browser_grant_id=activity_grant,
       provider=provider,
       started_at=started_at,
       initiated_by_app_id=None,
@@ -4360,11 +4345,9 @@ class ChatWriterActor:
     new_msg = dict(cmd.user_msg)
     # Only the authenticated route may supply this provenance, never message data.
     new_msg.pop("_browser_grant_id", None)
-    new_msg.pop("_browser_grant_epoch", None)
-    _require_browser_grant(db, cmd.browser_grant_id, cmd.browser_grant_epoch)
+    _require_browser_grant(db, cmd.browser_grant_id)
     if cmd.browser_grant_id is not None:
       new_msg["_browser_grant_id"] = cmd.browser_grant_id
-      new_msg["_browser_grant_epoch"] = cmd.browser_grant_epoch
     new_msg.pop("_owner_input_at", None)
     if cmd.owner_input:
       new_msg["_owner_input_at"] = datetime.now(UTC).isoformat()
@@ -4908,14 +4891,10 @@ class ChatWriterActor:
         examined.append(row)
         continue
       grant_id = row.get("_browser_grant_id")
-      grant_epoch = row.get("_browser_grant_epoch")
       if grant_id is not None:
         try:
-          _require_browser_grant(db, grant_id, grant_epoch)
-        except Exception as exc:
-          from fastapi import HTTPException
-          if not isinstance(exc, (HTTPException, _PersistFailed)):
-            raise
+          _require_browser_grant(db, grant_id)
+        except _PersistFailed:
           row["delivery_status"] = "rejected"
           row["delivery_error"] = "browser_grant_unavailable"
           rejected_changed = True
@@ -4947,15 +4926,11 @@ class ChatWriterActor:
       product_result_run_token,
     )
     head_group = pending_message_group_key(pending[0])
-    head_grant = (
-      pending[0].get("_browser_grant_id"),
-      pending[0].get("_browser_grant_epoch"),
-    )
+    head_grant = pending[0].get("_browser_grant_id")
     promote_count = 0
     for msg in pending:
-      if (pending_message_group_key(msg) != head_group or (
-        msg.get("_browser_grant_id"), msg.get("_browser_grant_epoch")
-      ) != head_grant):
+      if (pending_message_group_key(msg) != head_group
+          or msg.get("_browser_grant_id") != head_grant):
         break
       promote_count += 1
     promoted_group = pending[:promote_count]
@@ -4964,8 +4939,9 @@ class ChatWriterActor:
     consumed_cids = agent_pending.pop("_consumed_cids", [])
     initiated_by_app_id = agent_pending.pop("_initiated_by_app_id", None)
     grant_id = agent_pending.pop("_browser_grant_id", None)
-    grant_epoch = agent_pending.pop("_browser_grant_epoch", None)
-    _require_browser_grant(db, grant_id, grant_epoch)
+    # Rows queued before the grant epoch retired still carry it; drop it.
+    agent_pending.pop("_browser_grant_epoch", None)
+    _require_browser_grant(db, grant_id)
     agent_pending.pop("_owner_authored", None)
     owner_inputs = [
       row["_owner_input_at"] for row in promoted_group if row.get("_owner_input_at")
@@ -5075,8 +5051,7 @@ class ChatWriterActor:
       )
     )
     if root_run_id != durable_run_token and grant_id is None:
-      root_grant_id, root_grant_epoch = _root_browser_lineage(db, root_run_id)
-      grant_id, grant_epoch = root_grant_id, root_grant_epoch
+      grant_id = _root_browser_lineage(db, root_run_id)
     self._close_nonterminal_runs(
       db, cmd.chat_id, cmd.ending_status, except_token=durable_run_token
     )
@@ -5087,7 +5062,6 @@ class ChatWriterActor:
       provider=chat.provider, started_at=started_at,
       initiated_by_app_id=initiated_by_app_id,
       browser_grant_id=grant_id,
-      browser_grant_epoch=grant_epoch,
       owner_input_at=owner_input_at,
       goal_objective=goal_objective,
       goal_id=goal_id,
@@ -5114,10 +5088,9 @@ class ChatWriterActor:
     prior = self._owned_live_run(db, chat.id, cmd.ending_run_token)
     if prior is None or prior.provider_execution_admitted is not True:
       return None
-    from fastapi import HTTPException
     try:
-      _require_browser_grant(db, prior.browser_grant_id, prior.browser_grant_epoch)
-    except (HTTPException, _PersistFailed):
+      _require_browser_grant(db, prior.browser_grant_id)
+    except _PersistFailed:
       return None
     from app.delegations import delegation_recovery_allowed
     if not delegation_recovery_allowed(
@@ -5213,7 +5186,6 @@ class ChatWriterActor:
       goal_id=goal.id if goal else None, goal_objective=goal.objective if goal else None,
       initiated_by_app_id=prior.initiated_by_app_id,
       browser_grant_id=prior.browser_grant_id,
-      browser_grant_epoch=prior.browser_grant_epoch,
       continuation_json=continuation_control_envelope(
         reason="goal_settlement", control_id=token, source_work_id=prior.id,
         goal_id=goal.id if goal else None, supersedes_run_token=prior.id,
@@ -6503,37 +6475,36 @@ def _stamp_provider_batch(messages: list[dict]) -> None:
     }
 
 
-def _require_browser_grant(db, grant_id: str | None, epoch: int | None) -> None:
+def _require_browser_grant(db, grant_id: str | None) -> None:
   """Fail closed before admitting work carrying a browser initiator."""
-  if grant_id is None and epoch is None:
+  if grant_id is None:
     return
-  if not grant_id or epoch is None:
-    raise _PersistFailed("Incomplete browser grant lineage")
-  from app.browser_access import validate_grant
-  owner_id = db.query(models.Owner.id).scalar()
-  if owner_id is None or not validate_grant(db, grant_id, epoch, owner_id):
+  from app.browser_access import BrowserLineage, is_live
+  try:
+    browser = BrowserLineage(grant_id)
+  except ValueError as exc:
+    raise _PersistFailed("Invalid browser grant lineage") from exc
+  if not is_live(db, browser, db.query(models.Owner.id).scalar()):
     raise _PersistFailed("Browser grant is no longer active")
 
 
-def _root_browser_lineage(db, root_run_id: str) -> tuple[str | None, int | None]:
+def _root_browser_lineage(db, root_run_id: str) -> str | None:
   run = db.get(models.ChatRun, root_run_id)
   if run is None:
     raise _PersistFailed("Continuation root is unavailable")
-  lineage = run.browser_grant_id, run.browser_grant_epoch
-  _require_browser_grant(db, *lineage)
-  return lineage
+  _require_browser_grant(db, run.browser_grant_id)
+  return run.browser_grant_id
 
 
-def _delegation_browser_lineage(db, child_chat_id: str) -> tuple[str | None, int | None]:
+def _delegation_browser_lineage(db, child_chat_id: str) -> str | None:
   row = db.query(models.Delegation).filter(
     models.Delegation.child_chat_id == child_chat_id,
     models.Delegation.cancelled_at.is_(None),
   ).first()
   if row is None:
-    return None, None
-  lineage = row.browser_grant_id, row.browser_grant_epoch
-  _require_browser_grant(db, *lineage)
-  return lineage
+    return None
+  _require_browser_grant(db, row.browser_grant_id)
+  return row.browser_grant_id
 
 
 def _commit_or_rollback(db) -> bool:

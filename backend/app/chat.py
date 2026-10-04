@@ -5654,14 +5654,9 @@ async def _run_chat_impl_with_db(
   run_lineage = db.get(models.ChatRun, run_token) if run_token else None
   if run_lineage is None:
     raise RuntimeError("Provider admission has no durable run lineage")
-  if run_lineage.browser_grant_id is not None:
-    from app.browser_access import validate_grant
-    validate_grant(
-      db, run_lineage.browser_grant_id, run_lineage.browser_grant_epoch,
-      owner.id,
-    )
-  elif run_lineage.browser_grant_epoch is not None:
-    raise RuntimeError("Incomplete browser grant lineage")
+  from app.browser_access import BrowserLineage, require_live
+  run_browser = BrowserLineage.of(run_lineage.browser_grant_id)
+  require_live(db, run_browser, owner.id)
 
   if run_policy is not None:
     from app.delegations import delegation_execution_token
@@ -5674,8 +5669,7 @@ async def _run_chat_impl_with_db(
       owner.username,
       owner.token_epoch,
       run_id=run_token,
-      browser_grant_id=run_lineage.browser_grant_id,
-      browser_grant_epoch=run_lineage.browser_grant_epoch,
+      browser=run_browser,
     )
 
   # Build the base environment shared by all providers.
@@ -5875,7 +5869,6 @@ async def _run_chat_impl_with_db(
       db, include_owner_connectors=include_owner_connectors,
       owner_id=owner.id, owner_epoch=owner.token_epoch,
       browser_grant_id=run_lineage.browser_grant_id,
-      browser_grant_epoch=run_lineage.browser_grant_epoch,
     )
   except Exception:
     log.warning(

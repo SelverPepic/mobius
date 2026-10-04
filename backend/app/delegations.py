@@ -23,6 +23,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased, load_only
 
 from app import auth, models
+from app.browser_access import BrowserLineage, require_live
 from app.timeutil import now_naive_utc
 from app.usage_metrics import summarize_chat_run_tokens
 
@@ -112,7 +113,6 @@ class DelegationIntent:
   # name never re-files the helper.
   goal_task_id: str | None = None
   browser_grant_id: str | None = None
-  browser_grant_epoch: int | None = None
 
 
 def same_delegation_intent(
@@ -152,9 +152,7 @@ def _attach_existing_delegation(
     raise ValueError(
       "task key is already attached to different immutable work"
     )
-  if intent.browser_grant_id is not None and (
-    row.browser_grant_id, row.browser_grant_epoch
-  ) != (intent.browser_grant_id, intent.browser_grant_epoch):
+  if intent.browser_grant_id is not None and row.browser_grant_id != intent.browser_grant_id:
     raise ValueError("task key belongs to different browser authority")
   # Notification is an observation owner, not task identity. Reattachment
   # must not add a second observer: the submit route may transfer an
@@ -194,16 +192,11 @@ def create_or_attach_delegation(
       ),
     ).order_by(models.ChatRun.started_at.desc()).first()
   grant_id = intent.browser_grant_id or (spawning_run.browser_grant_id if spawning_run else None)
-  grant_epoch = (intent.browser_grant_epoch if intent.browser_grant_id is not None
-                 else spawning_run.browser_grant_epoch if spawning_run else None)
   if grant_id is not None:
-    from app.browser_access import validate_grant
-    owner_id = db.query(models.Owner.id).scalar()
-    validate_grant(db, grant_id, grant_epoch, owner_id)
+    require_live(db, BrowserLineage(grant_id), db.query(models.Owner.id).scalar())
   # Attachment must carry the same authority as the existing child. The
   # authenticated guest wins over an owner-authored parent physical run.
-  resolved_intent = replace(intent, browser_grant_id=grant_id,
-                            browser_grant_epoch=grant_epoch)
+  resolved_intent = replace(intent, browser_grant_id=grant_id)
   row = db.query(models.Delegation).filter(
     models.Delegation.parent_root_run_id == intent.parent_root_run_id,
     models.Delegation.task_key == intent.task_key,
@@ -217,7 +210,6 @@ def create_or_attach_delegation(
     parent_chat_id=intent.parent_chat_id,
     parent_root_run_id=intent.parent_root_run_id,
     browser_grant_id=grant_id,
-    browser_grant_epoch=grant_epoch,
     task_key=intent.task_key,
     goal_task_id=intent.goal_task_id,
     child_chat_id=child_id,
@@ -1226,15 +1218,10 @@ def delegation_execution_token(
     raise RuntimeError("Delegation has no durable run lineage")
   if run.chat_id != row.child_chat_id:
     raise RuntimeError("Delegation run does not belong to its child chat")
-  if (run.browser_grant_id, run.browser_grant_epoch) != (
-    row.browser_grant_id, row.browser_grant_epoch,
-  ):
+  if run.browser_grant_id != row.browser_grant_id:
     raise RuntimeError("Delegation run browser lineage does not match")
-  if run.browser_grant_id is not None:
-    from app.browser_access import validate_grant
-    validate_grant(db, run.browser_grant_id, run.browser_grant_epoch, owner.id)
-  elif run.browser_grant_epoch is not None:
-    raise RuntimeError("Incomplete browser grant lineage")
+  browser = BrowserLineage.of(run.browser_grant_id)
+  require_live(db, browser, owner.id)
   return auth.create_agent_token(
     row.child_chat_id,
     owner.username,
@@ -1243,8 +1230,7 @@ def delegation_execution_token(
     expires_delta=auth.AGENT_RUN_TOKEN_TTL,
     delegation_id=policy.delegation_id,
     delegation_chat=row.child_chat_id,
-    browser_grant_id=run.browser_grant_id,
-    browser_grant_epoch=run.browser_grant_epoch,
+    browser=browser,
   )
 
 

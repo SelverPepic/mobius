@@ -68,6 +68,7 @@ from app.response_policy import (
   static_embed_csp,
 )
 from app.storage_io import ParentIsFile, atomic_write
+from app.account_browser_access import SharedAccessError
 from app import activity, models
 # providers and push are on the agent's write surface; deferred into
 # lifespan with try/except so a SyntaxError in either doesn't prevent
@@ -392,6 +393,14 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 @app.exception_handler(IntegerOutOfRange)
 async def _integer_out_of_range_handler(_request: Request, exc: IntegerOutOfRange):
   return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+
+@app.exception_handler(SharedAccessError)
+async def _shared_access_error_handler(_request: Request, exc: SharedAccessError):
+  # Shared-access failures the Connect app branches on carry a stable code.
+  return JSONResponse(
+    status_code=exc.status_code, content={"detail": exc.detail, "code": exc.code},
+  )
 
 
 @app.exception_handler(ParentIsFile)

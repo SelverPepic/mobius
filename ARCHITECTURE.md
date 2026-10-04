@@ -1861,23 +1861,31 @@ configured HTTPS origin.
 cookie exchange. A 15-minute bearer stays in memory; the renewal credential is
 HttpOnly/Secure/SameSite=Strict and path-confined to the session routes. Accepting
 a new invitation atomically retires the previous session presented by its cookie.
-Cookie exchanges use an origin-scoped Web Lock across live tabs; browsers without
-that capability fail visibly before sending an exchange. A tab dying mid-request
-can still interrupt cookie ordering; server-side grant validation remains the
-authority boundary. If cleanup of a superseded redemption fails, its cookie may
-remain restorable; the page must not imply server sign-out succeeded. Independent
-browsers may hold separate sessions.
+Only a sign-in (invite redemption or account finalization) writes that cookie,
+with a long fixed lifetime; renewal returns a bearer and never rewrites it, so a
+late renewal response cannot overwrite a newer sign-in. The server-side idle
+expiry is the authority. When two tabs sign this browser in, the last one wins
+and the other tab notices at its next renewal. Independent browsers may hold
+separate sessions.
 This never replaces the installation owner's login. `/shell/shared` owns an
 independent query cache and grant/tab-scoped navigation and drafts. Leaving ends
 that browser session, while revoking the recipient ends all their sessions.
 
-Every bearer descendant retains `browser_grant` and its epoch. Browser-derived
-app, embedded-chat and media tokens also retain the originating session. The
-central resolver checks the live grant/session rather than trusting JWT expiry.
+Every bearer descendant retains one `BrowserLineage`: the `browser_grant`, and
+for browser-derived app, embedded-chat and media tokens also the originating
+session. `browser_access.is_live` is the single rule every resolver, stream,
+writer admission, delegation, app service and Connect replay uses; it checks the
+live grant/session rather than trusting JWT expiry. Revocation is terminal
+(nothing clears `revoked_at`), so the grant id alone is sufficient lineage.
 Guest-started agent runs and child delegations retain durable grant lineage;
 renewing or resuming work cannot manufacture installation-owner authority.
 Turn-issued MCP broker capabilities also carry owner/grant lineage; upload and
-response streams stop forwarding after their authority is revoked. Bytes already
+response streams stop forwarding after their authority is revoked. Guest event
+streams and broker exchanges share `access_signal.until_revoked`: committed
+writes to access tables advance one in-process revision, and an open stream
+rechecks liveness in a worker thread only when it moves (or after a 30-second
+safety interval for out-of-process writes), so idle streams close on revocation
+and busy ones cost no query per event. Bytes already
 forwarded to a remote service cannot be recalled.
 Installation identity, credential, access administration and lifecycle controls
 remain separately gated; ordinary readable owner-input cards retain their
@@ -1906,15 +1914,17 @@ revocation or account replacement racing registration cannot activate it.
 The callback verifies issuer, audience, subject, origin, grant, nonce and proof
 expiry, then redirects with a non-secret pending ID. It never writes the refresh
 cookie: a cross-site callback cannot receive the old SameSite=Strict cookie.
-The shared shell removes the marker and finalizes with a same-origin POST under
-the existing cookie Web Lock. That transaction consumes the browser-bound proof,
+The shared shell removes the marker and finalizes with a same-origin POST. That
+transaction consumes the browser-bound proof,
 rechecks local permission, and retires the previous browser session. Failed proof
 validation leaves that prior session unchanged. Verified proof admission expires
 within 60 seconds; old pending rows are pruned on subsequent starts.
 
 Local validation pins the issuer, runtime origin and grantor credential generation
 (or managed instance ID and owner subject). Changing those bindings invalidates
-existing account-derived sessions and credentials. Unlink commits revocation of
+existing account-derived sessions and credentials; Connect lists such grants as
+`inactive`, and inviting the same handle again replaces them. One live grant
+exists per handle. Revoke and unlink share `browser_access.end_grant`. Unlink commits revocation of
 all account grants before attempting descendant stops and issuer cleanup; partial
 cleanup retains the link for an explicit retry. Legacy invitation grants are not
 revoked by account unlink. Issuer-side link loss blocks discovery and new proofs;
