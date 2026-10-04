@@ -456,11 +456,7 @@ def _tools_list_result() -> dict[str, Any]:
   return {
     "tools": [
       *(
-        {**_TOOL_DEFINITIONS[name], "_meta": {
-          **ALWAYS_LOAD_META,
-          **({"mobius/resultIndependent": True}
-             if name == CHECKPOINT_CHAT_TOOL else {}),
-        }}
+        {**_TOOL_DEFINITIONS[name], "_meta": ALWAYS_LOAD_META}
         for name in _available_tool_names()
       ),
       *_app_tool_listings(),
@@ -1338,7 +1334,7 @@ _TOOL_DEFINITIONS = {
   REQUEST_QUESTION_TOOL: {
     "name": REQUEST_QUESTION_TOOL,
     "description": (
-      "Ask 1–3 ordinary clarifying questions. "
+      "Ask 1–10 ordinary clarifying questions; prefer a small batch when enough. "
       "Only the question text is required; card-only ids, headings, and an "
       "empty options list are supplied when omitted. "
       "The saved card blocks further work until the owner answers or Stops; "
@@ -1355,7 +1351,7 @@ _TOOL_DEFINITIONS = {
       "type": "object", "additionalProperties": False,
       "required": ["questions"],
       "properties": {"questions": {
-        "type": "array", "minItems": 1, "maxItems": 3,
+        "type": "array", "minItems": 1, "maxItems": 10,
         "items": {
           "type": "object", "additionalProperties": False,
           "required": ["question"],
@@ -1409,8 +1405,10 @@ _TOOL_DEFINITIONS = {
     "name": NOTIFY_OWNER_TOOL,
     "description": (
       "Send the owner a push notification for a meaningful event: a finished "
-      "long task, an error or question that needs them, or when they asked to "
-      "be told. Not for routine confirmations. target defaults to this chat's "
+      "long task, an error that needs them outside a card, or when they asked "
+      "to be told. Not for routine confirmations, and not for a saved "
+      "question, approval, restart or secure-input card: the card sends its "
+      "own notification. target defaults to this chat's "
       "in-app link; use /shell/?app=ID for an app. tag groups pushes about one "
       "thing so a newer one replaces the older. The push is skipped while the "
       "owner is viewing this chat. Never fire one from a script under test."
