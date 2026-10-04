@@ -6126,7 +6126,7 @@ _SCHEMA_MIGRATIONS = (
   # Window-based, so it needs no journal. A new ID (not an edited 0082) so
   # databases that ran an earlier, journal-based draft also run this once.
   ("0083_retire_quiet_write_sessions", _retire_quiet_write_sessions),
-  ("0083_chat_media_directory", _move_chat_media_out_of_generated),
+  ("0084_chat_media_directory", _move_chat_media_out_of_generated),
 )
 
 

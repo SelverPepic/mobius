@@ -1790,7 +1790,7 @@ def test_run_migrations_records_an_inspectable_append_only_history(tmp_path):
     "0082_run_owner_input_at",
     "0082_drop_agent_write_journal",
     "0083_retire_quiet_write_sessions",
-    "0083_chat_media_directory",
+    "0084_chat_media_directory",
   ]
   assert second == first
 

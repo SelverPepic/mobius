@@ -179,7 +179,7 @@ def test_collision_does_not_block_database_startup(tmp_path, monkeypatch):
   models.Base.metadata.create_all(eng)
   migrations._ensure_migration_ledger(eng)
   for version, _migration in migrations._SCHEMA_MIGRATIONS:
-    if version != "0083_chat_media_directory":
+    if version != "0084_chat_media_directory":
       migrations._record_migration(eng, version)
   with Session(eng) as session:
     colliding = _legacy_chat(session, data_dir, b"old", media=b"different")
@@ -187,7 +187,7 @@ def test_collision_does_not_block_database_startup(tmp_path, monkeypatch):
 
   migrations.run_migrations(eng)
 
-  assert "0083_chat_media_directory" in {
+  assert "0084_chat_media_directory" in {
     row["version"] for row in migrations.schema_migration_history(eng)
   }
   with Session(eng) as session:
@@ -203,14 +203,14 @@ def test_collision_does_not_block_database_startup(tmp_path, monkeypatch):
 def test_unreadable_legacy_file_does_not_block_database_startup(
   tmp_path, monkeypatch, caplog,
 ):
-  """A file error leaves that chat as-is; the others move and 0083 records."""
+  """A file error leaves that chat as-is; the others move and 0084 records."""
   data_dir = tmp_path / "data"
   monkeypatch.setenv("DATA_DIR", str(data_dir))
   eng = create_engine(f"sqlite:///{tmp_path / 'boot.db'}")
   models.Base.metadata.create_all(eng)
   migrations._ensure_migration_ledger(eng)
   for version, _migration in migrations._SCHEMA_MIGRATIONS:
-    if version != "0083_chat_media_directory":
+    if version != "0084_chat_media_directory":
       migrations._record_migration(eng, version)
   with Session(eng) as session:
     unreadable = _legacy_chat(session, data_dir, b"locked", media=None)
@@ -227,7 +227,7 @@ def test_unreadable_legacy_file_does_not_block_database_startup(
   with caplog.at_level("WARNING", logger="app.schema_migrations"):
     migrations.run_migrations(eng)
 
-  assert "0083_chat_media_directory" in {
+  assert "0084_chat_media_directory" in {
     row["version"] for row in migrations.schema_migration_history(eng)
   }
   with Session(eng) as session:
@@ -260,7 +260,7 @@ def test_unenterable_chat_folder_does_not_block_database_startup(
   models.Base.metadata.create_all(eng)
   migrations._ensure_migration_ledger(eng)
   for version, _migration in migrations._SCHEMA_MIGRATIONS:
-    if version != "0083_chat_media_directory":
+    if version != "0084_chat_media_directory":
       migrations._record_migration(eng, version)
   with Session(eng) as session:
     locked = _legacy_chat(session, data_dir, b"locked", media=None)
@@ -273,7 +273,7 @@ def test_unenterable_chat_folder_does_not_block_database_startup(
   finally:
     locked_root.chmod(0o755)
 
-  assert "0083_chat_media_directory" in {
+  assert "0084_chat_media_directory" in {
     row["version"] for row in migrations.schema_migration_history(eng)
   }
   with Session(eng) as session:
@@ -357,7 +357,7 @@ def test_upgrade_runs_the_move_once_and_later_boots_skip_the_scan(
   models.Base.metadata.create_all(eng)
   migrations._ensure_migration_ledger(eng)
   for version, _migration in migrations._SCHEMA_MIGRATIONS:
-    if version != "0083_chat_media_directory":
+    if version != "0084_chat_media_directory":
       migrations._record_migration(eng, version)
 
   chat_id = str(uuid.uuid4())
@@ -382,7 +382,7 @@ def test_upgrade_runs_the_move_once_and_later_boots_skip_the_scan(
   assert stored_content() == f"/api/chats/{chat_id}/media/old.png"
   assert (data_dir / "chats" / chat_id / "media" / "old.png").exists()
   assert not old_dir.exists()
-  assert "0083_chat_media_directory" in {
+  assert "0084_chat_media_directory" in {
     row["version"] for row in migrations.schema_migration_history(eng)
   }
 
