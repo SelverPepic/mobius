@@ -20,7 +20,7 @@
  */
 import { test, expect } from '@playwright/test'
 import { createTaggedChat, attachCleanup } from './_chatTracker.mjs'
-import { mockAcceptedMessages } from './_mockAcceptedMessages.mjs'
+import { mockAcceptedMessages, releaseMockRoutesAfterEach } from './_mockAcceptedMessages.mjs'
 import * as paneModel from '../frontend/src/components/Shell/paneModel.js'
 import { DRAG_HOLD_HAPTIC_MS, PRESS_MENU_HOLD_MS } from '../frontend/src/components/Shell/dragController.js'
 import { settledBox } from './_geometry.mjs'
@@ -34,6 +34,7 @@ const PHONE = { width: 412, height: 760 }
 
 test.use({ serviceWorkers: 'block' })
 attachCleanup()
+releaseMockRoutesAfterEach()
 
 function builderSeed(tabs) {
   return paneModel.setViewMode(paneModel.seedFromFlatTabs(tabs), 'panes')
