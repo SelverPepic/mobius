@@ -176,7 +176,6 @@ def declare_wait(
     raise WaitValidationError("condition_owner must not exceed 160 characters")
   if kind not in ("command", "timer", "github_checks"):
     raise WaitValidationError("kind must be 'command', 'timer', or 'github_checks'")
-  details = None
   if kind == "github_checks":
     if command or delay_secs is not None:
       raise WaitValidationError("GitHub checks cannot also specify a command or timer")
@@ -184,7 +183,6 @@ def declare_wait(
       spec = GitHubChecks.model_validate(github_checks)
     except ValueError as exc:
       raise WaitValidationError("github_checks needs repository, pull_request, and head_sha") from exc
-    details = {"github_checks": spec.model_dump()}
     condition_owner = condition_owner or "GitHub"
     command = spec.command()
   elif github_checks is not None:
@@ -260,7 +258,6 @@ def declare_wait(
     ),
     kind=kind,
     command=command,
-    condition_json=details,
     due_at=due_at,
     interval_secs=interval,
     deadline_at=deadline_at,
@@ -365,13 +362,6 @@ def wait_resume_blocker(db: Session, row: models.ChatWait) -> str | None:
   return None
 
 
-def _latest_observation(row: models.ChatWait) -> dict | None:
-  """The typed checker's bounded progress; custom command output stays private."""
-  if row.kind != "github_checks" or not row.checks_count:
-    return None
-  return read_check_observation(0, row.last_output).model_dump()
-
-
 def serialize_wait(row: models.ChatWait, *, db: Session) -> dict:
   # Platform activation has no product deadline. Its non-null storage value is
   # retained only for compatibility with the original shared ChatWait schema.
@@ -383,7 +373,6 @@ def serialize_wait(row: models.ChatWait, *, db: Session) -> dict:
     "condition_owner": row.condition_owner,
     "kind": row.kind,
     "command": row.command,
-    "latest_result": _latest_observation(row),
     "status": row.status,
     "delivery_pending": row.status in _OUTCOMES and row.resume_delivered_at is None,
     "resume_delivered_at": (

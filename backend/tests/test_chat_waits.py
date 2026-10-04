@@ -2257,18 +2257,6 @@ def test_wait_resume_existence_gate_does_not_load_chat_payloads(
   assert db.get(models.ChatWait, wait_id).status == ("cancelled" if deleted else "met")
 
 
-def test_custom_command_output_is_never_reported_as_progress(client, owner_token, db):
-  chat_id = _owner_chat(client, owner_token)
-  row = _command_wait(db, chat_id=chat_id, description='Website ready', command='test -f ready')
-  row.last_output = 'do not expose arbitrary command output'
-  row.last_exit_code = 1
-  row.checks_count = 2
-  db.commit()
-  view = chat_waits_mod.serialize_wait(row, db=db)
-  assert view['latest_result'] is None
-  assert 'do not expose' not in str(view)
-
-
 @pytest.mark.parametrize('state,total,completed,expected', [
   ('pending', 4, 3, 'armed'), ('pending', 0, 0, 'armed'), ('met', 4, 4, 'met'), ('failed', 0, 0, 'failed'),
 ])
@@ -2289,8 +2277,6 @@ def test_typed_check_observations_keep_progress_separate_from_monitor_failure(
   db.expire_all()
   row = db.get(models.ChatWait, row.id)
   assert row.status == expected
-  view = chat_waits_mod.serialize_wait(row, db=db)
-  assert view['latest_result'] == payload
   assert 'Observed check progress' in chat_waits_mod._compose_resume_notice(row, 'met')
 
 
@@ -2319,7 +2305,6 @@ def test_wait_route_accepts_typed_check_but_rejects_mixed_execution(client, owne
   response = client.post('/api/chat-waits', json=payload, headers=auth)
   assert response.status_code == 200, response.text
   assert response.json()['kind'] == 'github_checks'
-  assert response.json()['latest_result'] is None
   assert response.json()['condition_owner'] == 'GitHub'
   for extra in ({'command': 'true'}, {'delay_secs': 60}, {'deadline_secs': None},
                 {'github_checks': {'repository': 'owner/repo', 'pull_request': 7}}):

@@ -44,15 +44,13 @@ def api(path, deadline):
         raise CheckError("GitHub returned an unreadable check response; try again later.") from exc
 
 
-def object_page(path, key, deadline, first=None):
+def object_page(path, key, deadline):
     """Paginate count-bearing GitHub check collections, rejecting partial evidence."""
     items = []
     expected = None
     page = 1
     while True:
-        data = first if page == 1 and first is not None else api(
-            f"{path}{'&' if '?' in path else '?'}per_page=100&page={page}", deadline
-        )
+        data = api(f"{path}?per_page=100&page={page}", deadline)
         if not isinstance(data, dict) or type(data.get("total_count")) is not int or data["total_count"] < 0 or not isinstance(data.get(key), list):
             raise CheckError("GitHub returned incomplete check data; try again later.")
         if expected is None:
@@ -73,28 +71,14 @@ def object_page(path, key, deadline, first=None):
 
 
 def list_runs(repo, head, deadline):
-    suites_path = f"repos/{repo}/commits/{head}/check-suites"
-    first = api(f"{suites_path}?per_page=100&page=1", deadline)
-    # Validate even when the ordinary ref endpoint suffices; incomplete suite
-    # evidence cannot establish that the ref endpoint is below GitHub's cap.
-    if (not isinstance(first, dict) or type(first.get("total_count")) is not int
-            or first["total_count"] < 0 or not isinstance(first.get("check_suites"), list)
-            or len(first["check_suites"]) != min(PAGE_SIZE, first["total_count"])
-            or not all(isinstance(suite, dict) for suite in first["check_suites"])):
+    suites = api(f"repos/{repo}/commits/{head}/check-suites?per_page=1", deadline)
+    if not isinstance(suites, dict) or type(suites.get("total_count")) is not int or suites["total_count"] < 0:
         raise CheckError("GitHub returned incomplete check suites; try again later.")
-    if first["total_count"] < 1000:
-        # GitHub's default filter=latest ignores historical reruns.
-        return object_page(f"repos/{repo}/commits/{head}/check-runs", "check_runs", deadline)
-    # The commit-ref endpoint can truncate when a SHA has >1,000 suites.
-    # Enumerate every suite, then its latest check runs instead.
-    suites = object_page(suites_path, "check_suites", deadline, first=first)
-    all_runs = []
-    for suite in suites:
-        suite_id = suite.get("id")
-        if type(suite_id) is not int or suite_id <= 0 or suite.get("head_sha") != head:
-            raise CheckError("GitHub returned inconsistent check suites; try again later.")
-        all_runs.extend(object_page(f"repos/{repo}/check-suites/{suite_id}/check-runs", "check_runs", deadline))
-    return all_runs
+    # GitHub limits the commit-ref endpoint to the 1,000 newest suites.
+    if suites["total_count"] >= 1000:
+        raise CheckError("This commit has too many check suites to observe completely.")
+    # GitHub's default filter=latest ignores historical reruns.
+    return object_page(f"repos/{repo}/commits/{head}/check-runs", "check_runs", deadline)
 
 
 def list_statuses(repo, head, deadline):
@@ -154,17 +138,14 @@ def observe(repo, pr, expected_sha):
     if total == 0:
         return result("pending", "No checks have appeared for this commit yet.", 0, 0)
     if completed < total:
-        return result("pending", f"{completed} of {total} checks have finished; waiting for the rest.", completed, total, failed)
+        return result("pending", f"{completed} of {total} checks have finished; waiting for the rest.", completed, total)
     if failed:
-        return result("met", f"All {total} checks finished; {failed} reported failure.", completed, total, failed)
-    return result("met", f"All {total} checks finished.", completed, total, 0)
+        return result("met", f"All {total} checks finished; {failed} reported failure.", completed, total)
+    return result("met", f"All {total} checks finished.", completed, total)
 
 
-def result(state, summary, completed, total, failed_count=None):
-    value = {"state": state, "summary": summary, "completed": completed, "total": total}
-    if failed_count is not None:
-        value["failed_count"] = failed_count
-    return value
+def result(state, summary, completed, total):
+    return {"state": state, "summary": summary, "completed": completed, "total": total}
 
 
 def main():

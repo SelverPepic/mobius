@@ -66,16 +66,18 @@ def declare_wait(
   github_checks: dict | None = None,
 ) -> dict:
   """Arm one bounded wait through the chat-bound platform API."""
+  # Empty values are absent, as the route and core treat them.
+  command, delay_secs, github_checks = command or None, delay_secs or None, github_checks or None
   if sum(value is not None for value in (command, delay_secs, github_checks)) != 1:
     raise SystemExit("declare needs exactly one of command, delay_secs, or github_checks")
   if command and not (condition_owner or "").strip():
     raise SystemExit("command waits need --owner")
-  if (command or github_checks is not None) and deadline_secs is None:
+  if (command or github_checks) and deadline_secs is None:
     raise SystemExit("command waits need --deadline")
   return _call("POST", "/api/chat-waits", {
     "description": description,
     "condition_owner": condition_owner,
-    "kind": "github_checks" if github_checks is not None else "command" if command else "timer",
+    "kind": "github_checks" if github_checks else "command" if command else "timer",
     "github_checks": github_checks,
     "command": command,
     "delay_secs": delay_secs,

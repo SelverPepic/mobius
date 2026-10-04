@@ -45,7 +45,7 @@ else:
 
 def base(runs, statuses=None):
     replies = {f"repos/owner/repo/pulls/7": {"head": {"sha": SHA}}}
-    replies[f"repos/owner/repo/commits/{SHA}/check-suites?per_page=100&page=1"] = {
+    replies[f"repos/owner/repo/commits/{SHA}/check-suites?per_page=1"] = {
         "total_count": 1 if runs else 0,
         "check_suites": [{"id": 1, "head_sha": SHA}] if runs else [],
     }
@@ -61,7 +61,7 @@ def test_later_page_pending_and_shell_silent(tmp_path):
     replies = base(runs)
     process, value = fixture_run(tmp_path, replies)
     assert process.returncode == 0
-    assert value == {"state": "pending", "summary": "149 of 150 checks have finished; waiting for the rest.", "completed": 149, "total": 150, "failed_count": 0}
+    assert value == {"state": "pending", "summary": "149 of 150 checks have finished; waiting for the rest.", "completed": 149, "total": 150}
     shell = fixture_run(tmp_path, replies, shell=True)
     assert (shell.returncode, shell.stdout, shell.stderr) == (1, "", "")
 
@@ -70,7 +70,7 @@ def test_failed_checks_are_terminal_not_broken(tmp_path):
     replies = base([run_item(1, conclusion="failure"), run_item(2)], [{"context": "legacy", "state": "error"}])
     process, value = fixture_run(tmp_path, replies)
     assert process.returncode == 0
-    assert (value["state"], value["completed"], value["total"], value["failed_count"]) == ("met", 3, 3, 2)
+    assert value == {"state": "met", "summary": "All 3 checks finished; 2 reported failure.", "completed": 3, "total": 3}
     assert "2 reported failure" in value["summary"]
     assert fixture_run(tmp_path, replies, shell=True).returncode == 0
 
@@ -93,29 +93,12 @@ def test_1000_runs_in_one_suite_still_use_paginated_ref_endpoint(tmp_path):
     assert (value["state"], value["completed"], value["total"]) == ("pending", 999, 1000)
 
 
-def test_more_than_1000_suites_fall_back_and_reuse_first_page(monkeypatch):
-    spec = importlib.util.spec_from_file_location("pr_checks", SCRIPTS / "pr-checks.py")
-    checker = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(checker)
-    suites = [{"id": i + 1, "head_sha": SHA} for i in range(1001)]
-    calls = []
-
-    def fake_api(path, deadline):
-        calls.append(path)
-        assert "filter=all" not in path
-        if "/check-suites?" in path:
-            page = int(path.rsplit("page=", 1)[1])
-            return {"total_count": len(suites), "check_suites": suites[(page - 1) * 100:page * 100]}
-        if "/check-suites/" in path:
-            suite_id = int(path.split("/check-suites/", 1)[1].split("/", 1)[0])
-            status = "queued" if suite_id == 1001 else "completed"
-            return {"total_count": 1, "check_runs": [run_item(suite_id, status=status)]}
-        pytest.fail(f"unexpected ref check-run call: {path}")
-
-    monkeypatch.setattr(checker, "api", fake_api)
-    runs = checker.list_runs("owner/repo", SHA, 9999999999)
-    assert len(runs) == 1001 and runs[-1]["status"] == "queued"
-    assert calls.count(f"repos/owner/repo/commits/{SHA}/check-suites?per_page=100&page=1") == 1
+def test_more_than_1000_suites_fail_clearly_instead_of_reading_truncated_runs(tmp_path):
+    replies = base([run_item(1)])
+    replies[f"repos/owner/repo/commits/{SHA}/check-suites?per_page=1"] = {"total_count": 1001, "check_suites": [{"id": 1}]}
+    del replies[f"repos/owner/repo/commits/{SHA}/check-runs?per_page=100&page=1"]
+    _, value = fixture_run(tmp_path, replies)
+    assert value["state"] == "failed" and "too many check suites" in value["summary"]
 
 
 def test_replaced_head_is_diagnostic(tmp_path):
