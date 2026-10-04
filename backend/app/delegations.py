@@ -20,7 +20,7 @@ import uuid
 
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, aliased
+from sqlalchemy.orm import Session, aliased, load_only
 
 from app import auth, models
 from app.timeutil import now_naive_utc
@@ -626,6 +626,39 @@ def derived_status(
     if load_result else None
   )
   result = _assistant_result(chat) if chat is not None else ""
+  return _project_delegation_status(row, run, result)
+
+
+def delegation_statuses(
+  db: Session, rows: list[models.Delegation],
+) -> dict[str, str]:
+  """Project a helper collection with one read, without child transcripts.
+
+  Use the same exact latest-run ordering and status rules as result-bearing
+  reads. Plans need only statuses, not the runs' provider or activity payloads.
+  This snapshot belongs to this call; nothing is cached across lifecycle changes.
+  """
+  if not rows:
+    return {}
+  runs = db.query(models.ChatRun).join(
+    models.Delegation, models.ChatRun.id == _latest_child_run_id(),
+  ).filter(
+    models.Delegation.id.in_([row.id for row in rows]),
+  ).options(load_only(
+    models.ChatRun.id, models.ChatRun.chat_id, models.ChatRun.status,
+    raiseload=True,
+  )).all()
+  by_chat = {run.chat_id: run for run in runs}
+  return {
+    row.id: _project_delegation_status(row, by_chat.get(row.child_chat_id), "")[0]
+    for row in rows
+  }
+
+
+def _project_delegation_status(
+  row: models.Delegation, run: models.ChatRun | None, result: str,
+) -> tuple[str, models.ChatRun | None, str]:
+  """Shared status rules for full results and lightweight plan reads."""
   if row.interrupted_at is not None:
     notice = (
       "This legacy read-only helper was interrupted during the single-mode "
