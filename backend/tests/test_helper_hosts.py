@@ -8,6 +8,7 @@ import pytest
 
 from app import claude_helper_host as claude_host
 from app import helper_hosts
+from app.provider_errors import ProviderErrorKind, classify_provider_error
 
 
 # ----------------------------------------------------------------- identity
@@ -486,7 +487,6 @@ def test_a_usage_limit_inside_a_host_parks_like_the_private_runner(
   and never resumed: in a host the limit arrives only as the helper's own
   API-error message. It must reach the turn's result as a limit."""
   from claude_agent_sdk.types import AssistantMessage, TextBlock
-  from app import chat as chat_mod
 
   limit_text = "You've hit your session limit · resets 12:50am (UTC)"
   host = claude_host.ClaudeHelperHost(
@@ -514,7 +514,9 @@ def test_a_usage_limit_inside_a_host_parks_like_the_private_runner(
   result = turn("task")
 
   assert result["error"] == limit_text
-  assert chat_mod._is_limit_terminal(result)
+  assert classify_provider_error(
+    result["error"], status=result.get("api_error_status"),
+  ) is ProviderErrorKind.USAGE_LIMIT
 
 
 def test_a_dispatch_that_never_starts_says_what_the_dispatcher_did(
