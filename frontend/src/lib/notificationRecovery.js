@@ -53,16 +53,6 @@ export function notificationRecoveryAction(notification) {
   return null
 }
 
-export function hasProtectedRecoveryReceipt(notification) {
-  return Array.isArray(notification?.actions) && notification.actions.some(value => (
-    value
-    && typeof value === 'object'
-    && typeof value.action === 'string'
-    && value.action.startsWith('recover_')
-    && value.action !== 'recover_chat'
-  ))
-}
-
 export function recoveryUnavailableLabel(action, now = Date.now()) {
   if (action.completedAt) return 'Restored'
   return now >= Date.parse(action.expiresAt) ? 'Recovery window expired' : null

@@ -221,27 +221,34 @@ def test_owner_can_dismiss_one_notification(client, auth):
   assert missing.status_code == 404
 
 
-@pytest.mark.parametrize("action", ["recover_app", "recover_project", "recover_future"])
-@pytest.mark.parametrize("with_chat_action", [False, True])
-def test_single_item_dismissal_preserves_other_recovery_receipts(client, auth, db, action, with_chat_action):
-  """Chat dismissal does not permit erasing other recovery paths, even mixed receipts."""
+@pytest.mark.parametrize(
+  "actions",
+  [
+    [{"action": "recover_chat", "resource_id": "chat-123"}],
+    [{"action": "recover_app", "resource_id": "app-123"}],
+    [{"action": "recover_project", "resource_id": "project-123"}],
+    [{"action": "recover_chat"}, {"action": "recover_app"}],
+  ],
+)
+def test_single_item_dismissal_applies_to_every_recovery_receipt(client, auth, db, actions):
+  """Every deletion receipt follows the same rule: an explicit × removes it."""
   owner = db.query(models.Owner).first()
-  receipt_id = "recovery-receipt-not-dismissable"
+  receipt_id = "recovery-receipt-dismissable"
   db.add(models.Notification(
     id=receipt_id,
     owner_id=owner.id,
     source_type="shell",
-    title="Protected recovery",
-    actions=[{"action": action, "resource_id": "resource-123"}]
-    + ([{"action": "recover_chat"}] if with_chat_action else []),
+    title="Deleted",
+    actions=actions,
   ))
   db.commit()
 
   response = client.delete(
     f"/api/notifications/{receipt_id}", headers=auth,
   )
-  assert response.status_code == 409, response.text
-  assert db.query(models.Notification).filter_by(id=receipt_id).one_or_none()
+  assert response.status_code == 200, response.text
+  db.expire_all()
+  assert db.query(models.Notification).filter_by(id=receipt_id).one_or_none() is None
 
 
 def test_clear_preserves_active_undo_and_records_only_count(client, auth, db, monkeypatch):
@@ -300,7 +307,6 @@ def test_clear_uses_dismiss_recovery_family_and_expires_unknown_receipts(client,
   ))
   db.commit()
 
-  assert client.delete("/api/notifications/future-recovery-future", headers=auth).status_code == 409
   cleared = client.delete("/api/notifications", headers=auth)
   assert cleared.status_code == 200, cleared.text
   assert cleared.json() == {"deleted": 1}

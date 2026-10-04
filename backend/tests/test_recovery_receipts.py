@@ -75,10 +75,9 @@ def _delete(client, auth, db, resource):
   return receipt
 
 
-@pytest.mark.parametrize("resource", ["chat"], indirect=True)
-def test_dismiss_chat_deletion_notice_preserves_deleted_chat(client, auth, db, resource):
-  """Explicit × removes only the selected receipt, never the recoverable chat."""
-  _, row, _ = resource
+def test_dismissing_a_deletion_notice_keeps_the_resource_recoverable(client, auth, db, resource):
+  """One × removes only the receipt; the chat, app or project stays recoverable."""
+  kind, row, url = resource
   receipt = _delete(client, auth, db, resource)
   receipt_id = receipt.id
   deleted_at = row.deleted_at
@@ -87,8 +86,12 @@ def test_dismiss_chat_deletion_notice_preserves_deleted_chat(client, auth, db, r
   assert response.json() == {"deleted": 1}
   db.expire_all()
   assert db.get(models.Notification, receipt_id) is None
-  assert db.get(models.Chat, row.id).deleted_at == deleted_at
+  assert db.get(type(row), row.id).deleted_at == deleted_at
   assert all(n["id"] != receipt_id for n in client.get("/api/notifications", headers=auth).json())
+  recovered = client.post(f"{url}/recover", headers=auth)
+  assert recovered.status_code == 200, recovered.text
+  db.expire_all()
+  assert db.get(type(row), row.id).deleted_at is None
 
 
 @pytest.mark.parametrize("resource", ["app"], indirect=True)

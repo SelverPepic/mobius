@@ -8,7 +8,6 @@ import { notificationQueries } from '../../hooks/queries.js'
 import NotificationsView from '../../components/NotificationsView/NotificationsView.jsx'
 import {
   completeNotificationRecovery,
-  hasProtectedRecoveryReceipt,
   notificationRecoveryAction,
   parseNotificationRecoveryAction,
   recoveryFailure,
@@ -35,16 +34,6 @@ test('recovery notifications require a matching tombstone-bound resource action'
     { completed_at: 'not-a-date' }, { deleted_at: null }, { expires_at: null },
     { expires_at: deletedAt },
   ]) assert.equal(parseNotificationRecoveryAction(receipt(fields)), null)
-})
-
-test('only chat recovery receipts permit deliberate individual dismissal', () => {
-  assert.equal(hasProtectedRecoveryReceipt({ actions: [{ action: 'recover_chat' }] }), false)
-  for (const action of ['recover_app', 'recover_project', 'recover_future']) {
-    assert.equal(hasProtectedRecoveryReceipt({ actions: [{ action }] }), true)
-    assert.equal(hasProtectedRecoveryReceipt({ actions: [{ action: 'recover_chat' }, { action }] }), true)
-  }
-  assert.equal(hasProtectedRecoveryReceipt({ actions: [{ action: 'open_chat' }] }), false)
-  assert.equal(hasProtectedRecoveryReceipt({ actions: null }), false)
 })
 
 test('completed and expired receipts remain inspectable but are not actionable', () => {
@@ -129,21 +118,22 @@ test('rendered history disables expired Undo and offers older pages', () => {
   queryClient.clear()
 })
 
-test('rendered chat receipts offer dismissal throughout recovery while other recovery stays protected', () => {
+test('rendered deletion receipts for chats, apps and projects all offer dismissal', () => {
   const queryClient = new QueryClient()
   const rows = [
     { id: 'active', actions: [receipt({ expires_at: '2099-01-01T00:00:00Z' })] },
     { id: 'restored', actions: [receipt({ completed_at: deletedAt })] },
-    { id: 'app', actions: [{ action: 'recover_app' }] },
-    { id: 'project', actions: [{ action: 'recover_project' }] },
+    { id: 'app', actions: [receipt({ action: 'recover_app', resource_type: 'app' })] },
+    { id: 'project', actions: [receipt({ action: 'recover_project', resource_type: 'project' })] },
     { id: 'mixed', actions: [receipt(), { action: 'recover_app' }] },
   ].map(row => ({ ...row, title: row.id, source_type: 'shell', sent_at: deletedAt }))
   queryClient.setQueryData(notificationQueries.list.key, { pages: [rows], pageParams: [null] })
   const html = renderToStaticMarkup(React.createElement(QueryClientProvider, { client: queryClient },
     React.createElement(NotificationsView, { onDismiss() {}, onRecoveryAction() {} }),
   ))
-  for (const title of ['active', 'restored']) assert.ok(html.includes(`aria-label="Dismiss ${title}"`))
-  for (const title of ['app', 'project', 'mixed']) assert.ok(!html.includes(`aria-label="Dismiss ${title}"`))
+  for (const title of ['active', 'restored', 'app', 'project', 'mixed']) {
+    assert.ok(html.includes(`aria-label="Dismiss ${title}"`), title)
+  }
   assert.match(html, />Undo</)
   assert.match(html, />Restored</)
   queryClient.clear()
