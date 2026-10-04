@@ -126,6 +126,8 @@ def _step_levels(monkeypatch):
   monkeypatch.setattr(compat, "COMPAT_LEVEL", 1)
   monkeypatch.setattr(compat, "REQUIRED_IMAGE_LEVEL", 1)
   monkeypatch.setattr(owu, "_GATE_PASSED", False)
+  monkeypatch.setattr(owu, "_GATE_SETTLED", False)
+  monkeypatch.setattr(owu, "_REPORTED_FLOOR", None)
   monkeypatch.setattr(owu.time, "sleep", lambda _s: None)
 
 
@@ -571,3 +573,69 @@ def test_a_missing_progress_row_is_recreated_not_looped_on(tmp_path):
     batches += 1
     assert batches < 5
   assert _query(path, "SELECT status, done_units FROM upgrade_tasks") == [("done", 1)]
+
+
+# --- the floor reported to deployment controllers -----------------------------
+
+
+def _report_from(monkeypatch, path, steps):
+  """Point reported_floor at this database with these steps registered."""
+  import app.database
+
+  monkeypatch.setattr(owu, "_REGISTRY", list(steps))
+  monkeypatch.setattr(app.database, "engine", create_engine(f"sqlite:///{path}"))
+
+
+def test_a_real_refusal_reports_the_floor_it_left(tmp_path, monkeypatch):
+  path = _database(tmp_path, {"a": "[1]"})
+  step = ToyStep()
+  _report_from(monkeypatch, path, [step])
+  assert owu.reported_floor() is None  # the gate has not run: unknown
+  monkeypatch.setattr(owu, "_free_bytes", lambda _path: 10)
+  with pytest.raises(owu.StepRefusal):
+    owu.run_gate(path, EXISTING, [step])
+  assert owu.readiness_verdict() == {"reason": "one_way_upgrade_pending"}
+  assert owu.reported_floor() == 0
+  # Never cached after a refusal: a later raise by another process is seen.
+  conn = sqlite3.connect(path)
+  conn.execute("UPDATE platform_compat SET floor = 1 WHERE id = 1")
+  conn.commit()
+  conn.close()
+  assert owu.reported_floor() == 1
+
+
+def test_a_failure_inside_activation_reports_the_old_floor(tmp_path, monkeypatch):
+  path = _database(tmp_path, {"a": "[1]"})
+  step = ToyStep()
+
+  def broken_edit(conn):
+    conn.execute("ALTER TABLE toy_units RENAME COLUMN legacy TO legacy_v1")
+    raise RuntimeError("simulated failure before COMMIT")
+
+  step.activation_schema_edits = broken_edit
+  _report_from(monkeypatch, path, [step])
+  with pytest.raises(RuntimeError):
+    owu.run_gate(path, EXISTING, [step])
+  assert "legacy" in _columns(sqlite3.connect(path), "toy_units")
+  assert _floor(path) == 0
+  assert owu.reported_floor() == 0
+
+
+def test_a_later_step_refusing_reports_the_earlier_steps_floor(tmp_path, monkeypatch):
+  class RefusingStep(ToyStep):
+    level = 2
+    name = "toy2"
+
+    def legacy_present(self, conn):
+      return False
+
+  monkeypatch.setattr(compat, "COMPAT_LEVEL", 2)
+  monkeypatch.setattr(compat, "REQUIRED_IMAGE_LEVEL", 2)
+  path = _database(tmp_path, {"a": "[1]"})
+  steps = [ToyStep(), RefusingStep()]
+  _report_from(monkeypatch, path, steps)
+  with pytest.raises(owu.StepRefusal) as refused:
+    owu.run_gate(path, EXISTING, steps)
+  assert refused.value.database_failure_reason == "upgrade_schema_inconsistent"
+  assert _state(path) == "active"
+  assert owu.reported_floor() == 1

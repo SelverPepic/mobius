@@ -302,6 +302,9 @@ class OneWayStep:
 _REGISTRY: list[OneWayStep] | None = None
 
 _GATE_PASSED = False
+# The gate has ended in this process, passed or refused. Only the gate raises
+# the floor, so from here on the floor cannot change within this process.
+_GATE_SETTLED = False
 
 
 def registered_steps() -> tuple[OneWayStep, ...]:
@@ -716,6 +719,18 @@ def run_gate(
   Raises StepRefusal when that is not possible; the boot then stays
   unserviceable while the legacy data remains authoritative and untouched.
   """
+  global _GATE_SETTLED
+  try:
+    _run_gate(database_path, existing_tables, steps)
+  finally:
+    _GATE_SETTLED = True
+
+
+def _run_gate(
+  database_path: str,
+  existing_tables: frozenset[str] | None,
+  steps: Sequence[OneWayStep] | None,
+) -> None:
   global _GATE_PASSED
   steps = registered_steps() if steps is None else tuple(steps)
   check_registry(steps)
@@ -759,16 +774,23 @@ def reported_floor() -> int | None:
 
   The account service reads it from /api/health to decide whether rolling a
   failed replacement back to an older image is safe. Only the startup gate
-  raises the floor, so once it has passed the value is fixed for this process
-  and cached. None means unknown (unreadable, or a damaged floor record):
-  callers must then treat an older image as unsafe.
+  raises the floor, so once it has ended -- passed, or refused with the
+  legacy data still authoritative -- this process can no longer change it. A
+  pass caches the value; a refusal reports the floor it left (usually the old
+  one, read fresh each time), letting a controller restore the previous image
+  instead of stranding the instance. Another process on the same database
+  could still raise it later, so a controller must only trust the value from
+  the image it is deciding about. None means unknown (the gate is still running, the database is
+  unreadable, or the floor record is damaged): callers must then treat an
+  older image as unsafe.
   """
   global _REPORTED_FLOOR
   if _REPORTED_FLOOR is not None:
     return _REPORTED_FLOOR
-  if registered_steps() and not _GATE_PASSED:
+  if registered_steps() and not _GATE_SETTLED:
     # A conversion may still raise the floor in this very process: the value
-    # read now could be stale a moment later, so it is unknown until the gate.
+    # read now could be stale a moment later, so it is unknown until the gate
+    # has ended.
     return None
   try:
     from app.database import engine
@@ -778,6 +800,8 @@ def reported_floor() -> int | None:
   if seen.floor_record == "missing_row":
     return None
   if _GATE_PASSED:
+    # A refused process re-reads instead: another process on the same database
+    # (a recovery or trial container) could still raise the floor after it.
     _REPORTED_FLOOR = seen.floor
   return seen.floor
 
