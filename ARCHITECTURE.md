@@ -1302,17 +1302,14 @@ carries it.
 Helper delivery distinguishes a provider's final report from its progress prose.
 Provider adapters emit a private `assistant_result` event: Codex uses its ordered
 terminal agent item (or an exact completed-item reference), while the Claude
-helper host uses the child response or explicit `SubagentHandback.message`, not
-the task notification's summary. Claude's ordered forwarded messages also cover
-late hook callbacks. The shared sink strips quiet-write frames without admitting
-new commands and persists `result` on the exact assistant segment via its usual
-writer snapshot. The full `content` and blocks stay intact. Result projection
-uses the current physical attempt, retaining substantive findings across only
-verified quiet-write-repair lineage. A blank follow-up cannot inherit earlier
-success. Unattributed historical prose remains readable as history, never guessed
-as the result of a known new attempt. Failed attempts retain partial text and
-errors, and lifecycle status remains independent from report content. This adds
-no summarizer, provider call, new queue, or database table.
+helper host reads the child's ordered stream, taking an explicit
+`SubagentHandback.message` or else the child's latest response, never the task
+notification's summary. The shared sink persists `result` on the exact
+assistant segment via its usual writer snapshot; the full `content` and blocks
+stay intact. The delegation result prefers that report, else the latest text
+block, plus the latest error so failures stay actionable. Lifecycle status
+remains independent from report content. This adds no summarizer, provider
+call, new queue, or database table.
 
 An idle recipient is woken only when it has an unfinished Goal. An armed
 external Wait remains active but no longer suppresses an explicitly
