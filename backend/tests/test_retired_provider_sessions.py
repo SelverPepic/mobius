@@ -138,6 +138,8 @@ async def test_a_retired_session_starts_fresh_with_the_chats_own_history(
   assert "<resumed_context>" in call["user_message"]
   assert "The broker fix is committed." in call["user_message"]
   assert call["user_message"].rstrip().endswith("Carry on.")
+  # Its provider sees a first turn, so it also gets the first-turn context.
+  assert "<agent_experience>" in (call.get("system_prompt") or call.get("skill_text") or "")
 
 
 @pytest.mark.asyncio
@@ -148,6 +150,7 @@ async def test_an_ordinary_session_still_resumes_natively(
   call = await _run_turn(monkeypatch, provider_id, provider_name, retired=False)
   assert call["session_id"] == "old-session"
   assert "<resumed_context>" not in call["user_message"]
+  assert "<agent_experience>" not in (call.get("system_prompt") or call.get("skill_text") or "")
 
 
 @pytest.mark.asyncio
@@ -168,15 +171,17 @@ async def test_a_retired_helper_is_refused_instead_of_resumed(
 
 
 def test_resume_retired_is_false_for_unknown_or_missing_sessions(db):
-  assert resume_retired(db, "claude", None) is False
-  assert resume_retired(db, "claude", "never-seen") is False
+  assert resume_retired(db, None) is False
+  assert resume_retired(db, "never-seen") is False
 
 
 def _retirement_db(tmp_path, *, journal_applied_at):
   eng = create_engine(f"sqlite:///{tmp_path / 'retire.db'}")
   with eng.begin() as conn:
     conn.execute(text("CREATE TABLE schema_migrations (version VARCHAR(128) PRIMARY KEY, applied_at DATETIME)"))
-    conn.execute(text("CREATE TABLE chats (id VARCHAR(64) PRIMARY KEY, session_id VARCHAR(256))"))
+    conn.execute(text(
+      "CREATE TABLE chats (id VARCHAR(64) PRIMARY KEY, session_id VARCHAR(256), provider VARCHAR(32))"
+    ))
     conn.execute(text(
       "CREATE TABLE chat_runs (id VARCHAR(64) PRIMARY KEY, chat_id VARCHAR(64), "
       "started_at DATETIME, provider_session_id VARCHAR(256))"
@@ -191,9 +196,11 @@ def _retirement_db(tmp_path, *, journal_applied_at):
       conn.execute(text("INSERT INTO schema_migrations VALUES ('0078_agent_write_journal', :at)"),
                    {"at": journal_applied_at})
     conn.execute(text(
-      "INSERT INTO chats VALUES ('top', 'tainted'), ('crashed', 'crashed-session'), "
-      "('old', 'clean'), ('host-helper', 'claude-host:h1:agent-1:tool-1'), "
-      "('old-helper', 'old-helper-session')"
+      "INSERT INTO chats VALUES ('top', 'tainted', 'claude'), "
+      "('crashed', 'crashed-session', 'codex'), ('old', 'clean', 'codex'), "
+      "('host-helper', 'claude-host:h1:agent-1:tool-1', 'claude'), "
+      "('old-helper', 'old-helper-session', 'claude'), "
+      "('unlinked', 'unlinked-session', 'mobius'), ('twin', 'unlinked-session', 'mobius')"
     ))
     conn.execute(text(
       "INSERT INTO chat_runs VALUES "
@@ -201,7 +208,9 @@ def _retirement_db(tmp_path, *, journal_applied_at):
       "('r-crashed', 'crashed', '2026-10-02 11:00:00', NULL), "
       "('r-old', 'old', '2026-09-20 10:00:00', 'clean'), "
       "('r-host', 'host-helper', '2026-10-02 12:00:00', NULL), "
-      "('r-old-helper', 'old-helper', '2026-09-20 12:00:00', 'old-helper-session')"
+      "('r-old-helper', 'old-helper', '2026-09-20 12:00:00', 'old-helper-session'), "
+      "('r-unlinked', 'unlinked', '2026-10-02 13:00:00', NULL), "
+      "('r-twin', 'twin', '2026-10-02 14:00:00', NULL)"
     ))
     conn.execute(text("INSERT INTO delegations VALUES ('d1', 'host-helper'), ('d2', 'old-helper')"))
     conn.execute(text(
@@ -229,7 +238,12 @@ def test_migration_retires_every_session_used_while_the_instruction_was_sent(tmp
   links, pointers = _retired(eng)
   # A run's own session, and a chat's current session even when its run died
   # before recording one; sessions only used before the window stay resumable.
-  assert links == {"tainted": 1, "crashed-session": 1, "clean": 0, "old-helper-session": 0}
+  # A current session that never got a link (best-effort recording) gets one,
+  # already retired, once even when two chats name it.
+  assert links == {
+    "tainted": 1, "crashed-session": 1, "clean": 0, "old-helper-session": 0,
+    "unlinked-session": 1, "claude-host:h1:agent-1:tool-1": 1,
+  }
   # A helper resumes through its pointer (shared-host helpers have no session
   # link at all), so a helper that ran in the window loses it.
   assert pointers["host-helper"] is None
@@ -250,3 +264,21 @@ def test_migration_is_a_no_op_on_a_database_without_session_links(tmp_path):
   migrations._retire_quiet_write_sessions(eng)
   with eng.connect() as conn:
     assert conn.execute(text("SELECT count(*) FROM sqlite_master")).scalar_one() == 0
+
+
+def test_reseed_drops_leaked_write_frames_from_replies_only():
+  """A reseeded session must not see itself writing the retired frames."""
+  from types import SimpleNamespace
+  from app.chat_context import _build_resumed_context
+
+  frame = '<MOBIUS_WRITE n1>\n{"id":"n1.write-1","tool":"checkpoint_chat","arguments":{}}\n</MOBIUS_WRITE>'
+  chat = SimpleNamespace(messages=[
+    {"role": "user", "content": "Why do replies show <MOBIUS_WRITE ... />?", "ts": 1},
+    {"role": "assistant", "content": f"Fixed the broker.\n{frame}\nDone.", "ts": 2},
+    {"role": "assistant", "content": '<MOBIUS_WRITE n2>\n{"id":"n2.write-1"}', "ts": 3},
+    {"role": "assistant", "content": 'Saved. <MOBIUS_WRITE tool="checkpoint_chat" />', "ts": 4},
+  ])
+  block = _build_resumed_context(chat)
+  replies = block.split("Why do replies show <MOBIUS_WRITE ... />?", 1)[1]
+  assert "MOBIUS_WRITE" not in replies and "write-1" not in replies
+  assert "Fixed the broker." in replies and "Done." in replies and "Saved." in replies

@@ -5389,6 +5389,17 @@ async def _run_chat_impl_with_db(
   from app.delegations import policy_for_chat
   run_policy = policy_for_chat(db, chat_id) if chat_row is not None else None
   provider = get_provider(provider_id)
+  # A retired session is not resumed: its own history would keep the model
+  # following a withdrawn instruction. A top-level chat starts fresh and is
+  # reseeded from its transcript, exactly as for a lost session. (A retired
+  # helper has no session pointer left, so it gets the no-replay refusal.)
+  session_retired = (
+    run_policy is None
+    and provider_runtime_kind(provider) in ("claude_sdk", "codex_sdk")
+    and resume_retired(db, session_id)
+  )
+  # The provider sees this turn as its first: it gets the first-turn context.
+  starts_fresh = not session_id or session_retired
   codex_native_skills_ready = False
   if provider.name == "Codex":
     try:
@@ -5438,7 +5449,7 @@ async def _run_chat_impl_with_db(
   # the command's length limit. Keep it out of the persisted prompt snapshot as
   # well, so later turns reuse the stable constitution bytes.
   startup_context = ""
-  if not session_id and run_policy is None:
+  if starts_fresh and run_policy is None:
     # `build_memory_block` is pure; the activity emit + envelope live here.
     ordered_chat_ids = recent_chat_digest_order(db)
     block = memory.build_memory_block(
@@ -5503,7 +5514,7 @@ async def _run_chat_impl_with_db(
     # window. Compose app-context + report into one block so the report keeps
     # its place right AFTER </app_context>.
     block = app_context_block
-    if not session_id:
+    if starts_fresh:
       report_block = _build_app_report_block(db, chat_id, settings.data_dir)
       if report_block:
         block = f"{app_context_block}\n\n{report_block}"
@@ -5887,17 +5898,6 @@ async def _run_chat_impl_with_db(
   # but no resumable provider session, refuse replay for parent review.
   fresh_delegated_session = (
     run_policy is not None and not session_id and len(messages) > 1
-  )
-  # A retired session is not resumed: its own history would keep the model
-  # following a withdrawn instruction. A top-level chat starts fresh and is
-  # reseeded from its transcript, exactly as for a lost session. (A retired
-  # helper has no session pointer left, so it gets the no-replay refusal.)
-  session_runtime = provider_runtime_kind(provider)
-  session_retired = (
-    run_policy is None and session_runtime in ("claude_sdk", "codex_sdk")
-    and resume_retired(
-      db, "claude" if session_runtime == "claude_sdk" else "codex", session_id,
-    )
   )
   # A close() below detaches chat_row. Precompute the only provider-time value
   # that still reads it (the bounded fallback for a session that cannot be

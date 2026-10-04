@@ -5830,7 +5830,8 @@ def _retire_quiet_write_sessions(eng) -> None:
   history, so the model keeps emitting frames nothing reads any more: raw text
   in the reply and a lost save. Every session a run used in that window is
   retired, and so is each chat's current session if the chat ran in it, which
-  also covers runs that died before recording their session. A helper's
+  also covers runs that died before recording their session (a missing link is
+  added already retired). A helper's
   session pointer is cleared instead (shared-host helpers resume through it
   rather than a session link), so its next follow-up gets the ordinary
   no-replay refusal. Idempotent; chat history is untouched.
@@ -5863,6 +5864,17 @@ def _retire_quiet_write_sessions(eng) -> None:
           WHERE session_id IS NOT NULL AND id IN ({window})
         )
       )
+    """), {"since": since, "now": datetime.now(UTC).replace(tzinfo=None)})
+    conn.execute(text(f"""
+      INSERT INTO chat_session_links
+        (provider, session_id, chat_id, first_seen_at, last_seen_at, resume_retired_at)
+      SELECT c.provider, c.session_id, MIN(c.id), :now, :now, :now FROM chats c
+      WHERE c.session_id IS NOT NULL AND c.provider IS NOT NULL AND c.provider <> ''
+        AND length(c.session_id) <= 128 AND c.id IN ({window})
+        AND NOT EXISTS (
+          SELECT 1 FROM chat_session_links l WHERE l.session_id = c.session_id
+        )
+      GROUP BY c.provider, c.session_id
     """), {"since": since, "now": datetime.now(UTC).replace(tzinfo=None)})
     if "delegations" in tables:
       conn.execute(text(f"""
