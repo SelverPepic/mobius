@@ -226,6 +226,12 @@ function twoChatPanes(chatA, chatB) {
 async function waitTiled(page) {
   await expect(page.locator('.workspace__chrome')).toHaveCount(1, { timeout: 8000 })
   await expect(page.locator('.workspace__divider').first()).toBeVisible({ timeout: 8000 })
+  // A chat tab reads "Chat" until the chat list names it, then widens to its
+  // title and pushes every later tab sideways. The strip can sit still for many
+  // frames before the list arrives, so a frame settle alone can hand out
+  // placeholder geometry; wait for every fixture chat to carry its title.
+  await expect(page.locator('[data-pane-strip] .shell__tab-open[title="Chat"]'))
+    .toHaveCount(0, { timeout: 8000 })
   await page.evaluate(() => new Promise(r =>
     requestAnimationFrame(() => requestAnimationFrame(r))))
   await waitStripSettled(page)
