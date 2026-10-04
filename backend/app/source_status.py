@@ -61,11 +61,14 @@ def _git_env(repo: Path) -> dict[str, str]:
   return env
 
 
-def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def _git(
+  repo: Path, *args: str, stdin: str | None = None,
+) -> subprocess.CompletedProcess[str]:
   try:
     return subprocess.run(
-      ["git", "-C", str(repo), *args], capture_output=True, text=True,
-      errors="replace", timeout=_GIT_TIMEOUT, check=False, env=_git_env(repo),
+      ["git", "-C", str(repo), *args], input=stdin, capture_output=True,
+      text=True, errors="replace", timeout=_GIT_TIMEOUT, check=False,
+      env=_git_env(repo),
     )
   except (OSError, subprocess.TimeoutExpired) as exc:
     return subprocess.CompletedProcess(
@@ -265,11 +268,21 @@ def _local_paths_changed_since(
   """
   if not since or not paths:
     return {}
+  # Most recorded sources belong to other projects, so check them all with a
+  # single batch query instead of one process per commit.
+  check = _git(
+    repo, "cat-file", "--batch-check=%(objecttype)",
+    stdin="".join(f"{sha}^{{commit}}\n" for sha in since),
+  )
+  if check.returncode != 0:
+    return {}
+  found = [
+    sha for sha, kind in zip(since, check.stdout.splitlines())
+    if kind == "commit"
+  ]
   wanted = set(paths)
   result: dict[str, list[str]] = {}
-  for sha in since:
-    if _git(repo, "cat-file", "-e", f"{sha}^{{commit}}").returncode != 0:
-      continue
+  for sha in found:
     proc = _git(repo, "diff", "--no-renames", "--name-only", "-z", sha, local)
     if proc.returncode != 0:
       continue
