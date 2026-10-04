@@ -14,6 +14,19 @@ const frameCacheModel = readFileSync(
   'utf8',
 )
 
+test('app content is selectable by default without exposing controls and drag handles to touch selection', () => {
+  assert.match(frame, /body\s*\{\s*-webkit-user-select:\s*text;\s*user-select:\s*text;/)
+  const controls = frame.match(/button, \[role="button"\][\s\S]*?\{([^}]+)\}/)
+  assert.ok(controls)
+  assert.match(controls[0], /input\[type="button"\]/)
+  assert.match(controls[0], /input\[type="submit"\]/)
+  assert.match(controls[0], /input\[type="reset"\]/)
+  assert.match(controls[0], /\[draggable="true"\]/)
+  assert.match(controls[0], /\[data-split-role="handle"\]/)
+  assert.match(controls[1], /-webkit-user-select:\s*none;\s*user-select:\s*none;/)
+  assert.match(frame, /input, textarea, \[contenteditable\], \[contenteditable\] \* \{[^}]*user-select:\s*text;/)
+})
+
 test('frame suspension reaches the live app before paint', () => {
   assert.match(canvas, /frameVisible = visible/)
   assert.match(canvas, /useEffect\(\(\) => \{[\s\S]*sendVisibility\(swap\.liveVersion, frameVisible\)/)
