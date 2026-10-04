@@ -1205,21 +1205,16 @@ def _clear_upstream(repo: Path) -> None:
   )
 
 
-def _import_probe(
-  repo: Path = PLATFORM_REPO, timeout: int = _PROBE_TIMEOUT, *,
-  smoke_provider: bool = False,
-):
-  """Import the served backend in a fresh subprocess, optionally resolving a provider.
+def _import_probe(repo: Path = PLATFORM_REPO, timeout: int = _PROBE_TIMEOUT):
+  """Import the backend and run its candidate-owned startup smoke when present.
 
-  The post-merge variant exercises chat provider selection too: import alone
-  cannot catch a text-clean caller/signature mismatch. This MUST be a subprocess
-  so the reconcile process, which already imported the old ``app.platform_update``,
-  validates the new on-disk tree without corrupting its own interpreter. The
-  subprocess cwd/env mirror the uvicorn exec. The env scrubs
-  ``PYTHONPATH`` (no stray path may shadow ``app``) and the ``GIT_*`` pointers,
-  and keeps ``DATABASE_URL`` / ``DATA_DIR`` so settings resolve as the served
-  process does; the withheld signing key is replaced by an import-only
-  placeholder. Returns ``(ok, error)``.
+  ``app.startup_selftest`` is the stable module entry point, not a promise about
+  internal provider APIs. Older candidates without that module get import-only
+  validation. Errors inside a present selftest fail the probe, never fall back.
+  The fresh interpreter validates the new on-disk tree, not this updater's
+  already-imported modules. Its cwd/env mirror uvicorn: PYTHONPATH and GIT_*
+  pointers are scrubbed, DATABASE_URL / DATA_DIR retained, and the withheld
+  signing key replaced by an import-only placeholder. Returns (ok, error).
   """
   backend = repo / "backend"
   env = dict(os.environ)
@@ -1229,9 +1224,12 @@ def _import_probe(
   ):
     env.pop(var, None)
   import_probe_env(env)
-  probe = "import app.main"
-  if smoke_provider:
-    probe += "\nfrom app.providers import get_provider\nget_provider()"
+  probe = (
+    "import app.main\n"
+    "import importlib.util, runpy\n"
+    "if importlib.util.find_spec('app.startup_selftest') is not None:\n"
+    "    runpy.run_module('app.startup_selftest', run_name='__main__')\n"
+  )
   try:
     proc = subprocess.run(
       [sys.executable or "python3", "-c", probe],
@@ -2817,13 +2815,13 @@ def _finalize_update(
   _activate_candidate(repo, local, pre, tip)
   app_git.remove_overlay_worktree(repo, _overlay_candidate_path(repo))
 
-  # A text-clean merge can fail at import or first provider resolution. Roll it
+  # A text-clean merge can fail at import or the candidate startup smoke. Roll it
   # back before accepting the update. Skip the probe when no served backend
   # code changed: that tree is byte-identical to the already-running version.
   if platform_activation.backend_import_probe_required(changed):
     if progress:
       progress(PlatformUpdatePhase.VALIDATING)
-    ok, err = _import_probe(repo, smoke_provider=True)
+    ok, err = _import_probe(repo)
     if not ok:
       return _roll_back_update(
         repo, local, pre, tip, target, err, err,

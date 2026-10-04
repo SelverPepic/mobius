@@ -78,6 +78,9 @@ def _write_backend(root: Path, main_py: str = _MAIN_PY, foo_py: str | None = _FO
   (app_dir / "__init__.py").write_text("")
   (app_dir / "main.py").write_text(main_py)
   (app_dir / "providers.py").write_text(_PROVIDERS_PY)
+  (app_dir / "startup_selftest.py").write_text(
+    "from app.providers import get_provider\nget_provider()\n"
+  )
   if foo_py is not None:
     (app_dir / "foo.py").write_text(foo_py)
 
@@ -1533,7 +1536,49 @@ def test_import_broken_merge_rolls_back(clone_env):
   assert _served_sha(platform) == pre
 
 
-def test_text_clean_provider_signature_merge_rolls_back_before_chat_start(clone_env):
+def test_candidate_smoke_can_rename_internal_provider_function(clone_env):
+  origin, platform = clone_env
+  _advance_origin(origin, edits={
+    "backend/app/providers.py": "def select_provider():\n  return 'ready'\n",
+    "backend/app/startup_selftest.py": (
+      "from app.providers import select_provider\nselect_provider()\n"
+    ),
+  })
+  result = pu.reconcile_clone(platform)
+  assert result.status == "updated", result.error
+  assert pu._import_probe(platform) == (True, "")
+  assert "select_provider" in (platform / "backend/app/providers.py").read_text()
+
+
+@pytest.mark.parametrize("smoke", [
+  "raise RuntimeError('candidate smoke failed')\n",
+  "import missing_candidate_smoke_dependency\n",
+])
+def test_candidate_smoke_failure_rolls_back(clone_env, smoke):
+  origin, platform = clone_env
+  pre = _served_sha(platform)
+  _advance_origin(origin, edits={"backend/app/startup_selftest.py": smoke})
+  result = pu.reconcile_clone(platform)
+  assert result.status == "rolled_back"
+  assert _served_sha(platform) == pre
+
+
+def test_candidate_without_selftest_uses_import_only(clone_env):
+  origin, platform = clone_env
+  _advance_origin(origin, edits={
+    "backend/app/providers.py": "raise RuntimeError('not imported by main')\n",
+  }, deletes=["backend/app/startup_selftest.py"])
+  result = pu.reconcile_clone(platform)
+  assert result.status == "updated", result.error
+  assert not (platform / "backend/app/startup_selftest.py").exists()
+  assert pu._import_probe(platform) == (True, "")
+  (platform / "backend/app/main.py").write_text("raise RuntimeError('bad main')\n")
+  ok, error = pu._import_probe(platform)
+  assert not ok
+  assert "bad main" in error
+
+
+def test_candidate_smoke_rejects_text_clean_provider_signature_merge(clone_env):
   origin, platform = clone_env
   local = _PROVIDERS_PY.replace("sync_app_model_providers(data_dir):", "sync_app_model_providers():")
   upstream = _PROVIDERS_PY.replace("return 'ready'", "sync_app_model_providers('/data')\n  return 'ready'")
@@ -1579,7 +1624,7 @@ def test_failed_candidate_never_rolls_back_a_newer_concurrent_writer(
   _advance_origin(origin, edits={"backend/app/foo.py": "VALUE = 'update'\n"})
   raced: dict[str, str] = {}
 
-  def fail_after_concurrent_commit(repo=platform, timeout=pu._PROBE_TIMEOUT, *, smoke_provider=False):
+  def fail_after_concurrent_commit(repo=platform, timeout=pu._PROBE_TIMEOUT):
     raced["sha"] = _local_commit(
       platform, edits={"concurrent.txt": "newer owner\n"},
       msg="concurrent writer after activation",
