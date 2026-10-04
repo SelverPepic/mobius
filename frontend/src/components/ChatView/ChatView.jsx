@@ -97,7 +97,9 @@ import ConnectionStatus from './ConnectionStatus.jsx'
 import ProgressRail from './ProgressRail.jsx'
 import GoalPlanDetails from './GoalPlanDetails.jsx'
 import GoalDraftChip from './GoalDraftChip.jsx'
-import GoalAutoResumePrompt from './GoalAutoResumePrompt.jsx'
+import GoalAutoResumePrompt, {
+  shouldOfferGoalAutoResume,
+} from './GoalAutoResumePrompt.jsx'
 import WaitingChip from './WaitingChip.jsx'
 import AssistantReply from './AssistantReply.jsx'
 import ArchivedChatNotice from './ArchivedChatNotice.jsx'
@@ -5823,6 +5825,11 @@ export default function ChatView({
     authoritativeHandoff: serverHandoff,
   })
   const goalHandoff = goalPresentation?.handoff?.kind || 'none'
+  const goalAutoResumeOffered = shouldOfferGoalAutoResume({
+    embedded,
+    goalStatus: goalPresentation?.status,
+    autoResumeEnabled,
+  })
   const goalResumeBlocked = useCallback(() => resumeBlocked() || !canResumeGoal(goalPresentation, {
     turnActive, hasPendingQuestion, chatHandoff,
   }), [resumeBlocked, goalPresentation, turnActive, hasPendingQuestion, chatHandoff])
@@ -6371,7 +6378,7 @@ export default function ChatView({
             </div>
           )}
         </div>
-        {!embedded && actionableGoalPresentation && !autoResumeEnabled && (
+        {goalAutoResumeOffered && (
           <GoalAutoResumePrompt
             goalKey={goalPresentation?.id || activeGoalObjective}
             saving={autoResumeSaving}

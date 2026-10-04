@@ -3,6 +3,16 @@
 
 import { useState } from 'react'
 
+export function shouldOfferGoalAutoResume({
+  embedded = false,
+  goalStatus = '',
+  autoResumeEnabled = false,
+}) {
+  return !embedded
+    && ['active', 'paused'].includes(goalStatus)
+    && !autoResumeEnabled
+}
+
 export default function GoalAutoResumePrompt({
   goalKey,
   saving = false,

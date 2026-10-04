@@ -3,7 +3,27 @@ import test from 'node:test'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 
-import GoalAutoResumePrompt from '../GoalAutoResumePrompt.jsx'
+import GoalAutoResumePrompt, {
+  shouldOfferGoalAutoResume,
+} from '../GoalAutoResumePrompt.jsx'
+
+test('offers the policy only for actionable top-level Goals that have it disabled', () => {
+  assert.equal(shouldOfferGoalAutoResume({
+    goalStatus: 'active', autoResumeEnabled: false,
+  }), true)
+  assert.equal(shouldOfferGoalAutoResume({
+    goalStatus: 'paused', autoResumeEnabled: false,
+  }), true)
+  assert.equal(shouldOfferGoalAutoResume({
+    goalStatus: 'completed', autoResumeEnabled: false,
+  }), false)
+  assert.equal(shouldOfferGoalAutoResume({
+    goalStatus: 'active', autoResumeEnabled: true,
+  }), false)
+  assert.equal(shouldOfferGoalAutoResume({
+    embedded: true, goalStatus: 'active', autoResumeEnabled: false,
+  }), false)
+})
 
 test('offers a standby-safe provider-reset continuation without promising manual-stop recovery', () => {
   const html = renderToStaticMarkup(createElement(GoalAutoResumePrompt, {
