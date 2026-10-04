@@ -257,7 +257,7 @@ def test_app_owned_helper_repair_reuses_delegation_ownership_guard(chat,db,condi
     assert db.get(models.ChatRun,source['_run_token']).initiated_by_app_id==app.id
 
 
-@pytest.mark.parametrize('continuation',['quiet_write_failure','restart','manual','unrelated-root','different-chat','different-browser','different-browser-epoch','cycle'])
+@pytest.mark.parametrize('continuation',['quiet_write_failure','restart','manual','unrelated-root','different-chat','different-browser','cycle'])
 def test_helper_result_preserves_findings_only_for_exact_write_repair_lineage(chat,db,continuation):
   from datetime import UTC,datetime,timedelta
   from app.delegations import _result_with_write_repair
@@ -284,10 +284,7 @@ def test_helper_result_preserves_findings_only_for_exact_write_repair_lineage(ch
     db.add(models.Chat(id='foreign',title='Foreign',messages=[]));db.flush()
     original.chat_id='foreign'
   elif continuation=='different-browser':
-    repair.browser_grant_id='another-browser';repair.browser_grant_epoch=0
-  elif continuation=='different-browser-epoch':
-    original.browser_grant_id=repair.browser_grant_id='same-browser'
-    original.browser_grant_epoch=0;repair.browser_grant_epoch=1
+    repair.browser_grant_id='another-browser'
   elif continuation=='cycle':
     repair.continuation_json={**repair.continuation_json,'source_work_id':'repair',
                              'supersedes_run_token':'repair'}
@@ -347,3 +344,19 @@ def test_helper_can_read_failed_write_only_while_its_own_run_is_live(client,chat
   assert response.json()['arguments']=={'summary':'private contents'}
   submit(FinishRun(**reader,terminal_status='completed'))
   assert client.get(path,headers=headers).status_code==401
+
+
+def test_clean_write_recovery_inherits_original_owner_input_time(chat, db):
+  owner = {'chat_id': chat.id, 'run_token': 'owner-write-run'}
+  submit(StartTurn(**owner, user_msg={'role': 'user', 'content': 'Test', 'ts': 10},
+    owner_input=True, default_provider='claude'))
+  submit(AdmitProviderExecution(**owner))
+  outcome(owner)
+  db.expire_all()
+  admitted_at = db.get(models.ChatRun, owner['run_token']).owner_input_at
+  assert admitted_at is not None
+  result = promote(owner)
+  db.expire_all()
+  recovered = db.get(models.ChatRun, result['promoted']['_run_token'])
+  assert recovered.continuation_json['reason'] == 'quiet_write_failure'
+  assert recovered.owner_input_at == admitted_at

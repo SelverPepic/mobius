@@ -66,16 +66,19 @@ def test_broker_and_app_consumers_share_the_root_owned_socket():
   # The test runtime deliberately overrides the broker path so it cannot reach
   # a host-owned socket. Verify the production default from the module source.
   assert socket in BROKER_PATH.read_text(encoding="utf-8")
-  for relative in (
-    "app/runtime_identity.py",
-    "app/contribution_broker.py",
-    "app/community_broker.py",
-    "app/providers.py",
-    "scripts/entrypoint.sh",
-  ):
+  for relative in ("app/runtime_identity.py", "scripts/entrypoint.sh"):
     source = (backend / relative).read_text(encoding="utf-8")
     assert socket in source
     assert "/data/run/mobius-identity-broker.sock" not in source
+  # App broker clients resolve the socket only through runtime_identity.
+  for relative in (
+    "app/providers.py",
+    "app/contribution_broker.py",
+    "app/community_broker.py",
+  ):
+    source = (backend / relative).read_text(encoding="utf-8")
+    assert "MOBIUS_IDENTITY_BROKER_SOCKET" not in source
+    assert "mobius-identity-broker.sock" not in source
 
 
 @pytest.fixture()
@@ -1608,3 +1611,12 @@ def test_inference_final_byte_limit_runs_after_real_web_rewrite(monkeypatch, cap
     server.shutdown()
     server.server_close()
     thread.join(timeout=2)
+
+
+def test_shared_inbox_broker_exposes_only_exact_response_route():
+  path = "/api/instance/v1/browser-access/shared/respond"
+  assert broker_module._managed_upstream_path("POST", "/managed" + path) == path
+  assert broker_module.BROKER_ROUTE_EPOCH >= 7
+  for method, suffix in (("GET", ""), ("DELETE", ""), ("POST", "/other"),
+                         ("POST", "?subject=other"), ("POST", "/../grants")):
+    assert broker_module._managed_upstream_path(method, "/managed" + path + suffix) is None
