@@ -17,6 +17,7 @@ from sqlalchemy import Text, case, cast, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.chat_handoffs import project_handoff
 from app import (
   activity,
   auth,
@@ -51,7 +52,7 @@ from app.chat import (
   mark_chat_deleted,
   recover_chat_generation,
   stop_chat_for,
-  usage_limit_waiting_chat_ids,
+  continuation_handoff_for_chat,
   continuation_wait_for_chat,
 )
 from app.broadcast import get_system_broadcast
@@ -71,7 +72,7 @@ from app.chat_titles import (
 )
 from app.database import get_db
 from app.delegations import background_helper_chat_ids, serialize_background_helpers
-from app.goal_plans import presented_goal
+from app.goal_plans import presented_goal, presented_deferred_goals
 from app.helper_transcripts import read_helper_conversation
 from app.memory_observability import record_memory_checkpoint_once
 from app.owner_input import OwnerInputKind
@@ -446,21 +447,28 @@ def issue_media_token(
       app_nonce=principal.app_instance_id,
       chat_id=chat_id,
       session_id=principal.embed_session_id,
+      browser_grant_id=principal.browser_grant_id,
+      browser_grant_epoch=principal.browser_grant_epoch,
+      browser_session_id=principal.browser_session_id,
     )
   else:
     token = auth.create_media_token(
       chat_id=chat_id,
       owner_username=principal.owner.username,
       token_epoch=principal.owner.token_epoch,
+      browser_grant_id=principal.browser_grant_id,
+      browser_grant_epoch=principal.browser_grant_epoch,
+      browser_session_id=principal.browser_session_id,
     )
   return {"token": token, "expires_in": 900}
+
 
 
 def _owner_chat_summary(
   chat,
   *,
   durable_running: bool = False,
-  durable_waiting: bool = False,
+  handoff: dict | None = None,
   transient_owner_input_kind: OwnerInputKind | None = None,
   unseen_failure_version: int | None = None,
   project_ref: dict | None = None,
@@ -487,7 +495,8 @@ def _owner_chat_summary(
     # Waiting is durable idle work, distinct from an agent actively streaming.
     # The drawer renders it explicitly rather than making an armed chat look
     # inactive or overloading the running indicator.
-    "waiting": durable_waiting,
+    "waiting": bool(handoff and handoff["kind"] == "automatic"),
+    "handoff": handoff or {"kind": "none", "reason": None},
     # A turn parked on the owner's AskUserQuestion answer is `running` but is
     # NOT streaming — nothing to interrupt, and the card is durable — so the
     # shell excludes it from the reload-defer's active-turn test. The durable
@@ -804,6 +813,14 @@ def _chat_detail_response(
       if expose_session else {"count": 0, "items": []}
     ),
   }
+  response["handoff"] = project_handoff(
+    owner_input=bool(response["pending_question_id"]) or chat.id in secure_inputs.pending_chat_ids(),
+    running=running,
+    waits=response["waits"],
+    helper_count=response["background_helpers"]["count"],
+    park=continuation_handoff_for_chat(db, chat.id),
+    goal=response["goal"],
+  )
   if requested_anchor_found is not None:
     response["requested_anchor_found"] = requested_anchor_found
   return response
@@ -900,11 +917,14 @@ def list_chats(
     # owner conversation into the drawer by setting owner_visible at creation.
     chats = [c for c in chats if _visible_in_owner_drawer(c)]
   durable_running = running_chat_ids(db, (chat.id for chat in chats))
-  durable_waiting = (
-    outstanding_wait_chat_ids(db)
-    | background_helper_chat_ids(db, (chat.id for chat in chats))
-    | usage_limit_waiting_chat_ids(db, (chat.id for chat in chats))
-  )
+  wait_chat_ids = outstanding_wait_chat_ids(db)
+  helper_chat_ids = background_helper_chat_ids(db, (chat.id for chat in chats))
+  park_candidates = {
+    row[0] for row in db.query(models.ChatRun.chat_id).filter(
+      models.ChatRun.chat_id.in_([chat.id for chat in chats]),
+      models.ChatRun.status.in_(("parked", "resume_pending")),
+    ).distinct().all()
+  }
   unseen_failures = chat_failure_activity.unseen_versions(
     db, (chat.id for chat in chats),
   )
@@ -914,14 +934,29 @@ def list_chats(
       "shell_chat_list_first_response",
       chat_count=len(chats),
     )
-  return [
-    _owner_chat_summary(
+  deferred_goals = presented_deferred_goals(db, (chat.id for chat in chats))
+  result = []
+  for chat in chats:
+    owner_kind = "question" if chat.pending_question_id is not None else (
+      "secure_input" if chat.id in secure_input_chats else None
+    )
+    waits = [serialize_wait(row, db=db) for row in outstanding_waits_for_chat(db, chat.id)] \
+      if chat.id in wait_chat_ids else []
+    park = continuation_handoff_for_chat(db, chat.id) if chat.id in park_candidates \
+      else {"kind": "none", "reason": None}
+    handoff = project_handoff(
+      owner_input=bool(owner_kind),
+      running=chat.id in durable_running or is_chat_running(chat.id),
+      waits=waits,
+      helper_count=1 if chat.id in helper_chat_ids else 0,
+      park=park,
+      goal=deferred_goals.get(chat.id),
+    )
+    result.append(_owner_chat_summary(
       chat,
       durable_running=chat.id in durable_running,
-      durable_waiting=chat.id in durable_waiting,
-      transient_owner_input_kind=(
-        "secure_input" if chat.id in secure_input_chats else None
-      ),
+      handoff=handoff,
+      transient_owner_input_kind=owner_kind,
       unseen_failure_version=unseen_failures.get(chat.id),
       project_ref=(
         {
@@ -930,12 +965,10 @@ def list_chats(
           "root_path": chat.project_root_path,
           "color": chat.project_color,
         }
-        if chat.project_ref_id is not None
-        else None
+        if chat.project_ref_id is not None else None
       ),
-    )
-    for chat in chats
-  ]
+    ))
+  return result
 
 
 class ChatFailureSeenRequest(BaseModel):
@@ -1805,7 +1838,7 @@ def get_chat_runtime(
   )
   running = is_chat_running(chat.id)
   run_id, run_status, runtime_revision = _latest_run_snapshot(db, chat.id)
-  return {
+  response = {
     "running": running,
     "restart_observation_key": restart_observation_key(db, chat.id),
     "run_id": run_id,
@@ -1827,6 +1860,14 @@ def get_chat_runtime(
       if principal.scope != "chat_embed" else {"count": 0, "items": []}
     ),
   }
+  response["handoff"] = project_handoff(
+    owner_input=bool(response["pending_question_id"]) or chat.id in secure_inputs.pending_chat_ids(),
+    running=running, waits=response["waits"],
+    helper_count=response["background_helpers"]["count"],
+    park=continuation_handoff_for_chat(db, chat.id),
+    goal=response["goal"],
+  )
+  return response
 
 
 @router.get("/{chat_id}/message-sources")
@@ -2191,6 +2232,29 @@ def get_thinking_trace_by_id(
       "X-Thinking-Complete": "1" if row.complete else "0",
     },
   )
+
+
+@router.get("/{chat_id}/write-outcomes/{run_id}/{operation_id}")
+def get_chat_write_outcome(
+  chat_id: str, run_id: str, operation_id: str,
+  _: models.Owner = Depends(get_current_owner),
+  db: Session = Depends(get_db),
+):
+  """Read one original write for repair, without replay or execution authority.
+
+  Like agent-context, this is owner/owner-agent observability, not an app or
+  shared-frame surface. Arguments are never automatically stuffed into failure
+  context; the agent retrieves one bounded operation only when it needs it.
+  """
+  get_active_chat_or_404(db, chat_id, load_fields=())
+  row = db.query(models.AgentWriteIntent).filter_by(
+    chat_id=chat_id, source_run_id=run_id, operation_id=operation_id,
+  ).first()
+  if row is None:
+    raise HTTPException(status_code=404, detail="Write outcome not found.")
+  return {"run_id": run_id, "id": row.operation_id, "tool": row.tool,
+          "arguments": json.loads(row.arguments_json), "status": row.status,
+          "stage": row.stage, "reason": row.reason}
 
 
 @router.get("/{chat_id}/agent-context")
@@ -2886,12 +2950,14 @@ async def compact_chat(
   provider switches use the atomic ``/provider-switch`` route.
   """
   from app.chat_queue import get_transition_lock
+  from app.chat_continuity import note_path, recovery_source
+  from app.chat_notes import extract_cumulative_summary
   from app.chat_writer import (
     PersistCompaction, alloc_run_token, await_ack, get_writer,
     messages_fingerprint,
   )
   from app.compaction import (
-    CompactionError, load_cumulative_summary, summarize_chat,
+    CompactionError, summarize_chat,
   )
 
   async with get_transition_lock(chat_id):
@@ -2917,16 +2983,25 @@ async def compact_chat(
     messages = list(chat.messages or [])
     data_dir = get_settings().data_dir
     try:
-      source_summary = load_cumulative_summary(data_dir, chat_id)
+      try:
+        note = note_path(data_dir, chat_id).read_text(encoding="utf-8")
+      except OSError:
+        note = ""
+      source_summary = extract_cumulative_summary(note)
+      source_messages = messages
+      source_note_hash = None
+      try:
+        source_summary, source_messages = recovery_source(note, messages)
+      except ValueError:
+        # Legacy or changed notes cannot replace history. Preserve the old
+        # full-transcript backstop, including its existing work limits.
+        pass
+      else:
+        source_note_hash = hashlib.sha256(note.encode("utf-8")).hexdigest()
       instructions = body.instructions if body is not None else None
-      # The agent-saved cumulative summary is best-effort and can lag the
-      # latest turn. Manual compaction retires the provider session, so always
-      # synthesize from the current transcript and use that summary only as an
-      # additional seed; copying it verbatim could drop the newest decisions
-      # from the fresh session that follows.
       settings_obj = chat.agent_settings_json or {}
       summary = await summarize_chat(
-        messages,
+        source_messages,
         data_dir=data_dir,
         provider_id=source_provider,
         source_summary=source_summary,
@@ -2948,6 +3023,7 @@ async def compact_chat(
         summary=summary,
         expected_provider=source_provider,
         source_messages_hash=messages_fingerprint(messages),
+        source_note_hash=source_note_hash,
       )))
     except Exception:
       raise HTTPException(
@@ -3216,7 +3292,7 @@ def _app_chat_started(chat: models.Chat, db: Session) -> bool:
     or chat.session_id
     or is_chat_running(chat.id)
     or has_nonterminal_run(db, chat.id)
-    or (goal and goal.get("status") in {"running", "paused", "completed"})
+    or (goal and goal.get("status") in {"active", "paused", "completed", "cannot_complete", "cancelled"})
   )
 
 

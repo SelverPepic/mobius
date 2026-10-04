@@ -233,17 +233,17 @@ def test_goal_routing_rechecks_phase_transitions_and_prefers_platform_tool():
   assert "Parallelism itself is not the saving" in planning_normalized
   assert "Serialize dependencies, shared writes, plan revisions" in planning_normalized
   assert "call `update_goal` with `complete" in planning_normalized
-  assert "refused while tasks or helpers are unfinished" in planning_normalized
+  assert "No outcome closes while helpers are active" in planning_normalized
   assert "goal_plan.py" not in planning
   assert "not a keyword trigger" in planning_normalized
   assert "first-class `promote_goal` tool" in planning_normalized
   assert "resilience, not an equivalent convenience path" in planning_normalized
   assert "an attempted tool call returns a failure" in planning_normalized
-  assert "A Goal never continues by itself" in planning_normalized
+  assert "one targeted settlement continuation in the existing runner" in planning_normalized
   assert "Terminal settlement" not in planning_normalized
   assert "turns are not a budget" in planning_normalized
   assert "With no arguments it returns the full plan" in planning_normalized
-  assert "Do not end a run merely to refresh context" in planning_normalized
+  assert "Do not end merely to refresh context" in planning_normalized
 
 
 def test_called_off_goal_settles_through_update_goal_not_chat_stop():
@@ -254,13 +254,13 @@ def test_called_off_goal_settles_through_update_goal_not_chat_stop():
     repo / "backend" / "scripts" / "seed-skills" / "goal-planning.md"
   ).read_text(encoding="utf-8").split())
 
-  assert "set its unfinished tasks to `cancelled` with `update_goal`" in planning
-  assert "`complete: 'Owner called off: reason'`" in planning
+  assert "record `cancel: 'Owner called off: reason'`" in planning
+  assert "Cancellation is not successful completion" in planning
   assert "Never settle a Goal by stopping the chat" in planning
   assert "Only when the owner explicitly asks you to stop" in planning
 
 
-def test_goal_turns_end_plainly_unless_a_promise_needs_a_waker():
+def test_goal_responsibility_requires_truthful_outcome_or_real_handoff():
   repo = Path(__file__).resolve().parents[2]
   core = (repo / "skill" / "core.md").read_text(encoding="utf-8")
   planning = (
@@ -274,14 +274,15 @@ def test_goal_turns_end_plainly_unless_a_promise_needs_a_waker():
   waiting_normalized = " ".join(waiting.split())
 
   assert "**Never leave an invisible wait.**" in core
-  assert "Nothing resumes an unfinished Goal by itself" in core_normalized
-  assert "arm what will wake you" in core_normalized
-  assert "declare a durable monitor" in core_normalized
-  assert "an idle chat is simply the partner's turn" in core_normalized
-  assert "Never rely on a paused Goal" in core_normalized
-  assert "### When your turn ends" in planning
-  assert "the chat is the owner's turn unless something you armed will wake it" in planning_normalized
-  assert "never promise to continue later without arming what will wake you" in planning_normalized
+  assert "until a truthful outcome or real handoff" in core_normalized
+  assert "save an answerable card whose answer continues the work" in core_normalized
+  assert "seek an actionable owner decision before declaring **Cannot complete**" in core_normalized
+  assert "A prose promise or paused Goal is not a handoff" in core_normalized
+  assert "bounded execution recovery never overrides Stop or owner approval" in core_normalized
+  assert "### Responsibility, handoffs and outcomes" in planning
+  assert "Its answer resumes the same work" in planning_normalized
+  assert "A temporary approval gate or outage is not capitulation" in planning_normalized
+  assert "Stop and arbitrary process crashes never grant automatic continuation" in planning_normalized
   # The retired rule demanded one owning interaction at every Goal turn end.
   assert "create exactly one owning interaction" not in planning_normalized
   assert "# Waiting visibly — durable monitors or explicit owner actions" in waiting

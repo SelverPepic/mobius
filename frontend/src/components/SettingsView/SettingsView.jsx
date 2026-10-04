@@ -277,6 +277,7 @@ export default function SettingsView({
   focusTarget = null,
   active = true,
   refreshToken = 0,
+  onLeaveSharedAccess = null,
 }) {
   const settingsBoundaryRef = useRef(null)
   const queryClient = useQueryClient()
@@ -897,6 +898,10 @@ export default function SettingsView({
 
   async function signOut() {
     if (signingOut) return
+    if (onLeaveSharedAccess) {
+      await onLeaveSharedAccess()
+      return
+    }
     setSigningOut(true)
     try {
       await clearExplicitOwnerSession({
@@ -1280,7 +1285,7 @@ export default function SettingsView({
                   onClick={signOut}
                   disabled={signingOut}
                 >
-                  {signingOut ? 'Signing out…' : 'Sign out'}
+                  {signingOut ? 'Leaving…' : onLeaveSharedAccess ? 'Leave shared access' : 'Sign out'}
                 </button>
               </div>
             ) : (
@@ -1289,7 +1294,7 @@ export default function SettingsView({
                 type="button"
                 onClick={() => setSignOutConfirm(true)}
               >
-                Sign out
+                {onLeaveSharedAccess ? 'Leave shared access' : 'Sign out'}
               </button>
             )}
           </div>

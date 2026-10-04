@@ -1,3 +1,5 @@
+import { isSharedBrowserRoute } from './sharedBrowserWorkspace.js'
+
 /**
  * Consumes the one-shot shell snapshot written immediately before a rebuild.
  *
@@ -41,4 +43,5 @@ export function writeShellReload(storage, value) {
 
 // One reader for the whole page load. App and useNavigation share this parsed
 // value; a second storage read would see the already-removed key.
-export const shellReload = consumeShellReload()
+export const shellReload = isSharedBrowserRoute()
+  ? null : consumeShellReload()

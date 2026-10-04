@@ -728,8 +728,10 @@ def test_claude_receives_an_owner_goal_command_as_a_plain_request(
     asyncio.run(_scenario())
 
   prompt = captured["user_message"]
-  assert prompt.startswith("[Context — current time:")
-  assert "Goal: ship the fix" in prompt
+  # Per-run delivery instructions may precede the time header; neither may
+  # turn the owner's request back into Claude's native slash command.
+  assert any(line.startswith("[Context — current time:") for line in prompt.splitlines())
+  assert prompt.endswith("\n\nGoal: ship the fix")
   assert not any(line.startswith("/goal") for line in prompt.splitlines())
 
 

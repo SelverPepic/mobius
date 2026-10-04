@@ -110,6 +110,9 @@ def mint_embed_capability(
     chat_id=chat_id,
     instance_id=body.instance_id,
     owner_epoch=principal.owner.token_epoch,
+    browser_grant_id=principal.browser_grant_id,
+    browser_grant_epoch=principal.browser_grant_epoch,
+    browser_session_id=principal.browser_session_id,
     role="participant",
     operations_json=list(PARTICIPANT_OPERATIONS),
     expires_at=expires_at,
@@ -163,6 +166,12 @@ def exchange_embed_capability(
     or chat.created_by_app_id != grant.app_id
   ):
     raise HTTPException(status_code=401, detail="Embed bootstrap grant was revoked.")
+
+  if grant.browser_grant_id is not None:
+    from app.browser_access import validate_grant, validate_session
+    validate_grant(db, grant.browser_grant_id, grant.browser_grant_epoch, owner.id)
+    if grant.browser_session_id is not None:
+      validate_session(db, grant.browser_session_id, grant.browser_grant_id, owner.id)
 
   # A lost/slow response can make the parent mint and exchange a replacement
   # while this older request is still in flight. Grant creation order is the
@@ -238,6 +247,9 @@ def exchange_embed_capability(
     role=claims["role"],
     operations=claims["operations"],
     expires_delta=SESSION_TTL,
+    browser_grant_id=grant.browser_grant_id,
+    browser_grant_epoch=grant.browser_grant_epoch,
+    browser_session_id=grant.browser_session_id,
   )
   return {
     "token": token,

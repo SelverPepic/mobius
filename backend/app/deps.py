@@ -108,6 +108,9 @@ class Principal:
   app_is_service: bool = False
   # Signed supervised-job identity/grant; never copied into frame bearers.
   app_job_secrets: frozenset[str] = frozenset()
+  browser_grant_id: str | None = None
+  browser_grant_epoch: int | None = None
+  browser_session_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -134,6 +137,7 @@ class SharedAppPrincipal:
   instance_id: str | None = None
   member_id: str | None = None
   display_name: str | None = None
+  browser_grant_id: str | None = None
 
   @property
   def is_owner(self) -> bool:
@@ -220,6 +224,14 @@ def _resolve_owner(
     raise HTTPException(status_code=401, detail="Owner not found.")
   if payload.get("epoch", 0) != owner.token_epoch:
     raise HTTPException(status_code=401, detail="Token revoked.")
+  # Every descendant bearer keeps the recipient grant; JWT expiry alone is
+  # never the revocation boundary for shared-instance access.
+  if "browser_grant" in payload or "browser_grant_epoch" in payload:
+    from app.browser_access import validate_grant
+    validate_grant(db, payload.get("browser_grant"), payload.get("browser_grant_epoch"), owner.id)
+  if "browser_session" in payload:
+    from app.browser_access import validate_session
+    validate_session(db, payload["browser_session"], payload.get("browser_grant"), owner.id)
   connect_agent = payload.get(connect_outbound.AGENT_CLAIM)
   if connect_agent is not None:
     if not connect_outbound.agent_access_active(connect_agent):
@@ -401,7 +413,8 @@ def resolve_shared_app_principal(token: str, db: Session) -> SharedAppPrincipal:
   owner, payload = _resolve_owner(token, db)
   scope = payload.get("scope")
   if scope is None:
-    return SharedAppPrincipal(owner=owner, role="owner", display_name=owner.username)
+    return SharedAppPrincipal(owner=owner, role="owner", display_name=owner.username,
+                              browser_grant_id=payload.get("browser_grant"))
   if scope != "shared_app_collaborator":
     raise HTTPException(403, "Token scope is not valid for shared apps.")
   member_id = payload.get("shared_app_member")
@@ -453,6 +466,9 @@ def get_agent_principal(
     scope="owner",
     chat_id=chat_id,
     run_id=payload.get("agent_run"),
+    browser_grant_id=payload.get("browser_grant"),
+    browser_grant_epoch=payload.get("browser_grant_epoch"),
+    browser_session_id=payload.get("browser_session"),
   )
 
 
@@ -729,6 +745,9 @@ def _generic_principal(owner: models.Owner, payload: dict, db: Session) -> Princ
     chat_id=payload.get("agent_chat") or payload.get("delegation_chat"),
     run_id=payload.get("agent_run"),
     delegation_id=payload.get("delegation_id"),
+    browser_grant_id=payload.get("browser_grant"),
+    browser_grant_epoch=payload.get("browser_grant_epoch"),
+    browser_session_id=payload.get("browser_session"),
     app_is_service=app_id is not None and payload.get("service") is True,
     app_job_secrets=frozenset(payload.get("job_secrets", [])) if app_id is not None else frozenset(),
   )
@@ -766,7 +785,7 @@ def require_nondelegated_owner_or_app_control(
   principal: Principal = Depends(get_principal),
 ) -> None:
   """Admit owner/top-level-agent and scoped-app actors, never a child agent."""
-  require_nondelegated_owner_control(principal)
+  require_installation_owner_control(principal)
 
 
 def _owner_principal_or_403(principal: Principal) -> models.Owner:
@@ -784,8 +803,15 @@ def get_current_owner_for_lifecycle_control(
 ) -> models.Owner:
   """Resolve a plain owner or top-level agent for lifecycle controls."""
   owner = _owner_principal_or_403(principal)
-  require_nondelegated_owner_control(principal)
+  require_installation_owner_control(principal)
   return owner
+
+
+def require_installation_owner_control(principal: Principal) -> None:
+  """Shared collaborators may use the workspace, not mint installation authority."""
+  require_nondelegated_owner_control(principal)
+  if principal.browser_grant_id is not None:
+    raise HTTPException(403, "Only the installation owner can manage this access.")
 
 
 def get_owner_or_delegated_owner_for_app_token(
@@ -899,17 +925,11 @@ def get_delegation_principal(
     return Principal(
       owner=owner, app_id=int(app_id) if app_id is not None else None, scope="delegation",
       chat_id=str(chat_id), delegation_id=str(delegation_id),
+      browser_grant_id=payload.get("browser_grant"),
+      browser_grant_epoch=payload.get("browser_grant_epoch"),
+      browser_session_id=payload.get("browser_session"),
     )
-  if payload.get("scope") not in (None, "app"):
-    raise HTTPException(status_code=403, detail="Token scope is not valid here.")
-  app_id = _enforce_app_scope(payload, db)
-  return Principal(
-    owner=owner, app_id=app_id,
-    app_instance_id=payload.get("app_nonce") if app_id is not None else None,
-    scope="app" if app_id is not None else "owner",
-    chat_id=payload.get("delegation_chat"),
-    delegation_id=payload.get("delegation_id"),
-  )
+  return _generic_principal(owner, payload, db)
 
 
 def get_chat_view_principal(
@@ -929,18 +949,7 @@ def get_chat_view_principal(
   owner, payload = _resolve_owner(token, db)
   embed = _enforce_chat_embed_scope(payload, db, embed_instance_id)
   if embed is None:
-    if payload.get("scope") not in (None, "app"):
-      raise HTTPException(status_code=403, detail="Token scope is not valid here.")
-    app_id = _enforce_app_scope(payload, db)
-    return Principal(
-      owner=owner,
-      app_id=app_id,
-      app_instance_id=payload.get("app_nonce") if app_id is not None else None,
-      scope="app" if app_id is not None else "owner",
-      chat_id=payload.get("agent_chat") or payload.get("delegation_chat"),
-      run_id=payload.get("agent_run"),
-      delegation_id=payload.get("delegation_id"),
-    )
+    return _generic_principal(owner, payload, db)
   return Principal(
     owner=owner,
     app_id=embed["app_id"],
@@ -951,6 +960,9 @@ def get_chat_view_principal(
     embed_session_id=embed["session_id"],
     embed_role=embed["role"],
     operations=embed["operations"],
+    browser_grant_id=payload.get("browser_grant"),
+    browser_grant_epoch=payload.get("browser_grant_epoch"),
+    browser_session_id=payload.get("browser_session"),
   )
 
 
@@ -1359,3 +1371,24 @@ def get_owner_or_app_with_filesystem_access(
       "to use the owner filesystem."
     ),
   )
+
+
+async def revocable_browser_stream(iterator, principal: Principal):
+  """Do not deliver another event from an already-open revoked browser stream."""
+  try:
+    async for chunk in iterator:
+      if principal.browser_grant_id is not None:
+        from app.browser_access import validate_grant, validate_session
+        with SessionLocal() as db:
+          owner = db.get(models.Owner, principal.owner.id)
+          if owner is None or owner.token_epoch != principal.owner.token_epoch:
+            return
+          try:
+            validate_grant(db, principal.browser_grant_id, principal.browser_grant_epoch, owner.id)
+            if principal.browser_session_id is not None:
+              validate_session(db, principal.browser_session_id, principal.browser_grant_id, owner.id)
+          except HTTPException:
+            return
+      yield chunk
+  finally:
+    await iterator.aclose()

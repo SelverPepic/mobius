@@ -840,6 +840,7 @@ def test_runtime_route_does_not_select_transcript_json(
     "continuation_wait": None,
     "active_goal_objective": None,
     "goal": None,
+    "handoff": {"kind": "working", "reason": None},
     "pending_messages": [],
     "pending_question_id": None,
     "updated_at": created.json()["updated_at"],

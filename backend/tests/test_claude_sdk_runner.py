@@ -3453,3 +3453,57 @@ async def test_failed_native_withdrawal_reaps_before_sdk_eof_only_on_failure(mon
   assert clients[0].disconnected
   assert trace == (["withdraw", "reap", "disconnect"] if withdrawal_fails
                    else ["withdraw", "disconnect", "reap"])
+
+
+def test_forwarded_claude_finals_use_sdk_envelope_identity_without_stream_indices():
+  """Real hosted shape: each completed block has a UUID, but no stream start."""
+  bus = _ChatBus()
+  first = AssistantMessage(content=[TextBlock(text="First.")], model="synthetic",
+    message_id="same-api-message", uuid="envelope-one")
+  second = AssistantMessage(content=[TextBlock(text="Second.")], model="synthetic",
+    message_id="same-api-message", uuid="envelope-two")
+  for message in (first, second, first):
+    dispatch_sdk_message(message, bus, None)
+  finals = [e for e in bus.events if e["type"] == "text_final"]
+  assert finals[0]["text_item_id"] == finals[2]["text_item_id"]
+  assert finals[0]["text_item_id"] != finals[1]["text_item_id"]
+  assert [b["content"] for b in _reduce(bus.events) if b["type"] == "text"] == ["First.", "Second."]
+
+
+def test_replayed_envelope_does_not_consume_the_next_streamed_block_identity():
+  bus = _ChatBus()
+  dispatch_sdk_message(_stream_message_start("msg"), bus, None)
+  for index in (0, 1):
+    dispatch_sdk_message(_stream_text_block_start(index), bus, None)
+  first = AssistantMessage(content=[TextBlock(text="First.")], model="synthetic",
+    message_id="msg", uuid="envelope-one")
+  second = AssistantMessage(content=[TextBlock(text="Second.")], model="synthetic",
+    message_id="msg", uuid="envelope-two")
+  for message in (first, first, second):
+    dispatch_sdk_message(message, bus, None)
+  assert [e["text_item_id"] for e in bus.events if e["type"] == "text_final"] == ["msg:0", "msg:0", "msg:1"]
+
+
+def test_forwarded_multi_block_envelope_does_not_alias_its_text_blocks():
+  bus = _ChatBus()
+  message = AssistantMessage(content=[TextBlock(text="First."), TextBlock(text="Second.")],
+    model="synthetic", message_id="msg", uuid="envelope")
+  dispatch_sdk_message(message, bus, None)
+  finals = [e for e in bus.events if e["type"] == "text_final"]
+  assert finals[0]["text_item_id"] != finals[1]["text_item_id"]
+
+
+def test_sdk_envelope_id_alone_never_manufactures_missing_message_authority():
+  bus = _ChatBus()
+  dispatch_sdk_message(AssistantMessage(content=[TextBlock(text="Text.")],
+    model="synthetic", uuid="envelope"), bus, None)
+  assert all("text_item_id" not in e for e in bus.events if e["type"] == "text_final")
+
+
+def test_claude_final_identity_cache_is_bounded_without_remembering_payloads():
+  bus = _ChatBus()
+  for n in range(1030):
+    dispatch_sdk_message(AssistantMessage(content=[TextBlock(text="not retained in identity cache")],
+      model="synthetic", message_id="msg", uuid=f"envelope-{n}"), bus, None)
+  assert len(bus._claude_final_text_items) == 1024
+  assert "not retained" not in str(bus._claude_final_text_items)

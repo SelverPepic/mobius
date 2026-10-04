@@ -2558,7 +2558,7 @@ def test_codex_oversized_provider_notification_is_not_laundered_into_memory_retr
   )
   assert result["error"] == message
   assert not result.get("oom_killed")
-  assert chat._park_exit(bc, result, result["error"]) == {"parked": False}
+  assert chat._park_exit(bc, result, result["error"]) == {"parked": False, "oversized": True}
   event = bc.events[-1]
   assert "pause" not in event
   assert message in event["message"]
@@ -5077,3 +5077,100 @@ def test_a_stop_before_the_codex_turn_starts_reports_the_prompt_unsent(
   assert thread.turn_args is None
   assert result["error"] is None
   assert result["prompt_sent"] is False
+
+
+@pytest.mark.parametrize("delivery", ["notification", "completed"])
+@pytest.mark.parametrize("info, expected", [
+  ("contextWindowExceeded", {"context_window_exceeded": True}),
+  ({"httpConnectionFailed": {"httpStatusCode": 413}}, {"api_error_status": 413}),
+  ({"responseStreamConnectionFailed": {"httpStatusCode": 413}}, {"api_error_status": 413}),
+  ({"responseStreamDisconnected": {"httpStatusCode": 413}}, {"api_error_status": 413}),
+  ({"responseTooManyFailedAttempts": {"httpStatusCode": 413}}, {"api_error_status": 413}),
+])
+def test_typed_size_failure_reaches_recovery_without_matching_error_prose(
+  monkeypatch, delivery, info, expected,
+):
+  from app import chat
+  types = pytest.importorskip("openai_codex.generated.v2_all")
+  error = types.TurnError.model_validate({
+    "message": "Provider refused this input.", "codexErrorInfo": info,
+  })
+  sdk = _fake_sdk(None)
+  if delivery == "notification":
+    notification = SimpleNamespace(
+      method="error", payload=sdk["ErrorNotification"](
+        error=error, thread_id="thread-1", turn_id="turn-1", will_retry=False,
+      ),
+    )
+  else:
+    notification = SimpleNamespace(
+      method="turn/completed", payload=_FakeTurnCompletedNotification(
+        SimpleNamespace(id="turn-1", status=_FakeTurnStatus.failed, error=error),
+      ),
+    )
+  result, bc = _run_turn_whose_stream_dies(
+    monkeypatch, AssertionError("must finish at the size failure"),
+    notifications=[notification],
+    sdk_patch={"ErrorNotification": sdk["ErrorNotification"]},
+  )
+  assert result["error"] == error.message
+  assert {key: result[key] for key in expected} == expected
+  assert not result.get("oom_killed")
+  assert chat._park_exit(bc, result, result["error"]) == {
+    "parked": False, "oversized": True,
+  }
+  if info == "contextWindowExceeded":
+    assert "model's context window" in bc.events[-1]["message"]
+
+
+@pytest.mark.parametrize("info", [
+  None, "badRequest", "sessionBudgetExceeded", "usageLimitExceeded",
+  {"httpConnectionFailed": {"httpStatusCode": 400}},
+  {"httpConnectionFailed": {"httpStatusCode": 429}},
+  {"httpConnectionFailed": {"httpStatusCode": 500}},
+])
+def test_non_size_sdk_errors_do_not_gain_context_recovery(info):
+  types = pytest.importorskip("openai_codex.generated.v2_all")
+  error = types.TurnError.model_validate({
+    "message": "Image dimensions too large", "codexErrorInfo": info,
+  })
+  assert codex_events._codex_size_failure(error) == {}
+
+
+def test_sdk_retrying_size_notice_is_not_a_terminal_recovery(monkeypatch):
+  types = pytest.importorskip("openai_codex.generated.v2_all")
+  error = types.TurnError.model_validate({
+    "message": "Provider refused input.", "codexErrorInfo": "contextWindowExceeded",
+  })
+  sdk = _fake_sdk(None)
+  result, _ = _run_turn_whose_stream_dies(
+    monkeypatch, AssertionError("must finish normally"),
+    notifications=[
+      SimpleNamespace(method="error", payload=sdk["ErrorNotification"](
+        error=error, thread_id="thread-1", turn_id="turn-1", will_retry=True,
+      )),
+      *_goal_completion_notifications(),
+    ],
+    sdk_patch={"ErrorNotification": sdk["ErrorNotification"]},
+  )
+  assert not result.get("context_window_exceeded")
+  assert result["error"] is None
+
+
+def test_own_stop_does_not_turn_stale_size_details_into_recovery(monkeypatch):
+  types = pytest.importorskip("openai_codex.generated.v2_all")
+  error = types.TurnError.model_validate({
+    "message": "Provider refused input.", "codexErrorInfo": "contextWindowExceeded",
+  })
+  result, _ = _run_turn_whose_stream_dies(
+    monkeypatch, AssertionError("must finish at interruption"),
+    on_register=_mark_interrupted,
+    notifications=[SimpleNamespace(
+      method="turn/completed", payload=_FakeTurnCompletedNotification(
+        SimpleNamespace(id="turn-1", status=_FakeTurnStatus.interrupted, error=error),
+      ),
+    )],
+  )
+  assert result["error"] is None
+  assert result["terminal_status"] == "interrupted"
+  assert not result.get("context_window_exceeded")

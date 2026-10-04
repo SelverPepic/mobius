@@ -645,7 +645,7 @@ def test_connector_capabilities_do_not_change_the_host_key(monkeypatch):
 
 
 @pytest.mark.parametrize("supports_effort", [True, False])
-def test_every_hosted_helper_gets_the_claude_register(tmp_path, supports_effort):
+def test_every_hosted_helper_gets_the_claude_register_and_text_stream(tmp_path, supports_effort):
   """Hosted helpers get the same Claude register as a top-level turn."""
   from contextlib import ExitStack
   from types import SimpleNamespace
@@ -659,6 +659,7 @@ def test_every_hosted_helper_gets_the_claude_register(tmp_path, supports_effort)
   for resume in (None, "host-session"):
     with ExitStack() as stack:
       options = factory(host, resume, stack)
+    assert options.include_partial_messages and options.forward_subagent_text
     assert set(options.agents) == {
       "mobius-helper", *(claude_host.agent_type_for(e) for e in claude_host.EFFORTS),
     }

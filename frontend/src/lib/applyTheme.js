@@ -1,3 +1,5 @@
+import { isSharedBrowserRoute } from './sharedBrowserWorkspace.js'
+
 /**
  * Theme application library — the SINGLE source of truth for how a
  * Möbius surface paints the active theme onto its own DOM.
@@ -44,6 +46,7 @@ const DEFAULT_BG = '#0d0d0d'
 const DEFAULT_MODE = 'dark'
 
 function defaultStore() {
+  if (isSharedBrowserRoute()) return null
   try { return globalThis.localStorage } catch { return null }
 }
 
@@ -271,7 +274,7 @@ export const PREPAINT_SRC = `(function () {
         mode = d.mode || infer(bg);
       }
     } catch (e) {}
-    if (!bg) {
+    if (!bg && !(location.pathname.endsWith('/shell/shared') || location.pathname.endsWith('/shell/shared/'))) {
       try {
         var raw = localStorage.getItem('mobius-theme');
         if (raw) {
@@ -328,7 +331,7 @@ export const PREPAINT_SRC = `(function () {
     // Opaque app frames use a memory-only storage shim with an EMPTY slot, so it must NOT write — else it clobbers the owner's
     // real theme with the dark default and the shell re-reads it (drawer bleed).
     try {
-      if (window.parent === window) {
+      if (window.parent === window && !(location.pathname.endsWith('/shell/shared') || location.pathname.endsWith('/shell/shared/'))) {
         localStorage.setItem('mobius-theme', JSON.stringify({ bg: bg, mode: mode }));
       }
     } catch (e) {}

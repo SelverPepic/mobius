@@ -23,7 +23,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from sqlalchemy import Text, cast, literal_column, or_, text
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 from starlette.concurrency import run_in_threadpool
 
 from app import (
@@ -54,6 +54,7 @@ from app.chat_event_sink import (
   active_sink_memory_diagnostics,
   commit_steer_cut,
   get_active_sink,
+  get_owned_sink,
   register_active_sink,
   steer_delivery_failed_event,
   steered_into_turn_event,
@@ -86,6 +87,7 @@ from app.chat_writer import (
   AdmitProviderExecution,
   AppendPending,
   Barrier,
+  BeginNoteRecovery,
   CancelPending,
   ClearPresentedGoal,
   ClearPending,
@@ -363,61 +365,67 @@ def _future_auto_resuming_limit_park_for_chat(
   return run if run.parked_until > current else None
 
 
-def _latest_run_is_usage_park(db: Session, chat_id: str) -> bool:
-  """Whether the chat's LATEST run is a usage-limit park awaiting resume.
+def continuation_handoff_for_chat(db: Session, chat_id: str) -> dict:
+  """Read the latest park's scheduler eligibility without admitting a turn.
 
-  Latest-run-wins, exactly like `_parked_until_for_chat`: a fresh turn inserts a
-  newer running row, so a superseded park never keeps the mark. Query failures
-  read as not-waiting — this only feeds a passive drawer indicator.
+  This is a presentation projection. The sweep and `_auto_resume_chat` still
+  re-check every condition under their transition locks at claim time.
   """
-  try:
-    run = (
-      db.query(models.ChatRun.status, models.ChatRun.park_reason)
-      .filter(models.ChatRun.chat_id == chat_id)
-      .order_by(
-        models.ChatRun.started_at.desc(),
-        models.ChatRun.id.desc(),
-      )
-      .first()
-    )
-  except Exception:
-    return False
+  run = _latest_continuation_park(db, chat_id)
   if run is None:
-    return False
-  status, park_reason = run
-  return status in ("parked", "resume_pending") and park_reason == "usage_limit"
-
-
-def usage_limit_waiting_chat_ids(
-  db: Session,
-  chat_ids: Iterable[str],
-) -> set[str]:
-  """Chat ids parked on a provider usage limit, awaiting resume.
-
-  A usage-limit park can sit for hours until the provider reset (or a manual /
-  credit-driven Resume) with no other running signal, so the drawer marks it as
-  "waiting" — the same passive indicator armed Waits and background helpers use.
-  Bounded to the caller's chat set and confirmed latest-run-wins so a formerly
-  parked chat that has since moved on clears the mark.
-  """
-  bounded = tuple(dict.fromkeys(chat_ids))
-  if not bounded:
-    return set()
-  try:
-    rows = (
-      db.query(models.ChatRun.chat_id)
-      .filter(
-        models.ChatRun.chat_id.in_(bounded),
-        models.ChatRun.status.in_(("parked", "resume_pending")),
-        models.ChatRun.park_reason == "usage_limit",
-      )
-      .distinct()
-      .all()
+    return {"kind": "none", "reason": None}
+  from app.goals import goal_allows_automatic_resume
+  if not goal_allows_automatic_resume(db, run):
+    return {"kind": "recovery", "reason": "goal_held"}
+  chat = db.query(models.Chat).options(load_only(
+    models.Chat.id, models.Chat.deleted_at, models.Chat.pending_question_id,
+    models.Chat.auto_resume_on_limit, models.Chat.auto_resume_on_restart,
+    models.Chat.pending_messages,
+  )).filter(models.Chat.id == chat_id).first()
+  if chat is None or chat.deleted_at is not None:
+    return {"kind": "none", "reason": None}
+  if _has_unanswered_question(chat):
+    return {"kind": "owner_input", "reason": "question"}
+  if any(
+    isinstance(msg, dict) and msg.get("_initiated_by_app_id") is not None
+    for msg in list(chat.pending_messages or [])
+  ):
+    return {"kind": "recovery", "reason": "app_attributed_work"}
+  from app.delegations import delegation_recovery_allowed, limit_resume_delegation
+  if not delegation_recovery_allowed(
+    db, child_chat_id=chat_id, initiated_by_app_id=run.initiated_by_app_id,
+  ):
+    return {"kind": "recovery", "reason": "delegation_barrier"}
+  reason = run.park_reason
+  restart = reason == "restart"
+  auto_retry = reason in AUTO_RETRY_PARK_REASONS
+  delegated = None
+  if not restart and not auto_retry:
+    delegated = limit_resume_delegation(
+      db, child_chat_id=chat_id, run_token=run.id,
+      initiated_by_app_id=run.initiated_by_app_id,
     )
-  except Exception:
-    return set()
-  candidates = {str(row[0]) for row in rows}
-  return {cid for cid in candidates if _latest_run_is_usage_park(db, cid)}
+  if reason == "model_capacity" and _model_capacity_retry_exhausted(db, run):
+    return {"kind": "recovery", "reason": "model_retry_exhausted"}
+  if run.initiated_by_app_id is not None and not restart and not auto_retry and delegated is None:
+    return {"kind": "recovery", "reason": "app_attributed_work"}
+  if not (_park_continues_automatically(chat, run) or delegated is not None):
+    return {"kind": "recovery", "reason": "manual_resume"}
+  if restart:
+    from app.restart_ledger import authorized_restart_nonce
+    try:
+      nonce = authorized_restart_nonce()
+    except Exception:
+      nonce = None
+    if not nonce or not run.restart_nonce or nonce != run.restart_nonce:
+      return {"kind": "recovery", "reason": "restart_manual"}
+  from app.platform_update import late_edits_pending, read_prepared_update
+  if late_edits_pending():
+    update = read_prepared_update()
+    if update and update["replayed"]:
+      return {"kind": "recovery", "reason": "restart_required"}
+    return {"kind": "automatic", "reason": "restoring_edits"}
+  return {"kind": "automatic", "reason": reason}
 
 
 def continuation_wait_for_chat(db: Session, chat_id: str) -> str | None:
@@ -612,8 +620,9 @@ async def _finish_run(
 def _after_terminal_status(chat_id: str, terminal_status: str) -> None:
   """Post-commit follow-up for a durable Stop of this chat's work.
 
-  FinishRun released the stopped Goal's work claims in its own commit; the
-  followers are woken off this lifecycle path, which may still hold locks.
+  Explicit Stop preparation released the Goal's claims before interruption;
+  wake its followers off this lifecycle path, which may still hold locks.
+  A physical run ending by itself supplies no Goal-stop intent.
   """
   if terminal_status == "stopped":
     from app.agent_coordination import schedule_claim_settlement
@@ -1376,9 +1385,11 @@ def _pending_head_is_stale(
   pending: list[dict], now_ms: int,
 ) -> bool:
   """Whether the queue head is old enough for an unattended claim."""
-  if not pending or not isinstance(pending[0], dict):
+  head = next((row for row in pending if isinstance(row, dict)
+               and row.get("delivery_status") != "rejected"), None)
+  if head is None:
     return False
-  timestamp = pending[0].get("ts")
+  timestamp = head.get("ts")
   if not isinstance(timestamp, (int, float)) or isinstance(timestamp, bool):
     return False
   age_ms = _IDLE_PENDING_MIN_AGE_SECS * 1000
@@ -1955,6 +1966,9 @@ def _auto_resume_recovery(
   from app.delegations import retired_delegation_for_chat
   if retired_delegation_for_chat(db, chat.id):
     return None
+  from app.goals import goal_allows_automatic_resume
+  if not goal_allows_automatic_resume(db, physical):
+    return None
   control = physical.continuation_json
   messages = list(chat.messages or [])
   source = messages[-1] if messages else None
@@ -1982,6 +1996,8 @@ def _auto_resume_recovery(
     else ()
   )
   if not park_reasons:
+    return None
+  if reason == "compaction" and (chat.pending_messages or _has_unanswered_question(chat)):
     return None
   park = db.query(models.ChatRun).filter(
     models.ChatRun.id == recorded_park,
@@ -2188,6 +2204,9 @@ async def _auto_resume_chat(
               .first()
             )
             latest_id = latest[0] if latest is not None else None
+            from app.goals import goal_allows_automatic_resume
+            if park is not None and not goal_allows_automatic_resume(check_db, park):
+              return False
             restart_park = (
               park is not None and park.park_reason == "restart"
             )
@@ -2502,6 +2521,9 @@ async def sweep_reset_parks(
       isinstance(msg, dict) and msg.get("_initiated_by_app_id") is not None
       for msg in pending
     )
+    from app.goals import goal_allows_automatic_resume
+    if not goal_allows_automatic_resume(db, run):
+      return "Goal held or settled"
     if chat is None or chat.deleted_at is not None:
       return "chat unavailable"
     from app.delegations import delegation_recovery_allowed
@@ -2878,7 +2900,8 @@ def _log_superseded_run(chat_id: str, phase: str) -> None:
 
 
 async def stop_chat(
-  chat_id: str | None = None, db: Session = None,
+  chat_id: str | None = None, db: Session = None, *,
+  actor: str | None = None, actor_id: str | None = None,
 ) -> tuple[bool, list[str]]:
   """Kills the active subprocess for a chat, bumps its generation, and
   clears its pending queue so a queued continuation cannot auto-start
@@ -2891,7 +2914,7 @@ async def stop_chat(
   isn't double-sent. The global sweep (`chat_id=None`) returns `[]` for it —
   that path doesn't resend."""
   if chat_id is not None:
-    return await stop_chat_for(chat_id, db=db)
+    return await stop_chat_for(chat_id, db=db, actor=actor, actor_id=actor_id)
   from app.broadcast import _broadcasts
   # Snapshot `_broadcasts` via `list()` first — iterating the live
   # mapping can raise RuntimeError if a concurrent task creates a
@@ -2901,14 +2924,89 @@ async def stop_chat(
   }
   stopped_any = False
   for cid in targets:
-    stopped_cid, _ = await stop_chat_for(cid, db=db)
+    stopped_cid, _ = await stop_chat_for(cid, db=db, actor=actor, actor_id=actor_id)
     if stopped_cid:
       stopped_any = True
   return stopped_any, []
 
 
+def browser_grant_active_chat_ids(db, grant_id: str) -> list[str]:
+  """Return attributed live/parked chats for the existing Stop machinery.
+
+  ``stop_browser_grant_runs`` rechecks these candidates under each transition
+  lock; no second scheduler or cancellation state is introduced here.
+  """
+  return [chat_id for (chat_id,) in db.query(models.ChatRun.chat_id).filter(
+    models.ChatRun.browser_grant_id == grant_id,
+    models.ChatRun.status.in_(models.NONTERMINAL_RUN_STATUSES),
+  ).distinct().all()]
+
+
+async def stop_browser_grant_runs(grant_id: str, db: Session = None) -> dict:
+  """Stop only physical runs still attributed to a revoked browser grant.
+
+  A fresh state read under each chat's transition lock prevents a stale
+  revocation sweep from stopping a replacement owner/other-guest turn. Leave
+  queued messages intact: unrelated owner intent must not be collapsed by a
+  remote recipient's revocation. Attributed child chats are included because
+  their ChatRuns carry the inherited grant; unstarted children fail the
+  writer's grant check before their first provider admission.
+  """
+  from app.database import SessionLocal
+  from app.chat_writer import RejectBrowserPending
+  with SessionLocal() as state_db:
+    candidates = set(browser_grant_active_chat_ids(state_db, grant_id))
+    for candidate in _nonempty_pending_queues(state_db):
+      if any(isinstance(row, dict) and row.get("_browser_grant_id") == grant_id
+             for row in candidate.pending_messages or []):
+        candidates.add(candidate.id)
+  stopped: list[str] = []
+  incomplete: list[str] = []
+  rejected_messages = 0
+  for chat_id in sorted(candidates):
+    async with chat_queue.get_transition_lock(chat_id):
+      with SessionLocal() as state_db:
+        from app.run_state import latest_run
+        current = latest_run(state_db, chat_id)
+        attributed = (
+          current is not None
+          and current.status in models.NONTERMINAL_RUN_STATUSES
+          and current.browser_grant_id == grant_id
+        )
+      if attributed:
+        complete, _ = await _stop_chat_for_locked(
+          chat_id, db=db, preserve_pending=True,
+        )
+        with SessionLocal() as state_db:
+          from app.run_state import latest_run
+          after = latest_run(state_db, chat_id)
+          still_attributed = (
+            after is not None
+            and after.status in models.NONTERMINAL_RUN_STATUSES
+            and after.browser_grant_id == grant_id
+          )
+        if not complete or still_attributed:
+          incomplete.append(chat_id)
+        else:
+          stopped.append(chat_id)
+      async with chat_queue.get_lock(chat_id):
+        result = await _await_ack(get_writer().submit(RejectBrowserPending(
+          chat_id=chat_id, browser_grant_id=grant_id,
+        )))
+        rejected_messages += result["rejected"]
+  if incomplete:
+    from fastapi import HTTPException
+    raise HTTPException(status_code=503, detail={
+      "code": "browser_grant_stop_incomplete",
+      "message": "Access was revoked, but some attributed runs are still stopping. Retry revocation.",
+      "chat_ids": incomplete,
+    })
+  return {"stopped_chat_ids": stopped, "rejected_messages": rejected_messages}
+
+
 async def stop_chat_for(
-  chat_id: str, db: Session = None,
+  chat_id: str, db: Session = None, *,
+  actor: str | None = None, actor_id: str | None = None,
 ) -> tuple[bool, list[str]]:
   """Kills the agent subprocess for a specific chat.
 
@@ -2935,7 +3033,7 @@ async def stop_chat_for(
   handle, queue behind it, and then be stranded when Stop releases ownership.
   """
   async with chat_queue.get_transition_lock(chat_id):
-    return await _stop_chat_for_locked(chat_id, db=db)
+    return await _stop_chat_for_locked(chat_id, db=db, actor=actor, actor_id=actor_id)
 
 
 async def clear_goal_for(chat_id: str, expected_goal_id: str) -> dict:
@@ -2972,7 +3070,8 @@ async def clear_goal_for(chat_id: str, expected_goal_id: str) -> dict:
       return {"status": "conflict", "goal_id": current_goal["id"]}
 
     plan_complete = bool(
-      current_plan is not None and current_plan["summary"]["can_complete"]
+      current_goal["status"] in {"completed", "cannot_complete", "cancelled"}
+      or (current_plan is not None and current_plan["summary"]["can_complete"])
     )
     if not plan_complete:
       handles = registry.get_handles(chat_id)
@@ -3009,7 +3108,9 @@ async def clear_goal_for(chat_id: str, expected_goal_id: str) -> dict:
 
 
 async def _stop_chat_for_locked(
-  chat_id: str, db: Session = None,
+  chat_id: str, db: Session = None, *,
+  preserve_pending: bool = False,
+  actor: str | None = None, actor_id: str | None = None,
 ) -> tuple[bool, list[str]]:
   """Stop one chat while its per-chat lifecycle transition is exclusive."""
   stopped_gen = current_run_generation(chat_id)
@@ -3019,12 +3120,17 @@ async def _stop_chat_for_locked(
   # Fence the terminal drain before yielding to writer persistence: otherwise
   # cancellation could release A's hold just as the old turn promotes B.
   bump_run_generation(chat_id)
+  sink = get_owned_sink(chat_id)
+  if sink is not None:
+    sink.interrupt_write_delivery()
   handles = registry.get_handles(chat_id)
   if handles:
     _clear_after_terminal_generation[chat_id] = stopped_gen
     _clear_after_terminal_status[chat_id] = "stopped"
-  from app.chat_writer import CancelActivationWaits
-  await _await_ack(get_writer().submit(CancelActivationWaits(chat_id=chat_id)))
+  from app.chat_writer import PrepareChatStop
+  await _await_ack(get_writer().submit(PrepareChatStop(
+    chat_id=chat_id, actor=actor, actor_id=actor_id,
+  )))
   # The queue-lock window guards the clear's COMPOUND decision against a
   # racing append/cancel/promote (the actor's ClearPending serializes the
   # DB write itself). Generation bump happens BEFORE the lock so the dying
@@ -3044,7 +3150,7 @@ async def _stop_chat_for_locked(
   # an empty cleared list: handleStop re-sends only what the backend confirms
   # it cleared (the PM-115 contract), so an empty list means the frontend
   # re-sends nothing and the queue rides through the restart intact.
-  if not draining:
+  if not draining and not preserve_pending:
     try:
       async with asyncio.timeout(chat_queue.TERMINAL_LOCK_TIMEOUT_SECS):
         async with chat_queue.get_lock(chat_id):
@@ -3768,10 +3874,10 @@ def _parse_reset_text(text: str, now: datetime) -> datetime | None:
 # interrupted the turn, not a provider quota, so the paid-retry opt-in for
 # limits does not apply.
 RESOURCE_PARK_REASONS = frozenset({"memory", "storage"})
-# These waits are owned by Möbius rather than the paid-limit preference. They
-# retain the interrupted request and retry with a pause; no extra usage is
-# requested or consumed merely because a model was momentarily busy.
-AUTO_RETRY_PARK_REASONS = RESOURCE_PARK_REASONS | frozenset({"model_capacity"})
+# These recoveries belong to the interrupted turn rather than the paid-limit
+# preference. Compaction is admitted only after one bounded synthesis succeeds;
+# the saved attempt flag prevents repeated synthesis/retry on the same root.
+AUTO_RETRY_PARK_REASONS = RESOURCE_PARK_REASONS | frozenset({"model_capacity", "compaction"})
 
 
 def _park_continues_automatically(chat, park) -> bool:
@@ -3784,6 +3890,8 @@ def _park_continues_automatically(chat, park) -> bool:
   reason = park.park_reason if park is not None else None
   if reason == "restart":
     return bool(chat.auto_resume_on_restart)
+  if reason == "compaction":
+    return not chat.pending_messages and not chat.pending_question_id
   if reason in AUTO_RETRY_PARK_REASONS:
     return True
   return bool(chat.auto_resume_on_limit)
@@ -3921,7 +4029,8 @@ def _park_exit(
 
   Memory recovery requires the runner's attempt-correlated ``oom_killed``
   evidence. A generic failure cannot claim another process's cgroup kill;
-  explicit request-size rejections remain terminal even if memory is low.
+  explicit size rejections never become memory retries. A separately fenced
+  note recovery may construct a smaller context after the failure is saved.
 
   A planned restart is already the authoritative terminal outcome by the time
   the provider exits: ``drain_all_for_restart`` publishes the resumable pause
@@ -3935,21 +4044,27 @@ def _park_exit(
     return {"parked": False}
   if (
     (runner_result or {}).get("api_error_status") == 413
+    or (runner_result or {}).get("context_window_exceeded") is True
     or any(marker in (error_text or "").lower() for marker in (
       "request body is too large", "request body too large",
       "request entity too large", "payload too large",
     ))
   ):
+    size_message = (
+      "This conversation exceeds the model's context window."
+      if (runner_result or {}).get("context_window_exceeded") is True
+      else "This request is too large to send."
+    )
     sink.publish({
       "type": "error",
       "message": (
         f"{error_text or 'The provider rejected an oversized request.'}\n\n"
-        "This request is too large to send. Compact the conversation or "
+        f"{size_message} Compact the conversation or "
         "reduce its attachments, or continue in a new chat using your saved "
         "files. Retrying it unchanged will not help."
       ),
     })
-    return {"parked": False}
+    return {"parked": False, "oversized": True}
   if runner_result is not None:
     limit = _is_limit_terminal(runner_result)
   else:
@@ -4047,6 +4162,86 @@ def _park_exit(
   }
 
 
+async def _recover_oversized_turn(*, sink, chat_id: str, run_gen: int | None):
+  """One source-fenced compaction, then the existing durable park/sweep handoff.
+
+  Failed synthesis never retires the session. A durable claim precedes any
+  model call; a crash or another oversized response cannot renew its budget.
+  Queued owner input wins, and helpers never gain new replay permission.
+  """
+  from app.compaction import PreparedNoteRecovery, RecoverySynthesisHandle
+  from app.config import get_settings
+
+  prepared = None
+  try:
+    async with chat_queue.get_transition_lock(chat_id):
+      async with chat_queue.get_lock(chat_id):
+        if _run_generation_superseded(chat_id, run_gen) or draining:
+          return chat_queue.TerminalDisposition.STALE_NO_ACTION
+        source = await _await_ack(get_writer().submit(BeginNoteRecovery(
+          chat_id=chat_id, run_token=sink.run_token or "", generation=run_gen,
+        )))
+    if source is not None:
+      if _run_generation_superseded(chat_id, run_gen) or draining:
+        return chat_queue.TerminalDisposition.STALE_NO_ACTION
+      task = asyncio.create_task(source.summarize(data_dir=get_settings().data_dir))
+      handle = RecoverySynthesisHandle(chat_id, task)
+      registry.register(handle)
+      # Restart/Stop must see this exact run while its isolated synthesis is
+      # active; late owner messages still queue (this handle cannot steer).
+      register_active_sink(chat_id, sink)
+      try:
+        briefing = await task
+        prepared = PreparedNoteRecovery(source, briefing)
+      except asyncio.CancelledError:
+        # Owner Stop/restart cancels the isolated synthesis, not another turn.
+        if not _run_generation_superseded(chat_id, run_gen) and not draining:
+          raise
+      finally:
+        unregister_active_sink(chat_id, sink)
+        if registry.get_handle(chat_id, handle.kind) is handle:
+          registry.unregister(chat_id, handle.kind)
+          if not _run_generation_superseded(chat_id, run_gen) and not draining:
+            registry.mark_starting(chat_id)
+  except Exception:
+    _get_logger().warning("note-based recovery failed chat_id=%s", chat_id, exc_info=True)
+
+  try:
+    async with asyncio.timeout(chat_queue.TERMINAL_LOCK_TIMEOUT_SECS):
+      async with chat_queue.get_transition_lock(chat_id):
+        async with chat_queue.get_lock(chat_id):
+          if _run_generation_superseded(chat_id, run_gen) or draining:
+            return chat_queue.TerminalDisposition.STALE_NO_ACTION
+          parked = False
+          if prepared is not None:
+            parked = bool(await _await_ack(get_writer().submit(ParkRun(
+              chat_id=chat_id, run_token=sink.run_token or "",
+              parked_until=datetime.now(UTC).replace(tzinfo=None),
+              park_reason="compaction", compaction=prepared,
+            ))))
+          if _run_generation_superseded(chat_id, run_gen) or draining:
+            return chat_queue.TerminalDisposition.STALE_NO_ACTION
+          if not parked:
+            sink.publish({"type": "error", "message": (
+              "Automatic compaction could not safely recover this oversized request. "
+              "Your conversation and previous session are unchanged. "
+              "No automatic retry was started; review the saved handoff or compact manually."
+            )})
+            await sink.finalize()
+            await _finish_run_strict(chat_id, sink.run_token or "", terminal_status="failed")
+          discard_starting(chat_id)
+          forget_chat_if_current(chat_id, run_gen)
+    # A committed compaction marker is read from the transcript, never streamed
+    # through the old sink (which would overwrite the finalized failed turn).
+    if parked:
+      get_system_broadcast().publish({"type": "chat_updated", "chatId": chat_id})
+    return (chat_queue.TerminalDisposition.LIMIT_PARKED if parked
+            else chat_queue.TerminalDisposition.EMPTY_TERMINAL_CLEARED)
+  except Exception:
+    _get_logger().warning("note recovery handoff not confirmed chat_id=%s", chat_id, exc_info=True)
+    return chat_queue.TerminalDisposition.FAILED_LEAVE_MARKER
+
+
 async def _complete_turn(
   *,
   bc,
@@ -4061,6 +4256,7 @@ async def _complete_turn(
   parked_until: datetime | None = None,
   park_reason: str | None = None,
   provider_free: bool = False,
+  oversized: bool = False,
   activity_results: tuple[tuple[str, str], ...] = (),
 ) -> chat_queue.TerminalDisposition:
   """Terminal sequence shared by both providers' success + error exits.
@@ -4086,8 +4282,10 @@ async def _complete_turn(
        silent loss is worse than a visible "couldn't save" error.
     2. On success: allocate the CONTINUATION's run_token, drain the queue
        under ONE bounded lock (`drain_and_release`). The drain returns the
-       exact unfinished Goal to execution first when no durable handoff owns
-       it; this decision is made after Finalize has saved any question card.
+       exact unfinished Goal to one targeted settlement pass when the queue
+       is empty and no durable handoff owns it; this decision is made after
+       Finalize has saved any question card. A second unhanded ending is a
+       visible technical recovery failure, not an endless loop or capitulation.
        Otherwise the drain returns the ordinary
        disposition: `CONTINUATION_PROMOTED` (a head was promoted — marker
        stays set, schedule the continuation), `EMPTY_TERMINAL_CLEARED` (the
@@ -4129,10 +4327,21 @@ async def _complete_turn(
   """
   # The turn is over — drop the live sink so a late steer can't reach a
   # finalizing turn. Identity-keyed, so a successor that already registered
-  # its own sink is untouched. Done before the finalize await so a steer
-  # landing during finalize falls back to the queue rather than splitting a
-  # turn that is already committing its terminal state.
-  unregister_active_sink(chat_id, sink)
+  # its own sink is untouched. Close steering before terminal awaits, while
+  # retaining Stop ownership through joined write draining. A late steer queues
+  # instead of splitting a turn already committing its terminal state.
+  sink.end_provider_stream()
+  write_delivery_error = None
+  try:
+    await sink.finish_write_delivery(interrupted=(
+      parked or bool(sink._last_error) or _run_generation_superseded(chat_id, run_gen)
+    ))
+  except asyncio.CancelledError:
+    raise  # The delivery owner has already joined its worker cleanup.
+  except Exception as exc:
+    write_delivery_error = exc
+  finally:
+    unregister_active_sink(chat_id, sink)
   if close_browser:
     await _close_turn_browser(chat_id, run_gen)
   # Recheck transcript ownership AFTER the asynchronous browser teardown.
@@ -4206,6 +4415,8 @@ async def _complete_turn(
     ending_status == "completed" and bool(activity_results)
   )
   try:
+    if write_delivery_error is not None:
+      raise write_delivery_error
     await sink.finalize(
       incorporate_activity_delivery=incorporate_activity_delivery,
     )
@@ -4253,6 +4464,20 @@ async def _complete_turn(
     _publish_chat_run_finished(chat_id)
     db.close()
     return chat_queue.TerminalDisposition.FAILED_LEAVE_MARKER
+
+  if oversized and we_own_gen and not stop_handoff_successor:
+    # This path owns its terminal transition: normal queue drain must not
+    # replay a failed context or promote another send while synthesis runs.
+    disposition = await _recover_oversized_turn(
+      sink=sink, chat_id=chat_id, run_gen=run_gen,
+    )
+    clear_active_broadcast_if(bc)
+    bc.publish({"type": "done", "cost_usd": cost_usd})
+    bc.mark_completed()
+    if disposition is not chat_queue.TerminalDisposition.STALE_NO_ACTION:
+      _publish_chat_run_finished(chat_id)
+    db.close()
+    return disposition
 
   # Finalize is the owning atomic boundary for the helper-result envelope and
   # terminal assistant response. Publish after that boundary so passive
@@ -4397,6 +4622,14 @@ async def _complete_turn(
     db.close()
     return chat_queue.TerminalDisposition.FAILED_LEAVE_MARKER
 
+  if disposition is chat_queue.TerminalDisposition.GOAL_SETTLEMENT_FAILED:
+    # The writer saved this note before the exact failed terminal closed.
+    # Publish only: another sink write could overwrite its committed block.
+    from app.continuations import GOAL_SETTLEMENT_UNFINISHED_MESSAGE
+    bc.publish({
+      "type": "error", "code": "goal_settlement_unfinished", "resumable": True,
+      "message": GOAL_SETTLEMENT_UNFINISHED_MESSAGE,
+    })
   if next_user:
     get_system_broadcast().publish({
       "type": "chat_run_started",
@@ -4594,6 +4827,18 @@ async def run_chat(
           )
   finally:
     browser_cancelled = None
+    sink = get_owned_sink(chat_id) if chat_id else None
+    if run_token and sink is not None and getattr(sink, "run_token", None) == run_token:
+      # Unexpected setup/provider cancellation can bypass _complete_turn.
+      # Join only this run's writes before releasing runtime ownership.
+      sink.interrupt_write_delivery()
+      try:
+        await sink.finish_write_delivery(interrupted=True)
+      except asyncio.CancelledError as exc:
+        browser_cancelled = exc
+      except Exception:
+        _get_logger().exception("quiet-write cleanup could not persist chat_id=%s", chat_id)
+      unregister_active_sink(chat_id, sink)
     if chat_id and not runtime_settled:
       # Cancellation or an unexpected provider/setup exception may bypass
       # _complete_turn. Defer cancellation from joined browser cleanup until
@@ -4765,12 +5010,14 @@ _MEMORY_RECLAIM_DISPOSITIONS = frozenset({
   chat_queue.TerminalDisposition.LIMIT_PARKED,
   chat_queue.TerminalDisposition.QUESTION_PARKED,
   chat_queue.TerminalDisposition.ACTIVATION_PARKED,
+  chat_queue.TerminalDisposition.GOAL_SETTLEMENT_FAILED,
 })
 
 
 async def _acknowledge_provider_success(
   *, chat_id: str, run_token: str, delivered_through,
   wait_results: tuple[str, ...] = (),
+  write_failure_receipts: tuple[tuple[str, str], ...] = (),
 ) -> None:
   """Best-effort provider-success and delivery acknowledgement.
 
@@ -4793,6 +5040,12 @@ async def _acknowledge_provider_success(
       ),
       wait_results=wait_results,
     )))
+    if write_failure_receipts:
+      from app.chat_writer import AcknowledgeAgentWriteFailures
+      await _await_ack(get_writer().submit(AcknowledgeAgentWriteFailures(
+        chat_id=chat_id, run_token=run_token,
+        reports=write_failure_receipts,
+      )))
     if wait_results:
       from app.chat_waits import (
         _broadcast_changed,
@@ -5428,6 +5681,18 @@ async def _run_chat_impl_with_db(
     db.close()
     return disposition
 
+  run_lineage = db.get(models.ChatRun, run_token) if run_token else None
+  if run_lineage is None:
+    raise RuntimeError("Provider admission has no durable run lineage")
+  if run_lineage.browser_grant_id is not None:
+    from app.browser_access import validate_grant
+    validate_grant(
+      db, run_lineage.browser_grant_id, run_lineage.browser_grant_epoch,
+      owner.id,
+    )
+  elif run_lineage.browser_grant_epoch is not None:
+    raise RuntimeError("Incomplete browser grant lineage")
+
   if run_policy is not None:
     from app.delegations import delegation_execution_token
     agent_token = delegation_execution_token(
@@ -5439,6 +5704,8 @@ async def _run_chat_impl_with_db(
       owner.username,
       owner.token_epoch,
       run_id=run_token,
+      browser_grant_id=run_lineage.browser_grant_id,
+      browser_grant_epoch=run_lineage.browser_grant_epoch,
     )
 
   # Build the base environment shared by all providers.
@@ -5606,6 +5873,10 @@ async def _run_chat_impl_with_db(
   # the provider's path.
   from app.agent_activity_provider import resolve_agent_activity_binding
   agent_activity_binding = resolve_agent_activity_binding(db)
+  from app.agent_write_context import prepare_write_context
+  write_context = prepare_write_context(db, chat_id=chat_id, run_id=run_token or "",
+    top_level=run_policy is None, coordination_enabled=coordination_tools_enabled)
+  user_message = write_context.prompt + "\n\n" + user_message
 
   # Snapshot owner-managed MCP connections while this request session is still
   # live. Provider turns can wait for hours, so neither runner may query the
@@ -5635,8 +5906,10 @@ async def _run_chat_impl_with_db(
         "owner MCP connections withheld (%s) chat_id=%s", reason, chat_id,
       )
     connector_turn_plan = build_turn_plan(
-      db,
-      include_owner_connectors=include_owner_connectors,
+      db, include_owner_connectors=include_owner_connectors,
+      owner_id=owner.id, owner_epoch=owner.token_epoch,
+      browser_grant_id=run_lineage.browser_grant_id,
+      browser_grant_epoch=run_lineage.browser_grant_epoch,
     )
   except Exception:
     log.warning(
@@ -5783,6 +6056,8 @@ async def _run_chat_impl_with_db(
       run_token=run_token,
       agent_activity_binding=agent_activity_binding,
     )
+    sink.attach_write_delivery(nonce=write_context.nonce, env=base_env,
+                               eligible_tools=write_context.eligible_tools)
     register_active_sink(chat_id, sink)
     runner_result: dict = {}
     # The provider can run for hours.  Everything needed to launch it is now
@@ -5833,6 +6108,7 @@ async def _run_chat_impl_with_db(
           run_token=run_token or "",
           delivered_through=coordination_message_through,
           wait_results=wait_results,
+          write_failure_receipts=write_context.failure_receipts,
         )
       usage_metrics = runner_result.get("usage_metrics")
       await _record_run_metrics(
@@ -5967,6 +6243,8 @@ async def _run_chat_impl_with_db(
       run_token=run_token,
       agent_activity_binding=agent_activity_binding,
     )
+    sink.attach_write_delivery(nonce=write_context.nonce, env=base_env,
+                               eligible_tools=write_context.eligible_tools)
     register_active_sink(chat_id, sink)
     # As in the Codex path, do not pin a pooled connection while the provider
     # is thinking or waiting for user input.  Resume fallback has already
@@ -6025,6 +6303,7 @@ async def _run_chat_impl_with_db(
           run_token=run_token or "",
           delivered_through=coordination_message_through,
           wait_results=wait_results,
+          write_failure_receipts=write_context.failure_receipts,
         )
       usage_metrics = runner_result.get("usage_metrics")
       await _record_run_metrics(

@@ -1,4 +1,5 @@
 import { useRef, useState } from 'react'
+import { currentSharedBrowserGrantId, currentSharedBrowserStorage, isSharedBrowserRoute } from '../../lib/sharedBrowserWorkspace.js'
 
 
 // Disclosure state is screen state, not transcript data. Keep it for the
@@ -8,6 +9,17 @@ import { useRef, useState } from 'react'
 const STORAGE_PREFIX = 'chat-disclosures:'
 const cache = new Map()
 
+function disclosureStorage() {
+  if (isSharedBrowserRoute()) return currentSharedBrowserStorage()
+  try { return globalThis.sessionStorage ?? null } catch { return null }
+}
+
+function cacheKey(chatId) {
+  if (!isSharedBrowserRoute()) return `owner:${chatId}`
+  const grant = currentSharedBrowserGrantId()
+  return grant ? `shared:${grant}:${chatId}` : null
+}
+
 function storageKey(chatId) {
   return `${STORAGE_PREFIX}${chatId}`
 }
@@ -15,26 +27,28 @@ function storageKey(chatId) {
 function readOpenKeys(chatId) {
   const id = String(chatId || '')
   if (!id) return new Set()
-  if (cache.has(id)) return cache.get(id)
+  const scopedId = cacheKey(id)
+  if (!scopedId) return new Set()
+  if (cache.has(scopedId)) return cache.get(scopedId)
   let keys = []
   try {
-    const parsed = JSON.parse(sessionStorage.getItem(storageKey(id)) || '[]')
+    const parsed = JSON.parse(disclosureStorage()?.getItem(storageKey(id)) || '[]')
     if (Array.isArray(parsed)) keys = parsed.filter(key => typeof key === 'string')
   } catch {}
   const openKeys = new Set(keys)
-  cache.set(id, openKeys)
+  cache.set(scopedId, openKeys)
   return openKeys
 }
 
 export function persistDisclosureOpen(chatId, disclosureKey, open) {
   const id = String(chatId || '')
   const key = String(disclosureKey || '')
-  if (!id || !key) return
+  if (!id || !key || !cacheKey(id)) return
   const openKeys = readOpenKeys(id)
   if (open) openKeys.add(key)
   else openKeys.delete(key)
   try {
-    sessionStorage.setItem(storageKey(id), JSON.stringify([...openKeys]))
+    disclosureStorage()?.setItem(storageKey(id), JSON.stringify([...openKeys]))
   } catch {}
 }
 

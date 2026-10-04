@@ -76,7 +76,7 @@ from app import activity, models
 from app.routes import (
   admin_router, agent_coordination_router, apps_router, app_services_router,
   app_tools_router,
-  auth_router,
+  auth_router, browser_access_router,
   app_chat_router,
   chat_continuity_router, chat_embed_router, chat_logs_router, chat_router,
   chats_router, chats_stream_router,
@@ -996,6 +996,7 @@ app.include_router(public_storage_router)
 app.include_router(public_apps_router)
 app.include_router(local_services_router)
 app.include_router(connect_router)
+app.include_router(browser_access_router)
 app.include_router(client_error_router)
 app.include_router(client_signal_router)
 app.include_router(community_router)

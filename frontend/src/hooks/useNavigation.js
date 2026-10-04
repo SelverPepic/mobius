@@ -22,6 +22,7 @@ import {
 } from '../lib/navigationPersistence.js'
 import { drawerOpenBlockedByDrag } from '../lib/drawerLifecycle.js'
 import { shellReload } from '../lib/shellReloadState.js'
+import { isSharedBrowserRoute } from '../lib/sharedBrowserWorkspace.js'
 import { recordClientError } from '../lib/errorLog.js'
 import * as tabModel from '../components/Shell/tabModel.js'
 import * as paneModel from '../components/Shell/paneModel.js'
@@ -90,9 +91,11 @@ export const deepLink = parseShellDeepLink(window.location)
 // instead of defaulting to a chat. Only the canvas needs an explicit
 // signal (chat is the default). shellReload / deepLink (an explicit
 // destination for THIS load) take precedence — see below.
-const restored = readRestoredCanvas(localStorage)
+const sharedBrowserRoute = isSharedBrowserRoute(window.location.pathname)
+const effectiveShellReload = sharedBrowserRoute ? null : shellReload
+const restored = sharedBrowserRoute ? null : readRestoredCanvas(localStorage)
 
-const returnView = consumeReturnView(sessionStorage)
+const returnView = sharedBrowserRoute ? null : consumeReturnView(sessionStorage)
 
 // The app id cold-restored to the canvas (null unless the storage-restore
 // — not shellReload/deepLink — drove it). The restore is OPTIMISTIC: this
@@ -100,7 +103,7 @@ const returnView = consumeReturnView(sessionStorage)
 // live /api/apps list ONCE and demotes a restored-but-uninstalled canvas
 // to chat. See ARCHITECTURE.md (Navigation back-stack + drawer model).
 export const coldRestoredCanvasAppId =
-  (!shellReload?.activeView && !deepLink?.view && restored?.view === 'canvas')
+  (!effectiveShellReload?.activeView && !deepLink?.view && restored?.view === 'canvas')
     ? restored.appId
     : null
 
@@ -150,6 +153,8 @@ export default function useNavigation({
   replaceImplicitBootTab,
   dragActiveRef,
   beforeRestoreRouteRef,
+  navigationStorage = localStorage,
+  routePath = '/shell/',
 }) {
   // Monotonic presentation signal for re-revealing an already-active tab. The
   // semantic route remains a no-op (no history or workspace write), but a drawer
@@ -161,11 +166,11 @@ export default function useNavigation({
   // cold-restore, shell-reload) can never strand Back with nothing to pop. Lazy
   // so it's computed exactly once; `seedHome` is consumed by the mount effect.
   const [initialNav] = useState(() => resolveInitialNav({
-    shellReload,
+    shellReload: effectiveShellReload,
     deepLink,
-    returnView,
-    restored,
-    storedChatId: safeStoredChatId(),
+    returnView: sharedBrowserRoute ? null : returnView,
+    restored: sharedBrowserRoute ? readRestoredCanvas(navigationStorage) : restored,
+    storedChatId: safeStoredChatId(navigationStorage),
   }))
   // Settings is the ONLY view state navigation owns globally (§1). It is the
   // full-workspace TAKEOVER overlay used in single mode (and when the builder
@@ -282,7 +287,7 @@ export default function useNavigation({
   // Non-authoritative: the last non-null active chat id, used ONLY to resolve
   // the semantic-home (`homeSeed`) route. It never decides what renders while a
   // pane has an active tab.
-  const lastChatIdRef = useRef(initialNav.chatId ?? safeStoredChatId())
+  const lastChatIdRef = useRef(initialNav.chatId ?? safeStoredChatId(navigationStorage))
   if (activeChatId) lastChatIdRef.current = activeChatId
 
   // Android back gesture synthesizes a click on the logo ~300ms later.
@@ -1369,11 +1374,11 @@ export default function useNavigation({
       }
       // A marked provider return, not an ordinary Settings link, may replace
       // the stale destination claimed by a prior shell reload.
-      const claimedReloadDestination = shellReload?.destinationClaimed && !deepLink?.providerReturn
+      const claimedReloadDestination = effectiveShellReload?.destinationClaimed && !deepLink?.providerReturn
         ? {
-            view: shellReload.activeView,
-            appId: shellReload.activeAppId ?? null,
-            chatId: shellReload.activeChatId ?? null,
+            view: effectiveShellReload.activeView,
+            appId: effectiveShellReload.activeAppId ?? null,
+            chatId: effectiveShellReload.activeChatId ?? null,
           }
         : null
       if (claimedReloadDestination) {
@@ -1469,7 +1474,7 @@ export default function useNavigation({
       const baseRoute = seedHome
         ? navRoute('chat', lastChatIdRef.current, null, bootPaneId)
         : initialRoute
-      currentNavStateRef.current = replaceNavEntry('base', '/shell/', baseRoute)
+      currentNavStateRef.current = replaceNavEntry('base', routePath, baseRoute)
       furthestNavIndexRef.current = navEntryIndex(currentNavStateRef.current) ?? 0
 
       // Seed HOME as the back-stack root when this load booted into a deep
@@ -2224,16 +2229,16 @@ export default function useNavigation({
 
   // Fade back in after shell-reload.
   useEffect(() => {
-    if (!shellReload) return
+    if (!effectiveShellReload) return
     document.body.style.transition = 'opacity 0.2s ease'
     document.body.style.opacity = '1'
   }, [])
 
   useEffect(() => {
-    persistActiveNavigation(localStorage, {
+    persistActiveNavigation(navigationStorage, {
       activeView, activeChatId, activeAppId,
     })
-  }, [activeView, activeChatId, activeAppId])
+  }, [activeView, activeChatId, activeAppId, navigationStorage])
 
   return {
     initialNav,

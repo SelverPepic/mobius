@@ -229,6 +229,51 @@ function createCapabilityHost({ providers, getDeclaration, isActive, send }) {
 }
 
 //#endregion
+//#region src/lib/sharedBrowserWorkspace.js
+function isSharedBrowserRoute(pathname = globalThis.location?.pathname) {
+	const path = sharedBrowserRoutePath();
+	return pathname === path || pathname === `${path}/`;
+}
+function sharedBrowserRoutePath() {
+	return `${(import.meta.env?.BASE_URL || "/").replace(/\/$/, "")}/shell/shared`;
+}
+const memoryValues = /* @__PURE__ */ new Map();
+const memoryStorage = {
+	get length() {
+		return memoryValues.size;
+	},
+	key: (index) => [...memoryValues.keys()][index] ?? null,
+	getItem: (key) => memoryValues.get(key) ?? null,
+	setItem: (key, value) => memoryValues.set(key, String(value)),
+	removeItem: (key) => memoryValues.delete(key)
+};
+function sharedBrowserStorageForGrant(grantId) {
+	let storage = memoryStorage;
+	try {
+		storage = globalThis.sessionStorage || memoryStorage;
+	} catch {}
+	return sharedBrowserWorkspaceStorage(grantId, storage);
+}
+function sharedBrowserWorkspaceStorage(grantId, storage) {
+	const prefix = `mobius:shared-browser:${encodeURIComponent(grantId)}:`;
+	const keys = () => Array.from({ length: storage.length }, (_, index) => storage.key(index)).filter((key) => key?.startsWith(prefix)).map((key) => key.slice(prefix.length));
+	return {
+		getItem: (key) => storage.getItem(prefix + key),
+		setItem: (key, value) => storage.setItem(prefix + key, value),
+		removeItem: (key) => storage.removeItem(prefix + key),
+		key: (index) => keys()[index] ?? null,
+		get length() {
+			return keys().length;
+		}
+	};
+}
+let activeGrantId = null;
+function currentSharedBrowserStorage() {
+	if (!isSharedBrowserRoute() || !activeGrantId) return null;
+	return sharedBrowserStorageForGrant(activeGrantId);
+}
+
+//#endregion
 //#region src/lib/deviceStorage.js
 const DEVICE_STORAGE = "device.storage";
 const KEY_RE = /^[A-Za-z0-9._:-]{1,128}$/;
@@ -241,6 +286,7 @@ function capabilityError(name, message, code) {
 }
 function browserStorage(explicit) {
 	if (explicit !== void 0) return explicit;
+	if (isSharedBrowserRoute()) return currentSharedBrowserStorage();
 	try {
 		return globalThis.localStorage || null;
 	} catch {

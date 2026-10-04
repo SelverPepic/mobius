@@ -731,7 +731,10 @@ def test_owner_message_queues_behind_future_limit_park(
   assert response.json()["status"] == "queued"
   assert scheduled == []
   assert _run_row("rt-park-owner-queue")["status"] == "parked"
-  assert _chat_row(cid)["pending"] == [{
+  pending = _chat_row(cid)["pending"]
+  accepted_at = pending[0].pop("_owner_input_at")
+  assert datetime.fromisoformat(accepted_at).tzinfo == UTC
+  assert pending == [{
     "role": "user",
     "content": "also check the weekly limit",
     "ts": response.json()["ts"],
@@ -3168,9 +3171,9 @@ def test_unrelated_failures_never_consume_old_or_concurrent_oom_kills(
   )
   sink = _Sink()
   for _ in range(3):
-    assert chat_mod._park_exit(sink, {"error": message}, message) == {
-      "parked": False,
-    }
+    disposition = chat_mod._park_exit(sink, {"error": message}, message)
+    assert disposition["parked"] is False
+    assert disposition.get("oversized", False) == ("request body is too large" in message)
   assert all("pause" not in event for event in sink.events)
   assert all(message in event["message"] for event in sink.events)
 
@@ -3180,11 +3183,11 @@ def test_unrelated_failures_never_consume_old_or_concurrent_oom_kills(
   ({"api_error_status": 413}, None),
   ({}, "Request Entity Too Large"),
 ])
-def test_oversized_request_preserves_reason_and_offers_remedy_without_retry(
+def test_oversized_request_preserves_reason_and_requests_changed_context_recovery(
   result, message,
 ):
   sink = _Sink()
-  assert chat_mod._park_exit(sink, result, message) == {"parked": False}
+  assert chat_mod._park_exit(sink, result, message) == {"parked": False, "oversized": True}
   assert len(sink.events) == 1
   event = sink.events[0]
   assert "pause" not in event

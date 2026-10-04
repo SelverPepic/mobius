@@ -198,7 +198,7 @@ from app.deps import (
   Principal,
   get_agent_run_principal,
   get_principal,
-  require_nondelegated_owner_control,
+  require_installation_owner_control,
   require_nondelegated_owner_or_app_control,
   reject_cross_site,
 )
@@ -5698,7 +5698,7 @@ _HUMAN_REQUIRED_TITLE = "Your contribution needs you"
 
 def _require_autopilot_agent(principal: Principal) -> None:
   """Mutation rounds run under the owner's agent credential, never an app JWT."""
-  require_nondelegated_owner_control(principal)
+  require_installation_owner_control(principal)
   if principal.app_id is not None:
     raise HTTPException(
       status_code=403,

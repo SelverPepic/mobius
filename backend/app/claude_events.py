@@ -366,6 +366,41 @@ def _claude_text_item_id(message_id: str | None, index: object) -> str | None:
   return f"{message_id}:{index}"
 
 
+def _claude_final_text_item_id(bc, message, block_ordinal: int) -> str | None:
+  """Name a complete text block even when the SDK did not forward its deltas.
+
+  Hosted Claude forwards separate authoritative envelopes with stable UUIDs,
+  but not necessarily content_block_start events. The envelope UUID and its
+  own block position identify that snapshot; a guessed API block index does
+  not. Remember the chosen identity so replay cannot consume the next queued
+  streamed index or rename a block whose streamed identity was already used.
+  """
+  message_id = message.message_id
+  envelope = getattr(message, "uuid", None)
+  key = (message_id, envelope, block_ordinal) if message_id and envelope else None
+  finals = getattr(bc, "_claude_final_text_items", None)
+  if key is not None and finals is not None and key in finals:
+    return finals[key]
+  item_id = _claude_text_item_id(
+    message_id, _claude_final_index(bc, message_id, "text"),
+  )
+  if item_id is None and key is not None:
+    item_id = f"claude-envelope:{message_id}:{envelope}:{block_ordinal}"
+  if key is not None and item_id is not None:
+    if finals is None:
+      finals = {}
+      try:
+        bc._claude_final_text_items = finals
+      except AttributeError:
+        return item_id
+    # This is a bounded presentation-identity cache, not the write replay
+    # ledger. Quiet writes retain their durable logical-operation deduplication.
+    if len(finals) >= 1024:
+      finals.pop(next(iter(finals)))
+    finals[key] = item_id
+  return item_id
+
+
 def dispatch_sdk_message(
   sdk_msg: Any,
   bc,
@@ -595,7 +630,7 @@ def dispatch_sdk_message(
     if usage_state is not None and sdk_msg.usage:
       usage_state["latest_model_usage"] = dict(sdk_msg.usage)
     server_tools: dict[str, str] = {}
-    for block in sdk_msg.content:
+    for block_ordinal, block in enumerate(sdk_msg.content):
       if isinstance(block, ToolUseBlock):
         # block.id is the canonical tool_use_id; the matching ToolResultBlock
         # carries it as .tool_use_id. Thread it through so a large tool output
@@ -699,10 +734,7 @@ def dispatch_sdk_message(
         # deltas' id, so events.py replaces THIS block by identity instead of
         # guessing the trailing text block.
         if block.text:
-          item_id = _claude_text_item_id(
-            sdk_msg.message_id,
-            _claude_final_index(bc, sdk_msg.message_id, "text"),
-          )
+          item_id = _claude_final_text_item_id(bc, sdk_msg, block_ordinal)
           bc.publish({
             "type": "text_final", "content": block.text,
             **({"text_item_id": item_id} if item_id else {}),
