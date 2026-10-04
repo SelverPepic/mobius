@@ -120,10 +120,15 @@ def _runtime_tree(root: Path, *, lock: str | None, service: bytes | None = SERVI
 
 
 def _fake_env(env: Path) -> None:
-  """What a venv looks like to the resolver, without building one."""
+  """What a venv looks like to the resolver, without building one.
+
+  Like ``python -m venv``, it names the base interpreter, never the venv the
+  tests may run in; a mismatched ``home`` loads another Python's stdlib.
+  """
+  base = Path(getattr(sys, "_base_executable", None) or sys.executable)
   (env / "bin").mkdir(parents=True)
-  (env / "pyvenv.cfg").write_text("home = /usr/local/bin\n")
-  (env / "bin" / "python").symlink_to(sys.executable)
+  (env / "pyvenv.cfg").write_text(f"home = {base.parent}\n")
+  (env / "bin" / "python").symlink_to(base)
 
 
 def _keyed(data_dir, app_id: int, lock: str) -> Path:
