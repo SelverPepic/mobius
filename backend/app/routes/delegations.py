@@ -136,9 +136,7 @@ def _row_for_principal(
 
 def _require_guest_child_lineage(row: models.Delegation, principal: Principal) -> None:
   """A guest may not start a clean owner or another guest's child run."""
-  if principal.browser_grant_id is not None and (
-    row.browser_grant_id, row.browser_grant_epoch
-  ) != (principal.browser_grant_id, principal.browser_grant_epoch):
+  if principal.browser_grant_id is not None and row.browser_grant_id != principal.browser_grant_id:
     raise HTTPException(status_code=403, detail="This helper belongs to another browser authority.")
 
 
@@ -274,7 +272,6 @@ async def submit_or_attach(
       cwd=cwd,
       notify_parent_on_complete=body.notify_parent_on_complete,
       browser_grant_id=principal.browser_grant_id,
-      browser_grant_epoch=principal.browser_grant_epoch,
     )
     try:
       row, attached = create_or_attach_delegation(db, intent)
