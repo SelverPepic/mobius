@@ -584,14 +584,12 @@ def parent_root_run_id(
   return (run.goal_id or run.root_run_id or run.id) if run is not None else None
 
 
-def _assistant_result(chat: models.Chat) -> tuple[str, bool]:
+def _assistant_result(chat: models.Chat) -> str:
   """Return the latest child assistant outcome as plain text.
 
   The outcome is the message's last text block (the report; earlier text
   blocks are progress narration split off by tools or provider items) plus
-  its latest error, so a failed or stopped helper stays actionable. The flag
-  says earlier non-empty text blocks were omitted, so readers can mark the
-  result truncated and point at the full transcript.
+  its latest error, so a failed or stopped helper stays actionable.
   """
   for message in reversed(list(chat.messages or [])):
     if not isinstance(message, dict) or message.get("role") != "assistant":
@@ -605,31 +603,24 @@ def _assistant_result(chat: models.Chat) -> tuple[str, bool]:
               and b.get("type") == "error" and isinstance(b.get("message"), str)
               and b["message"].strip()]
     if texts or errors:
-      return "\n\n".join(texts[-1:] + errors[-1:]), len(texts) > 1
+      return "\n\n".join(texts[-1:] + errors[-1:])
     content = message.get("content")
     if isinstance(content, str) and content.strip():
-      return content.strip(), False
-  return "", False
-
-
-def _derived_result(
-  db: Session, row: models.Delegation,
-) -> tuple[str, models.ChatRun | None, str, bool]:
-  """`derived_status` plus whether earlier report text was omitted."""
-  run = latest_run(db, row.child_chat_id)
-  chat = db.query(models.Chat).filter(models.Chat.id == row.child_chat_id).first()
-  result, omitted = _assistant_result(chat) if chat is not None else ("", False)
-  status, run, result = _project_delegation_status(row, run, result)
-  return status, run, result, omitted and run is not None
+      return content.strip()
+  return ""
 
 
 def derived_status(
   db: Session, row: models.Delegation, *, load_result: bool = True,
 ) -> tuple[str, models.ChatRun | None, str]:
   """Project delegation state from its child ChatRun + transcript."""
-  if load_result:
-    return _derived_result(db, row)[:3]
-  return _project_delegation_status(row, latest_run(db, row.child_chat_id), "")
+  run = latest_run(db, row.child_chat_id)
+  chat = (
+    db.query(models.Chat).filter(models.Chat.id == row.child_chat_id).first()
+    if load_result else None
+  )
+  result = _assistant_result(chat) if chat is not None else ""
+  return _project_delegation_status(row, run, result)
 
 
 def delegation_statuses(
@@ -1002,7 +993,7 @@ def serialize_source_work(db: Session, row: models.Delegation) -> dict:
   """Small durable projection for Changes and the source-chat action card."""
   if row.source_work_id is None:
     raise ValueError("delegation is not source-attached work")
-  status, _run, result, omitted = _derived_result(db, row)
+  status, _run, result = derived_status(db, row)
   usage = summarize_chat_run_tokens(
     db.query(
       *[getattr(models.ChatRun, field) for field in (
@@ -1026,7 +1017,7 @@ def serialize_source_work(db: Session, row: models.Delegation) -> dict:
     db.commit()
   _record_lifecycle(db, row, status)
   result = result or ""
-  truncated = omitted or len(result) > _SOURCE_WORK_RESULT_MAX
+  truncated = len(result) > _SOURCE_WORK_RESULT_MAX
   return {
     "id": row.source_work_id,
     "intent": row.source_work_intent or "",
@@ -2219,8 +2210,9 @@ def _compose_wake_notice(
   """
   items = []
   for row in rows:
-    status, _, result, truncated = _derived_result(db, row)
+    status, _, result = derived_status(db, row)
     result = result or ""
+    truncated = False
     if len(result) > _WAKE_RESULT_MAX:
       result = result[:_WAKE_RESULT_MAX]
       truncated = True
