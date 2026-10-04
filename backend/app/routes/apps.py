@@ -13,7 +13,7 @@ import tempfile
 import uuid
 from datetime import datetime, UTC
 from pathlib import Path
-from typing import Callable, Literal
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
@@ -1282,17 +1282,14 @@ async def _fetch_update_candidate(
   manifest_url: str,
   *,
   strict: bool,
-  fetch_package: Callable[..., object] | None = None,
 ):
   """Fetch one Git candidate; Store updates have no parallel HTTP transport."""
   from app import install
 
   if install._derive_repo_ref(manifest_url) is None or not app_git.has_origin(repo):
     raise ValueError("app has no root Git update source")
-  # Preview/install retain payloads; update discovery needs only a complete
-  # identity. Both use this same origin/lock seam.
   return await asyncio.to_thread(
-    fetch_package or install.fetch_git_install_candidate,
+    install.fetch_git_install_candidate,
     repo,
     manifest_url,
     strict=strict,
@@ -1492,11 +1489,10 @@ async def update_check(
   # fetching the candidate and comparing it with the recorded baseline.
   async with fs_locks.source_dir_lock(str(repo)):
     try:
-      candidate = await _fetch_update_candidate(
-        repo,
-        fetch_manifest_url,
-        strict=False,
-        fetch_package=install.fetch_git_package_summary,
+      # Discovery needs only the complete package identity, not its payload.
+      # The summary fetch enforces the same root-Git origin guard as install.
+      candidate = await asyncio.to_thread(
+        install.fetch_git_package_summary, repo, fetch_manifest_url,
       )
       pending, pending_state = await asyncio.to_thread(
         _current_pending_update,

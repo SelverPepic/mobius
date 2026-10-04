@@ -6260,7 +6260,7 @@ def _update_check(
 ):
   candidate = _git_candidate(manifest, jsx, sources=sources, job=job)
   with patch(
-    "app.routes.apps._fetch_update_candidate", return_value=candidate,
+    "app.install.fetch_git_package_summary", return_value=candidate,
   ), patch("app.install.read_git_install_candidate", return_value=candidate):
     return client.get(
       f"/api/apps/{app_id}/update-check",
@@ -6512,9 +6512,7 @@ def test_update_check_final_fence_preserves_concurrent_pending_conflict(
   upstream_v2 = JSX_MULTI.replace("ORIGINAL TITLE", "UPSTREAM TITLE")
   manifest_v2 = {**manifest_v1, "version": "2.0.0"}
 
-  async def advance_during_fetch(
-    _repo, _manifest_url, *, strict=True, fetch_package=None,
-  ):
+  def advance_during_fetch(_repo, _manifest_url):
     recorded_tree = {"index.jsx": upstream_v2.encode()}
     if recorded_manifest is not None:
       recorded_tree["mobius.json"] = recorded_manifest
@@ -6536,7 +6534,7 @@ def test_update_check_final_fence_preserves_concurrent_pending_conflict(
     return _git_candidate(manifest_v2, upstream_v2)
 
   monkeypatch.setattr(
-    "app.routes.apps._fetch_update_candidate", advance_during_fetch,
+    "app.install.fetch_git_package_summary", advance_during_fetch,
   )
   res = client.get(f"/api/apps/{app_id}/update-check", headers=auth)
   assert res.status_code == 200, res.text
@@ -6650,7 +6648,7 @@ def test_update_check_malformed_candidate_degrades_to_unknown(
   assert installed.status_code == 201, installed.text
   candidate = {**manifest, **invalid} if isinstance(invalid, dict) else invalid
   with patch(
-    "app.routes.apps._fetch_update_candidate",
+    "app.install.fetch_git_package_summary",
     side_effect=ValueError(f"invalid candidate: {candidate!r}"),
   ):
     response = client.get(
@@ -6837,7 +6835,7 @@ def test_update_check_network_failure_degrades_to_null(
 
   # A failed Git fetch degrades to unknown rather than breaking Store refresh.
   with patch(
-    "app.routes.apps._fetch_update_candidate",
+    "app.install.fetch_git_package_summary",
     side_effect=RuntimeError("synthetic origin outage"),
   ):
     res = client.get(f"/api/apps/{app_id}/update-check", headers=auth)
@@ -6862,9 +6860,7 @@ def test_update_check_releases_db_connection_before_remote_fetch(
 
   entered = []
 
-  async def _slow_remote_fetch(
-    _repo, _url, *, strict=True, fetch_package=None,
-  ):
+  def _slow_remote_fetch(_repo, _url):
     entered.append(True)
     assert checked_out_connections() <= baseline, (
       "update-check kept its request DB connection checked out while "
@@ -6873,7 +6869,7 @@ def test_update_check_releases_db_connection_before_remote_fetch(
     raise HTTPException(status_code=502, detail="synthetic upstream outage")
 
   with patch(
-    "app.routes.apps._fetch_update_candidate", new=_slow_remote_fetch,
+    "app.install.fetch_git_package_summary", new=_slow_remote_fetch,
   ):
     res = client.get(f"/api/apps/{app_id}/update-check", headers=auth)
 

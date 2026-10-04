@@ -128,17 +128,6 @@ def test_full_and_summary_fetch_share_origin_guard_before_any_fetch(repo):
     fetch.assert_not_called()
 
 
-def test_update_fetch_selects_summary_but_preview_keeps_full_candidate(repo):
-  from app.routes.apps import _fetch_update_candidate
-  source = ('https://example.invalid/actual.git', 'main')
-  with patch('app.install._derive_repo_ref', return_value=source), patch('app.app_git.has_origin', return_value=True), patch('app.install.fetch_git_install_candidate', return_value='full') as full, patch('app.install.fetch_git_package_summary', return_value='summary') as summary:
-    assert asyncio.run(_fetch_update_candidate(repo, URL, strict=True)) == 'full'
-    assert asyncio.run(_fetch_update_candidate(repo, URL, strict=False, fetch_package=install.fetch_git_package_summary)) == 'summary'
-  assert full.call_count == summary.call_count == 1
-  assert full.call_args.kwargs['strict'] is True
-  assert summary.call_args.kwargs['strict'] is False
-
-
 @pytest.mark.parametrize('legacy', [False, True])
 @pytest.mark.parametrize('changed', [False, True])
 def test_real_update_route_streams_source_or_rereads_exact_legacy_commit(
@@ -166,10 +155,12 @@ def test_real_update_route_streams_source_or_rereads_exact_legacy_commit(
     'mobius.json': json.dumps(manifest).encode(), 'index.jsx': incoming.encode(),
   })
 
-  async def fetched(repo, url, *, strict, fetch_package):
-    assert fetch_package is install.fetch_git_package_summary and strict is False
-    return await asyncio.to_thread(install.read_git_package_summary, repo, commit)
-  monkeypatch.setattr('app.routes.apps._fetch_update_candidate', fetched)
+  def fetched(repo, url):
+    return install.read_git_package_summary(repo, commit)
+  monkeypatch.setattr(install, 'fetch_git_package_summary', fetched)
+  def full_fetch(*args, **kwargs):
+    pytest.fail('Update discovery must not fetch the full install candidate')
+  monkeypatch.setattr(install, 'fetch_git_install_candidate', full_fetch)
   original_reader = install.read_git_install_candidate
   legacy_reads = []
   def full_reader(repo, ref, url, **kwargs):
