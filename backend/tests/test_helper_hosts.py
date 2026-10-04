@@ -562,7 +562,7 @@ def test_host_helper_sessions_round_trip():
   assert claude_host.agent_type_for(None) == "mobius-helper"
 
 
-def test_boot_ends_only_hosts_whose_server_is_gone(monkeypatch):
+def test_boot_ends_only_hosts_whose_server_is_gone(monkeypatch, real_end_orphaned_hosts):
   import subprocess
   gone = subprocess.Popen(["true"])
   gone.wait()
@@ -586,7 +586,7 @@ def test_boot_ends_only_hosts_whose_server_is_gone(monkeypatch):
     lambda path: [str(p.pid) for p in procs] if path == "/proc" else real_listdir(path),
   )
   try:
-    assert helper_hosts.end_orphaned_hosts() == 2
+    assert real_end_orphaned_hosts() == 2
     orphan.wait(timeout=2)
     unowned.wait(timeout=2)
     assert owned.poll() is None
