@@ -5880,9 +5880,9 @@ def _move_chat_media_out_of_generated(eng) -> None:
       return []
     return [source for source in old_dir.iterdir() if source.is_file()]
 
-  def first_collision(chat_id: str) -> str | None:
-    for source in old_files(chat_id):
-      destination = chats_root / chat_id / "media" / source.name
+  def first_collision(sources: list[Path], media_dir: Path) -> str | None:
+    for source in sources:
+      destination = media_dir / source.name
       if destination.exists() and (
         not destination.is_file()
         or not filecmp.cmp(source, destination, shallow=False)
@@ -5890,25 +5890,34 @@ def _move_chat_media_out_of_generated(eng) -> None:
         return source.name
     return None
 
-  movable = []
+  log = logging.getLogger(__name__)
   for chat_id in sorted(chat_ids):
-    collision = first_collision(chat_id)
-    if collision is None:
-      movable.append(chat_id)
-    else:
-      logging.getLogger(__name__).warning(
-        "Left chat %s on legacy generated/ media: media/%s already exists "
-        "with different bytes",
-        chat_id, collision,
-      )
-
-  for chat_id in movable:
     media_dir = chats_root / chat_id / "media"
-    sources = old_files(chat_id)
-    for source in sources:
-      media_dir.mkdir(parents=True, exist_ok=True)
-      if not (media_dir / source.name).exists():
-        shutil.copy2(source, media_dir / source.name)
+    # Any file error leaves this chat exactly as it was, like a collision:
+    # a one-time migration must never stop boot.
+    try:
+      sources = old_files(chat_id)
+      collision = first_collision(sources, media_dir)
+      if collision is not None:
+        log.warning(
+          "Left chat %s on legacy generated/ media: media/%s already exists "
+          "with different bytes",
+          chat_id, collision,
+        )
+        continue
+      for source in sources:
+        destination = media_dir / source.name
+        if destination.exists():
+          continue
+        media_dir.mkdir(parents=True, exist_ok=True)
+        # Copy under a temporary name so an interrupted copy never leaves a
+        # truncated file that a retry would mistake for a collision.
+        partial = media_dir / f".{source.name}.partial"
+        shutil.copy2(source, partial)
+        os.replace(partial, destination)
+    except OSError as error:
+      log.warning("Left chat %s on legacy generated/ media: %s", chat_id, error)
+      continue
     with eng.begin() as conn:
       conn.execute(text(
         "UPDATE chats SET " + ", ".join(
@@ -5919,11 +5928,17 @@ def _move_chat_media_out_of_generated(eng) -> None:
         "old": f"/api/chats/{chat_id}/generated/",
         "new": f"/api/chats/{chat_id}/media/",
       })
-    for source in sources:
-      source.unlink()
-    old_dir = chats_root / chat_id / "generated"
-    if old_dir.is_dir() and not any(old_dir.iterdir()):
-      old_dir.rmdir()
+    try:
+      for source in sources:
+        source.unlink()
+      old_dir = chats_root / chat_id / "generated"
+      if old_dir.is_dir() and not any(old_dir.iterdir()):
+        old_dir.rmdir()
+    except OSError as error:
+      log.warning(
+        "Moved chat %s media but could not remove the old generated/ copy: %s",
+        chat_id, error,
+      )
 
 
 _SCHEMA_MIGRATIONS = (

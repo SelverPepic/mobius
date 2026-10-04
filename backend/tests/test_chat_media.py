@@ -1,3 +1,5 @@
+import errno
+import shutil
 import uuid
 from pathlib import Path
 
@@ -153,6 +155,81 @@ def test_collision_does_not_block_database_startup(tmp_path, monkeypatch):
       f"/api/chats/{clean}/media/img.png"
     )
   assert (data_dir / "chats" / colliding / "generated" / "img.png").exists()
+
+
+def test_unreadable_legacy_file_does_not_block_database_startup(
+  tmp_path, monkeypatch, caplog,
+):
+  """A file error leaves that chat as-is; the others move and 0083 records."""
+  data_dir = tmp_path / "data"
+  monkeypatch.setenv("DATA_DIR", str(data_dir))
+  eng = create_engine(f"sqlite:///{tmp_path / 'boot.db'}")
+  models.Base.metadata.create_all(eng)
+  migrations._ensure_migration_ledger(eng)
+  for version, _migration in migrations._SCHEMA_MIGRATIONS:
+    if version != "0083_chat_media_directory":
+      migrations._record_migration(eng, version)
+  with Session(eng) as session:
+    unreadable = _legacy_chat(session, data_dir, b"locked", media=None)
+    clean = _legacy_chat(session, data_dir, b"clean", media=None)
+  real_copy = shutil.copy2
+
+  def copy2(source, destination, **kwargs):
+    if unreadable in str(source):
+      raise PermissionError(errno.EACCES, "Permission denied", str(source))
+    return real_copy(source, destination, **kwargs)
+
+  monkeypatch.setattr(shutil, "copy2", copy2)
+
+  with caplog.at_level("WARNING", logger="app.schema_migrations"):
+    migrations.run_migrations(eng)
+
+  assert "0083_chat_media_directory" in {
+    row["version"] for row in migrations.schema_migration_history(eng)
+  }
+  with Session(eng) as session:
+    assert session.get(models.Chat, unreadable).messages[0]["content"] == (
+      f"/api/chats/{unreadable}/generated/img.png"
+    )
+    assert session.get(models.Chat, clean).messages[0]["content"] == (
+      f"/api/chats/{clean}/media/img.png"
+    )
+  stuck_root = data_dir / "chats" / unreadable
+  assert (stuck_root / "generated" / "img.png").read_bytes() == b"locked"
+  assert not (stuck_root / "media" / "img.png").exists()
+  assert (data_dir / "chats" / clean / "media" / "img.png").read_bytes() == (
+    b"clean"
+  )
+  assert any(
+    unreadable in r.getMessage()
+    for r in caplog.records if r.levelname == "WARNING"
+  )
+
+
+def test_interrupted_copy_is_not_a_collision_on_retry(db, monkeypatch):
+  """A copy cut short leaves no truncated media file for a retry to trip on."""
+  data_dir = Path(get_settings().data_dir)
+  chat_id = _legacy_chat(db, data_dir, b"full-image-bytes", media=None)
+
+  def interrupted_copy(source, destination, **kwargs):
+    Path(destination).write_bytes(b"full")
+    raise OSError(errno.ENOSPC, "No space left on device", str(destination))
+
+  with monkeypatch.context() as patch:
+    patch.setattr(shutil, "copy2", interrupted_copy)
+    _move_chat_media_out_of_generated(db.get_bind())
+  assert not (_chat_root(chat_id) / "media" / "img.png").exists()
+
+  _move_chat_media_out_of_generated(db.get_bind())
+  db.expire_all()
+
+  assert db.get(models.Chat, chat_id).messages[0]["content"] == (
+    f"/api/chats/{chat_id}/media/img.png"
+  )
+  assert (_chat_root(chat_id) / "media" / "img.png").read_bytes() == (
+    b"full-image-bytes"
+  )
+  assert not (_chat_root(chat_id) / "generated").exists()
 
 
 def test_upgrade_runs_the_move_once_and_later_boots_skip_the_scan(
