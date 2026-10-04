@@ -87,9 +87,11 @@ function appFrameShortcuts() {
       listeners.set(type, callback)
     },
   }
-  runInNewContext(source, { window, document, Array, String, Boolean })
+  const navigator = { userActivation: { isActive: false } }
+  runInNewContext(source, { window, document, navigator, Array, String, Boolean })
   return {
     child,
+    navigator,
     parent,
     shellPosts,
     childPosts,
@@ -141,6 +143,10 @@ test('the app frame shares shell chords with its direct child frames and relays 
   frameDoc.message(frameDoc.child, { type: 'moebius:frame-shortcuts-request' })
   assert.equal(frameDoc.childPosts.length, 2, 'a newly loaded child gets the current chords')
 
+  frameDoc.message(frameDoc.child, { type: 'moebius:shell-shortcut', actionId: 'search.open' })
+  assert.equal(frameDoc.shellPosts.length, 0, 'a scripted child post without a user gesture is not relayed')
+
+  frameDoc.navigator.userActivation.isActive = true
   frameDoc.message({ postMessage() { assert.fail('not a child frame') } }, { type: 'moebius:frame-shortcuts-request' })
   frameDoc.message({}, { type: 'moebius:shell-shortcut', actionId: 'search.open' })
   frameDoc.message(frameDoc.child, { type: 'moebius:shell-shortcut', actionId: 'chat.new' })

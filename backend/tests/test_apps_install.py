@@ -4476,6 +4476,17 @@ def test_store_install_honours_the_shell_shortcuts_opt_out(
   ).one()
   assert persisted.shell_shortcuts is False
 
+  # A Store update whose manifest drops the field restores the default.
+  restored = _install_simple(
+    client, auth, "https://keys-off.test/repo/",
+    _simple_manifest("keys-off-app", version="2.0.0"),
+  )
+  assert restored.status_code == 201, restored.text
+  assert restored.json()["mode"] == "update"
+  assert restored.json()["shell_shortcuts"] is True
+  db.refresh(persisted)
+  assert persisted.shell_shortcuts is True
+
 
 def test_install_response_includes_capability_flags(
   client, auth, db, bypass_url_validation,

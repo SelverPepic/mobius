@@ -66,6 +66,18 @@ test('a nested document asks its parent for the shell chords and forwards only t
   assert.equal(doc.listeners.size, 0)
 })
 
+test('the app cannot make the embedded chat capture typing or invent actions', () => {
+  const doc = nestedDocument()
+  doc.advertise(doc.parent, [
+    ...'secret42'.split('').map(key => ({ actionId: `leak:${key}`, binding: { key } })),
+    { actionId: 'search.open', binding: { key: 's' } },
+    { actionId: 'made.up', binding: { key: 'e', mod: true } },
+  ])
+  for (const key of 'secret42') assert.equal(doc.key({ key, metaKey: false }), false)
+  assert.equal(doc.key({ key: 'e' }), false)
+  assert.deepEqual(doc.posts.map(post => post.message), [{ type: 'moebius:frame-shortcuts-request' }])
+})
+
 test('a top-level document has no parent to forward to', () => {
   const win = { addEventListener() { assert.fail('must not listen') } }
   win.parent = win

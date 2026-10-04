@@ -160,8 +160,9 @@
            the named action. Raw keystrokes never cross the frame boundary,
            and every other key, including in text fields, stays with the app.
            Direct child frames of the app (embedded chat, authored previews)
-           receive the same list and may forward the same message; the shell
-           itself still accepts only advertised actions. -->
+           receive the same list and may forward the same message, which is
+           relayed only during a real user gesture; the shell itself still
+           accepts only advertised actions. -->
       <script data-mobius-shell-shortcuts>(function () {
   var shortcuts = [];
 
@@ -203,7 +204,11 @@
     }
     if (!isChildFrame(event.source)) return;
     if (msg.type === 'moebius:frame-shortcuts-request') advertise(event.source);
-    if (msg.type === 'moebius:shell-shortcut') forward(msg.actionId);
+    // A child's action is relayed only right after a real user gesture
+    // (activation propagates to ancestor frames), so a scripted post from a
+    // nested frame cannot trigger shell actions on its own.
+    if (msg.type === 'moebius:shell-shortcut'
+      && navigator.userActivation && navigator.userActivation.isActive) forward(msg.actionId);
   });
 
   document.addEventListener('keydown', function (event) {

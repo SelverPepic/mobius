@@ -882,20 +882,21 @@ shortcuts. It applies only to a direct child frame of your app document:
 ```html
 <script>
 (() => {
+  const p = window.parent
   let shortcuts = []
   addEventListener('message', (e) => {
-    if (e.source === parent && e.data?.type === 'moebius:frame-shortcuts') shortcuts = e.data.shortcuts || []
+    if (e.source === p && e.data?.type === 'moebius:frame-shortcuts') shortcuts = e.data.shortcuts || []
   })
   document.addEventListener('keydown', (e) => {
     if (e.isComposing || e.repeat) return
-    const hit = shortcuts.find(({ binding: b }) => e.key.toLowerCase() === b.key.toLowerCase()
+    const hit = shortcuts.find(({ binding: b }) => String(e.key || '').toLowerCase() === b.key.toLowerCase()
       && (e.metaKey || e.ctrlKey) === !!b.mod && e.shiftKey === !!b.shift && e.altKey === !!b.alt)
     if (!hit) return
     e.preventDefault()
     e.stopImmediatePropagation()
-    parent.postMessage({ type: 'moebius:shell-shortcut', actionId: hit.actionId }, '*')
+    p.postMessage({ type: 'moebius:shell-shortcut', actionId: hit.actionId }, '*')
   }, true)
-  parent.postMessage({ type: 'moebius:frame-shortcuts-request' }, '*')
+  p.postMessage({ type: 'moebius:frame-shortcuts-request' }, '*')
 })()
 </script>
 ```
