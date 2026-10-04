@@ -8,6 +8,7 @@ import json
 import logging
 import secrets
 import dataclasses
+from contextlib import aclosing
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
@@ -18,6 +19,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app import broker_access_signal
 from app import connectors as core
 from app import connector_oauth as connector_oauth_mod
 from app import models
@@ -63,6 +65,9 @@ _BROKER_RESPONSE_HEADERS = {
   "mcp-session-id",
 }
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+# Commits in this process wake open exchanges at once; this bounds how long a
+# revocation written by another process (an operator script) can go unseen.
+_BROKER_OUT_OF_PROCESS_RECHECK_SECONDS = 30.0
 _CREATE_LOCK = asyncio.Lock()
 
 
@@ -83,6 +88,9 @@ class _BrokerSnapshot:
   # of (name, value) pairs keeps the frozen snapshot cleanly copyable through
   # ``dataclasses.replace`` when the OAuth token is attached.
   extra_headers: tuple[tuple[str, str], ...] = ()
+  # Access-change revision captured before this snapshot's lineage was last
+  # validated; any later revocation advances past it.
+  access_revision: int = 0
 
 
 class ConnectorCreate(BaseModel):
@@ -488,7 +496,11 @@ async def _open_broker_upstream(
 
 
 def _broker_lineage_active(connector_id: int, snapshot: _BrokerSnapshot) -> bool:
-  """Fresh broker-side check; a copied provider token is never grant authority."""
+  """Fresh broker-side check; a copied provider token is never grant authority.
+
+  Every table read here must be in ``broker_access_signal.ACCESS_TABLES`` so
+  that a committed change to it wakes open exchanges for a recheck.
+  """
   with SessionLocal() as db:
     row = db.get(models.Connector, connector_id)
     if (row is None or not row.enabled or row.status != "ok"
@@ -501,23 +513,51 @@ def _broker_lineage_active(connector_id: int, snapshot: _BrokerSnapshot) -> bool
   return True
 
 
-async def _revocable_broker_upload(
-  request: Request, connector_id: int, snapshot: _BrokerSnapshot,
+class _BrokerRevoked(Exception):
+  """The grant behind an open broker exchange is gone."""
+
+
+async def _until_broker_revoked(
+  iterator, connector_id: int, snapshot: _BrokerSnapshot,
 ):
-  """Stop forwarding a long request body as soon as its grant disappears."""
-  iterator = request.stream()
+  """Forward ``iterator`` items, raising ``_BrokerRevoked`` once access ends.
+
+  Lineage is rechecked in a worker thread, and only after an access-relevant
+  commit (or the slow out-of-process safety interval), so an idle or long
+  stream costs the event loop nothing. A chunk is forwarded only while the
+  last passing check covers the latest access change.
+  """
+  loop = asyncio.get_running_loop()
+  checked = snapshot.access_revision
+  # The safety deadline moves only after a passing check, so a busy stream
+  # still rechecks out-of-process changes on schedule.
+  recheck_at = loop.time() + _BROKER_OUT_OF_PROCESS_RECHECK_SECONDS
   next_chunk = None
   try:
     while True:
-      if not _broker_lineage_active(connector_id, snapshot):
-        raise HTTPException(status_code=401, detail="MCP broker capability rejected.")
-      next_chunk = asyncio.create_task(anext(iterator))
-      while True:
-        done, _ = await asyncio.wait({next_chunk}, timeout=1.0)
-        if not _broker_lineage_active(connector_id, snapshot):
-          raise HTTPException(status_code=401, detail="MCP broker capability rejected.")
-        if done:
-          break
+      if next_chunk is None:
+        next_chunk = asyncio.create_task(anext(iterator))
+      change = asyncio.create_task(broker_access_signal.wait_for_change(
+        checked, timeout=max(0.0, recheck_at - loop.time()),
+      ))
+      try:
+        await asyncio.wait(
+          {next_chunk, change}, return_when=asyncio.FIRST_COMPLETED,
+        )
+      finally:
+        change.cancel()
+        await asyncio.gather(change, return_exceptions=True)
+      revision = broker_access_signal.current_revision()
+      if revision != checked or loop.time() >= recheck_at:
+        if not await asyncio.to_thread(
+          _broker_lineage_active, connector_id, snapshot,
+        ):
+          raise _BrokerRevoked
+        checked = revision
+        recheck_at = loop.time() + _BROKER_OUT_OF_PROCESS_RECHECK_SECONDS
+        continue
+      if not next_chunk.done():
+        continue  # The wait ended a hair before the deadline; wait again.
       try:
         chunk = next_chunk.result()
       except StopAsyncIteration:
@@ -529,6 +569,22 @@ async def _revocable_broker_upload(
       next_chunk.cancel()
       await asyncio.gather(next_chunk, return_exceptions=True)
     await iterator.aclose()
+
+
+async def _revocable_broker_upload(
+  request: Request, connector_id: int, snapshot: _BrokerSnapshot,
+):
+  """Stop forwarding a long request body as soon as its grant disappears."""
+  async with aclosing(
+    _until_broker_revoked(request.stream(), connector_id, snapshot),
+  ) as chunks:
+    try:
+      async for chunk in chunks:
+        yield chunk
+    except _BrokerRevoked:
+      raise HTTPException(
+        status_code=401, detail="MCP broker capability rejected.",
+      ) from None
 
 
 @router.api_route("/{connector_id}/broker", methods=["GET", "POST", "DELETE"])
@@ -567,35 +623,25 @@ async def broker_connector(
   finally:
     db.close()
 
-  if not _broker_lineage_active(connector_id, snapshot):
+  # Capture the revision before validating, so a revocation that commits
+  # during or after this check always wakes the exchange for a recheck.
+  snapshot = dataclasses.replace(
+    snapshot, access_revision=broker_access_signal.current_revision(),
+  )
+  if not await asyncio.to_thread(_broker_lineage_active, connector_id, snapshot):
     raise HTTPException(status_code=401, detail="MCP broker capability rejected.")
   client, upstream = await _open_broker_upstream(request, snapshot)
 
   async def stream():
-    iterator = _redacted_broker_stream(upstream, snapshot)
-    next_chunk = None
     try:
-      while True:
-        if not _broker_lineage_active(connector_id, snapshot):
-          return
-        next_chunk = asyncio.create_task(anext(iterator))
-        while True:
-          done, _ = await asyncio.wait({next_chunk}, timeout=1.0)
-          if not _broker_lineage_active(connector_id, snapshot):
-            return
-          if done:
-            break
-        try:
-          chunk = next_chunk.result()
-        except StopAsyncIteration:
-          return
-        next_chunk = None
-        yield chunk
+      async with aclosing(_until_broker_revoked(
+        _redacted_broker_stream(upstream, snapshot), connector_id, snapshot,
+      )) as chunks:
+        async for chunk in chunks:
+          yield chunk
+    except _BrokerRevoked:
+      return
     finally:
-      if next_chunk is not None and not next_chunk.done():
-        next_chunk.cancel()
-        await asyncio.gather(next_chunk, return_exceptions=True)
-      await iterator.aclose()
       await upstream.aclose()
       await client.aclose()
 
