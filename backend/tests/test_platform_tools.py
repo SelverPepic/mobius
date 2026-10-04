@@ -13,6 +13,20 @@ import pytest
 from app import platform_tools
 
 
+def test_goal_copy_guidance_separates_owner_text_from_verification_evidence():
+  control = _control_module()
+  objective = control._TOOL_DEFINITIONS['promote_goal']['inputSchema']['properties']['objective']
+  complete = control._TOOL_DEFINITIONS['update_goal']['inputSchema']['properties']['complete']
+  assert 'plain-language outcome shown to the owner' in objective['description']
+  assert 'verification criteria in tasks' in objective['description']
+  assert 'Set true after verifying the whole outcome' in complete['description']
+  assert 'evidence in task results or the chat checkpoint' in complete['description']
+  assert 'No separate success summary' in complete['description']
+  assert complete['type'] == 'boolean'
+  assert complete['enum'] == [True]
+  assert 'maxLength' not in complete
+
+
 @pytest.mark.parametrize("top_level,coordination", [(True, True), (True, False), (False, True)])
 def test_helpers_are_builtin_without_subagents_app(monkeypatch, top_level, coordination):
   monkeypatch.delenv("MOBIUS_SUBAGENT_HELPER", raising=False)
@@ -339,6 +353,23 @@ def test_a_settled_goal_does_not_offer_its_old_next_action(monkeypatch):
       "goal": {**goal, "status": status}, "plan": None,
     })
     assert ("Next action: Run the probe" in control._call_update_goal({})) is shown
+
+
+def test_defer_tool_records_a_quiet_hold_not_ready_work_or_a_terminal_outcome(monkeypatch):
+  control = _control_module()
+  monkeypatch.setenv("CHAT_ID", "chat-1")
+  sent = []
+  def record(method, path, body):
+    sent.append(body)
+    return {"goal": {"status": "stopped", "revision": 5,
+      "hold": {"cause": "deferred", "reason": "Tests deferred by owner"}},
+      "plan": {"tasks": [], "summary": {"ready": ["later"], "running": []}}}
+  monkeypatch.setattr(control, "_agent_api_call", record)
+  receipt = control._call_update_goal({"defer": "Tests deferred by owner"})
+  assert sent == [{"defer": "Tests deferred by owner"}]
+  assert "On hold: Tests deferred by owner" in receipt and "End normally" in receipt
+  assert "Ready:" not in receipt and "Outcome:" not in receipt
+  assert "defer" in control._TOOL_DEFINITIONS[control.UPDATE_GOAL_TOOL]["inputSchema"]["properties"]
 
 
 def test_platform_control_tools_are_marked_always_loaded(monkeypatch):
@@ -1311,3 +1342,27 @@ def test_builtin_delegation_guidance_is_available_without_an_app():
   assert "State read-only limits in the task" in text
   assert "read-only children" not in text
   assert "complete `delegation`" in (root / "claude.md").read_text()
+
+
+def test_completion_tool_sends_a_flag_and_returns_only_a_receipt(monkeypatch):
+  control = _control_module()
+  monkeypatch.setenv("CHAT_ID", "chat-1")
+  sent = []
+  def record(method, path, body):
+    sent.append(body)
+    return {"goal": {"status": "completed", "revision": 2, "result": None},
+            "plan": {"tasks": [], "summary": {"completed": 1, "total": 1}}}
+  monkeypatch.setattr(control, "_agent_api_call", record)
+  receipt = control._call_update_goal({"complete": True})
+  assert sent == [{"complete": True}]
+  assert receipt == "Goal completed, revision 2: 1/1 tasks complete."
+
+
+def test_legacy_success_text_is_readable_but_not_repeated_in_write_receipts():
+  control = _control_module()
+  payload = {"goal": {"status": "completed", "revision": 2,
+                      "result": "Historical result"}, "plan": None}
+  assert "Historical result" not in control._goal_report(payload, full=False)
+  assert "Historical result" in control._goal_report(payload, full=True)
+  payload["goal"]["status"] = "cannot_complete"
+  assert "Historical result" in control._goal_report(payload, full=False)

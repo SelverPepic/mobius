@@ -23,7 +23,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from sqlalchemy import Text, cast, literal_column, or_, text
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 from starlette.concurrency import run_in_threadpool
 
 from app import (
@@ -365,61 +365,67 @@ def _future_auto_resuming_limit_park_for_chat(
   return run if run.parked_until > current else None
 
 
-def _latest_run_is_usage_park(db: Session, chat_id: str) -> bool:
-  """Whether the chat's LATEST run is a usage-limit park awaiting resume.
+def continuation_handoff_for_chat(db: Session, chat_id: str) -> dict:
+  """Read the latest park's scheduler eligibility without admitting a turn.
 
-  Latest-run-wins, exactly like `_parked_until_for_chat`: a fresh turn inserts a
-  newer running row, so a superseded park never keeps the mark. Query failures
-  read as not-waiting — this only feeds a passive drawer indicator.
+  This is a presentation projection. The sweep and `_auto_resume_chat` still
+  re-check every condition under their transition locks at claim time.
   """
-  try:
-    run = (
-      db.query(models.ChatRun.status, models.ChatRun.park_reason)
-      .filter(models.ChatRun.chat_id == chat_id)
-      .order_by(
-        models.ChatRun.started_at.desc(),
-        models.ChatRun.id.desc(),
-      )
-      .first()
-    )
-  except Exception:
-    return False
+  run = _latest_continuation_park(db, chat_id)
   if run is None:
-    return False
-  status, park_reason = run
-  return status in ("parked", "resume_pending") and park_reason == "usage_limit"
-
-
-def usage_limit_waiting_chat_ids(
-  db: Session,
-  chat_ids: Iterable[str],
-) -> set[str]:
-  """Chat ids parked on a provider usage limit, awaiting resume.
-
-  A usage-limit park can sit for hours until the provider reset (or a manual /
-  credit-driven Resume) with no other running signal, so the drawer marks it as
-  "waiting" — the same passive indicator armed Waits and background helpers use.
-  Bounded to the caller's chat set and confirmed latest-run-wins so a formerly
-  parked chat that has since moved on clears the mark.
-  """
-  bounded = tuple(dict.fromkeys(chat_ids))
-  if not bounded:
-    return set()
-  try:
-    rows = (
-      db.query(models.ChatRun.chat_id)
-      .filter(
-        models.ChatRun.chat_id.in_(bounded),
-        models.ChatRun.status.in_(("parked", "resume_pending")),
-        models.ChatRun.park_reason == "usage_limit",
-      )
-      .distinct()
-      .all()
+    return {"kind": "none", "reason": None}
+  from app.goals import goal_allows_automatic_resume
+  if not goal_allows_automatic_resume(db, run):
+    return {"kind": "recovery", "reason": "goal_held"}
+  chat = db.query(models.Chat).options(load_only(
+    models.Chat.id, models.Chat.deleted_at, models.Chat.pending_question_id,
+    models.Chat.auto_resume_on_limit, models.Chat.auto_resume_on_restart,
+    models.Chat.pending_messages,
+  )).filter(models.Chat.id == chat_id).first()
+  if chat is None or chat.deleted_at is not None:
+    return {"kind": "none", "reason": None}
+  if _has_unanswered_question(chat):
+    return {"kind": "owner_input", "reason": "question"}
+  if any(
+    isinstance(msg, dict) and msg.get("_initiated_by_app_id") is not None
+    for msg in list(chat.pending_messages or [])
+  ):
+    return {"kind": "recovery", "reason": "app_attributed_work"}
+  from app.delegations import delegation_recovery_allowed, limit_resume_delegation
+  if not delegation_recovery_allowed(
+    db, child_chat_id=chat_id, initiated_by_app_id=run.initiated_by_app_id,
+  ):
+    return {"kind": "recovery", "reason": "delegation_barrier"}
+  reason = run.park_reason
+  restart = reason == "restart"
+  auto_retry = reason in AUTO_RETRY_PARK_REASONS
+  delegated = None
+  if not restart and not auto_retry:
+    delegated = limit_resume_delegation(
+      db, child_chat_id=chat_id, run_token=run.id,
+      initiated_by_app_id=run.initiated_by_app_id,
     )
-  except Exception:
-    return set()
-  candidates = {str(row[0]) for row in rows}
-  return {cid for cid in candidates if _latest_run_is_usage_park(db, cid)}
+  if reason == "model_capacity" and _model_capacity_retry_exhausted(db, run):
+    return {"kind": "recovery", "reason": "model_retry_exhausted"}
+  if run.initiated_by_app_id is not None and not restart and not auto_retry and delegated is None:
+    return {"kind": "recovery", "reason": "app_attributed_work"}
+  if not (_park_continues_automatically(chat, run) or delegated is not None):
+    return {"kind": "recovery", "reason": "manual_resume"}
+  if restart:
+    from app.restart_ledger import authorized_restart_nonce
+    try:
+      nonce = authorized_restart_nonce()
+    except Exception:
+      nonce = None
+    if not nonce or not run.restart_nonce or nonce != run.restart_nonce:
+      return {"kind": "recovery", "reason": "restart_manual"}
+  from app.platform_update import late_edits_pending, read_prepared_update
+  if late_edits_pending():
+    update = read_prepared_update()
+    if update and update["replayed"]:
+      return {"kind": "recovery", "reason": "restart_required"}
+    return {"kind": "automatic", "reason": "restoring_edits"}
+  return {"kind": "automatic", "reason": reason}
 
 
 def continuation_wait_for_chat(db: Session, chat_id: str) -> str | None:
@@ -614,8 +620,9 @@ async def _finish_run(
 def _after_terminal_status(chat_id: str, terminal_status: str) -> None:
   """Post-commit follow-up for a durable Stop of this chat's work.
 
-  FinishRun released the stopped Goal's work claims in its own commit; the
-  followers are woken off this lifecycle path, which may still hold locks.
+  Explicit Stop preparation released the Goal's claims before interruption;
+  wake its followers off this lifecycle path, which may still hold locks.
+  A physical run ending by itself supplies no Goal-stop intent.
   """
   if terminal_status == "stopped":
     from app.agent_coordination import schedule_claim_settlement
@@ -1959,6 +1966,9 @@ def _auto_resume_recovery(
   from app.delegations import retired_delegation_for_chat
   if retired_delegation_for_chat(db, chat.id):
     return None
+  from app.goals import goal_allows_automatic_resume
+  if not goal_allows_automatic_resume(db, physical):
+    return None
   control = physical.continuation_json
   messages = list(chat.messages or [])
   source = messages[-1] if messages else None
@@ -2194,6 +2204,9 @@ async def _auto_resume_chat(
               .first()
             )
             latest_id = latest[0] if latest is not None else None
+            from app.goals import goal_allows_automatic_resume
+            if park is not None and not goal_allows_automatic_resume(check_db, park):
+              return False
             restart_park = (
               park is not None and park.park_reason == "restart"
             )
@@ -2508,6 +2521,9 @@ async def sweep_reset_parks(
       isinstance(msg, dict) and msg.get("_initiated_by_app_id") is not None
       for msg in pending
     )
+    from app.goals import goal_allows_automatic_resume
+    if not goal_allows_automatic_resume(db, run):
+      return "Goal held or settled"
     if chat is None or chat.deleted_at is not None:
       return "chat unavailable"
     from app.delegations import delegation_recovery_allowed
@@ -2884,7 +2900,8 @@ def _log_superseded_run(chat_id: str, phase: str) -> None:
 
 
 async def stop_chat(
-  chat_id: str | None = None, db: Session = None,
+  chat_id: str | None = None, db: Session = None, *,
+  actor: str | None = None, actor_id: str | None = None,
 ) -> tuple[bool, list[str]]:
   """Kills the active subprocess for a chat, bumps its generation, and
   clears its pending queue so a queued continuation cannot auto-start
@@ -2897,7 +2914,7 @@ async def stop_chat(
   isn't double-sent. The global sweep (`chat_id=None`) returns `[]` for it —
   that path doesn't resend."""
   if chat_id is not None:
-    return await stop_chat_for(chat_id, db=db)
+    return await stop_chat_for(chat_id, db=db, actor=actor, actor_id=actor_id)
   from app.broadcast import _broadcasts
   # Snapshot `_broadcasts` via `list()` first — iterating the live
   # mapping can raise RuntimeError if a concurrent task creates a
@@ -2907,7 +2924,7 @@ async def stop_chat(
   }
   stopped_any = False
   for cid in targets:
-    stopped_cid, _ = await stop_chat_for(cid, db=db)
+    stopped_cid, _ = await stop_chat_for(cid, db=db, actor=actor, actor_id=actor_id)
     if stopped_cid:
       stopped_any = True
   return stopped_any, []
@@ -2988,7 +3005,8 @@ async def stop_browser_grant_runs(grant_id: str, db: Session = None) -> dict:
 
 
 async def stop_chat_for(
-  chat_id: str, db: Session = None,
+  chat_id: str, db: Session = None, *,
+  actor: str | None = None, actor_id: str | None = None,
 ) -> tuple[bool, list[str]]:
   """Kills the agent subprocess for a specific chat.
 
@@ -3015,7 +3033,7 @@ async def stop_chat_for(
   handle, queue behind it, and then be stranded when Stop releases ownership.
   """
   async with chat_queue.get_transition_lock(chat_id):
-    return await _stop_chat_for_locked(chat_id, db=db)
+    return await _stop_chat_for_locked(chat_id, db=db, actor=actor, actor_id=actor_id)
 
 
 async def clear_goal_for(chat_id: str, expected_goal_id: str) -> dict:
@@ -3052,7 +3070,8 @@ async def clear_goal_for(chat_id: str, expected_goal_id: str) -> dict:
       return {"status": "conflict", "goal_id": current_goal["id"]}
 
     plan_complete = bool(
-      current_plan is not None and current_plan["summary"]["can_complete"]
+      current_goal["status"] in {"completed", "cannot_complete", "cancelled"}
+      or (current_plan is not None and current_plan["summary"]["can_complete"])
     )
     if not plan_complete:
       handles = registry.get_handles(chat_id)
@@ -3091,6 +3110,7 @@ async def clear_goal_for(chat_id: str, expected_goal_id: str) -> dict:
 async def _stop_chat_for_locked(
   chat_id: str, db: Session = None, *,
   preserve_pending: bool = False,
+  actor: str | None = None, actor_id: str | None = None,
 ) -> tuple[bool, list[str]]:
   """Stop one chat while its per-chat lifecycle transition is exclusive."""
   stopped_gen = current_run_generation(chat_id)
@@ -3107,8 +3127,10 @@ async def _stop_chat_for_locked(
   if handles:
     _clear_after_terminal_generation[chat_id] = stopped_gen
     _clear_after_terminal_status[chat_id] = "stopped"
-  from app.chat_writer import CancelActivationWaits
-  await _await_ack(get_writer().submit(CancelActivationWaits(chat_id=chat_id)))
+  from app.chat_writer import PrepareChatStop
+  await _await_ack(get_writer().submit(PrepareChatStop(
+    chat_id=chat_id, actor=actor, actor_id=actor_id,
+  )))
   # The queue-lock window guards the clear's COMPOUND decision against a
   # racing append/cancel/promote (the actor's ClearPending serializes the
   # DB write itself). Generation bump happens BEFORE the lock so the dying
@@ -4022,16 +4044,22 @@ def _park_exit(
     return {"parked": False}
   if (
     (runner_result or {}).get("api_error_status") == 413
+    or (runner_result or {}).get("context_window_exceeded") is True
     or any(marker in (error_text or "").lower() for marker in (
       "request body is too large", "request body too large",
       "request entity too large", "payload too large",
     ))
   ):
+    size_message = (
+      "This conversation exceeds the model's context window."
+      if (runner_result or {}).get("context_window_exceeded") is True
+      else "This request is too large to send."
+    )
     sink.publish({
       "type": "error",
       "message": (
         f"{error_text or 'The provider rejected an oversized request.'}\n\n"
-        "This request is too large to send. Compact the conversation or "
+        f"{size_message} Compact the conversation or "
         "reduce its attachments, or continue in a new chat using your saved "
         "files. Retrying it unchanged will not help."
       ),
@@ -4254,8 +4282,10 @@ async def _complete_turn(
        silent loss is worse than a visible "couldn't save" error.
     2. On success: allocate the CONTINUATION's run_token, drain the queue
        under ONE bounded lock (`drain_and_release`). The drain returns the
-       exact unfinished Goal to execution first when no durable handoff owns
-       it; this decision is made after Finalize has saved any question card.
+       exact unfinished Goal to one targeted settlement pass when the queue
+       is empty and no durable handoff owns it; this decision is made after
+       Finalize has saved any question card. A second unhanded ending is a
+       visible technical recovery failure, not an endless loop or capitulation.
        Otherwise the drain returns the ordinary
        disposition: `CONTINUATION_PROMOTED` (a head was promoted — marker
        stays set, schedule the continuation), `EMPTY_TERMINAL_CLEARED` (the
@@ -4592,6 +4622,14 @@ async def _complete_turn(
     db.close()
     return chat_queue.TerminalDisposition.FAILED_LEAVE_MARKER
 
+  if disposition is chat_queue.TerminalDisposition.GOAL_SETTLEMENT_FAILED:
+    # The writer saved this note before the exact failed terminal closed.
+    # Publish only: another sink write could overwrite its committed block.
+    from app.continuations import GOAL_SETTLEMENT_UNFINISHED_MESSAGE
+    bc.publish({
+      "type": "error", "code": "goal_settlement_unfinished", "resumable": True,
+      "message": GOAL_SETTLEMENT_UNFINISHED_MESSAGE,
+    })
   if next_user:
     get_system_broadcast().publish({
       "type": "chat_run_started",
@@ -4972,6 +5010,7 @@ _MEMORY_RECLAIM_DISPOSITIONS = frozenset({
   chat_queue.TerminalDisposition.LIMIT_PARKED,
   chat_queue.TerminalDisposition.QUESTION_PARKED,
   chat_queue.TerminalDisposition.ACTIVATION_PARKED,
+  chat_queue.TerminalDisposition.GOAL_SETTLEMENT_FAILED,
 })
 
 
@@ -5645,14 +5684,9 @@ async def _run_chat_impl_with_db(
   run_lineage = db.get(models.ChatRun, run_token) if run_token else None
   if run_lineage is None:
     raise RuntimeError("Provider admission has no durable run lineage")
-  if run_lineage.browser_grant_id is not None:
-    from app.browser_access import validate_grant
-    validate_grant(
-      db, run_lineage.browser_grant_id, run_lineage.browser_grant_epoch,
-      owner.id,
-    )
-  elif run_lineage.browser_grant_epoch is not None:
-    raise RuntimeError("Incomplete browser grant lineage")
+  from app.browser_access import BrowserLineage, require_live
+  run_browser = BrowserLineage.of(run_lineage.browser_grant_id)
+  require_live(db, run_browser, owner.id)
 
   if run_policy is not None:
     from app.delegations import delegation_execution_token
@@ -5665,8 +5699,7 @@ async def _run_chat_impl_with_db(
       owner.username,
       owner.token_epoch,
       run_id=run_token,
-      browser_grant_id=run_lineage.browser_grant_id,
-      browser_grant_epoch=run_lineage.browser_grant_epoch,
+      browser=run_browser,
     )
 
   # Build the base environment shared by all providers.
@@ -5870,7 +5903,6 @@ async def _run_chat_impl_with_db(
       db, include_owner_connectors=include_owner_connectors,
       owner_id=owner.id, owner_epoch=owner.token_epoch,
       browser_grant_id=run_lineage.browser_grant_id,
-      browser_grant_epoch=run_lineage.browser_grant_epoch,
     )
   except Exception:
     log.warning(
