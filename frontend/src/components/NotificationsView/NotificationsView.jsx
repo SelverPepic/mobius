@@ -15,7 +15,7 @@ import {
   pointerSelectionChangedWithin,
   textSelectionSnapshot,
 } from '../../lib/selectableTextControl.js'
-import { formatRelativeTime, iconKindForSource } from './notificationsModel.js'
+import { formatRelativeTime, iconKindForSource, mergeNotificationRows } from './notificationsModel.js'
 import './NotificationsView.css'
 
 const ICONS = {
@@ -41,13 +41,16 @@ export default function NotificationsView({
   updateAvailable = false,
   onUpdateNow,
   onUpdateLater,
+  sessionNotices = [],
+  onNoticeAction,
 }) {
   const queryClient = useQueryClient()
   const {
     data, isLoading, isError, hasNextPage, fetchNextPage, isFetchingNextPage,
     isFetchNextPageError,
   } = notificationQueries.list.useQuery({ enabled: active })
-  const rows = data?.pages.flat() ?? []
+  const historyRows = data?.pages.flat() ?? []
+  const rows = mergeNotificationRows(historyRows, sessionNotices)
   const [now, setNow] = useState(() => Date.now())
   const pointerSelectionRef = useRef(null)
   const contentRef = useRef(null)
@@ -194,7 +197,7 @@ export default function NotificationsView({
         {isLoading && (
           <p className="notifications__hint" role="status">Loading…</p>
         )}
-        {isError && !rows.length && (
+        {isError && !historyRows.length && (
           <p className="notifications__hint" role="alert">
             Couldn’t load notifications. They’ll retry automatically.
           </p>
@@ -250,10 +253,7 @@ export default function NotificationsView({
             </li>
           )}
           {rows.map((n) => {
-            const parsedNav = parseNotificationTarget(n.target)
-            const nav = parsedNav?.view === 'chat' && n.title === 'Möbius needs your answer'
-              ? { ...parsedNav, focusQuestion: true }
-              : parsedNav
+            const nav = parseNotificationTarget(n.target)
             const recovery = notificationRecoveryAction(n)
             const protectsDismissal = hasRecoveryReceipt(n)
             const recoveryStatus = recoveryState[n.id]
@@ -284,6 +284,23 @@ export default function NotificationsView({
                   </span>
                   {n.body ? (
                     <span className="notifications__row-body">{n.body}</span>
+                  ) : null}
+                  {n.sessionAction || n.actionStatus || n.actionError ? (
+                    <span className="notifications__recovery">
+                      {n.sessionAction ? (
+                        <button
+                          type="button"
+                          className="notifications__recovery-action"
+                          disabled={n.actionWorking}
+                          onClick={() => onNoticeAction?.(n.id)}
+                        >
+                          {n.actionWorking ? 'Working…' : n.sessionAction.label}
+                        </button>
+                      ) : (
+                        <span className="notifications__recovery-status" role="status">{n.actionStatus}</span>
+                      )}
+                      {n.actionError && <span className="notifications__recovery-error" role="alert">{n.actionError}</span>}
+                    </span>
                   ) : null}
                   {recovery ? (
                     <span className="notifications__recovery">
@@ -343,7 +360,7 @@ export default function NotificationsView({
                       {body}
                     </button>
                   ) : (
-                    <div className="notifications__row">{body}</div>
+                    <div className={`notifications__row${n.variant === 'error' ? ' notifications__row--error' : ''}`}>{body}</div>
                   )}
                   {!protectsDismissal && (
                     <button

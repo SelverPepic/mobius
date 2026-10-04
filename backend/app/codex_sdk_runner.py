@@ -50,6 +50,7 @@ from app.codex_events import (
   _thinking_event,
   _codex_thinking_segment_id,
   _extract_rate_limit_reset,
+  _rate_limit_credits_depleted,
   _model_dump,
   _reasoning_summary_setting,
   _stamp_tool_use_id,
@@ -1955,6 +1956,7 @@ async def _run_codex_sdk_turn(
       # api_error_status=429 — instead of the 30-minute error-text fallback.
       rate_limit_resets_at: int | None = None
       rate_limit_reached = False
+      credits_depleted = False
 
       async for notification in turn.stream():
         payload = notification.payload
@@ -2183,9 +2185,10 @@ async def _run_codex_sdk_turn(
           continue
 
         if isinstance(payload, sdk["AccountRateLimitsUpdatedNotification"]):
-          _reset, _reached = _extract_rate_limit_reset(
-            getattr(payload, "rate_limits", None)
-          )
+          snapshot = getattr(payload, "rate_limits", None)
+          _reset, _reached = _extract_rate_limit_reset(snapshot)
+          if _rate_limit_credits_depleted(snapshot):
+            credits_depleted = True
           if _reset is not None:
             rate_limit_resets_at = _reset
           if _reached:
@@ -2266,6 +2269,8 @@ async def _run_codex_sdk_turn(
             })
             if rate_limit_resets_at is not None:
               limit_result["rate_limit_resets_at"] = rate_limit_resets_at
+            if credits_depleted:
+              limit_result["credits_depleted"] = True
             return limit_result
           raise RuntimeError(str(message or "Codex error"))
 

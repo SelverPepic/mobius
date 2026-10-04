@@ -691,6 +691,9 @@ class SendMessage(BaseModel):
   # Exact physical run shown by Resume; stale recovery controls cannot start
   # a new continuation after automatic recovery has already advanced it.
   resume_run_id: str | None = None
+  # Goal Resume names the durable obligation, not an unrelated chat tail.
+  resume_goal_id: str | None = Field(default=None, min_length=1, max_length=64)
+  resume_goal_revision: int | None = Field(default=None, ge=0)
   attachments: list[dict] | None = None
   timezone: str | None = None
   viewport: dict | None = None
@@ -748,6 +751,12 @@ class SendMessage(BaseModel):
 
   @model_validator(mode="after")
   def validate_continuation(self):
+    goal_target = self.resume_goal_id is not None or self.resume_goal_revision is not None
+    if goal_target and (
+      self.resume_goal_id is None or self.resume_goal_revision is None
+      or self.continuation != "manual" or self.resume_run_id is not None
+    ):
+      raise ValueError("Goal Resume requires one exact Goal id and revision")
     if (
       self.continuation == "manual"
       and self.content.strip()
