@@ -1185,7 +1185,7 @@ test.describe('Touch navigation', () => {
     expect(sends.length).toBe(1)
   })
 
-  test('a creation conflict while away waits for visible Retry before moving its draft', async ({ page }) => {
+  test('a creation conflict while away rotates silently once its chat is visible again', async ({ page }) => {
     await setup(page, { width: 1280, height: 900 })
     let releaseConflict
     const gate = new Promise(resolve => { releaseConflict = resolve })
@@ -1198,26 +1198,33 @@ test.describe('Touch navigation', () => {
       if (id === ids[0]) return route.fulfill({ status: 409, json: { detail: 'Tombstoned' } })
       return route.fulfill({ status: 200, json: createdChat(id) })
     })
+    const intentStatus = () => page.evaluate(() =>
+      JSON.parse(sessionStorage.getItem('new-chat-intent'))?.status,
+    )
     await page.keyboard.press('ControlOrMeta+n')
     await expect.poll(() => ids.length).toBe(1)
     const draft = 'Keep my draft through the conflict'
     await newChatSurface(page, ids[0]).getByRole('textbox', { name: 'Message Möbius…', exact: true }).fill(draft)
     await page.keyboard.press('ControlOrMeta+,')
     await expect(newChatSurface(page, NAV_CHATS[0].id)).toBeVisible()
+    const conflict = page.waitForResponse(response => (
+      response.request().method() === 'POST' && response.status() === 409
+    ))
     releaseConflict()
-    await expect.poll(() => page.evaluate(() =>
-      JSON.parse(sessionStorage.getItem('new-chat-intent'))?.status,
-    )).toBe('failed')
+    await conflict
+    // The conflict is remembered, not surfaced: the owner stays where they
+    // are, no replacement id is spent, and nothing is marked failed.
     await expect(newChatSurface(page, NAV_CHATS[0].id)).toBeVisible()
     expect(ids.length).toBe(1)
+    expect(await intentStatus()).toBe('allocating')
     await page.keyboard.press('ControlOrMeta+.')
-    await expect(newChatSurface(page, ids[0])).toBeVisible()
-    await page.getByRole('button', { name: 'Retry', exact: true }).click()
-    await expect.poll(() => ids.length).toBe(3)
-    expect(ids[1]).toBe(ids[0])
-    expect(ids[2]).not.toBe(ids[0])
-    await expect(newChatSurface(page, ids[2]).getByRole('textbox', { name: 'Message Möbius…', exact: true }))
+    await expect.poll(() => ids.length).toBe(2)
+    expect(ids[1]).not.toBe(ids[0])
+    await expect(newChatSurface(page, ids[1]).getByRole('textbox', { name: 'Message Möbius…', exact: true }))
       .toHaveValue(draft)
+    await expect(page.getByRole('button', { name: 'Retry', exact: true })).toHaveCount(0)
+    await expect.poll(intentStatus).not.toBe('failed')
+    expect(ids.length).toBe(2)
   })
 
   for (const navigationApi of [true, false]) {

@@ -13,6 +13,7 @@ import {
   mintNewChatIntentId,
   newChatIsAllocating,
   newChatPresentationIsCurrent,
+  resumedNewChatPresentation,
   readNewChatIntent,
   reconcileCreatedChatGuard,
   reconcileNewChatIntentCreate,
@@ -155,8 +156,56 @@ test('a conflict that arrives off-screen rotates silently once the owner returns
   assert.doesNotMatch(defer, /failure|failedNewChatPresentation|rememberOpenNewChatIntent/,
     'a background conflict must not surface a failure or Retry the owner never saw')
   assert.match(shellSource,
-    /if \(!session\?\.rotateTo \|\| !newChatPresentationIsCurrent\(session,[\s\S]*?\{ \.\.\.session, rotateTo: null \}[\s\S]*?rotateDraftFirstNewChatRef\.current\?\.\(resuming, session\.rotateTo\)/,
+    /const resuming = resumedNewChatPresentation\(session,[\s\S]*?if \(!resuming\) return[\s\S]*?rotateDraftFirstNewChatRef\.current\?\.\(resuming, session\.rotateTo\)/,
     'returning applies the remembered rotation without re-sending the conflicting id')
+})
+
+test('a remembered conflict resumes wherever its chat is visible again', () => {
+  const session = {
+    token: 7,
+    chatId: 'client-owned',
+    rotateTo: 'replacement',
+    materialized: false,
+    viewMode: 'panes',
+    paneId: 'left',
+    paneActiveKey: 'chat:client-owned',
+  }
+  const visible = {
+    viewMode: 'panes',
+    activeView: 'chat',
+    activeChatId: 'client-owned',
+    focusedPaneId: 'right',
+    paneActiveKey: 'chat:client-owned',
+  }
+
+  assert.equal(resumedNewChatPresentation(session, {
+    ...visible, activeChatId: 'other',
+  }), null, 'another chat is visible: keep remembering')
+  assert.equal(resumedNewChatPresentation(session, {
+    ...visible, activeView: 'canvas', activeChatId: null,
+  }), null)
+  assert.equal(resumedNewChatPresentation({ ...session, rotateTo: null }, visible), null,
+    'nothing remembered: nothing to resume')
+
+  // The tab moved to another pane: the rotation still applies there, and the
+  // resumed session owns that view so the rotation does not defer again.
+  const moved = resumedNewChatPresentation(session, visible)
+  assert.equal(newChatPresentationIsCurrent(session, visible), false)
+  assert.equal(moved.rotateTo, null)
+  assert.equal(moved.token, session.token)
+  assert.equal(newChatPresentationIsCurrent(moved, visible), true)
+
+  const standard = {
+    viewMode: 'single',
+    activeView: 'chat',
+    activeChatId: 'client-owned',
+    focusedPaneId: null,
+    paneActiveKey: null,
+  }
+  const switched = resumedNewChatPresentation(session, standard)
+  assert.deepEqual([switched.viewMode, switched.paneId, switched.paneActiveKey],
+    ['single', null, null])
+  assert.equal(newChatPresentationIsCurrent(switched, standard), true)
 })
 
 test('an accepted allocation activates the already-mounted canonical composer', () => {

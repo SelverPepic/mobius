@@ -61,6 +61,35 @@ export function newChatPresentationIsCurrent(presentation, {
 }
 
 /**
+ * Resume a conflict remembered while this creation was off-screen.
+ *
+ * The decision belongs to the allocation (its client id), not to the pane or
+ * tab that first showed it: the owner may come back to the chat from a moved
+ * Builder tab or another workspace mode. Once that chat is the active
+ * destination again, re-anchor the session where it is visible now so the
+ * rotation owns this view exactly as if the conflict had arrived on-screen.
+ * Returns null while the chat is not visible or nothing is remembered.
+ */
+export function resumedNewChatPresentation(presentation, {
+  viewMode,
+  activeView,
+  activeChatId,
+  focusedPaneId,
+  paneActiveKey,
+} = {}) {
+  if (!presentation?.rotateTo || activeView !== 'chat') return null
+  if (normalizedId(activeChatId) !== normalizedId(presentation.chatId)) return null
+  const panes = viewMode === 'panes'
+  return {
+    ...presentation,
+    rotateTo: null,
+    viewMode,
+    paneId: panes ? focusedPaneId : null,
+    paneActiveKey: panes ? paneActiveKey : null,
+  }
+}
+
+/**
  * Whether New Chat is still creating this chat's server row.
  *
  * New Chat routes to its client-minted id before the row exists, so a detail

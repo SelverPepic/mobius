@@ -121,6 +121,7 @@ import {
   reconcileNewChatIntentCreate,
   rememberCreatedChat,
   resolveNewChatIntentId,
+  resumedNewChatPresentation,
   reusableChatDetailVerdict,
   shouldRetryNewChatAllocation,
   stageVerifiedNewChatHandoff,
@@ -3800,20 +3801,24 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
   }, [activeChatId, activeView, newChatPresentation, requestComposer])
 
   // A conflict that arrived while this creation was off-screen applies the
-  // remembered rotation once its provisional chat is visible again, exactly
-  // as if the conflict had arrived while the owner was watching.
+  // remembered rotation once its provisional chat is visible again, wherever
+  // it is visible (a moved Builder tab included), exactly as if the conflict
+  // had arrived while the owner was watching.
   useEffect(() => {
     const session = newChatPresentationRef.current
-    if (!session?.rotateTo || !newChatPresentationIsCurrent(session, {
+    const focusedPaneId = workspace.viewMode === 'panes'
+      ? workspace.focusedPaneId
+      : null
+    const resuming = resumedNewChatPresentation(session, {
       viewMode: workspace.viewMode,
       activeView,
       activeChatId,
-      focusedPaneId: workspace.focusedPaneId,
-      paneActiveKey: session.paneId == null
+      focusedPaneId,
+      paneActiveKey: focusedPaneId == null
         ? null
-        : paneModel.activeKeyForOwner(workspace, session.paneId),
-    })) return
-    const resuming = { ...session, rotateTo: null }
+        : paneModel.activeKeyForOwner(workspace, focusedPaneId),
+    })
+    if (!resuming) return
     newChatPresentationRef.current = resuming
     setNewChatPresentation(resuming)
     void rotateDraftFirstNewChatRef.current?.(resuming, session.rotateTo)
