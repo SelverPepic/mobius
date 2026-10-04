@@ -42,6 +42,16 @@ def test_known_codex_refusals_explain_next_step_without_echoing_data(cause, acti
 
 
 @pytest.mark.parametrize("cause,action", CASES)
+def test_wording_fits_switch_and_manual_compact(cause, action):
+  # The summarizer also serves manual /compact, and app-provided or
+  # subscription providers are not reconnected in Settings.
+  message = compaction._provider_compaction_failure(cause)
+  assert action in message
+  assert "switch" not in message.lower()
+  assert "Settings" not in message
+
+
+@pytest.mark.parametrize("cause,action", CASES)
 def test_assistant_prose_is_not_failure_evidence(cause, action):
   stdout = json.dumps({"type": "agent_message", "text": cause}).encode()
   assert compaction._codex_compaction_failure(stdout, b"") == (
@@ -96,26 +106,39 @@ def test_known_refusal_reaches_switch_response_without_changing_chat(
   assert row.messages == before
 
 
+CLAUDE_TEXT_CASES = [
+  ("Your workspace is out of credits.", "Add credits"),
+  ("You've hit your weekly limit", "allowance"),
+  ("Invalid authentication credentials", "Reconnect"),
+]
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("source", ["result", "errors", "assistant-error", "status"])
-@pytest.mark.parametrize("cause,action,status", [
-  ("Your workspace is out of credits.", "Add credits", None),
-  ("You've hit your weekly limit", "allowance", 429),
-  ("Invalid authentication credentials", "Reconnect", 401),
+@pytest.mark.parametrize("source,cause,error_type,status,action", [
+  *[("result", cause, None, None, action) for cause, action in CLAUDE_TEXT_CASES],
+  *[("errors", cause, None, None, action) for cause, action in CLAUDE_TEXT_CASES],
+  *[("assistant-error", cause, "unknown", None, action)
+    for cause, action in CLAUDE_TEXT_CASES],
+  # Claude's own error types classify without relying on message wording.
+  ("assistant-error", "unrelated wording", "billing_error", None, "Add credits"),
+  ("assistant-error", "unrelated wording", "rate_limit", None, "allowance"),
+  ("assistant-error", "unrelated wording", "authentication_failed", None, "Reconnect"),
+  # HTTP status alone is enough, with no text at all.
+  ("status", None, None, 429, "allowance"),
+  ("status", None, None, 401, "Reconnect"),
 ])
 async def test_claude_error_terminal_is_actionable_and_discards_partial_text(
-  monkeypatch, tmp_path, source, cause, action, status,
+  monkeypatch, tmp_path, source, cause, error_type, status, action,
 ):
   from claude_agent_sdk.types import AssistantMessage, ResultMessage, TextBlock
 
-  if source == "status" and status is None:
-    pytest.skip("Credit exhaustion has no unambiguous HTTP status.")
+  private = f"{cause} secret-provider-data"
   terminal = ResultMessage(
     subtype="error_during_execution", duration_ms=1, duration_api_ms=1,
     is_error=True, num_turns=1, session_id="private-session",
-    result=cause + " secret-provider-data" if source == "result" else None,
-    errors=[cause + " secret-provider-data"] if source == "errors" else None,
-    api_error_status=status if source == "status" else None,
+    result=private if source == "result" else None,
+    errors=[private] if source == "errors" else None,
+    api_error_status=status,
   )
 
   class Provider:
@@ -134,7 +157,7 @@ async def test_claude_error_terminal_is_actionable_and_discards_partial_text(
     async def receive_response(self):
       yield AssistantMessage(
         content=[TextBlock(text=cause if source == "assistant-error" else "partial-secret")],
-        model="claude", error="unknown" if source == "assistant-error" else None,
+        model="claude", error=error_type,
       )
       yield terminal
 

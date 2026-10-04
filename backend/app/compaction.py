@@ -383,14 +383,9 @@ async def _run_claude_summarize_turn(
               errors.extend(msg.errors or [])
               if isinstance(msg.result, str):
                 errors.append(msg.result)
-              if msg.api_error_status in (401, 429):
-                errors.append(
-                  "authentication_failed" if msg.api_error_status == 401
-                  else "rate_limit"
-                )
-              raise CompactionError(
-                _provider_compaction_failure("\n".join(errors))
-              )
+              raise CompactionError(_provider_compaction_failure(
+                "\n".join(errors), status=msg.api_error_status,
+              ))
     except asyncio.TimeoutError:
       raise CompactionError(
         "Compaction receive loop timed out after "
@@ -436,9 +431,25 @@ def _codex_agent_text(stdout: bytes) -> str:
   return "".join(parts)
 
 
-def _provider_compaction_failure(text: str) -> str:
-  """Return only fixed, actionable messages for known synthesis refusals."""
+def _provider_compaction_failure(text: str, status: int | None = None) -> str:
+  """Return only fixed, actionable messages for known synthesis refusals.
+
+  The summarizer serves both provider switches and manual /compact, so the
+  wording must hold for either caller.
+  """
   unchanged = " Your existing conversation is unchanged."
+  sign_in = (
+    "The incoming provider could not sign in. Reconnect that provider, "
+    "then try again." + unchanged
+  )
+  limit = (
+    "The incoming provider has reached a usage or rate limit. "
+    "Try again when its allowance is available." + unchanged
+  )
+  if status == 401:
+    return sign_in
+  if status == 429:
+    return limit
   if re.search(
     r"request body is too large|request_body_too_large|"
     r"unexpected status 413\b|context_length_exceeded", text, re.IGNORECASE,
@@ -446,29 +457,23 @@ def _provider_compaction_failure(text: str) -> str:
     return "The provider rejected the compaction request as too large." + unchanged
   if re.search(
     r"out of credits|insufficient[_ ]credits|insufficient_quota|"
-    r"credit balance is too low", text, re.IGNORECASE,
+    r"billing_error|credit balance is too low", text, re.IGNORECASE,
   ):
     return (
       "The incoming provider is out of credits. Add credits for that provider, "
-      "then try switching again." + unchanged
+      "then try again." + unchanged
     )
   if re.search(
     r"rate[_ ]limit|usage[_ ]limit|weekly limit|session limit|"
     r"too many requests", text, re.IGNORECASE,
   ):
-    return (
-      "The incoming provider has reached a usage or rate limit. "
-      "Try switching again when its allowance is available." + unchanged
-    )
+    return limit
   if re.search(
     r"authentication_failed|authentication (?:failed|error)|"
     r"invalid authentication credentials|invalid_api_key|unauthorized|"
     r"login required|not logged in", text, re.IGNORECASE,
   ):
-    return (
-      "The incoming provider could not sign in. Reconnect that provider in "
-      "Settings, then try switching again." + unchanged
-    )
+    return sign_in
   return "The incoming provider could not compact the chat."
 
 
