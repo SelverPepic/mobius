@@ -585,12 +585,15 @@ def parent_root_run_id(
 
 
 def _assistant_result(chat: models.Chat) -> str:
-  """Return the latest child assistant outcome as plain text."""
+  """Return the latest child assistant outcome as plain text.
+
+  The outcome is the message's last text block (the report; earlier text
+  blocks are progress narration split off by tools or provider items) plus
+  its latest error, so a failed or stopped helper stays actionable.
+  """
   for message in reversed(list(chat.messages or [])):
     if not isinstance(message, dict) or message.get("role") != "assistant":
       continue
-    # Prefer the provider's final report. Legacy transcripts and interrupted
-    # attempts keep their latest text, never all progress narration joined.
     blocks = message.get("blocks")
     blocks = blocks if isinstance(blocks, list) else []
     texts = [b["content"].strip() for b in blocks if isinstance(b, dict)
@@ -599,10 +602,6 @@ def _assistant_result(chat: models.Chat) -> str:
     errors = [b["message"].strip() for b in blocks if isinstance(b, dict)
               and b.get("type") == "error" and isinstance(b.get("message"), str)
               and b["message"].strip()]
-    if isinstance(message.get("result"), str):
-      # A later failure (including review-required) remains actionable even
-      # when the provider already produced its substantive report.
-      return "\n\n".join([part for part in [message["result"].strip(), *errors[-1:]] if part])
     if texts or errors:
       return "\n\n".join(texts[-1:] + errors[-1:])
     content = message.get("content")

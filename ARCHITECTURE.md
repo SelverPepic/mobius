@@ -1299,17 +1299,12 @@ or completed Finalize, the result is owed. Stop drops a queued carrier, because
 the Delegation row still owes the result and the next owner turn's context
 carries it.
 
-Helper delivery distinguishes a provider's final report from its progress prose.
-Provider adapters emit a private `assistant_result` event: Codex uses its ordered
-terminal agent item (or an exact completed-item reference), while the Claude
-helper host reads the child's ordered stream, taking an explicit
-`SubagentHandback.message` or else the child's latest response, never the task
-notification's summary. The shared sink persists `result` on the exact
-assistant segment via its usual writer snapshot; the full `content` and blocks
-stay intact. The delegation result prefers that report, else the latest text
-block, plus the latest error so failures stay actionable. Lifecycle status
-remains independent from report content. This adds no summarizer, provider
-call, new queue, or database table.
+A helper's delivered result is its latest assistant message's last text block,
+plus that message's latest error so a failed or stopped helper stays actionable.
+Earlier text blocks in the same message are progress narration, split off by
+tool calls or by separate provider items; they stay in the child transcript as
+evidence but are not replayed to the parent. Lifecycle status remains
+independent from report content.
 
 An idle recipient is woken only when it has an unfinished Goal. An armed
 external Wait remains active but no longer suppresses an explicitly

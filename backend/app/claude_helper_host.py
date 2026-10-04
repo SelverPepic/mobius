@@ -130,11 +130,6 @@ class HelperTurn:
   launch_tool_use_id: str | None = None
   status: str | None = None
   summary: str | None = None
-  # The child's final report from its ordered stream: an explicit
-  # SubagentHandback message, else its latest response. Distinct from the task
-  # lifecycle summary; capturing it is not proof that the attempt succeeded.
-  result: str | None = None
-  handback_seen: bool = False
   usage: dict | None = None
   dispatch_error: str | None = None
   # The helper's last API error from its provider, as (kind, message text).
@@ -327,7 +322,6 @@ class ClaudeHelperHost(Host):
       TaskNotificationMessage,
       TaskStartedMessage,
       TaskUpdatedMessage,
-      ToolUseBlock,
     )
     from app.claude_events import dispatch_sdk_message
     try:
@@ -361,24 +355,8 @@ class ClaudeHelperHost(Host):
         turn = self._turn_for_parent(parent)
         if turn is None or turn.done.is_set():
           continue
-        if isinstance(message, AssistantMessage):
-          if error:
-            turn.api_error = (str(error), _message_text(message))
-          else:
-            # The ordered child stream precedes its task-end event, so it is
-            # the one capture point for the report. A handback replaces final
-            # prose; closing text after it never overwrites the report.
-            handback = next((block for block in message.content
-                             if isinstance(block, ToolUseBlock)
-                             and block.name == "SubagentHandback"), None)
-            text = _message_text(message)
-            if handback is not None:
-              turn.handback_seen = True
-              report = handback.input.get("message")
-              if isinstance(report, str):
-                turn.result = report
-            elif text.strip() and not turn.handback_seen:
-              turn.result = text
+        if isinstance(message, AssistantMessage) and error:
+          turn.api_error = (str(error), _message_text(message))
         try:
           rooted = dataclasses.replace(message, parent_tool_use_id=None)
           turn.session_state["sid"], _ = dispatch_sdk_message(
@@ -439,8 +417,6 @@ class ClaudeHelperHost(Host):
     if turn is None or turn.done.is_set() or not turn.started.is_set():
       return
     normalized = {"completed": "completed", "failed": "failed"}.get(status, "stopped")
-    if turn.result is not None:
-      turn.sink.publish({"type": "assistant_result", "content": turn.result})
     turn.finish(normalized, summary, dict(usage) if usage else None)
 
   # ------------------------------------------------------------------ work
