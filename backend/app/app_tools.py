@@ -24,8 +24,7 @@ from typing import Any
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
-from app import app_services, models, provider_usage
-from app.config import get_settings
+from app import app_services, models
 from app.app_capabilities import agent_tools_from_contract
 
 
@@ -159,11 +158,7 @@ async def call_app_tool(
       "path": f"/tools/{tool.name}",
       "query": {},
       "headers": {},
-      "body": {
-        "arguments": arguments, "call": moment,
-        # Host-owned, non-probing advice. Never supplied by tool arguments.
-        "provider_capacity": provider_usage.cached_provider_capacity(get_settings().data_dir),
-      },
+      "body": {"arguments": arguments, "call": moment},
       "public": False,
       "actor": actor,
     },
