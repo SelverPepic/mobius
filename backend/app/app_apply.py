@@ -837,6 +837,46 @@ async def apply_source_revision(
       if manifest is not None:
         _validate_static_asset_publish_paths(source_path, static_assets)
 
+      from app import applied_app_runtime
+      runtime_options = {}
+      runtime_assets = static_assets
+      if manifest is None:
+        # Ordinary Store source Apply accepts code, not a new package contract.
+        # Its ignored generated assets and runtime declarations remain exactly
+        # those from the previously applied package.
+        previous_runtime = applied_app_runtime.runtime_root(app)
+        previous_static = previous_runtime / "static"
+        runtime_assets = {
+          path.relative_to(previous_static).as_posix(): path.read_bytes()
+          for path in previous_static.rglob("*") if path.is_file()
+        }
+        previous_manifest = previous_runtime / "mobius.json"
+        runtime_options["runtime_manifest"] = (
+          previous_manifest.read_bytes() if previous_manifest.is_file() else None
+        )
+      # The runtime and its Python environment come from exactly the tree the
+      # commit below records, and are prepared before any row changes or Git
+      # commit: building or smoke-running an environment must not hold the
+      # database write lock, and a failure leaves nothing to undo.
+      runtime_staged = await asyncio.to_thread(
+        applied_app_runtime.prepare_runtime,
+        source_path, candidate.tree_oid,
+        static_assets=runtime_assets,
+        **runtime_options,
+      )
+      try:
+        python_env = await asyncio.to_thread(
+          app_python_env.prepare_env,
+          get_settings().data_dir, None if created else app.id,
+          runtime_staged.root,
+        )
+      except app_python_env.PythonEnvBuildError as exc:
+        raise AppApplyError(
+          "python_env_failed",
+          f"Could not build the app's Python environment. {exc}",
+          status_code=422,
+        ) from exc
+
       if manifest is not None:
         from app import install
 
@@ -898,43 +938,6 @@ async def apply_source_revision(
         # local source advances, require publication verification again rather
         # than silently offering a stale repository to other people.
         app.published_manifest_url = None
-      from app import applied_app_runtime
-      runtime_options = {}
-      runtime_assets = static_assets
-      if manifest is None:
-        # Ordinary Store source Apply accepts code, not a new package contract.
-        # Its ignored generated assets and runtime declarations remain exactly
-        # those from the previously applied package.
-        previous_runtime = applied_app_runtime.runtime_root(app)
-        previous_static = previous_runtime / "static"
-        runtime_assets = {
-          path.relative_to(previous_static).as_posix(): path.read_bytes()
-          for path in previous_static.rglob("*") if path.is_file()
-        }
-        previous_manifest = previous_runtime / "mobius.json"
-        runtime_options["runtime_manifest"] = (
-          previous_manifest.read_bytes() if previous_manifest.is_file() else None
-        )
-      runtime_staged = await asyncio.to_thread(
-        applied_app_runtime.prepare_runtime,
-        source_path, app.source_commit,
-        static_assets=runtime_assets,
-        **runtime_options,
-      )
-      # Build the declared Python environment from the accepted tree before
-      # its pointer is published: a failure leaves the previous revision live.
-      try:
-        python_env = await asyncio.to_thread(
-          app_python_env.prepare_env,
-          get_settings().data_dir, None if created else app.id,
-          runtime_staged.root,
-        )
-      except app_python_env.PythonEnvBuildError as exc:
-        raise AppApplyError(
-          "python_env_failed",
-          f"Could not build the app's Python environment. {exc}",
-          status_code=422,
-        ) from exc
       if created:
         # A new App has no numeric id until SQLite inserts it. Compiling after
         # that insert used to hold the database write lock for the entire

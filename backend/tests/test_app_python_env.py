@@ -779,6 +779,51 @@ def test_rebuild_accepted_env_uses_frozen_lock_after_image_change(
   assert len(builds) == 2
 
 
+def _database_writable() -> bool:
+  """Whether another connection could start a write right now."""
+  import sqlite3
+  path = os.environ["DATABASE_URL"].removeprefix("sqlite:///")
+  connection = sqlite3.connect(path, timeout=0.3, isolation_level=None)
+  try:
+    connection.execute("BEGIN IMMEDIATE")
+    connection.execute("ROLLBACK")
+    return True
+  except sqlite3.OperationalError as exc:
+    if "locked" not in str(exc):
+      raise
+    return False
+  finally:
+    connection.close()
+
+
+@pytest.mark.parametrize("change", ["service", "lock"], ids=["reused-env", "new-env"])
+def test_apply_checks_the_python_env_without_holding_the_database_write_lock(
+  client, auth, db, monkeypatch, change,
+):
+  """Other writers wait only seconds for SQLite, and an env check can take
+  minutes: an update's Apply must build and smoke-run before it writes."""
+  builds = _fake_builds(monkeypatch)
+  source = _source(lock="a==1\n", service=b"import json\n")
+  assert _apply(client, auth, source).status_code == 200
+  actual_smoke = app_python_env._smoke
+  writable = []
+
+  def observe(*args):
+    writable.append(_database_writable())
+    actual_smoke(*args)
+
+  monkeypatch.setattr(app_python_env, "_smoke", observe)
+  if change == "lock":
+    (source / "requirements.lock").write_text("a==2\n")
+  else:
+    (source / "service.py").write_bytes(b"import json, os\n")
+  applied = _apply(client, auth, source)
+
+  assert applied.status_code == 200, applied.text
+  assert writable == [True]
+  assert builds == (["a==1\n", "a==2\n"] if change == "lock" else ["a==1\n"])
+
+
 def test_rebuild_accepted_env_does_not_rerun_code_for_a_usable_env(
   client, auth, db, monkeypatch,
 ):
@@ -1108,7 +1153,106 @@ def test_store_update_refuses_a_tree_that_changed_while_it_was_checked(
   assert (applied_app_runtime.runtime_root(row) / "lib.py").read_bytes() == b"VALUE = 1\n"
   assert (source / "service.py").read_bytes() == draft
   assert (source / "lib.py").read_bytes() == b"VALUE = 1\n"
+  # The refused update is not committed either: the source is exactly its
+  # committed local state (the draft is kept as a local edit), so a retry works.
+  assert _git_text(source, "show", f"{app_git.LOCAL_BRANCH}:lib.py") == "VALUE = 1\n"
+  assert _git_text(source, "status", "--porcelain") == ""
   _assert_no_unlinked_env_or_runtime(app_id)
+
+  retried = store(
+    client, auth, lock="a==1\n", version="1.1.0", files={"lib.py": b"VALUE = 2\n"},
+  )
+  assert retried.status_code == 201, retried.text
+  db.expire_all()
+  root = applied_app_runtime.runtime_root(db.get(models.App, app_id))
+  assert (root / "lib.py").read_bytes() == b"VALUE = 2\n"
+  assert (root / "service.py").read_bytes() == draft
+
+
+def _git_text(repo: Path, *args: str) -> str:
+  import subprocess
+  return subprocess.run(
+    ["git", "-C", str(repo), *args], capture_output=True, text=True, check=True,
+  ).stdout
+
+
+def _git_origin_versions(tmp_path: Path, libs: list[bytes]) -> tuple[Path, dict, list[str]]:
+  """A bare Git origin whose successive commits change only ``lib.py``; the
+  manifest declares the service and lock but not ``lib.py``."""
+  import subprocess
+  from tests.test_apps_install import _fixture_commit
+  manifest = _manifest(
+    python={"lock": "requirements.lock"}, service={"entry": "service.py"},
+    source_files=["service.py", "requirements.lock"],
+  )
+  files = {
+    "mobius.json": json.dumps(manifest).encode(),
+    "index.jsx": b"export default function App() { return <div>x</div> }",
+    "service.py": b"import json, sys\nfrom lib import VALUE\n",
+    "requirements.lock": b"a==1\n",
+  }
+  work = tmp_path / "origin-work"
+  bare = tmp_path / "origin.git"
+  subprocess.run(["git", "init", "-q", "-b", "main", str(work)], check=True)
+  for name, content in files.items():
+    (work / name).write_bytes(content)
+  commits = []
+  for number, lib in enumerate(libs):
+    (work / "lib.py").write_bytes(lib)
+    commits.append(_fixture_commit(work, f"v{number}"))
+  subprocess.run(["git", "clone", "-q", "--bare", str(work), str(bare)], check=True)
+  return bare, files, commits
+
+
+def _install_from_origin(client, auth, bare: Path, files: dict, commit: str):
+  from tests.test_apps_install import _fake_async_client
+  base = "https://deps.test/origin/"
+  with patch(
+    "app.install._derive_repo_ref", return_value=(bare.as_uri(), commit),
+  ), patch(
+    "app.install.httpx.AsyncClient",
+    side_effect=_fake_async_client({base + name: (200, content) for name, content in files.items()}),
+  ):
+    return client.post("/api/apps/install", headers=auth, json={
+      "manifest_url": base + "mobius.json",
+    })
+
+
+@pytest.mark.usefixtures("store")
+def test_git_origin_update_refused_as_stale_installs_cleanly_on_retry(
+  client, auth, db, monkeypatch, tmp_path,
+):
+  _fake_builds(monkeypatch)
+  bare, files, (first, second) = _git_origin_versions(
+    tmp_path, [b"VALUE = 1\n", b"VALUE = 2\n"],
+  )
+  installed = _install_from_origin(client, auth, bare, files, first)
+  assert installed.status_code == 201, installed.text
+  app_id = installed.json()["id"]
+  source = Path(db.get(models.App, app_id).source_dir)
+  actual_smoke = app_python_env._smoke
+  edits = []
+
+  def edit_once(env, runtime_root, manifest, relative):
+    actual_smoke(env, runtime_root, manifest, relative)
+    if not edits:
+      edits.append(True)
+      (source / "notes.txt").write_text("agent note\n")
+
+  monkeypatch.setattr(app_python_env, "_smoke", edit_once)
+  stale = _install_from_origin(client, auth, bare, files, second)
+  assert stale.status_code == 409, stale.text
+  assert stale.json()["detail"]["code"] == "python_check_stale"
+  assert _git_text(source, "show", f"{app_git.LOCAL_BRANCH}:lib.py") == "VALUE = 1\n"
+
+  retried = _install_from_origin(client, auth, bare, files, second)
+  assert retried.status_code == 201, retried.text
+  db.expire_all()
+  row = db.get(models.App, app_id)
+  assert row.upstream_commit == second
+  root = applied_app_runtime.runtime_root(row)
+  assert (root / "lib.py").read_bytes() == b"VALUE = 2\n"
+  assert (root / "notes.txt").read_bytes() == b"agent note\n"
 
 
 @pytest.mark.usefixtures("store")
@@ -1136,6 +1280,14 @@ def test_git_origin_install_smokes_modules_its_manifest_does_not_list(
     (work / name).write_bytes(content)
   commit = _fixture_commit(work, "v1")
   subprocess.run(["git", "clone", "-q", "--bare", str(work), str(bare)], check=True)
+  actual_smoke = app_python_env._smoke
+  smoked = []
+
+  def observe(env, runtime_root, manifest, relative):
+    smoked.append((runtime_root / "helper.py").read_bytes())
+    actual_smoke(env, runtime_root, manifest, relative)
+
+  monkeypatch.setattr(app_python_env, "_smoke", observe)
 
   with patch(
     "app.install._derive_repo_ref", return_value=(bare.as_uri(), commit),
@@ -1148,6 +1300,7 @@ def test_git_origin_install_smokes_modules_its_manifest_does_not_list(
     })
 
   assert response.status_code == 201, response.text
+  assert smoked == [b"READY = True\n"]
   row = db.get(models.App, response.json()["id"])
   root = applied_app_runtime.runtime_root(row)
   assert (root / "helper.py").read_bytes() == b"READY = True\n"

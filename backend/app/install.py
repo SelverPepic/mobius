@@ -3690,10 +3690,12 @@ class ActivationPlan:
 
 @dataclass(frozen=True)
 class CheckedPythonTree:
-  """A reconciled runtime tree whose Python entries passed outside the locks."""
+  """A reconciled source tree whose Python entries passed outside the locks."""
 
-  # Content digest of every file the checked runtime tree serves.
-  revision: str
+  # The source-dir tree both passes snapshot at the same point, before compile
+  # and commit; with the same candidate's assets and manifest it fixes every
+  # served byte.
+  tree_oid: str
   env: app_python_env.StagedEnv
 
 
@@ -3707,9 +3709,13 @@ class _UncheckedPythonTree(Exception):
   """
 
   def __init__(
-    self, runtime: applied_app_runtime.PreparedRuntime, app_id: int | None,
+    self,
+    tree_oid: str,
+    runtime: applied_app_runtime.PreparedRuntime,
+    app_id: int | None,
   ) -> None:
     super().__init__("reconciled Python tree needs checking")
+    self.tree_oid = tree_oid
     self.runtime = runtime
     self.app_id = app_id
 
@@ -3733,7 +3739,7 @@ async def _check_reconciled_python(pending: _UncheckedPythonTree) -> CheckedPyth
     ) from exc
   finally:
     shutil.rmtree(pending.runtime.root, ignore_errors=True)
-  return CheckedPythonTree(revision=pending.runtime.revision, env=env)
+  return CheckedPythonTree(tree_oid=pending.tree_oid, env=env)
 
 
 def _require_package_python_lock(
@@ -3757,32 +3763,6 @@ def _require_package_python_lock(
         "lock in the app source, Apply it, and retry."
       ),
     })
-
-
-def _publish_install_python_env(
-  app: models.App,
-  checked: CheckedPythonTree | None,
-  runtime: applied_app_runtime.PreparedRuntime,
-  journal: InstallJournal,
-  data_dir: Path,
-) -> None:
-  """Link the env checked against exactly this tree, before its pointer is published.
-
-  The revision digests every served file, so a match means the second pass
-  serves exactly the bytes the first pass checked, however it got there.
-  """
-  if checked is None:
-    return
-  if checked.revision != runtime.revision:
-    raise HTTPException(409, detail={
-      "code": "python_check_stale",
-      "message": (
-        "The app's source changed while its Python code was being checked. "
-        "The update was not installed; try again."
-      ),
-    })
-  published = app_python_env.publish_env(data_dir, app.id, checked.env)
-  journal.rollback_actions.append(lambda: app_python_env.unpublish_env(published))
 
 
 def _apply_manifest_metadata(
@@ -3945,20 +3925,33 @@ async def _activate_install_source(
   )
   # The source dir now holds exactly what the commit below records.
   runtime_manifest = json.dumps(manifest, sort_keys=True).encode()
-  if python_declared and plan.python_check is None:
+  if python_declared:
+    # Both passes snapshot here, before anything is compiled or committed, so
+    # a stale second pass is refused while it has nothing durable to undo.
     snapshot = await asyncio.to_thread(app_git.snapshot_worktree, source_dir)
-    runtime = await asyncio.to_thread(
-      applied_app_runtime.prepare_runtime, source_dir, snapshot.tree_oid,
-      static_assets=plan.static_assets, runtime_manifest=runtime_manifest,
-    )
-    try:
-      _require_package_python_lock(
-        manifest, plan.published_source_tree, runtime.root,
+    if plan.python_check is None:
+      runtime = await asyncio.to_thread(
+        applied_app_runtime.prepare_runtime, source_dir, snapshot.tree_oid,
+        static_assets=plan.static_assets, runtime_manifest=runtime_manifest,
       )
-    except BaseException:
-      shutil.rmtree(runtime.root)
-      raise
-    raise _UncheckedPythonTree(runtime, app.id if plan.updating else None)
+      try:
+        _require_package_python_lock(
+          manifest, plan.published_source_tree, runtime.root,
+        )
+      except BaseException:
+        shutil.rmtree(runtime.root)
+        raise
+      raise _UncheckedPythonTree(
+        snapshot.tree_oid, runtime, app.id if plan.updating else None,
+      )
+    if snapshot.tree_oid != plan.python_check.tree_oid:
+      raise HTTPException(409, detail={
+        "code": "python_check_stale",
+        "message": (
+          "The app's source changed while its Python code was being checked. "
+          "The update was not installed; try again."
+        ),
+      })
 
   await compile_jsx(
     entry_source,
@@ -3991,13 +3984,17 @@ async def _activate_install_source(
     applied_app_runtime.prepare_runtime, source_dir, app.source_commit,
     static_assets=plan.static_assets, runtime_manifest=runtime_manifest,
   )
-  try:
-    _publish_install_python_env(
-      app, plan.python_check, runtime_staged, journal, data_dir,
+  if plan.python_check is not None:
+    try:
+      published_env = app_python_env.publish_env(
+        data_dir, app.id, plan.python_check.env,
+      )
+    except BaseException:
+      shutil.rmtree(runtime_staged.root)
+      raise
+    journal.rollback_actions.append(
+      lambda: app_python_env.unpublish_env(published_env)
     )
-  except BaseException:
-    shutil.rmtree(runtime_staged.root)
-    raise
   applied_app_runtime.publish_runtime(app, runtime_staged)
   return equivalence_target
 
@@ -4211,7 +4208,7 @@ async def install_from_manifest(
   # Phases 3 and 4. A declared Python lock takes two passes: the first stops
   # with the exact reconciled runtime tree and rolls back, that tree's env is
   # built and smoke-run holding no lock, and the second publishes only if it
-  # reconciles to byte-identical runtime content.
+  # reconciles the same source tree.
   install_candidate = functools.partial(
     _install_candidate,
     db,
