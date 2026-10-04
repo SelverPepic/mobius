@@ -504,9 +504,10 @@ _RESUME_CONTEXT_CHAR_BUDGET = 12000
 # Retired quiet-write frames that leaked into saved replies. A reseeded session
 # must not see itself writing them, or it keeps copying the withdrawn protocol.
 _WRITE_FRAME = re.compile(
-  r"<MOBIUS_WRITE\b[^>]*>.*?</MOBIUS_WRITE>"  # A complete frame.
-  r"|<MOBIUS_WRITE\b[^>]*>[ \t]*\n?[ \t]*\{[^\n]*\}"  # An unclosed one.
-  r"|</?MOBIUS_WRITE\b[^>]*>",  # Stray or self-closing tags.
+  r"<MOBIUS_WRITE\b[^>]*/>"  # A self-closing tag.
+  r"|<MOBIUS_WRITE\b[^>]*>.*?</MOBIUS_WRITE>"  # A complete frame.
+  r"|<MOBIUS_WRITE\b[^>]*>\s*\{(?:(?!\n[ \t]*\n).)*"  # An unclosed one, to its paragraph end.
+  r"|</?MOBIUS_WRITE\b[^>]*>",  # Any stray tag.
   re.DOTALL,
 )
 

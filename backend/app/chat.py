@@ -5529,7 +5529,7 @@ async def _run_chat_impl_with_db(
 
   if app_context_block and run_policy is None:
     # The report BODY goes right after the </app_context> line, but only on
-    # the FIRST turn (`not session_id`): the small app-context id/path lines
+    # the FIRST turn (`starts_fresh`): the small app-context id/path lines
     # are cheap and stay per-turn, while the report body is large and
     # unchanging, so re-sending it every message would just waste the context
     # window. Compose app-context + report into one block so the report keeps
@@ -5598,7 +5598,7 @@ async def _run_chat_impl_with_db(
     if activity_delivery.text:
       user_message = f"{activity_delivery.text}\n\n{user_message}"
 
-  if not session_id and run_policy is None:
+  if starts_fresh and run_policy is None:
     compaction_brief = _latest_compaction_brief(chat_row)
     if compaction_brief:
       block = (

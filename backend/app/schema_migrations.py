@@ -5990,8 +5990,10 @@ _SCHEMA_MIGRATIONS = (
   ("0081_browser_account_grants", _add_browser_account_grants),
   ("0081_goal_hold", _add_goal_hold),
   ("0082_run_owner_input_at", _add_run_owner_input_at),
-  ("0082_retire_quiet_write_sessions", _retire_quiet_write_sessions),
   ("0082_drop_agent_write_journal", _drop_agent_write_journal),
+  # Window-based, so it needs no journal. A new ID (not an edited 0082) so
+  # databases that ran an earlier, journal-based draft also run this once.
+  ("0083_retire_quiet_write_sessions", _retire_quiet_write_sessions),
 )
 
 

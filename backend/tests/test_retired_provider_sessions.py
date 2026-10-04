@@ -275,10 +275,11 @@ def test_reseed_drops_leaked_write_frames_from_replies_only():
   chat = SimpleNamespace(messages=[
     {"role": "user", "content": "Why do replies show <MOBIUS_WRITE ... />?", "ts": 1},
     {"role": "assistant", "content": f"Fixed the broker.\n{frame}\nDone.", "ts": 2},
-    {"role": "assistant", "content": '<MOBIUS_WRITE n2>\n{"id":"n2.write-1"}', "ts": 3},
-    {"role": "assistant", "content": 'Saved. <MOBIUS_WRITE tool="checkpoint_chat" />', "ts": 4},
+    {"role": "assistant", "content": '<MOBIUS_WRITE n2>\n{"id":"n2.write-1",\n "tool":"x"}\n\nNext.', "ts": 3},
+    {"role": "assistant", "content": 'Saved. <MOBIUS_WRITE tool="checkpoint_chat" /> Then ok.', "ts": 4},
   ])
   block = _build_resumed_context(chat)
   replies = block.split("Why do replies show <MOBIUS_WRITE ... />?", 1)[1]
   assert "MOBIUS_WRITE" not in replies and "write-1" not in replies
   assert "Fixed the broker." in replies and "Done." in replies and "Saved." in replies
+  assert "Next." in replies and "Then ok." in replies and '"tool":"x"' not in replies
