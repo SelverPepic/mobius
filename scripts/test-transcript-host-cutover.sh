@@ -122,6 +122,12 @@ PY
 }
 floor() { local value; value=$(sql "SELECT floor FROM platform_compat WHERE id = 1"); echo "${value:-0}"; }
 running_image() { docker inspect -f '{{.Image}}' mobius 2>/dev/null || true; }
+update_unbound() {  # the app's prepared update no longer names a replacement
+  local text  # an unreachable container is "not yet", never "released"
+  text=$(docker exec mobius sh -c 'f=/data/.platform-prepared-update.json; [ ! -e "$f" ] || cat "$f"') \
+    || return 1
+  python3 -c 'import json, sys; t = sys.argv[1]; sys.exit(0 if not t.strip() or json.loads(t).get("operation") is None else 1)' "$text"
+}
 
 wait_outcome() {  # <nonce>: print the settled root state for that request
   for _ in $(seq 1 360); do
@@ -310,10 +316,9 @@ interrupt_scenario() {  # <when: before|after> <how: container|worker>
       || fail "the previous release was not restored on the legacy data"
     assert_fixture_exact
     started=$SECONDS
-    # The restored release settles its bound prepared update on its own poll;
-    # a new attempt may start only after it has.
-    wait_for "the restored release to settle its update" \
-      '! docker exec mobius test -e /data/.platform-prepared-update.json'
+    # The restored release keeps its prepared update but, on its own poll,
+    # releases the failed replacement bound to it; Finish may then retry.
+    wait_for "the restored release to release the failed replacement" update_unbound
     nonce=$(queue_target)
     outcome=$(wait_outcome "$nonce")
     echo "timing before/resume: second attempt settled ($outcome) in $((SECONDS - started))s"
