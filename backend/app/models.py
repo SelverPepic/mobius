@@ -1165,6 +1165,10 @@ class App(Base):
   # — the store + drawer surface a small "agent" badge so the owner knows
   # which apps drive a sub-agent. Not a permission.
   embeds_agent = Column(Boolean, nullable=False, default=False)
+  # Shell keyboard commands (search, new chat, back...) keep working while
+  # focus is inside this app's frame. An app that needs those chords for its
+  # own UI declares `"shell_shortcuts": false` in its manifest.
+  shell_shortcuts = Column(Boolean, nullable=False, default=True)
   # Chat-log read tier this app's token may request against
   # GET /api/chat-logs. Read at request time (not baked into the JWT)
   # so flipping it revokes access on the very next request — the

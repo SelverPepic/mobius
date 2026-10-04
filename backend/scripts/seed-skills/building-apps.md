@@ -859,6 +859,47 @@ app-to-shell messages use `'*'`. For reply protocols, require
 are routing guards, not authorization; privileged operations still require the
 app's server-verified bearer.
 
+### Shell shortcuts
+
+Shell shortcuts (Cmd/Ctrl+K search, Cmd/Ctrl+N new chat, Cmd/Ctrl+, back, and
+the rest of the shortcut reference) work inside every app by default, including
+while a text field has focus. The app frame captures exactly those chords and
+nothing else, so every other key reaches the app. Apps need no code for this.
+
+An app that needs those chords for its own UI, such as a code editor or a
+terminal, turns this off for the whole app in `mobius.json`:
+
+```json
+{ "shell_shortcuts": false }
+```
+
+Embedded agent chat (`window.mobius.chat(...)`) is covered automatically.
+Other documents you nest in an iframe are separate documents, and keys typed
+there never reach the app frame. If you author that document (for example an
+interactive HTML preview), add this script to it to give it the same shell
+shortcuts. It applies only to a direct child frame of your app document:
+
+```html
+<script>
+(() => {
+  let shortcuts = []
+  addEventListener('message', (e) => {
+    if (e.source === parent && e.data?.type === 'moebius:frame-shortcuts') shortcuts = e.data.shortcuts || []
+  })
+  document.addEventListener('keydown', (e) => {
+    if (e.isComposing || e.repeat) return
+    const hit = shortcuts.find(({ binding: b }) => e.key.toLowerCase() === b.key.toLowerCase()
+      && (e.metaKey || e.ctrlKey) === !!b.mod && e.shiftKey === !!b.shift && e.altKey === !!b.alt)
+    if (!hit) return
+    e.preventDefault()
+    e.stopImmediatePropagation()
+    parent.postMessage({ type: 'moebius:shell-shortcut', actionId: hit.actionId }, '*')
+  }, true)
+  parent.postMessage({ type: 'moebius:frame-shortcuts-request' }, '*')
+})()
+</script>
+```
+
 ---
 
 ## Immersive mode — full-screen apps (games)

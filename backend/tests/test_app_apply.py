@@ -190,6 +190,37 @@ def test_apply_updates_multifile_revision_once(client, auth, db):
   ]
 
 
+def test_shell_shortcuts_are_on_unless_the_manifest_opts_out(client, auth, db):
+  source = _source()
+  created = _apply(client, auth, source)
+  assert created.status_code == 200, created.text
+  assert created.json()["app"]["shell_shortcuts"] is True
+  app_id = created.json()["app"]["id"]
+
+  manifest = json.loads((source / "mobius.json").read_text())
+  manifest["shell_shortcuts"] = False
+  (source / "mobius.json").write_text(json.dumps(manifest))
+  opted_out = _apply(client, auth, source)
+  assert opted_out.status_code == 200, opted_out.text
+  assert opted_out.json()["app"]["shell_shortcuts"] is False
+  row = db.query(models.App).populate_existing().filter_by(id=app_id).one()
+  assert row.shell_shortcuts is False
+
+  # Removing the declaration restores the default rather than keeping the
+  # previous value.
+  del manifest["shell_shortcuts"]
+  (source / "mobius.json").write_text(json.dumps(manifest))
+  restored = _apply(client, auth, source)
+  assert restored.status_code == 200, restored.text
+  assert restored.json()["app"]["shell_shortcuts"] is True
+
+  manifest["shell_shortcuts"] = "no"
+  (source / "mobius.json").write_text(json.dumps(manifest))
+  rejected = _apply(client, auth, source)
+  assert rejected.status_code >= 400
+  assert "shell_shortcuts" in rejected.text
+
+
 def test_apply_probes_the_implicit_service_identity_it_will_keep(
   client, auth, db,
 ):

@@ -3623,6 +3623,7 @@ async def _prepare_app_row(
     connect_manage=bool(permissions.get("connect_manage", False)),
     offline_capable=bool(manifest.get("offline_capable", False)),
     embeds_agent=bool(manifest.get("embeds_agent", False)),
+    shell_shortcuts=bool(manifest.get("shell_shortcuts", True)),
     offline_contract=manifest.get("offline") or None,
     system_prompt_file=manifest.get("system_prompt") or None,
     capability_contract=capability_contract,
@@ -3813,6 +3814,7 @@ def _apply_manifest_metadata(
     app.offline_capable = bool(manifest["offline_capable"])
   if "embeds_agent" in manifest:
     app.embeds_agent = bool(manifest["embeds_agent"])
+  app.shell_shortcuts = bool(manifest.get("shell_shortcuts", True))
   app.offline_contract = manifest.get("offline") or None
   app.system_prompt_file = manifest.get("system_prompt") or None
   app.capability_contract = capability_contract

@@ -566,7 +566,7 @@ def validate_manifest_contract(manifest) -> None:
   if manifest.get("icon") is not None:
     validate_repo_relative_path(manifest["icon"], "icon")
 
-  for field in ("offline_capable", "embeds_agent"):
+  for field in ("offline_capable", "embeds_agent", "shell_shortcuts"):
     if field in manifest and not isinstance(manifest[field], bool):
       _fail(f"Manifest `{field}` must be a boolean.")
 

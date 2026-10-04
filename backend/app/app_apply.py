@@ -558,6 +558,7 @@ def _apply_explicit_package_runtime(
     app.offline_capable = runtime_fields["offline_capable"]
   if "embeds_agent" in manifest:
     app.embeds_agent = bool(manifest["embeds_agent"])
+  app.shell_shortcuts = bool(manifest.get("shell_shortcuts", True))
   app.offline_contract = manifest.get("offline") or None
   app.system_prompt_file = manifest.get("system_prompt") or None
   app.project_templates_json = manifest.get("project_templates") or None
@@ -602,6 +603,7 @@ def _apply_local_manifest_runtime(
   if "offline_capable" in runtime_fields:
     app.offline_capable = runtime_fields["offline_capable"]
   app.embeds_agent = bool(manifest.get("embeds_agent", False))
+  app.shell_shortcuts = bool(manifest.get("shell_shortcuts", True))
   app.offline_contract = manifest.get("offline") or None
   app.system_prompt_file = manifest.get("system_prompt") or None
   app.project_templates_json = manifest.get("project_templates") or None
@@ -643,6 +645,7 @@ def _live_runtime_state(app: models.App) -> tuple:
     app.connect_manage,
     app.offline_capable,
     app.embeds_agent,
+    app.shell_shortcuts,
     app.offline_contract,
     app.system_prompt_file,
     app.project_templates_json,

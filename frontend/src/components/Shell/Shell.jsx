@@ -203,6 +203,7 @@ import useVisibleAppPresence from './useVisibleAppPresence.js'
 import useAppFrameCache from './useAppFrameCache.js'
 import useShellVisualViewport from './useShellVisualViewport.js'
 import useShellShortcuts from '../../hooks/useShellShortcuts.js'
+import { appFrameShortcutBindings } from '../../lib/keyboardShortcuts.js'
 import ShellBrand from './ShellBrand.jsx'
 import ScreenControlButton from './ScreenControlButton.jsx'
 import { createMediaSessionOwner } from './mediaSessionOwner.js'
@@ -4927,7 +4928,7 @@ export default function Shell({ onInitialVisualReady, sharedBrowserAccess = null
               onAppError={handleAppError}
               onHostRequest={handleAppHostRequest}
               onMediaSession={handleMediaSession}
-              shellShortcuts={shellFrameShortcuts}
+              shellShortcuts={appFrameShortcutBindings(app, shellFrameShortcuts)}
               onShellShortcut={runShellShortcut}
             />
             </ErrorBoundary>

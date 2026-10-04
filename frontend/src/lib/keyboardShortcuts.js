@@ -245,6 +245,14 @@ export function frameShortcutBindings(commands, { reserveUnavailable = false } =
   ))
 }
 
+// Shell chords reach every app frame unless the app's manifest declares
+// `"shell_shortcuts": false` because it needs those chords for its own UI.
+const NO_FRAME_SHORTCUTS = Object.freeze([])
+
+export function appFrameShortcutBindings(app, bindings) {
+  return app?.shell_shortcuts === false ? NO_FRAME_SHORTCUTS : bindings
+}
+
 export function shouldReserveShellShortcut(handled, standalone, command = null) {
   return handled === true || standalone === true || command?.reserveWhenUnavailable === true
 }

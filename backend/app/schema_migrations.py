@@ -5895,6 +5895,26 @@ def _drop_agent_write_journal(eng) -> None:
         conn.execute(text(f"DROP TABLE {table}"))
 
 
+def _add_app_shell_shortcuts(eng) -> None:
+  """Per-app opt-out from shell shortcuts; see ``models.App.shell_shortcuts``.
+
+  Existing apps default to true: shell shortcuts reach every app unless its
+  manifest declares otherwise, which the next apply records.
+  """
+  from sqlalchemy import inspect as sa_inspect, text
+
+  columns = {
+    column["name"] for column in sa_inspect(eng).get_columns("apps")
+  }
+  if "shell_shortcuts" in columns:
+    return
+  with eng.begin() as conn:
+    conn.execute(text(
+      "ALTER TABLE apps ADD COLUMN shell_shortcuts BOOLEAN "
+      "NOT NULL DEFAULT TRUE"
+    ))
+
+
 def _move_chat_media_out_of_generated(eng) -> None:
   """Move old chat images from ``generated/`` to ``media/`` and relink them.
 
@@ -6127,6 +6147,7 @@ _SCHEMA_MIGRATIONS = (
   # databases that ran an earlier, journal-based draft also run this once.
   ("0083_retire_quiet_write_sessions", _retire_quiet_write_sessions),
   ("0084_chat_media_directory", _move_chat_media_out_of_generated),
+  ("0085_app_shell_shortcuts", _add_app_shell_shortcuts),
 )
 
 
