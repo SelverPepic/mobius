@@ -1563,6 +1563,7 @@ class ChatEventSink:
       "publish_question only accepts question events; ordinary events go "
       "through publish()"
     )
+    assert event.get("question_id"), "a saved question card needs its question_id"
     # A continuation card and a native provider question share one owner-input
     # slot. Claim it synchronously in the reducer before awaiting persistence,
     # so concurrently dispatched tools cannot publish competing cards.
@@ -1610,6 +1611,17 @@ class ChatEventSink:
       # card is NOT broadcast.
       undo_question_scrub(receipt, self.assistant_blocks)
       raise
+    # The saved card owns its owner notification. Start it from the commit,
+    # not the broadcast, so a lost live publish cannot drop it, and keep the
+    # remote push off this save path (callers may hold the chat locks).
+    from app.owner_input import notify_owner_input_card
+    self._start_side_task(
+      notify_owner_input_card(
+        self.chat_id, event["question_id"], event.get("questions") or [],
+      ),
+      failure_message="owner-input notification failed chat_id=%s",
+      warn=True,
+    )
     # Committed durably — now (and only now) show the card.
     if event.get("response_mode") == "continuation" and self._write_delivery is not None:
       # Already accepted writes may drain; no command may be admitted after

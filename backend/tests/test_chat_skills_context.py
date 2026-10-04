@@ -509,6 +509,21 @@ def test_core_routes_operational_recipes_to_their_owning_skills():
   assert "Default `activation` to `background`" in notifications
 
 
+def test_notifications_skill_leaves_card_notifications_to_the_platform():
+  """Saved cards notify the owner themselves; the skill must not ask agents
+  for a second, duplicate "needs your answer" push."""
+  repo = Path(__file__).resolve().parents[2]
+  notifications = (
+    repo / "backend" / "scripts" / "seed-skills" / "notifications.md"
+  ).read_text()
+
+  assert "## Saved owner-input cards notify for you" in notifications
+  assert "Do not call\n`notify_owner` for a card" in notifications
+  assert "you fire the push yourself" not in notifications
+  assert "firing the push yourself" not in notifications
+  assert 'Title: "Möbius needs your answer"' not in notifications
+
+
 def test_advanced_app_skill_does_not_duplicate_the_component_catalog():
   repo = Path(__file__).resolve().parents[2]
   advanced = (
