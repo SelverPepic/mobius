@@ -1409,8 +1409,10 @@ _TOOL_DEFINITIONS = {
     "name": NOTIFY_OWNER_TOOL,
     "description": (
       "Send the owner a push notification for a meaningful event: a finished "
-      "long task, an error or question that needs them, or when they asked to "
-      "be told. Not for routine confirmations. target defaults to this chat's "
+      "long task, an error that needs them outside a card, or when they asked "
+      "to be told. Not for routine confirmations, and not for a saved "
+      "question, approval, restart or secure-input card: the card sends its "
+      "own notification. target defaults to this chat's "
       "in-app link; use /shell/?app=ID for an app. tag groups pushes about one "
       "thing so a newer one replaces the older. The push is skipped while the "
       "owner is viewing this chat. Never fire one from a script under test."
