@@ -5860,12 +5860,14 @@ def _move_chat_media_out_of_generated(eng) -> None:
         f"CAST({name} AS TEXT) LIKE {legacy_link}" for name in transcripts
       )
     )).scalars())
-    # Orphaned directories without a chat row are left alone.
+    # Orphaned directories without a chat row are left alone. ``os.path.isdir``
+    # never raises, so a chat folder that can be listed but not entered is
+    # skipped here and handled per chat below instead of stopping boot.
     on_disk = sorted(
       path.parent.name
       for path in chats_root.glob("*/generated")
-      if path.is_dir()
-    ) if chats_root.is_dir() else []
+      if os.path.isdir(path)
+    ) if os.path.isdir(chats_root) else []
     for offset in range(0, len(on_disk), 500):
       chat_ids.update(conn.execute(
         text("SELECT id FROM chats WHERE id IN :ids").bindparams(
@@ -5918,15 +5920,21 @@ def _move_chat_media_out_of_generated(eng) -> None:
     except OSError as error:
       log.warning("Left chat %s on legacy generated/ media: %s", chat_id, error)
       continue
+    # Bump updated_at only on chats whose links change: the browser reuses
+    # its cached copy of a chat while updated_at matches.
     with eng.begin() as conn:
       conn.execute(text(
         "UPDATE chats SET " + ", ".join(
           f"{name} = REPLACE({name}, :old, :new)" for name in transcripts
-        ) + " WHERE id = :chat_id"
+        ) + ", updated_at = :now WHERE id = :chat_id AND (" + " OR ".join(
+          f"CAST({name} AS TEXT) LIKE :pattern" for name in transcripts
+        ) + ")"
       ), {
         "chat_id": chat_id,
         "old": f"/api/chats/{chat_id}/generated/",
         "new": f"/api/chats/{chat_id}/media/",
+        "pattern": f"%/api/chats/{chat_id}/generated/%",
+        "now": datetime.now(UTC).replace(tzinfo=None),
       })
     try:
       for source in sources:

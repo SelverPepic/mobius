@@ -1,7 +1,11 @@
 import errno
+import os
 import shutil
 import uuid
+from datetime import datetime
 from pathlib import Path
+
+import pytest
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
@@ -204,6 +208,78 @@ def test_unreadable_legacy_file_does_not_block_database_startup(
     unreadable in r.getMessage()
     for r in caplog.records if r.levelname == "WARNING"
   )
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory modes")
+def test_unenterable_chat_folder_does_not_block_database_startup(
+  tmp_path, monkeypatch, caplog,
+):
+  """A chat folder that can be listed but not entered leaves only that chat."""
+  data_dir = tmp_path / "data"
+  monkeypatch.setenv("DATA_DIR", str(data_dir))
+  eng = create_engine(f"sqlite:///{tmp_path / 'boot.db'}")
+  models.Base.metadata.create_all(eng)
+  migrations._ensure_migration_ledger(eng)
+  for version, _migration in migrations._SCHEMA_MIGRATIONS:
+    if version != "0083_chat_media_directory":
+      migrations._record_migration(eng, version)
+  with Session(eng) as session:
+    locked = _legacy_chat(session, data_dir, b"locked", media=None)
+    clean = _legacy_chat(session, data_dir, b"clean", media=None)
+  locked_root = data_dir / "chats" / locked
+  locked_root.chmod(0o644)
+  try:
+    with caplog.at_level("WARNING", logger="app.schema_migrations"):
+      migrations.run_migrations(eng)
+  finally:
+    locked_root.chmod(0o755)
+
+  assert "0083_chat_media_directory" in {
+    row["version"] for row in migrations.schema_migration_history(eng)
+  }
+  with Session(eng) as session:
+    assert session.get(models.Chat, locked).messages[0]["content"] == (
+      f"/api/chats/{locked}/generated/img.png"
+    )
+    assert session.get(models.Chat, clean).messages[0]["content"] == (
+      f"/api/chats/{clean}/media/img.png"
+    )
+  assert (locked_root / "generated" / "img.png").read_bytes() == b"locked"
+  assert any(
+    locked in r.getMessage()
+    for r in caplog.records if r.levelname == "WARNING"
+  )
+
+
+def test_rewrite_bumps_updated_at_only_for_rewritten_chats(db):
+  """Browsers reuse a cached chat while updated_at matches, so a rewrite
+  must advance it; a chat whose links were already current keeps its stamp."""
+  data_dir = Path(get_settings().data_dir)
+  legacy = _legacy_chat(db, data_dir, b"img", media=None)
+  current = str(uuid.uuid4())
+  db.add(models.Chat(
+    id=current,
+    title="Current",
+    messages=[{"content": f"/api/chats/{current}/media/img.png"}],
+  ))
+  db.commit()
+  # Leftover generated/ copy puts the current chat on the work list too.
+  for name in ("generated", "media"):
+    (_chat_root(current) / name).mkdir(parents=True)
+    (_chat_root(current) / name / "img.png").write_bytes(b"img")
+  stale = datetime(2020, 1, 1)
+  with db.get_bind().begin() as conn:
+    conn.execute(text("UPDATE chats SET updated_at = :stale"), {"stale": stale})
+
+  _move_chat_media_out_of_generated(db.get_bind())
+  db.expire_all()
+
+  moved = db.get(models.Chat, legacy)
+  assert moved.messages[0]["content"] == f"/api/chats/{legacy}/media/img.png"
+  assert moved.updated_at.replace(tzinfo=None) > stale
+  untouched = db.get(models.Chat, current)
+  assert untouched.updated_at.replace(tzinfo=None) == stale
+  assert not (_chat_root(current) / "generated").exists()
 
 
 def test_interrupted_copy_is_not_a_collision_on_retry(db, monkeypatch):
