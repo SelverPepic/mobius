@@ -164,23 +164,6 @@ def wait_ack(ack: Future, *, timeout: float | None = None):
   return ack.result(timeout=ACK_TIMEOUT_SECS if timeout is None else timeout)
 
 
-def _replace_chat_media_path(value, old_prefix: str, new_prefix: str):
-  """Recursively rewrite media URLs inside JSON-compatible chat data."""
-  if isinstance(value, str):
-    return value.replace(old_prefix, new_prefix)
-  if isinstance(value, list):
-    return [
-      _replace_chat_media_path(item, old_prefix, new_prefix)
-      for item in value
-    ]
-  if isinstance(value, dict):
-    return {
-      key: _replace_chat_media_path(item, old_prefix, new_prefix)
-      for key, item in value.items()
-    }
-  return value
-
-
 # -- Commands (domain-level; a later milestone swaps their dispatch) -----
 @dataclass
 class _Command:
@@ -584,15 +567,6 @@ class BackfillAssistantIdentity(_Command):
 
 
 @dataclass
-class RewriteChatMediaPaths(_Command):
-  """Atomically rewrite one chat's legacy media URLs during boot."""
-
-  chat_id: str = ""
-  old_prefix: str = ""
-  new_prefix: str = ""
-
-
-@dataclass
 class ReconcileStartupChat(_Command):
   """Persist one interrupted-turn recovery plan during boot.
 
@@ -657,7 +631,6 @@ class StartTurn(_Command):
   default_provider: str = "claude"
   initiated_by_app_id: int | None = None
   browser_grant_id: str | None = None
-  browser_grant_epoch: int | None = None
   # The rendered recovery control names its exact interrupted physical run.
   resume_run_id: str | None = None
   restore_archived: bool = False
@@ -929,7 +902,6 @@ class AppendPending(_Command):
   question_id: str | None = None
   initiated_by_app_id: int | None = None
   browser_grant_id: str | None = None
-  browser_grant_epoch: int | None = None
   owner_input: bool = False
   front: bool = False
   require_answer_match: bool = False
@@ -1082,71 +1054,6 @@ class PersistCompaction(_Command):
   # Required when a verified note replaces a transcript prefix. The route
   # holds the checkpoint transition lock through this actor's commit.
   source_note_hash: str | None = None
-
-
-
-@dataclass
-class AdmitAgentWrites(_Command):
-  """Commit one authoritative item's intents before any external dispatch."""
-  chat_id: str = ""
-  run_token: str = ""
-  item_id: str = ""
-  fingerprint: str = ""
-  writes: tuple = ()
-
-
-@dataclass
-class AcknowledgeAgentWriteFailures(_Command):
-  """A successful authorized provider attempt consumed these exact reports."""
-  chat_id: str = ""
-  run_token: str = ""
-  reports: tuple[tuple[str, str], ...] = ()
-
-
-@dataclass
-class ClaimAgentWrite(_Command):
-  """Commit executing for the next write; at most one worker owns this run."""
-  chat_id: str = ""
-  run_token: str = ""
-
-
-@dataclass
-class SettleAgentWrite(_Command):
-  """Record an observed outcome, even if Stop raced the external response."""
-  chat_id: str = ""
-  run_token: str = ""
-  operation_id: str = ""
-  status: str = ""
-  reason: str | None = None
-
-
-@dataclass
-class SealAgentWrites(_Command):
-  """Close intake before draining accepted work and finalizing its run."""
-  chat_id: str = ""
-  run_token: str = ""
-
-
-@dataclass
-class InterruptAgentWrites(_Command):
-  """Fence lost/stopped work; retain cancellations and ambiguous effects."""
-  chat_id: str = ""
-  run_token: str = ""
-
-
-@dataclass
-class RecordAgentWriteFailure(_Command):
-  """Durably explain a rejected frame without persisting private raw bytes."""
-  chat_id: str = ""
-  run_token: str = ""
-  stage: str = "protocol"
-  reason: str = "invalid_frame"
-
-
-@dataclass
-class ReadAgentWriteOutcomes(_Command):
-  chat_id: str = ""
-  run_token: str = ""
 
 
 @dataclass
@@ -2171,8 +2078,6 @@ class ChatWriterActor:
       return self._migrate_chat(db, cmd)
     if isinstance(cmd, BackfillAssistantIdentity):
       return self._backfill_assistant_identity(db, cmd)
-    if isinstance(cmd, RewriteChatMediaPaths):
-      return self._rewrite_chat_media_paths(db, cmd)
     if isinstance(cmd, ReconcileStartupChat):
       return self._reconcile_startup_chat(db, cmd)
     if isinstance(cmd, StartTurn):
@@ -2195,10 +2100,6 @@ class ChatWriterActor:
       return self._persist_compaction(db, cmd)
     if isinstance(cmd, AuthorizeCheckpoint):
       return self._authorize_checkpoint(db, cmd)
-    if isinstance(cmd, (AdmitAgentWrites, AcknowledgeAgentWriteFailures, ClaimAgentWrite, SettleAgentWrite,
-                        SealAgentWrites, InterruptAgentWrites, ReadAgentWriteOutcomes,
-                        RecordAgentWriteFailure)):
-      return self._agent_write_command(db, cmd)
     if isinstance(cmd, SwitchProviderWithCompaction):
       return self._switch_provider_with_compaction(db, cmd)
     if isinstance(cmd, PromotePending):
@@ -2717,9 +2618,7 @@ class ChatWriterActor:
       or run.provider_execution_admitted is not False
     ):
       raise _PersistFailed("AdmitProviderExecution: run is not eligible")
-    _require_browser_grant(
-      db, run.browser_grant_id, run.browser_grant_epoch,
-    )
+    _require_browser_grant(db, run.browser_grant_id)
     if (run.continuation_json or {}).get("reason") == "compaction" and (
       chat.pending_messages or chat.pending_question_id
     ):
@@ -3098,36 +2997,6 @@ class ChatWriterActor:
       elif stash.complete and not row.complete:
         row.complete = True
 
-  def _rewrite_chat_media_paths(
-    self, db, cmd: "RewriteChatMediaPaths",
-  ) -> int:
-    """Rewrite both transcript blobs in one actor-owned transaction."""
-    from app.models import Chat
-
-    row = db.execute(select(
-      Chat.messages, Chat.pending_messages,
-    ).where(Chat.id == cmd.chat_id)).first()
-    if row is None:
-      return 0
-    messages, pending = row
-    rewritten_messages = _replace_chat_media_path(
-      messages, cmd.old_prefix, cmd.new_prefix,
-    )
-    rewritten_pending = _replace_chat_media_path(
-      pending, cmd.old_prefix, cmd.new_prefix,
-    )
-    values = {}
-    if rewritten_messages != messages:
-      values["messages"] = rewritten_messages
-    if rewritten_pending != pending:
-      values["pending_messages"] = rewritten_pending
-    if not values:
-      return 0
-    db.execute(update(Chat).where(Chat.id == cmd.chat_id).values(**values))
-    if not _commit_or_rollback(db):
-      raise _PersistFailed("RewriteChatMediaPaths did not persist")
-    return len(values)
-
   def _backfill_assistant_identity(
     self, db, cmd: "BackfillAssistantIdentity",
   ) -> int:
@@ -3246,9 +3115,6 @@ class ChatWriterActor:
         run_id=interrupted_ids[-1],
         failed_at=cmd.recovered_at,
       )
-    from app.agent_write_journal import interrupt as interrupt_agent_writes
-    interrupt_agent_writes(db, chat_id=cmd.chat_id,
-      run_ids=tuple(cmd.running_run_ids), reason="worker_lost_at_restart")
     if cmd.restart_run_id:
       restart_run = db.query(ChatRun).filter(
           ChatRun.chat_id == cmd.chat_id,
@@ -3551,17 +3417,13 @@ class ChatWriterActor:
         db.rollback()
         return StartTurnRecoveryChanged()
     grant_id = cmd.browser_grant_id
-    grant_epoch = cmd.browser_grant_epoch
     if resuming and prior is not None:
-      if grant_id is not None and (grant_id, grant_epoch) != (
-        prior.browser_grant_id, prior.browser_grant_epoch,
-      ):
+      if grant_id is not None and grant_id != prior.browser_grant_id:
         raise _PersistFailed("Browser grant cannot resume a foreign run")
       grant_id = prior.browser_grant_id
-      grant_epoch = prior.browser_grant_epoch
     elif grant_id is None:
-      grant_id, grant_epoch = _delegation_browser_lineage(db, cmd.chat_id)
-    _require_browser_grant(db, grant_id, grant_epoch)
+      grant_id = _delegation_browser_lineage(db, cmd.chat_id)
+    _require_browser_grant(db, grant_id)
     if not existing:
       chat.provider = cmd.default_provider or "claude"
     # Build the agent history as schemas.ChatMessage objects, exactly as the
@@ -3643,7 +3505,6 @@ class ChatWriterActor:
         prior.initiated_by_app_id if prior is not None else cmd.initiated_by_app_id
       ),
       browser_grant_id=grant_id,
-      browser_grant_epoch=grant_epoch,
       goal_objective=goal_objective,
       goal_id=goal_id,
       owner_input_at=started_at if cmd.owner_input else None,
@@ -4014,27 +3875,22 @@ class ChatWriterActor:
       superseded.status = "completed"
       superseded.ended_at = started_at
       superseded.restart_nonce = None
-      _require_browser_grant(
-        db, superseded.browser_grant_id, superseded.browser_grant_epoch,
-      )
+      _require_browser_grant(db, superseded.browser_grant_id)
     continuation_grant = (
-      (superseded.browser_grant_id, superseded.browser_grant_epoch)
+      superseded.browser_grant_id
       if superseded is not None else _root_browser_lineage(db, cmd.root_run_id)
     )
     # A readable card may be answered by a guest even when the interrupted
     # run belonged to the owner. The answerer's queued provenance wins for the
     # newly admitted physical run; never mint a clean owner bearer for it.
     if source.get("_browser_grant_id") is not None:
-      continuation_grant = (
-        source["_browser_grant_id"], source.get("_browser_grant_epoch"),
-      )
-      _require_browser_grant(db, *continuation_grant)
+      continuation_grant = source["_browser_grant_id"]
+      _require_browser_grant(db, continuation_grant)
     db.add(ChatRun(
       id=cmd.run_token,
       chat_id=cmd.chat_id,
       status="running",
-      browser_grant_id=continuation_grant[0],
-      browser_grant_epoch=continuation_grant[1],
+      browser_grant_id=continuation_grant,
       root_run_id=(
         cmd.root_run_id
         if continues_logical_root(agent_message)
@@ -4213,8 +4069,7 @@ class ChatWriterActor:
       chat_id=cmd.chat_id,
       status="running",
       root_run_id=cmd.root_run_id,
-      browser_grant_id=activity_grant[0],
-      browser_grant_epoch=activity_grant[1],
+      browser_grant_id=activity_grant,
       provider=provider,
       started_at=started_at,
       initiated_by_app_id=None,
@@ -4432,11 +4287,9 @@ class ChatWriterActor:
     new_msg = dict(cmd.user_msg)
     # Only the authenticated route may supply this provenance, never message data.
     new_msg.pop("_browser_grant_id", None)
-    new_msg.pop("_browser_grant_epoch", None)
-    _require_browser_grant(db, cmd.browser_grant_id, cmd.browser_grant_epoch)
+    _require_browser_grant(db, cmd.browser_grant_id)
     if cmd.browser_grant_id is not None:
       new_msg["_browser_grant_id"] = cmd.browser_grant_id
-      new_msg["_browser_grant_epoch"] = cmd.browser_grant_epoch
     new_msg.pop("_owner_input_at", None)
     if cmd.owner_input:
       new_msg["_owner_input_at"] = datetime.now(UTC).isoformat()
@@ -4760,41 +4613,6 @@ class ChatWriterActor:
       return None
     return run
 
-  def _agent_write_command(self, db, cmd):
-    from app import agent_write_journal as journal
-    if isinstance(cmd, (AdmitAgentWrites, ClaimAgentWrite, AcknowledgeAgentWriteFailures)):
-      run = self._owned_live_run(db, cmd.chat_id, cmd.run_token)
-    else:
-      # A completion is evidence, not renewed execution permission. Let the
-      # exact worker record a late result after Stop; never claim new work.
-      run = db.get(models.ChatRun, cmd.run_token)
-      if run is not None and (run.chat_id != cmd.chat_id or _active_chat(db, cmd.chat_id) is None):
-        run = None
-    if run is None:
-      db.rollback()
-      return {"status": "stale_run"}
-    if isinstance(cmd, (AdmitAgentWrites, ClaimAgentWrite, AcknowledgeAgentWriteFailures)):
-      _require_browser_grant(db, run.browser_grant_id, run.browser_grant_epoch)
-    if isinstance(cmd, AdmitAgentWrites):
-      return journal.admit(db, run, item_id=cmd.item_id,
-                           fingerprint=cmd.fingerprint, writes=cmd.writes)
-    if isinstance(cmd, AcknowledgeAgentWriteFailures):
-      return journal.acknowledge_failures(db, run, reports=cmd.reports)
-    if isinstance(cmd, ClaimAgentWrite):
-      return journal.claim(db, run)
-    if isinstance(cmd, SettleAgentWrite):
-      return journal.settle(db, run, operation_id=cmd.operation_id,
-                            status=cmd.status, reason=cmd.reason)
-    if isinstance(cmd, RecordAgentWriteFailure):
-      return journal.record_failure(db, run, stage=cmd.stage, reason=cmd.reason)
-    if isinstance(cmd, SealAgentWrites):
-      return journal.seal(db, run)
-    if isinstance(cmd, InterruptAgentWrites):
-      journal.interrupt(db, chat_id=cmd.chat_id, run_ids=(run.id,), reason="run_interrupted")
-      journal._commit(db)
-      return {"status": "interrupted"}
-    return journal.outcomes(db, run)
-
   def _authorize_checkpoint(self, db, cmd: AuthorizeCheckpoint) -> dict:
     chat = _active_chat(db, cmd.chat_id)
     if self._owned_live_run(db, cmd.chat_id, cmd.run_token) is None:
@@ -5015,14 +4833,10 @@ class ChatWriterActor:
         examined.append(row)
         continue
       grant_id = row.get("_browser_grant_id")
-      grant_epoch = row.get("_browser_grant_epoch")
       if grant_id is not None:
         try:
-          _require_browser_grant(db, grant_id, grant_epoch)
-        except Exception as exc:
-          from fastapi import HTTPException
-          if not isinstance(exc, (HTTPException, _PersistFailed)):
-            raise
+          _require_browser_grant(db, grant_id)
+        except _PersistFailed:
           row["delivery_status"] = "rejected"
           row["delivery_error"] = "browser_grant_unavailable"
           rejected_changed = True
@@ -5042,9 +4856,6 @@ class ChatWriterActor:
       chat.pending_messages = rejected + runnable
     pending = runnable
     if not pending:
-      repair = self._repair_quiet_writes(db, chat, cmd)
-      if repair is not None:
-        return repair
       settlement = self._settle_unhanded_goal(db, chat, cmd)
       if settlement is not None:
         return settlement
@@ -5057,15 +4868,11 @@ class ChatWriterActor:
       product_result_run_token,
     )
     head_group = pending_message_group_key(pending[0])
-    head_grant = (
-      pending[0].get("_browser_grant_id"),
-      pending[0].get("_browser_grant_epoch"),
-    )
+    head_grant = pending[0].get("_browser_grant_id")
     promote_count = 0
     for msg in pending:
-      if (pending_message_group_key(msg) != head_group or (
-        msg.get("_browser_grant_id"), msg.get("_browser_grant_epoch")
-      ) != head_grant):
+      if (pending_message_group_key(msg) != head_group
+          or msg.get("_browser_grant_id") != head_grant):
         break
       promote_count += 1
     promoted_group = pending[:promote_count]
@@ -5074,8 +4881,9 @@ class ChatWriterActor:
     consumed_cids = agent_pending.pop("_consumed_cids", [])
     initiated_by_app_id = agent_pending.pop("_initiated_by_app_id", None)
     grant_id = agent_pending.pop("_browser_grant_id", None)
-    grant_epoch = agent_pending.pop("_browser_grant_epoch", None)
-    _require_browser_grant(db, grant_id, grant_epoch)
+    # Rows queued before the grant epoch retired still carry it; drop it.
+    agent_pending.pop("_browser_grant_epoch", None)
+    _require_browser_grant(db, grant_id)
     agent_pending.pop("_owner_authored", None)
     owner_inputs = [
       row["_owner_input_at"] for row in promoted_group if row.get("_owner_input_at")
@@ -5185,8 +4993,7 @@ class ChatWriterActor:
       )
     )
     if root_run_id != durable_run_token and grant_id is None:
-      root_grant_id, root_grant_epoch = _root_browser_lineage(db, root_run_id)
-      grant_id, grant_epoch = root_grant_id, root_grant_epoch
+      grant_id = _root_browser_lineage(db, root_run_id)
     self._close_nonterminal_runs(
       db, cmd.chat_id, cmd.ending_status, except_token=durable_run_token
     )
@@ -5197,7 +5004,6 @@ class ChatWriterActor:
       provider=chat.provider, started_at=started_at,
       initiated_by_app_id=initiated_by_app_id,
       browser_grant_id=grant_id,
-      browser_grant_epoch=grant_epoch,
       owner_input_at=owner_input_at,
       goal_objective=goal_objective,
       goal_id=goal_id,
@@ -5224,10 +5030,9 @@ class ChatWriterActor:
     prior = self._owned_live_run(db, chat.id, cmd.ending_run_token)
     if prior is None or prior.provider_execution_admitted is not True:
       return None
-    from fastapi import HTTPException
     try:
-      _require_browser_grant(db, prior.browser_grant_id, prior.browser_grant_epoch)
-    except (HTTPException, _PersistFailed):
+      _require_browser_grant(db, prior.browser_grant_id)
+    except _PersistFailed:
       return None
     from app.delegations import delegation_recovery_allowed
     if not delegation_recovery_allowed(
@@ -5255,7 +5060,7 @@ class ChatWriterActor:
       return None
     from app.chat_waits import _goal_waits, _FIRED_UNDELIVERED
     # A handoff must own this Goal. An unrelated monitor is not permission
-    # to abandon its responsibility (quiet-write repair instead yields to any Wait).
+    # to abandon its responsibility.
     if _goal_waits(db, chat.id, goal.id).filter(
       (models.ChatWait.status == "armed") | _FIRED_UNDELIVERED,
     ).first() is not None:
@@ -5291,55 +5096,16 @@ class ChatWriterActor:
         raise _PersistFailed("Goal settlement recovery note did not persist")
       return {"history": [], "promoted": None, "session_id": chat.session_id,
               "settlement_error": note}
-    return self._admit_clean_recovery(
-      db, chat, prior, goal=goal, reason="goal_settlement",
-    )
+    return self._admit_goal_settlement(db, chat, prior, goal=goal)
 
-  def _repair_quiet_writes(self, db, chat, cmd: PromotePending) -> dict | None:
-    """Failures alone earn one model continuation at the existing queue drain.
-
-    Owner input/cards/activation win above this seam. Stop, provider failure,
-    resource holds, and an armed Wait never create execution permission here.
-    Helpers retain the same immutable chat policy and logical root.
-    """
-    prior = self._clean_recovery_owner(db, chat, cmd)
-    if prior is None:
-      return None
-    stream = db.get(models.AgentWriteStream, prior.id)
-    if stream is None or not stream.sealed or db.query(models.AgentWriteIntent.operation_id).filter(
-      models.AgentWriteIntent.source_run_id == prior.id,
-      models.AgentWriteIntent.status.in_(("queued", "executing")),
-    ).first():
-      return None
-    from app.agent_write_journal import failure_report
-    if failure_report(db, prior) is None:
-      return None
-    from app.continuations import recovery_attempted
-    if recovery_attempted(db, prior, reason="quiet_write_failure"):
-      return None
-    from app.chat_waits import _FIRED_UNDELIVERED
-    if db.query(models.ChatWait.id).filter(models.ChatWait.chat_id == chat.id,
-      (models.ChatWait.status == "armed") | _FIRED_UNDELIVERED).first():
-      return None
-    goal = db.get(models.ChatGoal, prior.goal_id) if prior.goal_id else None
-    if ((prior.goal_id and (goal is None or goal.status != "open"))
-        or (goal is not None and chat.dismissed_goal_id == goal.id)):
-      # Retain the negative receipt for the next authorized turn. Removing the
-      # Goal from the repair would bypass a hold by creating goal-less work.
-      return None
-    return self._admit_clean_recovery(
-      db, chat, prior, goal=goal, reason="quiet_write_failure",
-    )
-
-  def _admit_clean_recovery(self, db, chat, prior, *, goal, reason) -> dict:
-    """One actor-owned admission for bounded, provider-only clean recovery."""
+  def _admit_goal_settlement(self, db, chat, prior, *, goal) -> dict:
+    """One actor-owned admission for the bounded, provider-only Goal settlement."""
     from app.continuations import (
       continuation_control_envelope, continuation_protocol_source,
     )
-    prefixes = {"quiet_write_failure": "write-repair-", "goal_settlement": "goal-settlement-"}
-    token = prefixes[reason] + hashlib.sha256(prior.id.encode()).hexdigest()[:48]
+    token = "goal-settlement-" + hashlib.sha256(prior.id.encode()).hexdigest()[:48]
     source = continuation_protocol_source(
-      reason=reason, control_id=token, run_token=token,
+      reason="goal_settlement", control_id=token, run_token=token,
       source_work_id=prior.id, goal_id=goal.id if goal else None,
     )
     source["ts"] = next_message_ts(list(chat.messages or []))
@@ -5362,9 +5128,8 @@ class ChatWriterActor:
       goal_id=goal.id if goal else None, goal_objective=goal.objective if goal else None,
       initiated_by_app_id=prior.initiated_by_app_id,
       browser_grant_id=prior.browser_grant_id,
-      browser_grant_epoch=prior.browser_grant_epoch,
       continuation_json=continuation_control_envelope(
-        reason=reason, control_id=token, source_work_id=prior.id,
+        reason="goal_settlement", control_id=token, source_work_id=prior.id,
         goal_id=goal.id if goal else None, supersedes_run_token=prior.id,
       ),
     )
@@ -5601,8 +5366,6 @@ class ChatWriterActor:
     changed = False
     failed_run = None
     for run in q.order_by(ChatRun.started_at.asc(), ChatRun.id.asc()).all():
-      from app.agent_write_journal import interrupt as interrupt_agent_writes
-      interrupt_agent_writes(db, chat_id=chat_id, run_ids=(run.id,), reason="run_superseded")
       run.status = status
       run.ended_at = datetime.now(UTC)
       run.restart_nonce = None
@@ -5644,8 +5407,6 @@ class ChatWriterActor:
         ChatRun.chat_id == cmd.chat_id,
       ).first()
       if run is not None and run.status in models.NONTERMINAL_RUN_STATUSES:
-        from app.agent_write_journal import interrupt as interrupt_agent_writes
-        interrupt_agent_writes(db, chat_id=cmd.chat_id, run_ids=(run.id,), reason="run_finished")
         run.status = cmd.terminal_status
         run.ended_at = datetime.now(UTC)
         run.restart_nonce = None
@@ -5759,8 +5520,6 @@ class ChatWriterActor:
     )
     parks = cmd.parked_until is not None and run_is_current
     if run is not None and run.status == "running":
-      from app.agent_write_journal import interrupt as interrupt_agent_writes
-      interrupt_agent_writes(db, chat_id=cmd.chat_id, run_ids=(run.id,), reason="worker_lost")
       if parks:
         run.status = "parked"
         run.parked_until = cmd.parked_until
@@ -5908,8 +5667,6 @@ class ChatWriterActor:
             or run.restart_nonce == (cmd.restart_nonce or None)
           )
         )
-      from app.agent_write_journal import interrupt as interrupt_agent_writes
-      interrupt_agent_writes(db, chat_id=cmd.chat_id, run_ids=(run.id,), reason="run_parked")
       run_is_current = owner_is_ours and self._run_is_latest(db, run)
       if cmd.park_reason == "compaction":
         chat = _active_chat(db, cmd.chat_id)
@@ -6660,37 +6417,36 @@ def _stamp_provider_batch(messages: list[dict]) -> None:
     }
 
 
-def _require_browser_grant(db, grant_id: str | None, epoch: int | None) -> None:
+def _require_browser_grant(db, grant_id: str | None) -> None:
   """Fail closed before admitting work carrying a browser initiator."""
-  if grant_id is None and epoch is None:
+  if grant_id is None:
     return
-  if not grant_id or epoch is None:
-    raise _PersistFailed("Incomplete browser grant lineage")
-  from app.browser_access import validate_grant
-  owner_id = db.query(models.Owner.id).scalar()
-  if owner_id is None or not validate_grant(db, grant_id, epoch, owner_id):
+  from app.browser_access import BrowserLineage, is_live
+  try:
+    browser = BrowserLineage(grant_id)
+  except ValueError as exc:
+    raise _PersistFailed("Invalid browser grant lineage") from exc
+  if not is_live(db, browser, db.query(models.Owner.id).scalar()):
     raise _PersistFailed("Browser grant is no longer active")
 
 
-def _root_browser_lineage(db, root_run_id: str) -> tuple[str | None, int | None]:
+def _root_browser_lineage(db, root_run_id: str) -> str | None:
   run = db.get(models.ChatRun, root_run_id)
   if run is None:
     raise _PersistFailed("Continuation root is unavailable")
-  lineage = run.browser_grant_id, run.browser_grant_epoch
-  _require_browser_grant(db, *lineage)
-  return lineage
+  _require_browser_grant(db, run.browser_grant_id)
+  return run.browser_grant_id
 
 
-def _delegation_browser_lineage(db, child_chat_id: str) -> tuple[str | None, int | None]:
+def _delegation_browser_lineage(db, child_chat_id: str) -> str | None:
   row = db.query(models.Delegation).filter(
     models.Delegation.child_chat_id == child_chat_id,
     models.Delegation.cancelled_at.is_(None),
   ).first()
   if row is None:
-    return None, None
-  lineage = row.browser_grant_id, row.browser_grant_epoch
-  _require_browser_grant(db, *lineage)
-  return lineage
+    return None
+  _require_browser_grant(db, row.browser_grant_id)
+  return row.browser_grant_id
 
 
 def _commit_or_rollback(db) -> bool:
