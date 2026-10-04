@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import logging
 import math
 import sqlite3
 import json
@@ -83,6 +84,8 @@ from app.deps import (
   require_nondelegated_owner_or_app_control,
 )
 from app.storage_io import atomic_write
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(
   prefix="/api/connect",
@@ -288,9 +291,6 @@ class _ActiveCommand:
     not_after: float | None = None,
     fingerprint: str | None = None,
     browser_grant_id: str | None = None,
-    browser_grant_epoch: int | None = None,
-    browser_owner_id: int | None = None,
-    browser_owner_token_epoch: int | None = None,
   ) -> None:
     self.request_id = request_id
     self.timeout = timeout
@@ -305,10 +305,9 @@ class _ActiveCommand:
     self.fingerprint = fingerprint or _command_fingerprint(
       cmd, cwd, timeout, script=script, shell=shell,
     )
+    # A guest-started command carries its grant so revocation can find and
+    # stop it, also after a restart.
     self.browser_grant_id = browser_grant_id
-    self.browser_grant_epoch = browser_grant_epoch
-    self.browser_owner_id = browser_owner_id
-    self.browser_owner_token_epoch = browser_owner_token_epoch
     # The public final result, set once when the command finishes.
     self.result: dict | None = None
     self._changed = asyncio.Event()
@@ -351,10 +350,9 @@ class _ActiveCommand:
         if record.get("not_after") is not None else None
       ),
       fingerprint=str(record.get("fingerprint") or ""),
+      # Records written before the grant epoch retired also hold
+      # browser_grant_epoch/browser_owner_id/browser_owner_token_epoch; unused.
       browser_grant_id=record.get("browser_grant_id"),
-      browser_grant_epoch=record.get("browser_grant_epoch"),
-      browser_owner_id=record.get("browser_owner_id"),
-      browser_owner_token_epoch=record.get("browser_owner_token_epoch"),
     )
 
   def record(self) -> dict:
@@ -369,9 +367,6 @@ class _ActiveCommand:
     }
     if self.browser_grant_id is not None:
       record["browser_grant_id"] = self.browser_grant_id
-      record["browser_grant_epoch"] = self.browser_grant_epoch
-      record["browser_owner_id"] = self.browser_owner_id
-      record["browser_owner_token_epoch"] = self.browser_owner_token_epoch
     # Replay needs the command only during the short pre-start dispatch window.
     # Do not retain command text (which may contain sensitive arguments) for the
     # remainder of a long-running command.
@@ -562,7 +557,16 @@ def cancel_browser_grant_commands(grant_id: str) -> list[dict]:
     for command in list(_host_commands(host_id).values()):
       if command.browser_grant_id != grant_id:
         continue
-      _cancel_command(host_id, command)
+      try:
+        _cancel_command(host_id, command)
+      except Exception:
+        # Revocation already committed. One failed ledger write must not
+        # leave the remaining hosts' commands running; report this one as
+        # still pending so the owner can retry.
+        log.exception(
+          "Connect could not record the stop of command %s on host %s",
+          command.request_id, host_id,
+        )
       if command.result is None:
         pending.append({
           "host_id": host_id,
@@ -906,7 +910,8 @@ async def _await_command_result(
   deadline = begins_at + command.timeout + _RESULT_GRACE_SECONDS
   while command.result is None:
     if _now() >= deadline:
-      _cancel_command(host_id, command)
+      # A command that never confirmed its start expired; nobody canceled it.
+      _cancel_command(host_id, command, unstarted_outcome="expired")
       raise HTTPException(
         status_code=504,
         detail="The command timed out and Connect asked the machine to stop it.",
@@ -1035,42 +1040,15 @@ def _started_response(command: _ActiveCommand) -> dict:
   return {"request_id": command.request_id, "state": command.state}
 
 
-def _browser_command_authority(principal: Principal | None) -> tuple[str | None, int | None, int | None, int | None]:
-  """Bind command admission to the live recipient grant, not just a JWT."""
-  if not isinstance(principal, Principal) or principal.browser_grant_id is None:
-    return None, None, None, None
-  with SessionLocal() as db:
-    owner = db.get(models.Owner, principal.owner.id)
-    if owner is None or owner.token_epoch != principal.owner.token_epoch:
-      raise HTTPException(status_code=401, detail="Browser access unavailable.")
-    browser_access.validate_grant(
-      db, principal.browser_grant_id, principal.browser_grant_epoch, owner.id,
-    )
-    if principal.browser_session_id is not None:
-      browser_access.validate_session(
-        db, principal.browser_session_id, principal.browser_grant_id, owner.id,
-      )
-  return (
-    principal.browser_grant_id, principal.browser_grant_epoch,
-    principal.owner.id, principal.owner.token_epoch,
-  )
-
-
 def _command_grant_active(command: _ActiveCommand) -> bool:
   """Recheck durable guest authority before a recovered exec can be replayed."""
   if command.browser_grant_id is None:
     return True
   with SessionLocal() as db:
-    owner = db.get(models.Owner, command.browser_owner_id)
-    if owner is None or owner.token_epoch != command.browser_owner_token_epoch:
-      return False
-    try:
-      browser_access.validate_grant(
-        db, command.browser_grant_id, command.browser_grant_epoch, owner.id,
-      )
-    except HTTPException:
-      return False
-  return True
+    return browser_access.is_live(
+      db, browser_access.BrowserLineage(command.browser_grant_id),
+      db.query(models.Owner.id).scalar(),
+    )
 
 
 @router.post("/hosts/{host_id}/exec")
@@ -1080,8 +1058,9 @@ async def exec_on_host(
   _owner: models.Owner = Depends(get_owner_or_app_with_connect_manage),
   _principal: Principal = Depends(get_principal),
 ) -> dict:
-  browser_grant_id, browser_grant_epoch, browser_owner_id, browser_owner_token_epoch = (
-    _browser_command_authority(_principal)
+  # get_principal already proved the guest's grant and session are live.
+  browser_grant_id = (
+    _principal.browser_grant_id if isinstance(_principal, Principal) else None
   )
   host = _load_host(host_id)
   if host is None:
@@ -1160,9 +1139,6 @@ async def exec_on_host(
     not_after=not_after,
     fingerprint=fingerprint,
     browser_grant_id=browser_grant_id,
-    browser_grant_epoch=browser_grant_epoch,
-    browser_owner_id=browser_owner_id,
-    browser_owner_token_epoch=browser_owner_token_epoch,
   )
   commands[request_id] = command
   _persist_commands(host_id)
@@ -1396,6 +1372,13 @@ class StreamInventory(BaseModel):
     return value
 
 
+def _unsupported_runner() -> HTTPException:
+  return HTTPException(
+    status_code=426,
+    detail="This Connect runner is no longer supported. Update it in Connect.",
+  )
+
+
 @router.get("/stream")
 @router.post("/stream")
 async def stream(request: Request, inventory: StreamInventory | None = None) -> StreamingResponse:
@@ -1408,6 +1391,11 @@ async def stream(request: Request, inventory: StreamInventory | None = None) -> 
   runner_release = _reported_runner_release(
     request.query_params.get("release"),
   )
+  incompatible = protocol_version != _RUNNER_PROTOCOL_VERSION
+  if incompatible and host_id in _channels:
+    # A stray old runner sharing the token while a current one is connected
+    # must neither describe this machine nor end the current runner's work.
+    raise _unsupported_runner()
   # Persist transport compatibility and implementation release independently.
   # A protocol-compatible legacy runner may stay connected while Connect still
   # offers the owner the current implementation.
@@ -1426,18 +1414,16 @@ async def stream(request: Request, inventory: StreamInventory | None = None) -> 
     host["platform"] = plat[:80]
   host["last_seen"] = _now()
   _save_host(host)
-  if protocol_version != _RUNNER_PROTOCOL_VERSION:
-    # This runner replaced the one that ran any active command, and it cannot
-    # report or stop them. Finish them now so no caller waits on them.
+  if incompatible:
+    # No current runner is connected, so this runner replaced the one that ran
+    # any active command, and it cannot report or stop them. Finish them now
+    # so no caller waits on them.
     for command in list(_host_commands(host_id).values()):
       _finish_command_as_lost(
         host_id, command.request_id,
         "an incompatible Connect runner replaced the one running this command",
       )
-    raise HTTPException(
-      status_code=426,
-      detail="This Connect runner is no longer supported. Update it in Connect.",
-    )
+    raise _unsupported_runner()
   ch = _Channel()
   # A reconnecting runner replaces any stale channel.
   _replace_channel(host_id, ch)

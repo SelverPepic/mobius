@@ -399,8 +399,8 @@ class ChatRun(Base):
   provider_execution_admitted = Column(Boolean, nullable=True, default=False)
   # Browser initiator, retained across physical recovery and delegation. NULL
   # means an ordinary local/owner run, never an implicit shared grant.
+  # Upgraded databases may also keep a retired, unused browser_grant_epoch.
   browser_grant_id = Column(String(64), nullable=True, index=True)
-  browser_grant_epoch = Column(Integer, nullable=True)
   # Inclusive boundary of the peer-message page injected into this provider
   # admission. Both fields are NULL when no peer message was delivered. The
   # pair advances only after the provider call returns successfully. Admission
@@ -543,8 +543,8 @@ class Delegation(Base):
   parent_root_run_id = Column(String(64), nullable=False, index=True)
   # Snapshot the spawning physical run's browser initiator. A logical Goal can
   # span later physical turns with different human participants.
+  # Upgraded databases may also keep a retired, unused browser_grant_epoch.
   browser_grant_id = Column(String(64), nullable=True, index=True)
-  browser_grant_epoch = Column(Integer, nullable=True)
   task_key = Column(String(128), nullable=False)
   # The parent Goal plan task this helper works on, recorded at spawn. The
   # helper's name is free; this is what places it under its task.
@@ -939,8 +939,9 @@ class ChatEmbedGrant(Base):
   )
   instance_id = Column(String(160), nullable=False, index=True)
   owner_epoch = Column(Integer, nullable=False)
+  # The opener's browser lineage (browser_access.BrowserLineage). Upgraded
+  # databases may also keep a retired, unused browser_grant_epoch.
   browser_grant_id = Column(String(64), nullable=True)
-  browser_grant_epoch = Column(Integer, nullable=True)
   browser_session_id = Column(String(64), nullable=True)
   role = Column(String(32), nullable=False, default="participant")
   operations_json = Column(JSON, nullable=False, default=list)

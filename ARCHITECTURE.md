@@ -1791,6 +1791,27 @@ On narrow layouts the drawer is modeled as a *virtual route*: opening it pushes 
 
 The mobile design satisfies a few hard desiderata — no "two drawers" artifact during Chrome-Android swipe-back, the 250ms slide stays visible, one back-press exits the PWA from home, and closing the drawer (overlay tap / X) must never navigate. Three load-bearing invariants in `useNavigation.js` enforce this: (1) **`navTo` consumes the existing drawer-sentinel rather than pushing** when the drawer is open (it pushes one `'nav'` entry only if the drawer was closed), so an in-app nav reuses the drawer's history slot instead of growing the stack — keeping history pinned to a pre-drawer snapshot and killing the BFCache artifact; (2) **every close path funnels through `history.back()` → `handleBack`**, whose drawer-first guard (`if (drawerOpenRef && drawerPushedRef) { close; return }`) prevents over-popping `navStackRef`; (3) **`drawerPushedRef` is a ref, not state** (mutated synchronously in the same task as the history call) and is the single source of truth for "is a drawer-sentinel above the current entry." Activating the already-current destination is a close/no-op and must not create a duplicate history edge. Every shell-pushed entry is tagged `{__mobiusNav:true, kind}` via `navHistory.js` and written to *both* the classic History store and the Navigation API entry (`updateCurrentEntry`); both back handlers ignore untagged pops so sandboxed-iframe phantom entries can't over-pop — do not drop the tag from any push site or genuine sentinels read as phantoms and back-nav dies. Mini-apps install their own back-targets via the `moebius:nav-push` postMessage protocol (per-app counts in `appSentinelCountsRef`, capped at 20), consumed before navStack pops; `Shell.deleteChat` must scrub `navStackRef` of the deleted chat's entries or back lands on a 404'd chat. Three architectures were tried and rejected (per-nav pushState, `flushSync`-before-pushState, perpetual single-sentinel) — read `tests/navigation.spec.mjs` before changing anything.
 
+Ordinary reloads preserve a matching tagged chat/app route and its shell index,
+rather than reclassifying the current entry as a new base. A base entry that
+shows a non-chat surface is still replaced and gets the HOME seed behind it, so
+Back after reload reaches chat instead of leaving Möbius. Each shell push marks
+its tagged source with `hasShellForward`, so even a popstate-only browser can
+recover the Forward edge after reload without a second persisted history stack.
+Where available, the Navigation API's next entry verifies that Forward remains
+inside shell-owned history. Explicit launch destinations still establish their
+own base; a fresh push discards the previous Forward branch.
+
+New Chat's provisional row ownership outlives its visible presentation. Leaving
+releases the keyboard lease, not the creation session: Back/Forward must restore
+its composer without reading a not-yet-created row as a deletion. An off-screen
+allocation may publish success or failure but never redirect the workspace;
+an off-screen id conflict is remembered and applies the same silent rotation
+when its chat is visible again. A queued first Send waits for that chat to be
+materialized, visible, and runtime-ready; handing it over retires the creation
+session. Consuming
+its durable handoff is a one-shot claim shared by retained/remounted views, not
+merely a component-local request token.
+
 Transient shell surfaces that should dismiss on browser Back use the same owner
 through `useHistoryDismiss`. Opening one pushes a tagged `kind:'dismissible'`
 entry before the surface paints. An explicit close (X, backdrop, Escape)
@@ -1914,23 +1935,31 @@ configured HTTPS origin.
 cookie exchange. A 15-minute bearer stays in memory; the renewal credential is
 HttpOnly/Secure/SameSite=Strict and path-confined to the session routes. Accepting
 a new invitation atomically retires the previous session presented by its cookie.
-Cookie exchanges use an origin-scoped Web Lock across live tabs; browsers without
-that capability fail visibly before sending an exchange. A tab dying mid-request
-can still interrupt cookie ordering; server-side grant validation remains the
-authority boundary. If cleanup of a superseded redemption fails, its cookie may
-remain restorable; the page must not imply server sign-out succeeded. Independent
-browsers may hold separate sessions.
+Only a sign-in (invite redemption or account finalization) writes that cookie,
+with a long fixed lifetime; renewal returns a bearer and never rewrites it, so a
+late renewal response cannot overwrite a newer sign-in. The server-side idle
+expiry is the authority. When two tabs sign this browser in, the last one wins
+and the other tab notices at its next renewal. Independent browsers may hold
+separate sessions.
 This never replaces the installation owner's login. `/shell/shared` owns an
 independent query cache and grant/tab-scoped navigation and drafts. Leaving ends
 that browser session, while revoking the recipient ends all their sessions.
 
-Every bearer descendant retains `browser_grant` and its epoch. Browser-derived
-app, embedded-chat and media tokens also retain the originating session. The
-central resolver checks the live grant/session rather than trusting JWT expiry.
+Every bearer descendant retains one `BrowserLineage`: the `browser_grant`, and
+for browser-derived app, embedded-chat and media tokens also the originating
+session. `browser_access.is_live` is the single rule every resolver, stream,
+writer admission, delegation, app service and Connect replay uses; it checks the
+live grant/session rather than trusting JWT expiry. Revocation is terminal
+(nothing clears `revoked_at`), so the grant id alone is sufficient lineage.
 Guest-started agent runs and child delegations retain durable grant lineage;
 renewing or resuming work cannot manufacture installation-owner authority.
 Turn-issued MCP broker capabilities also carry owner/grant lineage; upload and
-response streams stop forwarding after their authority is revoked. Bytes already
+response streams stop forwarding after their authority is revoked. Guest event
+streams and broker exchanges share `access_signal.until_revoked`: committed
+writes to access tables advance one in-process revision, and an open stream
+rechecks liveness in a worker thread only when it moves (or after a 30-second
+safety interval for out-of-process writes), so idle streams close on revocation
+and busy ones cost no query per event. Bytes already
 forwarded to a remote service cannot be recalled.
 Installation identity, credential, access administration and lifecycle controls
 remain separately gated; ordinary readable owner-input cards retain their
@@ -1959,15 +1988,17 @@ revocation or account replacement racing registration cannot activate it.
 The callback verifies issuer, audience, subject, origin, grant, nonce and proof
 expiry, then redirects with a non-secret pending ID. It never writes the refresh
 cookie: a cross-site callback cannot receive the old SameSite=Strict cookie.
-The shared shell removes the marker and finalizes with a same-origin POST under
-the existing cookie Web Lock. That transaction consumes the browser-bound proof,
+The shared shell removes the marker and finalizes with a same-origin POST. That
+transaction consumes the browser-bound proof,
 rechecks local permission, and retires the previous browser session. Failed proof
 validation leaves that prior session unchanged. Verified proof admission expires
 within 60 seconds; old pending rows are pruned on subsequent starts.
 
 Local validation pins the issuer, runtime origin and grantor credential generation
 (or managed instance ID and owner subject). Changing those bindings invalidates
-existing account-derived sessions and credentials. Unlink commits revocation of
+existing account-derived sessions and credentials; Connect lists such grants as
+`inactive`, and inviting the same handle again replaces them. One live grant
+exists per handle. Revoke and unlink share `browser_access.end_grant`. Unlink commits revocation of
 all account grants before attempting descendant stops and issuer cleanup; partial
 cleanup retains the link for an explicit retry. Legacy invitation grants are not
 revoked by account unlink. Issuer-side link loss blocks discovery and new proofs;

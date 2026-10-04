@@ -66,16 +66,19 @@ def test_broker_and_app_consumers_share_the_root_owned_socket():
   # The test runtime deliberately overrides the broker path so it cannot reach
   # a host-owned socket. Verify the production default from the module source.
   assert socket in BROKER_PATH.read_text(encoding="utf-8")
-  for relative in (
-    "app/runtime_identity.py",
-    "app/contribution_broker.py",
-    "app/community_broker.py",
-    "app/providers.py",
-    "scripts/entrypoint.sh",
-  ):
+  for relative in ("app/runtime_identity.py", "scripts/entrypoint.sh"):
     source = (backend / relative).read_text(encoding="utf-8")
     assert socket in source
     assert "/data/run/mobius-identity-broker.sock" not in source
+  # App broker clients resolve the socket only through runtime_identity.
+  for relative in (
+    "app/providers.py",
+    "app/contribution_broker.py",
+    "app/community_broker.py",
+  ):
+    source = (backend / relative).read_text(encoding="utf-8")
+    assert "MOBIUS_IDENTITY_BROKER_SOCKET" not in source
+    assert "mobius-identity-broker.sock" not in source
 
 
 @pytest.fixture()

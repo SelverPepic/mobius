@@ -8,7 +8,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from starlette.requests import Request
 
-from app import broker_access_signal, connectors, models
+from app import access_signal, connectors, models
 from app.browser_access import create_invitation, revoke_grant
 from app.routes import connectors as routes
 
@@ -23,7 +23,7 @@ def test_bound_capability_rechecks_owner_and_browser_grant(tmp_path):
     grant, _ = create_invitation(db, owner, 'recipient')
     cap = connectors.mint_broker_capability(
       7, 'x' * 64, owner_id=owner.id, owner_epoch=owner.token_epoch,
-      browser_grant_id=grant.id, browser_grant_epoch=grant.epoch,
+      browser_grant_id=grant.id,
     )
     claims = connectors.verify_broker_capability(cap, 7, 'x' * 64, db=db)
     assert claims['browser_grant_id'] == grant.id
@@ -94,7 +94,7 @@ async def test_broker_stream_closes_after_grant_revoke_without_remote_io(monkeyp
   body = response.body_iterator
   assert await anext(body) == b'first'
   active = False
-  broker_access_signal.notify_access_changed()  # what the revoking commit does
+  access_signal.notify_access_changed()  # what the revoking commit does
   with pytest.raises(StopAsyncIteration):
     await anext(body)
   assert client in closed and upstream in closed
@@ -117,7 +117,7 @@ def test_turn_plan_issues_bound_broker_token_from_run_session(tmp_path):
     plan = connectors.build_turn_plan(
       db, include_owner_connectors=True,
       owner_id=owner.id, owner_epoch=owner.token_epoch,
-      browser_grant_id=grant.id, browser_grant_epoch=grant.epoch,
+      browser_grant_id=grant.id,
     )
     assert plan is not None
     server = next(iter(plan.claude_servers.values()))
@@ -153,7 +153,7 @@ async def test_broker_upload_stops_forwarding_after_revoke(monkeypatch):
   iterator = routes._revocable_broker_upload(Upload(), 7, snapshot)
   assert await anext(iterator) == b'first'
   active = False
-  broker_access_signal.notify_access_changed()  # what the revoking commit does
+  access_signal.notify_access_changed()  # what the revoking commit does
   from fastapi import HTTPException
   with pytest.raises(HTTPException) as error:
     await anext(iterator)
@@ -181,8 +181,9 @@ def test_open_stream_lineage_recheck_sees_fresh_revocation(tmp_path, monkeypatch
     snapshot = routes._BrokerSnapshot(
       url=connector.url, auth_header=None, secret=None,
       connector_id=connector.id, generation=connector.capability_id,
+      # Capabilities minted before the grant epoch retired still carry it.
       lineage={'owner_id': owner.id, 'owner_epoch': owner.token_epoch,
-               'browser_grant_id': grant.id, 'browser_grant_epoch': grant.epoch},
+               'browser_grant_id': grant.id, 'browser_grant_epoch': 0},
     )
     assert routes._broker_lineage_active(connector.id, snapshot)
     revoke_grant(db, grant.id, owner.id)
@@ -207,9 +208,9 @@ def test_only_committed_access_changes_wake_open_broker_streams(tmp_path):
     grant, _ = create_invitation(db, owner, 'recipient')
 
     def bumps(change) -> bool:
-      before = broker_access_signal.current_revision()
+      before = access_signal.current_revision()
       change()
-      return broker_access_signal.current_revision() != before
+      return access_signal.current_revision() != before
 
     # New rows cannot revoke an open exchange; unrelated tables are ignored.
     assert not bumps(lambda: (db.add(models.Connector(
@@ -255,14 +256,14 @@ def test_only_committed_access_changes_wake_open_broker_streams(tmp_path):
     )
     db.add(other)
     db.commit()
-    before = broker_access_signal.current_revision()
+    before = access_signal.current_revision()
     other.enabled = False
     db.flush()
     with db.begin_nested():
       db.add(models.Chat(id='c2', title='y'))
-    assert broker_access_signal.current_revision() == before
+    assert access_signal.current_revision() == before
     db.commit()
-    assert broker_access_signal.current_revision() != before
+    assert access_signal.current_revision() != before
 
 
 class _LineageProbe:
@@ -287,7 +288,7 @@ def _idle_stream(monkeypatch, probe):
   snapshot = routes._BrokerSnapshot(
     url='https://unused.example/mcp', auth_header=None, secret=None,
     connector_id=7, generation='x' * 64,
-    access_revision=broker_access_signal.current_revision(),
+    access_revision=access_signal.current_revision(),
   )
   monkeypatch.setattr(routes, '_broker_lineage_active', probe)
   return routes._until_broker_revoked(chunks(), 7, snapshot)
@@ -303,7 +304,7 @@ async def test_idle_broker_stream_rechecks_only_after_an_access_change(monkeypat
   assert probe.ran_on_main_thread == [] and not waiting.done()
 
   probe.active = False
-  broker_access_signal.notify_access_changed()
+  access_signal.notify_access_changed()
   with pytest.raises(routes._BrokerRevoked):
     await asyncio.wait_for(waiting, timeout=2)
   assert probe.ran_on_main_thread == [False], 'one recheck, off the event loop'
@@ -337,7 +338,7 @@ async def test_busy_stream_still_runs_the_out_of_process_safety_recheck(
   snapshot = routes._BrokerSnapshot(
     url='https://unused.example/mcp', auth_header=None, secret=None,
     connector_id=7, generation='x' * 64,
-    access_revision=broker_access_signal.current_revision(),
+    access_revision=access_signal.current_revision(),
   )
   monkeypatch.setattr(routes, '_broker_lineage_active', probe)
   stream = routes._until_broker_revoked(chunks(), 7, snapshot)
