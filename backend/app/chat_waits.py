@@ -176,6 +176,7 @@ def declare_wait(
     raise WaitValidationError("condition_owner must not exceed 160 characters")
   if kind not in ("command", "timer", "github_checks"):
     raise WaitValidationError("kind must be 'command', 'timer', or 'github_checks'")
+  condition = None
   if kind == "github_checks":
     if command or delay_secs is not None:
       raise WaitValidationError("GitHub checks cannot also specify a command or timer")
@@ -184,7 +185,10 @@ def declare_wait(
     except ValueError as exc:
       raise WaitValidationError("github_checks needs repository, pull_request, and head_sha") from exc
     condition_owner = condition_owner or "GitHub"
-    command = spec.command()
+    # Store the typed spec, not a command line: the checker's interpreter and
+    # script path are resolved at each check so an image update cannot break
+    # an armed wait.
+    condition = spec.model_dump()
   elif github_checks is not None:
     raise WaitValidationError("github_checks is only valid for a GitHub wait")
   condition_owner = (condition_owner or "").strip() or None
@@ -212,8 +216,9 @@ def declare_wait(
 
   due_at = None
   if kind in ("command", "github_checks"):
-    command = command if isinstance(command, str) else ""
-    if not command.strip():
+    if kind == "github_checks":
+      command = None
+    elif not (isinstance(command, str) and command.strip()):
       raise WaitValidationError("command waits need a check command")
     # Probe on the next supervisor tick. A malformed check should fail visibly
     # now, not after its whole polling interval, and an already-met condition
@@ -258,6 +263,7 @@ def declare_wait(
     ),
     kind=kind,
     command=command,
+    condition_json=condition,
     due_at=due_at,
     interval_secs=interval,
     deadline_at=deadline_at,
@@ -674,6 +680,7 @@ def _compose_resume_notice(row: models.ChatWait, outcome: str) -> str:
     "outcome": outcome,
     "kind": row.kind,
     "command": row.command,
+    **({"github_checks": row.condition_json} if row.kind == "github_checks" else {}),
     "checks_count": row.checks_count,
     "last_exit_code": row.last_exit_code,
     "declared_at": row.created_at.isoformat() if row.created_at else None,
@@ -1063,6 +1070,7 @@ async def _check_one(row_id: str) -> bool:
       return False
     kind = row.kind
     command = row.command
+    condition = row.condition_json
     due_at = row.due_at
     deadline_at = row.deadline_at
     interval = int(row.interval_secs or DEFAULT_INTERVAL_SECS)
@@ -1086,23 +1094,25 @@ async def _check_one(row_id: str) -> bool:
     met = verdict == "met"
     check_failed = verdict == "failed"
     exit_code = 0 if met else (2 if check_failed else 1)
+  elif kind == "github_checks":
+    exit_code, output = await _run_check(
+      GitHubChecks.model_validate(condition).command(), wait_id=row_id,
+    )
+    observation = read_check_observation(exit_code, output)
+    met = observation.state == "met"
+    check_failed = observation.state == "failed"
+    output = observation.model_dump_json()
   else:
     exit_code, output = await _run_check(command or "false", wait_id=row_id)
-    if kind == "github_checks":
-      observation = read_check_observation(exit_code, output)
-      met = observation.state == "met"
-      check_failed = observation.state == "failed"
-      output = observation.model_dump_json()
-    else:
-      met = exit_code == 0
-      # Command waits have a deliberate three-way contract. A normal unmet
-      # predicate is silent exit 1; output is reserved for diagnostics or a met
-      # result. This catches shell quoting, missing auth/environment, missing
-      # executables, timeouts, and provider errors without guessing from brittle
-      # message substrings. Only the typed GitHub checker reports progress.
-      check_failed = not met and not (
-        exit_code == 1 and not (output or "").strip()
-      )
+    met = exit_code == 0
+    # Command waits have a deliberate three-way contract. A normal unmet
+    # predicate is silent exit 1; output is reserved for diagnostics or a met
+    # result. This catches shell quoting, missing auth/environment, missing
+    # executables, timeouts, and provider errors without guessing from brittle
+    # message substrings. Only the typed GitHub checker reports progress.
+    check_failed = not met and not (
+      exit_code == 1 and not (output or "").strip()
+    )
 
   with SessionLocal() as db:
     row = db.query(models.ChatWait).filter(

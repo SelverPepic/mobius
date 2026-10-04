@@ -2280,6 +2280,38 @@ def test_typed_check_observations_keep_progress_separate_from_monitor_failure(
   assert 'Observed check progress' in chat_waits_mod._compose_resume_notice(row, 'met')
 
 
+def test_armed_github_wait_builds_checker_command_at_check_time(
+  client, owner_token, db, monkeypatch, tmp_path,
+):
+  from pathlib import Path
+  import sys
+  chat_id = _owner_chat(client, owner_token)
+  row = declare_wait(db, chat_id=chat_id, description='Checks finish', kind='github_checks',
+    github_checks={'repository': 'owner/repo', 'pull_request': 7, 'head_sha': 'a' * 40},
+    deadline_secs=600)
+  assert row.command is None
+  assert row.condition_json == {'repository': 'owner/repo', 'pull_request': 7, 'head_sha': 'a' * 40}
+  # An image update replaces the interpreter after the wait was armed.
+  argv_log = tmp_path / 'argv.json'
+  python = tmp_path / 'python3.99'
+  python.write_text(
+    '#!/bin/bash\n'
+    f'printf "%s\\n" "$@" > {argv_log}\n'
+    'echo \'{"state":"met","summary":"All 2 checks finished.","completed":2,"total":2}\'\n'
+  )
+  python.chmod(0o755)
+  monkeypatch.setattr(sys, 'executable', str(python))
+  asyncio.run(chat_waits_mod._check_one(row.id))
+  db.expire_all()
+  row = db.get(models.ChatWait, row.id)
+  assert row.status == 'met', row.last_output
+  argv = argv_log.read_text().split()
+  assert argv[0].endswith('/scripts/pr-checks.py') and Path(argv[0]).is_file()
+  assert argv[1:] == ['--json', 'owner/repo', '7', 'a' * 40]
+  notice = chat_waits_mod._compose_resume_notice(row, 'met')
+  assert '"github_checks":{"repository":"owner/repo","pull_request":7,' in notice
+
+
 @pytest.mark.parametrize('exit_code,output', [(0, 'not json'), (0, '{"state":"pending","summary":"waiting","completed":4,"total":4}'), (0, '{"state":"met","summary":"ready","completed":1,"total":4}'), (-1, 'timeout')])
 def test_broken_typed_observation_never_becomes_success_or_endless_pending(client, owner_token, db, monkeypatch, exit_code, output):
   chat_id = _owner_chat(client, owner_token)

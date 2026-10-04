@@ -97,3 +97,8 @@ def test_bad_evidence_is_safe_and_visible(tmp_path, value):
 def test_no_checks_remains_pending(tmp_path):
     _, observed = fixture_run(tmp_path, reply())
     assert (observed["state"], observed["completed"], observed["total"]) == ("pending", 0, 0)
+
+
+def test_unknown_state_is_unfinished_not_met(tmp_path):
+    _, observed = fixture_run(tmp_path, reply({"SUCCESS": 1, "SOME_NEW_STATE": 1}))
+    assert (observed["state"], observed["completed"], observed["total"]) == ("pending", 1, 2)

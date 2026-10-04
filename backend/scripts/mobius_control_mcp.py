@@ -144,8 +144,9 @@ DECLARE_WAIT_DESCRIPTION = (
   "real question card. Something must actually be advancing the condition: "
   "internal work needs an acknowledged durable executor first. Give exactly "
   "one of github_checks, command or delay_secs. Prefer github_checks for a "
-  "published pull request at an exact head; it reports progress without "
-  "shell scripting. Prefer a command when readiness is observable in "
+  "published pull request at an exact head: it follows the checks GitHub "
+  "shows on the pull request (manual workflow dispatches on the same commit "
+  "are not included) without shell scripting. Prefer a command when readiness is observable in "
   "other ways; use a timer when elapsed time is the condition or no safe "
   "read-only check is available. A command is a read-only check: exit 0 "
   "means met, silent exit 1 means not yet, anything else wakes the chat as a "
@@ -1609,7 +1610,7 @@ _TOOL_DEFINITIONS = {
         },
         "github_checks": {
           "type": "object",
-          "description": "Wait for all GitHub checks to finish on one published pull-request head (finished does not mean passed).",
+          "description": "Wait for the checks GitHub shows on one published pull-request head to finish (finished does not mean passed; manual workflow dispatches on the same commit are not included).",
           "properties": {
             "repository": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", "maxLength": 200},
             "pull_request": {"type": "integer", "minimum": 1},

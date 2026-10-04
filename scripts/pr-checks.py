@@ -3,7 +3,9 @@
 
 One GraphQL query reads the pull request's head commit and its
 statusCheckRollup per-state counts, so the head and the counts come from the
-same moment. No API error text is included in output.
+same moment. These are the checks GitHub shows on the pull request; manually
+dispatched workflow runs (workflow_dispatch) on the same commit are not
+included. No API error text is included in output.
 """
 
 import argparse
@@ -27,9 +29,12 @@ query($owner: String!, $name: String!, $number: Int!) {
   }
 }
 """
-# A check is finished unless it is in one of these states. Cancelled, skipped,
-# neutral and stale count as finished but not failed, as in app/github_checks.py.
-UNFINISHED = {"QUEUED", "IN_PROGRESS", "PENDING", "WAITING", "REQUESTED", "EXPECTED"}
+# CheckRunState and StatusState values that mean a check is done. Any other
+# state, including one GitHub adds later, counts as unfinished so the wait
+# leans toward pending rather than met. Cancelled, skipped, neutral and stale
+# count as finished but not failed, as in app/github_checks.py.
+FINISHED = {"SUCCESS", "COMPLETED", "CANCELLED", "SKIPPED", "NEUTRAL", "STALE",
+            "FAILURE", "ERROR", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED"}
 FAILED = {"FAILURE", "ERROR", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED"}
 
 
@@ -71,7 +76,7 @@ def observe(repo, pr, expected_sha):
     if not head.lower().startswith(expected_sha.lower()):
         return result("failed", "The requested commit is not the published pull-request head.", 0, 0)
     total = sum(counts.values())
-    completed = total - sum(n for state, n in counts.items() if state in UNFINISHED)
+    completed = sum(n for state, n in counts.items() if state in FINISHED)
     failed = sum(n for state, n in counts.items() if state in FAILED)
     if total == 0:
         return result("pending", "No checks have appeared for this commit yet.", 0, 0)

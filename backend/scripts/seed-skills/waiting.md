@@ -67,8 +67,9 @@ command. Give exactly one of `github_checks`, `command`, or `delay_secs`:
 }
 ```
 
-This uses the existing GitHub connection, counts every check run and commit
-status on that exact published head, and records a bounded progress summary
+This uses the existing GitHub connection, follows the checks GitHub shows on
+the pull request at that exact published head (manual workflow dispatches on
+the same commit are not included), and records a bounded progress summary
 that the wake-up result carries. **Finished does not mean passed**: failed,
 cancelled, or skipped checks still wake the chat for review. A replaced head or unreadable result is
 a failed monitor, not an ordinary pending check. No checks yet stays pending.

@@ -18,6 +18,8 @@ class GitHubChecks(BaseModel):
   head_sha: str = Field(pattern=r"^[a-fA-F0-9]{7,40}$")
 
   def command(self) -> str:
+    """The checker command, built at each check from the current interpreter
+    and checkout so an armed wait survives image updates."""
     script = Path(__file__).resolve().parents[2] / "scripts" / "pr-checks.py"
     return shlex.join([
       sys.executable, str(script), "--json", self.repository,
