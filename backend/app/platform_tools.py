@@ -73,6 +73,10 @@ CONTROL_TOOL_NAMES = (*OWNER_CONTROL_TOOL_NAMES, *PEER_TOOL_NAMES)
 # Above app_tools.TOOL_TIMEOUT_SECONDS and the control server's own HTTP wait,
 # so the innermost limit is the one that reports.
 CONTROL_TOOL_TIMEOUT_SECONDS = 630
+# Set only in a runner whose own hook ends a turn at a confirmed closing save;
+# the control server then offers checkpoint_chat's end_turn. Deliberately not in
+# CONTROL_ENV_VARS: forwarding it would offer end_turn where it cannot work.
+CLOSING_SAVE_ENV = "MOBIUS_CLOSING_SAVE_ENDS_TURN"
 CONTROL_ENV_VARS = (
   "API_BASE_URL",
   "AGENT_TOKEN",

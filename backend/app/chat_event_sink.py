@@ -8,6 +8,7 @@ rather than reaching through the broader chat scheduler.
 
 import asyncio
 import copy
+import secrets
 import time
 import uuid
 from datetime import UTC, datetime
@@ -410,6 +411,9 @@ class ChatEventSink:
     # only the bounded raw tail needed by protocol receipts; presentation
     # carving and persisted tool output remain independent.
     self._app_output_tails: dict[str, str] = {}
+    # Receipts of this run's confirmed closing saves (`checkpoint_chat` with
+    # `end_turn`). Like a saved card, only a receipt recorded here ends a turn.
+    self._closing_save_ids: set[str] = set()
 
   def _start_side_task(
     self,
@@ -1612,6 +1616,43 @@ class ChatEventSink:
           failure_message="finish-after-owner-card failed chat_id=%s",
           warn=True,
         )
+
+  def record_closing_save(self) -> str | None:
+    """Name a confirmed closing save so this turn's end hook can honor it.
+
+    Only a runner that stops at the tool boundary itself (it refuses the next
+    model request) may end a turn on a closing save; interrupting a provider
+    that already moved on would lose the saving and record an aborted turn.
+    A closing save sent beside another still-running tool is not honored
+    either: ending the turn could cut that tool or hide its failure.
+    """
+    if not self._runner_may_end_at_closing_save():
+      return None
+    if sum(1 for block in self.assistant_blocks
+           if block.get("type") == "tool" and block.get("status") == "running") > 1:
+      return None
+    receipt_id = secrets.token_urlsafe(12)
+    self._closing_save_ids.add(receipt_id)
+    return receipt_id
+
+  def ends_turn(self, receipt_id: str) -> bool:
+    """Whether this turn produced this turn-ending receipt: a saved
+    continuation card or a confirmed closing save.
+
+    A closing save is rechecked at the cut: an owner message admitted after
+    its receipt was issued still needs an answer, so the turn continues.
+    """
+    if receipt_id in self._closing_save_ids:
+      return self._runner_may_end_at_closing_save()
+    return self.has_continuation_card(receipt_id)
+
+  def _runner_may_end_at_closing_save(self) -> bool:
+    from app.runner_registry import registry
+    for handle in registry.get_handles(self.chat_id):
+      may_end = getattr(handle, "may_end_at_closing_save", None)
+      if callable(may_end) and may_end():
+        return True
+    return False
 
   def has_continuation_card(self, question_id: str) -> bool:
     """Whether this turn saved exactly this continuation owner-input card.
