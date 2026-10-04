@@ -208,3 +208,29 @@ async def test_shared_finished_retry_never_reexecutes_or_adopts_another_grant(db
   assert result["stdout"] == "shared result"
   assert command.browser_grant_id == first.id
   assert channel.queue.empty()
+
+
+def test_one_failed_stop_record_does_not_abort_revocation_on_other_hosts(db, monkeypatch):
+  owner = _owner(db)
+  grant, _ = create_invitation(db, owner, "laptop")
+  failing_host, _ = _host()
+  other_host, _ = _host()
+  failing = connect._ActiveCommand("a" * 16, 60, cmd="printf one", browser_grant_id=grant.id)
+  other = connect._ActiveCommand("b" * 16, 60, cmd="printf two", browser_grant_id=grant.id)
+  connect._host_commands(failing_host)[failing.request_id] = failing
+  connect._host_commands(other_host)[other.request_id] = other
+  connect._persist_commands(failing_host)
+  connect._persist_commands(other_host)
+  real_finish = connect.connect_output.finish
+  def finish(host_id, request_id, *args, **kwargs):
+    if request_id == failing.request_id:
+      raise OSError("disk full")
+    return real_finish(host_id, request_id, *args, **kwargs)
+  monkeypatch.setattr(connect.connect_output, "finish", finish)
+  revoke_grant(db, grant.id, owner.id)
+
+  pending = connect.cancel_browser_grant_commands(grant.id)
+
+  assert [item["request_id"] for item in pending] == [failing.request_id]
+  assert other.result is not None and other.result["outcome"] == "canceled"
+  assert connect._find_command(other_host, other.request_id) is None

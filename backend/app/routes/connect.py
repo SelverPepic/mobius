@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import logging
 import math
 import sqlite3
 import json
@@ -83,6 +84,8 @@ from app.deps import (
   require_nondelegated_owner_or_app_control,
 )
 from app.storage_io import atomic_write
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(
   prefix="/api/connect",
@@ -554,7 +557,16 @@ def cancel_browser_grant_commands(grant_id: str) -> list[dict]:
     for command in list(_host_commands(host_id).values()):
       if command.browser_grant_id != grant_id:
         continue
-      _cancel_command(host_id, command)
+      try:
+        _cancel_command(host_id, command)
+      except Exception:
+        # Revocation already committed. One failed ledger write must not
+        # leave the remaining hosts' commands running; report this one as
+        # still pending so the owner can retry.
+        log.exception(
+          "Connect could not record the stop of command %s on host %s",
+          command.request_id, host_id,
+        )
       if command.result is None:
         pending.append({
           "host_id": host_id,
@@ -898,7 +910,8 @@ async def _await_command_result(
   deadline = begins_at + command.timeout + _RESULT_GRACE_SECONDS
   while command.result is None:
     if _now() >= deadline:
-      _cancel_command(host_id, command)
+      # A command that never confirmed its start expired; nobody canceled it.
+      _cancel_command(host_id, command, unstarted_outcome="expired")
       raise HTTPException(
         status_code=504,
         detail="The command timed out and Connect asked the machine to stop it.",
@@ -1390,13 +1403,16 @@ async def stream(request: Request, inventory: StreamInventory | None = None) -> 
   host["last_seen"] = _now()
   _save_host(host)
   if protocol_version != _RUNNER_PROTOCOL_VERSION:
-    # This runner replaced the one that ran any active command, and it cannot
-    # report or stop them. Finish them now so no caller waits on them.
-    for command in list(_host_commands(host_id).values()):
-      _finish_command_as_lost(
-        host_id, command.request_id,
-        "an incompatible Connect runner replaced the one running this command",
-      )
+    # When no current runner is connected, this runner replaced the one that
+    # ran any active command, and it cannot report or stop them. Finish them
+    # now so no caller waits on them. A stray old runner sharing the token
+    # while a current one is connected must not end that runner's live work.
+    if host_id not in _channels:
+      for command in list(_host_commands(host_id).values()):
+        _finish_command_as_lost(
+          host_id, command.request_id,
+          "an incompatible Connect runner replaced the one running this command",
+        )
     raise HTTPException(
       status_code=426,
       detail="This Connect runner is no longer supported. Update it in Connect.",

@@ -1854,6 +1854,50 @@ def test_incompatible_runner_finishes_the_commands_it_replaced(client, auth):
   )["result"]["outcome"] == "lost"
 
 
+def test_stray_incompatible_runner_does_not_end_the_current_runners_work(client, auth):
+  pairing, runner_token = _paired_host(client, auth)
+  request_id = "c2" * 8
+  connect_routes._channels[pairing["id"]] = connect_routes._Channel()
+  connect_routes._host_commands(pairing["id"])[request_id] = (
+    connect_routes._ActiveCommand(
+      request_id, 30, started_at=time.time(), state="running",
+    )
+  )
+  connect_routes._persist_commands(pairing["id"])
+
+  response = client.get(
+    "/api/connect/stream?protocol=3",
+    headers={"Authorization": f"Bearer {runner_token}"},
+  )
+
+  assert response.status_code == 426
+  assert request_id in connect_routes._host_commands(pairing["id"])
+  assert connect_routes.connect_output.finished(pairing["id"], request_id) is None
+
+
+@pytest.mark.asyncio
+async def test_never_started_command_at_result_deadline_finishes_expired(
+  client, auth, monkeypatch,
+):
+  pairing, _ = _paired_host(client, auth)
+  monkeypatch.setattr(connect_routes, "_RESULT_GRACE_SECONDS", 0)
+  request_id = "e1" * 8
+  command = connect_routes._ActiveCommand(
+    request_id, 1, cmd="never confirmed", created_at=time.time() - 5,
+  )
+  connect_routes._host_commands(pairing["id"])[request_id] = command
+  connect_routes._persist_commands(pairing["id"])
+
+  with pytest.raises(connect_routes.HTTPException) as raised:
+    await connect_routes._await_command_result(pairing["id"], command)
+
+  assert raised.value.status_code == 504
+  assert connect_routes._host_commands(pairing["id"]) == {}
+  assert connect_routes.connect_output.finished(
+    pairing["id"], request_id,
+  )["result"]["outcome"] == "expired"
+
+
 def test_a_stray_registry_file_does_not_break_the_host_list(client, auth):
   pairing, _ = _paired_host(client, auth)
   (connect_routes._hosts_dir() / "legacy.json").write_text('{"id": "legacy"}')
