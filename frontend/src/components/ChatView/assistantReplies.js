@@ -57,6 +57,27 @@ function hasTextPosition(notes, block, index) {
   })
 }
 
+// Memoized blocks compare media_dimensions by identity, so a join must return
+// the same object on every recompute while its inputs are unchanged.
+const joinedMediaDimensions = new WeakMap()
+
+/** Media sizes for text joined from two rows; the later row wins for a shared path. */
+function joinMediaDimensions(earlier, later) {
+  if (!later || later === earlier) return earlier
+  if (!earlier) return later
+  let byLater = joinedMediaDimensions.get(earlier)
+  if (!byLater) {
+    byLater = new WeakMap()
+    joinedMediaDimensions.set(earlier, byLater)
+  }
+  let joined = byLater.get(later)
+  if (!joined) {
+    joined = { ...earlier, ...later }
+    byLater.set(later, joined)
+  }
+  return joined
+}
+
 /** Extend only an exact replay across an otherwise empty display seam. Real
  * thoughts/tools/timeline beats retain their position and existing safe cuts.
  * All rows keep their original keys and activity coordinates for restoration. */
@@ -91,11 +112,11 @@ export function presentAssistantReply(rows, { activeIndex = -1, positions = new 
         reply_live_text: index === activeIndex && after.length === 1,
       }
       // The owner now shows the later row's text, so it needs that row's
-      // image sizes too; the later row's entry wins for a shared path.
-      const mediaDimensions = ownerMessage.media_dimensions || current.media_dimensions
-        ? { ...ownerMessage.media_dimensions, ...current.media_dimensions }
-        : undefined
-      presented[owner.row].message = { ...ownerMessage, blocks: ownerBlocks, media_dimensions: mediaDimensions }
+      // image sizes too.
+      presented[owner.row].message = {
+        ...ownerMessage, blocks: ownerBlocks,
+        media_dimensions: joinMediaDimensions(ownerMessage.media_dimensions, current.media_dimensions),
+      }
       const nextBlocks = [...sourceBlocks(projected)]
       nextBlocks[0] = { ...nextBlocks[0], content: '', source_text_offset: replay.sourceOffset + replay.text.length }
       presented[index].message = {
