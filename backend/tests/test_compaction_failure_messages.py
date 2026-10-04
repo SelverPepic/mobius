@@ -266,3 +266,44 @@ async def test_claude_retried_rate_limit_does_not_mask_final_sign_in_failure(
       "prompt", data_dir=str(tmp_path), model=None, effort=None,
     )
   assert "Reconnect" in str(failure.value)
+
+
+@pytest.mark.asyncio
+async def test_claude_retried_rate_limit_does_not_mask_terminal_result_text(
+  monkeypatch, tmp_path,
+):
+  from claude_agent_sdk.types import AssistantMessage, ResultMessage, TextBlock
+
+  class Provider:
+    def build_env(self, **_kwargs):
+      return {}
+
+  class Client:
+    async def connect(self):
+      pass
+
+    async def query(self, _prompt):
+      pass
+
+    async def receive_response(self):
+      yield AssistantMessage(
+        content=[TextBlock(text="Rate limited; retrying")],
+        model="claude", error="rate_limit",
+      )
+      yield AssistantMessage(content=[TextBlock(text="partial")], model="claude")
+      yield ResultMessage(
+        subtype="error_during_execution", duration_ms=1, duration_api_ms=1,
+        is_error=True, num_turns=1, session_id="s",
+        result="Invalid authentication credentials",
+      )
+
+    async def disconnect(self):
+      pass
+
+  monkeypatch.setattr("app.providers.get_provider", lambda _pid: Provider())
+  monkeypatch.setattr("claude_agent_sdk.ClaudeSDKClient", lambda _opts: Client())
+  with pytest.raises(compaction.CompactionError) as failure:
+    await compaction._run_claude_summarize_turn(
+      "prompt", data_dir=str(tmp_path), model=None, effort=None,
+    )
+  assert "Reconnect" in str(failure.value)

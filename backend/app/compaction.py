@@ -388,9 +388,11 @@ async def _run_claude_summarize_turn(
               errors = list(msg.errors or [])
               if isinstance(msg.result, str):
                 errors.append(msg.result)
+              # The latest attempt's error type describes that attempt only;
+              # the terminal result's own text must not be overruled by it.
               raise CompactionError(_provider_compaction_failure(
                 "\n".join(errors or attempt_error), status=msg.api_error_status,
-                error_type=error_type,
+                error_type=None if errors else error_type,
               ))
     except asyncio.TimeoutError:
       raise CompactionError(

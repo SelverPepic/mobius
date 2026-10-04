@@ -1,5 +1,7 @@
 """One provider-error classifier shared by live turns and compaction."""
 
+import time
+
 import pytest
 
 from app import codex_events
@@ -42,9 +44,6 @@ WORKSPACE_CREDITS = "Your workspace is out of credits. Add credits to continue."
 def test_exhausted_workspace_credits_win_over_a_reached_limit_status():
   # Codex reports depleted workspace credits as a reached rate limit (429);
   # no reset time refills them, so they are credits, not a usage limit.
-  assert classify_provider_error(
-    "Codex usage limit reached.", status=429, credits_depleted=True,
-  ) is Kind.CREDITS
   assert classify_provider_error(WORKSPACE_CREDITS, status=429) is Kind.CREDITS
 
 
@@ -134,3 +133,13 @@ def test_codex_mobius_credit_wording_agrees_with_classifier(text):
     codex_events.MOBIUS_INSUFFICIENT_CREDITS_MESSAGE,
   }
   assert classify_provider_error(text) is Kind.CREDITS
+
+
+def test_long_limit_heavy_text_classifies_in_linear_time():
+  # Codex stderr is unbounded and chat classifies on the event loop; a
+  # pattern spanning "limit" ... "resets" took seconds on 24KB of this.
+  text = "limit " * 35_000
+  start = time.perf_counter()
+  assert classify_provider_error(text) is Kind.OTHER
+  assert classify_provider_error(text + "resets 5pm") is Kind.USAGE_LIMIT
+  assert time.perf_counter() - start < 0.2

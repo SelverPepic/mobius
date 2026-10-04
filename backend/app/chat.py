@@ -3999,11 +3999,8 @@ def _park_exit(
   # Claude reports 413 and 429 as `api_error_status`, and the Codex runner
   # turns a reached rate-limit window into 429. Results without a status, and
   # exception exits, classify by the error text.
-  credits_depleted = (runner_result or {}).get("credits_depleted") is True
   error_kind = classify_provider_error(
-    error_text,
-    status=(runner_result or {}).get("api_error_status"),
-    credits_depleted=credits_depleted,
+    error_text, status=(runner_result or {}).get("api_error_status"),
   )
   if (
     error_kind is ProviderErrorKind.TOO_LARGE
@@ -4028,7 +4025,10 @@ def _park_exit(
   # reached rate limit (429), but no reset time will refill them, so it is a
   # manual pause the owner resumes after adding credits. Other credit
   # failures are shown as plain errors.
-  if credits_depleted or is_workspace_credits_exhausted(error_text):
+  if (
+    (runner_result or {}).get("credits_depleted") is True
+    or is_workspace_credits_exhausted(error_text)
+  ):
     sink.publish(_pause_note(error_text, kind="credits", provider=provider_id))
     return {"parked": False}
   # A false positive only parks the queue for manual resend; a false negative
