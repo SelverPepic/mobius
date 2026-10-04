@@ -82,7 +82,11 @@ from app.chat_logging import (
   safe_commit as _safe_commit,
 )
 from app.goal_commands import goal_request_for_agent, is_goal_continue
-from app.provider_errors import ProviderErrorKind, classify_provider_error
+from app.provider_errors import (
+  ProviderErrorKind,
+  classify_provider_error,
+  is_workspace_credits_exhausted,
+)
 from app.chat_writer import (
   AcknowledgeProviderSuccess,
   AdmitProviderExecution,
@@ -3686,19 +3690,6 @@ _MODEL_CAPACITY_ERROR_MARKERS = (
 )
 
 
-# The provider's exhausted-workspace-credits rejection as plain error text, for
-# failures without the runner's structured ``credits_depleted`` flag. It is not
-# a timed limit: nothing resets on its own, so it is a manual pause the owner
-# continues after adding credits. Matched exactly so unrelated payment failures
-# keep the error card.
-_WORKSPACE_CREDITS_ERROR = "your workspace is out of credits. add credits to continue."
-
-
-def _is_workspace_credits_error_text(text: str | None) -> bool:
-  """Whether a provider rejected the turn because workspace credits ran out."""
-  return (text or "").strip().lower() == _WORKSPACE_CREDITS_ERROR
-
-
 def _is_model_capacity_error_text(text: str | None) -> bool:
   """Whether a provider says the specifically selected model is busy."""
   if not text:
@@ -4011,8 +4002,11 @@ def _park_exit(
   # Claude reports 413 and 429 as `api_error_status`, and the Codex runner
   # turns a reached rate-limit window into 429. Results without a status, and
   # exception exits, classify by the error text.
+  credits_depleted = (runner_result or {}).get("credits_depleted") is True
   error_kind = classify_provider_error(
-    error_text, status=(runner_result or {}).get("api_error_status"),
+    error_text,
+    status=(runner_result or {}).get("api_error_status"),
+    credits_depleted=credits_depleted,
   )
   if (
     error_kind is ProviderErrorKind.TOO_LARGE
@@ -4037,10 +4031,7 @@ def _park_exit(
   # reached rate limit (429), but no reset time will refill them, so it is a
   # manual pause the owner resumes after adding credits. Other credit
   # failures are shown as plain errors.
-  if (
-    (runner_result or {}).get("credits_depleted") is True
-    or _is_workspace_credits_error_text(error_text)
-  ):
+  if credits_depleted or is_workspace_credits_exhausted(error_text):
     sink.publish(_pause_note(error_text, kind="credits", provider=provider_id))
     return {"parked": False}
   # A false positive only parks the queue for manual resend; a false negative

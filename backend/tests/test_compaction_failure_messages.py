@@ -217,6 +217,14 @@ def test_compaction_shares_live_turn_rules(cause, action):
   assert action in compaction._provider_compaction_failure(cause)
 
 
+def test_compaction_reads_exhausted_workspace_credits_as_credits_not_limit():
+  # Live turns pause on this refusal even when Codex also reports a 429.
+  message = compaction._provider_compaction_failure(
+    "Your workspace is out of credits. Add credits to continue.", status=429,
+  )
+  assert "Add credits" in message
+
+
 @pytest.mark.asyncio
 async def test_claude_retried_rate_limit_does_not_mask_final_sign_in_failure(
   monkeypatch, tmp_path,

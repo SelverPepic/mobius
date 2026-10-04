@@ -3,7 +3,11 @@
 import pytest
 
 from app import codex_events
-from app.provider_errors import ProviderErrorKind as Kind, classify_provider_error
+from app.provider_errors import (
+  ProviderErrorKind as Kind,
+  classify_provider_error,
+  is_workspace_credits_exhausted,
+)
 
 
 @pytest.mark.parametrize("status,kind", [
@@ -30,6 +34,32 @@ def test_structured_fields_win_over_text():
   assert classify_provider_error(
     "rate limit exceeded", error_type="billing_error",
   ) is Kind.CREDITS
+
+
+WORKSPACE_CREDITS = "Your workspace is out of credits. Add credits to continue."
+
+
+def test_exhausted_workspace_credits_win_over_a_reached_limit_status():
+  # Codex reports depleted workspace credits as a reached rate limit (429);
+  # no reset time refills them, so they are credits, not a usage limit.
+  assert classify_provider_error(
+    "Codex usage limit reached.", status=429, credits_depleted=True,
+  ) is Kind.CREDITS
+  assert classify_provider_error(WORKSPACE_CREDITS, status=429) is Kind.CREDITS
+
+
+@pytest.mark.parametrize("text,exhausted", [
+  (WORKSPACE_CREDITS, True),
+  ("  your workspace is OUT OF CREDITS. add credits to continue.  ", True),
+  ("Your workspace is out of credits.", False),
+  ("Payment failed: card declined. Add credits to continue.", False),
+  ("Credit balance is too low", False),
+  (None, False),
+])
+def test_workspace_credits_refusal_is_matched_exactly(text, exhausted):
+  assert is_workspace_credits_exhausted(text) is exhausted
+  if exhausted:
+    assert classify_provider_error(text) is Kind.CREDITS
 
 
 def test_unmapped_structured_fields_fall_back_to_text():

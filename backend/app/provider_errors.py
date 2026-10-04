@@ -8,7 +8,9 @@ so the callers cannot disagree about what an error means.
 
 Structured fields win over text: an HTTP status or a provider's own error type
 is the provider's statement, while text matching is the fallback for errors
-that arrive only as a message.
+that arrive only as a message. Exhausted workspace credits win over the
+status, because Codex reports them as a reached rate limit (429) although no
+reset time will refill them.
 """
 
 import re
@@ -28,6 +30,19 @@ _STATUS_KINDS = {
   429: ProviderErrorKind.USAGE_LIMIT,
   401: ProviderErrorKind.AUTH,
 }
+
+# The provider's exact exhausted-workspace-credits rejection. Matched exactly
+# (not by the broader credits rule) because only this refusal is resumed by
+# adding credits to the workspace; other payment failures stay plain errors.
+_WORKSPACE_CREDITS_EXHAUSTED = (
+  "your workspace is out of credits. add credits to continue."
+)
+
+
+def is_workspace_credits_exhausted(text: str | None) -> bool:
+  """Whether the text is the provider's exhausted-workspace-credits refusal."""
+  return (text or "").strip().lower() == _WORKSPACE_CREDITS_EXHAUSTED
+
 
 # Claude's ``AssistantMessage.error`` values that name a kind on their own.
 _ERROR_TYPE_KINDS = {
@@ -76,8 +91,15 @@ def classify_provider_error(
   *,
   status: int | None = None,
   error_type: str | None = None,
+  credits_depleted: bool = False,
 ) -> ProviderErrorKind:
-  """Return the kind of a provider failure, structured fields first."""
+  """Return the kind of a provider failure, structured fields first.
+
+  ``credits_depleted`` is the Codex runner's flag from the rate-limit
+  snapshot's reached type.
+  """
+  if credits_depleted or is_workspace_credits_exhausted(text):
+    return ProviderErrorKind.CREDITS
   if status in _STATUS_KINDS:
     return _STATUS_KINDS[status]
   if error_type in _ERROR_TYPE_KINDS:
