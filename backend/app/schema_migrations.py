@@ -5832,11 +5832,13 @@ def _move_chat_media_out_of_generated(eng) -> None:
   instead of at every boot.
 
   Each step leaves a readable state if interrupted: copy into ``media/`` (the
-  old copy stays), commit the link rewrite, then delete the old copy. Every
-  name collision is checked before anything changes; a ``media/`` file with
-  different bytes fails closed rather than overwriting either image.
+  old copy stays), commit the link rewrite, then delete the old copy. Name
+  collisions are checked before anything changes. A chat whose ``generated/``
+  file would replace a different ``media/`` file is left exactly as it was
+  and logged, so neither image is lost and boot is never blocked by it.
   """
   import filecmp
+  import logging
   import shutil
 
   from sqlalchemy import bindparam, inspect as sa_inspect, text
@@ -5878,18 +5880,29 @@ def _move_chat_media_out_of_generated(eng) -> None:
       return []
     return [source for source in old_dir.iterdir() if source.is_file()]
 
-  for chat_id in sorted(chat_ids):
+  def first_collision(chat_id: str) -> str | None:
     for source in old_files(chat_id):
       destination = chats_root / chat_id / "media" / source.name
       if destination.exists() and (
         not destination.is_file()
         or not filecmp.cmp(source, destination, shallow=False)
       ):
-        raise RuntimeError(
-          f"Conflicting chat media file for chat {chat_id}: {source.name}"
-        )
+        return source.name
+    return None
 
+  movable = []
   for chat_id in sorted(chat_ids):
+    collision = first_collision(chat_id)
+    if collision is None:
+      movable.append(chat_id)
+    else:
+      logging.getLogger(__name__).warning(
+        "Left chat %s on legacy generated/ media: media/%s already exists "
+        "with different bytes",
+        chat_id, collision,
+      )
+
+  for chat_id in movable:
     media_dir = chats_root / chat_id / "media"
     sources = old_files(chat_id)
     for source in sources:

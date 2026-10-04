@@ -1,7 +1,6 @@
 import uuid
 from pathlib import Path
 
-import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
@@ -77,25 +76,83 @@ def test_retry_after_interrupted_cleanup_finishes_the_move(db, chat):
   assert chat.messages[0]["content"] == new_url
 
 
-def test_conflicting_file_fails_before_any_change(db, chat):
-  old_url = f"/api/chats/{chat.id}/generated/same.png"
-  chat.messages = [{"role": "assistant", "content": old_url}]
-  db.commit()
+def _legacy_chat(session, data_dir: Path, image: bytes, media: bytes | None):
+  """Add a chat linking ``generated/img.png``; optionally pre-seed ``media/``."""
+  chat_id = str(uuid.uuid4())
+  session.add(models.Chat(
+    id=chat_id,
+    title="Legacy",
+    messages=[{
+      "role": "assistant",
+      "content": f"/api/chats/{chat_id}/generated/img.png",
+    }],
+  ))
+  session.commit()
+  chat_root = data_dir / "chats" / chat_id
+  (chat_root / "generated").mkdir(parents=True)
+  (chat_root / "generated" / "img.png").write_bytes(image)
+  if media is not None:
+    (chat_root / "media").mkdir(parents=True)
+    (chat_root / "media" / "img.png").write_bytes(media)
+  return chat_id
 
-  old_dir = _chat_root(chat.id) / "generated"
-  media_dir = _chat_root(chat.id) / "media"
-  old_dir.mkdir(parents=True)
-  media_dir.mkdir(parents=True)
-  (old_dir / "same.png").write_bytes(b"old")
-  (media_dir / "same.png").write_bytes(b"different")
 
-  with pytest.raises(RuntimeError, match="Conflicting chat media file"):
+def test_collision_leaves_that_chat_as_is_and_migrates_the_others(
+  db, caplog,
+):
+  data_dir = Path(get_settings().data_dir)
+  colliding = _legacy_chat(db, data_dir, b"old", media=b"different")
+  clean = _legacy_chat(db, data_dir, b"clean", media=None)
+
+  with caplog.at_level("WARNING", logger="app.schema_migrations"):
     _move_chat_media_out_of_generated(db.get_bind())
+  db.expire_all()
 
-  db.refresh(chat)
-  assert chat.messages[0]["content"] == old_url
-  assert (old_dir / "same.png").read_bytes() == b"old"
-  assert (media_dir / "same.png").read_bytes() == b"different"
+  stuck = db.get(models.Chat, colliding)
+  assert stuck.messages[0]["content"] == (
+    f"/api/chats/{colliding}/generated/img.png"
+  )
+  assert (_chat_root(colliding) / "generated" / "img.png").read_bytes() == b"old"
+  assert (_chat_root(colliding) / "media" / "img.png").read_bytes() == (
+    b"different"
+  )
+  warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+  assert len(warnings) == 1
+  assert colliding in warnings[0] and "img.png" in warnings[0]
+
+  moved = db.get(models.Chat, clean)
+  assert moved.messages[0]["content"] == f"/api/chats/{clean}/media/img.png"
+  assert not (_chat_root(clean) / "generated").exists()
+  assert (_chat_root(clean) / "media" / "img.png").read_bytes() == b"clean"
+
+
+def test_collision_does_not_block_database_startup(tmp_path, monkeypatch):
+  """A media name collision must never stop the platform from booting."""
+  data_dir = tmp_path / "data"
+  monkeypatch.setenv("DATA_DIR", str(data_dir))
+  eng = create_engine(f"sqlite:///{tmp_path / 'boot.db'}")
+  models.Base.metadata.create_all(eng)
+  migrations._ensure_migration_ledger(eng)
+  for version, _migration in migrations._SCHEMA_MIGRATIONS:
+    if version != "0083_chat_media_directory":
+      migrations._record_migration(eng, version)
+  with Session(eng) as session:
+    colliding = _legacy_chat(session, data_dir, b"old", media=b"different")
+    clean = _legacy_chat(session, data_dir, b"clean", media=None)
+
+  migrations.run_migrations(eng)
+
+  assert "0083_chat_media_directory" in {
+    row["version"] for row in migrations.schema_migration_history(eng)
+  }
+  with Session(eng) as session:
+    assert session.get(models.Chat, colliding).messages[0]["content"] == (
+      f"/api/chats/{colliding}/generated/img.png"
+    )
+    assert session.get(models.Chat, clean).messages[0]["content"] == (
+      f"/api/chats/{clean}/media/img.png"
+    )
+  assert (data_dir / "chats" / colliding / "generated" / "img.png").exists()
 
 
 def test_upgrade_runs_the_move_once_and_later_boots_skip_the_scan(
