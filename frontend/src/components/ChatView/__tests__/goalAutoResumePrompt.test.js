@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { readFileSync } from 'node:fs'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 
@@ -105,4 +106,14 @@ test('blocked storage keeps the prompt usable', () => {
   assert.match(renderToStaticMarkup(createElement(GoalAutoResumePrompt, {
     chatId: 'chat-1', goalKey: 'goal-1', storage, onEnable() {},
   })), /Continue after resets/)
+})
+
+test('the enable button uses the theme foreground for accent fills', () => {
+  const css = readFileSync(new URL('../ChatView.css', import.meta.url), 'utf8')
+  const rule = css.match(/\.chat__goal-auto-resume-enable\s*\{([^}]*)\}/)
+  assert.ok(rule, 'enable button rule exists')
+  assert.match(rule[1], /background:\s*var\(--accent\)/)
+  // --accent-fg is the theme's only foreground for text on an --accent fill;
+  // a light custom accent sets it dark, so a fixed white would vanish.
+  assert.match(rule[1], /color:\s*var\(--accent-fg\b/)
 })
