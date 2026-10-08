@@ -9,10 +9,10 @@ import GoalAutoResumePrompt, {
 
 test('offers the policy only for actionable top-level Goals that have it disabled', () => {
   assert.equal(shouldOfferGoalAutoResume({
-    goalStatus: 'active', autoResumeEnabled: false,
+    goalStatus: 'active', autoResumeEnabled: false, policyKnown: true,
   }), true)
   assert.equal(shouldOfferGoalAutoResume({
-    goalStatus: 'paused', autoResumeEnabled: false,
+    goalStatus: 'paused', autoResumeEnabled: false, policyKnown: true,
   }), true)
   assert.equal(shouldOfferGoalAutoResume({
     goalStatus: 'completed', autoResumeEnabled: false,
@@ -21,7 +21,16 @@ test('offers the policy only for actionable top-level Goals that have it disable
     goalStatus: 'active', autoResumeEnabled: true,
   }), false)
   assert.equal(shouldOfferGoalAutoResume({
-    embedded: true, goalStatus: 'active', autoResumeEnabled: false,
+    embedded: true, goalStatus: 'active', autoResumeEnabled: false, policyKnown: true,
+  }), false)
+})
+
+test('waits for the chat policy to load before offering it', () => {
+  assert.equal(shouldOfferGoalAutoResume({
+    goalStatus: 'active', autoResumeEnabled: false,
+  }), false)
+  assert.equal(shouldOfferGoalAutoResume({
+    goalStatus: 'active', autoResumeEnabled: false, policyKnown: false,
   }), false)
 })
 

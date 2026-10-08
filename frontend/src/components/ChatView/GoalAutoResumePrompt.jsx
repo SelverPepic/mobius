@@ -7,8 +7,13 @@ export function shouldOfferGoalAutoResume({
   embedded = false,
   goalStatus = '',
   autoResumeEnabled = false,
+  policyKnown = false,
 }) {
-  return !embedded
+  // Until chat info loads, autoResumeEnabled reads false even when the
+  // policy is on, so wait for it rather than flash a prompt for a setting
+  // that is already enabled.
+  return policyKnown
+    && !embedded
     && ['active', 'paused'].includes(goalStatus)
     && !autoResumeEnabled
 }

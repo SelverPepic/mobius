@@ -5829,6 +5829,7 @@ export default function ChatView({
     embedded,
     goalStatus: goalPresentation?.status,
     autoResumeEnabled,
+    policyKnown: chatInfo != null,
   })
   const goalResumeBlocked = useCallback(() => resumeBlocked() || !canResumeGoal(goalPresentation, {
     turnActive, hasPendingQuestion, chatHandoff,
