@@ -6381,6 +6381,7 @@ export default function ChatView({
         </div>
         {goalAutoResumeOffered && (
           <GoalAutoResumePrompt
+            chatId={chatId}
             goalKey={goalPresentation?.id || activeGoalObjective}
             saving={autoResumeSaving}
             error={autoResumeErrorSource === 'goal' ? autoResumeError : ''}
