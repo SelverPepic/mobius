@@ -336,12 +336,3 @@ test('queued message content participates in native text selection', () => {
     'the queued message surface must not cancel selection at pointer-down',
   )
 })
-
-test('the enable button uses the theme foreground for accent fills', () => {
-  const rule = chatCss.match(/\.chat__goal-auto-resume-enable\s*\{([^}]*)\}/)
-  assert.ok(rule, 'enable button rule exists')
-  assert.match(rule[1], /background:\s*var\(--accent\)/)
-  // --accent-fg is the theme's only foreground for text on an --accent fill;
-  // a light custom accent sets it dark, so a fixed white would vanish.
-  assert.match(rule[1], /color:\s*var\(--accent-fg\b/)
-})

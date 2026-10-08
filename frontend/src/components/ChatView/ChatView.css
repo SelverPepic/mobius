@@ -3890,7 +3890,7 @@
 
 .chat__goal-auto-resume-enable {
   background: var(--accent);
-  color: var(--accent-fg, #fff);
+  color: var(--accent-text, white);
 }
 
 .chat__goal-auto-resume-later {
